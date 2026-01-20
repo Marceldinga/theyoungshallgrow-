@@ -1,12 +1,8 @@
 
-# app.py ✅ COMPLETE SINGLE-FILE VERSION (uses members_legacy)
-from __future__ import annotations
-
-import os
 import streamlit as st
-import pandas as pd
 from supabase import create_client
-from postgrest.exceptions import APIError
+import os
+import pandas as pd
 
 APP_BRAND = "theyoungshallgrow"
 
@@ -153,10 +149,7 @@ def load_app_state(url: str, anon_key: str, schema: str) -> dict:
     client = create_client(url.strip(), anon_key.strip())
     rows = safe_select(client, "app_state", "*", schema=schema, limit=1)
     return rows[0] if rows else {}
-
-
-@st.cache_data(ttl=90)
-from supabase import create_client
+    
 
 @st.cache_data(ttl=30)
 def load_current_session_id(SUPABASE_URL: str, SUPABASE_ANON_KEY: str, SUPABASE_SCHEMA: str):
