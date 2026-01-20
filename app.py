@@ -156,43 +156,35 @@ def load_app_state(url: str, anon_key: str, schema: str) -> dict:
 
 
 @st.cache_data(ttl=90)
-def load_current_session_id(url: str, anon_key: str, schema: str) -> str | None:
-    client = create_client(url.strip(), anon_key.strip())
+import streamlit as st
+from supabase import create_client
 
-    # Try view first
-    rows = safe_select(client, "current_season_view", "*", schema=schema, limit=1)
-    if R := (R := (R[0] if R else None)):
-        for k in ("session_id", "season_id", "current_session_id", "id", "season_name", "session_name"):
-            if k in R and R[k]:
-                return str(R[k])
+@st.cache_data(ttl=30)
+def load_current_session_id(SUPABASE_URL: str, SUPABASE_ANON_KEY: str, SUPABASE_SCHEMA: str):
+    sb = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-    # Fallback: sessions_legacy
-    rows = safe_select(client, "sessions_legacy", "*", schema=schema, order_by="id", order_desc=True, limit=1)
-    if rows:
-        row = rows[0]
-        for k in ("id", "session_id", "season_id", "season_name", "session_name"):
-            if k in row and row[k]:
-                return str(row[k])
+    try:
+        resp = (
+            sb.schema(SUPABASE_SCHEMA)
+              .table("app_state")
+              .select("next_payout_index")
+              .limit(1)
+              .execute()
+        )
+    except Exception as e:
+        st.error(f"Failed to load session id: {e}")
+        return None
 
-    return None
+    rows = getattr(resp, "data", None)
 
-# ============================================================
-# UI: TOP BAR ACTIONS
-# ============================================================
-bar1, bar2 = st.columns([1, 0.25])
-with bar2:
-    if st.button("🔄 Refresh data", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
+    if not rows or not isinstance(rows, list):
+        return None
 
-st.title(f"🏦 {APP_BRAND} • Bank Dashboard")
+    row = rows[0]
+    if not isinstance(row, dict):
+        return None
 
-# ============================================================
-# LOAD DATA
-# ============================================================
-sid = load_current_session_id(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
-app_state = load_app_state(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
-labels, label_to_id, label_to_name, df_members = load_members_legacy(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
+    return row.get("next_payout_index")
 
 # ============================================================
 # KPI CARDS
