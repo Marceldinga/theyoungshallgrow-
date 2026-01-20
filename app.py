@@ -1,16 +1,16 @@
 
-# app.py ✅ SINGLE CLEAN UPDATED FILE WITH IMPORT DEBUG FOR payout.py
+# app.py ✅ SINGLE CLEAN UPDATED FILE (correct render_admin placement)
 from __future__ import annotations
 
 import os
-from admin_panels import render_admin
-# ...
-elif page == "Admin":
-    render_admin(sb_service=sb_service, schema=SUPABASE_SCHEMA, actor_email="admin@yourorg.com")
 import streamlit as st
 import pandas as pd
 from supabase import create_client
 from postgrest.exceptions import APIError
+
+# ✅ Import panels
+from admin_panels import render_admin
+from payout import render_payouts
 
 APP_BRAND = "theyoungshallgrow"
 
@@ -66,18 +66,6 @@ with top_r:
 st.title(f"🏦 {APP_BRAND} • Bank Dashboard")
 
 # ============================================================
-# ✅ IMPORT payout.py SAFELY (SHOW REAL ERROR IF IT FAILS)
-# ============================================================
-render_payouts = None
-try:
-    from payout import render_payouts  # payout.py must exist in same folder
-except Exception as e:
-    st.error("❌ Failed to import payout.py (render_payouts).")
-    st.write("This usually means payout.py crashed during import (missing dependency or syntax error).")
-    st.code(str(e), language="text")
-    st.stop()
-
-# ============================================================
 # SAFE HELPERS
 # ============================================================
 def safe_select(
@@ -105,20 +93,8 @@ def safe_select(
         st.error(f"Unexpected error reading {schema}.{table_name}: {e}")
         return []
 
-def safe_upsert(client, table_name: str, payload: dict, schema: str = "public"):
-    try:
-        resp = client.schema(schema).table(table_name).upsert(payload).execute()
-        return resp.data or []
-    except APIError as e:
-        st.error(f"Supabase APIError writing {schema}.{table_name}")
-        st.code(str(e), language="text")
-        return []
-    except Exception as e:
-        st.error(f"Unexpected error writing {schema}.{table_name}: {e}")
-        return []
-
 # ============================================================
-# LOADERS (cache_data must take only primitives)
+# LOADERS
 # ============================================================
 @st.cache_data(ttl=90)
 def load_members_legacy(url: str, anon_key: str, schema: str):
@@ -137,16 +113,16 @@ def load_members_legacy(url: str, anon_key: str, schema: str):
     label_to_name = dict(zip(df["label"], df["name"]))
     return labels, label_to_id, label_to_name, df
 
-@st.cache_data(ttl=90)
-def load_app_state(url: str, anon_key: str, schema: str) -> dict:
-    client = create_client(url, anon_key)
-    rows = safe_select(client, "app_state", "*", schema=schema, limit=1)
-    return rows[0] if rows else {}
-
 @st.cache_data(ttl=60)
 def load_current_season_view(url: str, anon_key: str, schema: str) -> dict:
     client = create_client(url, anon_key)
     rows = safe_select(client, "current_season_view", "*", schema=schema, limit=1)
+    return rows[0] if rows else {}
+
+@st.cache_data(ttl=60)
+def load_app_state(url: str, anon_key: str, schema: str) -> dict:
+    client = create_client(url, anon_key)
+    rows = safe_select(client, "app_state", "*", schema=schema, limit=1)
     return rows[0] if rows else {}
 
 @st.cache_data(ttl=60)
@@ -172,19 +148,20 @@ page = st.sidebar.radio(
 )
 
 # ============================================================
-# DASHBOARD PAGE
+# DASHBOARD
 # ============================================================
 if page == "Dashboard":
     labels, label_to_id, label_to_name, df_members = load_members_legacy(
         SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA
     )
-    app_state = load_app_state(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
+
     season = load_current_season_view(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
+    state = load_app_state(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Members", f"{len(df_members):,}")
-    c2.metric("Next Payout Index", str(season.get("next_payout_index") or app_state.get("next_payout_index") or "N/A"))
-    c3.metric("Next Payout Date", str(season.get("next_payout_date") or app_state.get("next_payout_date") or "N/A"))
+    c2.metric("Next Payout Index", str(season.get("next_payout_index") or state.get("next_payout_index") or "N/A"))
+    c3.metric("Next Payout Date", str(season.get("next_payout_date") or state.get("next_payout_date") or "N/A"))
     c4.metric("Next Beneficiary", str(season.get("next_beneficiary") or "N/A"))
 
     st.divider()
@@ -203,7 +180,7 @@ if page == "Dashboard":
             st.info("members_legacy empty or not readable.")
 
 # ============================================================
-# CONTRIBUTIONS PAGE
+# CONTRIBUTIONS
 # ============================================================
 elif page == "Contributions":
     st.header("Contributions (View)")
@@ -214,7 +191,7 @@ elif page == "Contributions":
         st.dataframe(df, use_container_width=True)
 
 # ============================================================
-# PAYOUTS PAGE (CONNECTED)
+# PAYOUTS
 # ============================================================
 elif page == "Payouts":
     if not sb_service:
@@ -223,36 +200,17 @@ elif page == "Payouts":
         render_payouts(sb_service, SUPABASE_SCHEMA)
 
 # ============================================================
-# LOANS PAGE (placeholder)
+# LOANS
 # ============================================================
 elif page == "Loans":
     st.header("Loans")
-    st.info("Next: we will wire loans here using service key (loan_payments, snapshots, history).")
+    st.info("Next step: wire render_loans() in loans.py (service key).")
 
 # ============================================================
-# ADMIN PAGE
+# ✅ ADMIN (NOW CALLS YOUR HIGH-STANDARD admin_panels.py)
 # ============================================================
 elif page == "Admin":
-    st.header("Admin (Service Key)")
     if not sb_service:
         st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY in secrets.")
-        st.stop()
-
-    if st.button("✅ Initialize app_state (id=1)"):
-        safe_upsert(sb_service, "app_state", {"id": 1, "next_payout_index": 1}, schema=SUPABASE_SCHEMA)
-        st.cache_data.clear()
-        st.success("Initialized.")
-        st.rerun()
-
-    state = safe_select(sb_service, "app_state", "*", schema=SUPABASE_SCHEMA, limit=1)
-    state = state[0] if state else {}
-
-    st.subheader("Set next_payout_index")
-    current_idx = int(state.get("next_payout_index") or 1)
-    new_idx = st.number_input("next_payout_index", min_value=1, step=1, value=current_idx)
-
-    if st.button("💾 Save"):
-        safe_upsert(sb_service, "app_state", {"id": 1, "next_payout_index": int(new_idx)}, schema=SUPABASE_SCHEMA)
-        st.cache_data.clear()
-        st.success("Saved.")
-        st.rerun()
+    else:
+        render_admin(sb_service=sb_service, schema=SUPABASE_SCHEMA, actor_email="admin@yourorg.com")
