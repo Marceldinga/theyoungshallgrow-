@@ -1,3 +1,4 @@
+
 # app.py
 import streamlit as st
 import pandas as pd
@@ -329,26 +330,42 @@ next_idx = next_unpaid_beneficiary(active_ids, already_paid_ids, raw_next_idx)
 ben_row = fetch_one(client.table("member_registry").select("full_name").eq("legacy_member_id", next_idx))
 ben_name = (ben_row or {}).get("full_name") or f"Member {next_idx}"
 
-sid = current_session_id(client)
+sid = current_session_id(client)  # kept for other legacy panels if needed
 
-# KPI totals (fast + safe)
-pot = 0.0
+# -------------------------
+# KPI TOTALS (UPDATED)
+# -------------------------
+# Contribution Pot from v_contribution_pot (strict rotation-based)
+pot_amount = 0.0
+pot_sub = ""
 try:
-    resp = (
+    pot_row = (
+        client.table("v_contribution_pot")
+        .select("next_payout_index,next_payout_date,pot_amount,pot_status")
+        .single()
+        .execute()
+        .data
+    )
+    pot_amount = float(pot_row.get("pot_amount") or 0)
+    pot_sub = (
+        f"Rotation #{pot_row.get('next_payout_index')} • "
+        f"Payout: {pot_row.get('next_payout_date')} • "
+        f"{pot_row.get('pot_status')}"
+    )
+except Exception:
+    pot_amount = 0.0
+    pot_sub = "Rotation pot unavailable"
+
+# All-time contributions (paid+contributed only)
+total_contrib_all = 0.0
+try:
+    resp2 = (
         client.table("contributions_legacy")
-        .select("amount,kind,session_id")
-        .eq("session_id", sid)
+        .select("amount,kind")
         .in_("kind", ALLOWED_CONTRIB_KINDS)
         .limit(20000)
         .execute()
     )
-    pot = sum(float(r.get("amount") or 0) for r in (resp.data or []))
-except Exception:
-    pot = 0.0
-
-total_contrib_all = 0.0
-try:
-    resp2 = client.table("contributions_legacy").select("amount").limit(20000).execute()
     total_contrib_all = sum(float(r.get("amount") or 0) for r in (resp2.data or []))
 except Exception:
     total_contrib_all = 0.0
@@ -397,8 +414,8 @@ payout_ok, payout_missing = (True, [])
 # -------------------------
 k = st.columns(10)
 with k[0]: kpi("Next Beneficiary", f"{next_idx} — {ben_name}", "Rotation index (skips already-paid)")
-with k[1]: kpi("Contribution Pot", money(pot), f"Current session ({sid}) • kinds={','.join(ALLOWED_CONTRIB_KINDS)}")
-with k[2]: kpi("All-time Contributions", money(total_contrib_all), "Lifetime")
+with k[1]: kpi("Contribution Pot", money(pot_amount), pot_sub)
+with k[2]: kpi("All-time Contributions", money(total_contrib_all), "Lifetime (paid+contributed)")
 with k[3]: kpi("Foundation Total", money(f_total), "Paid + Pending")
 with k[4]: kpi("Active Loans", str(active_loans), f"Total due {money(active_total_due)}")
 with k[5]: kpi("Loan Due Now", money(active_total_due), f"Principal {money(active_principal)} • Interest {money(active_total_due - active_principal)}")
