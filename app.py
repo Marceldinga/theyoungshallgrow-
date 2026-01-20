@@ -3,6 +3,11 @@ import streamlit as st
 import pandas as pd
 import os
 from supabase import create_client
+import streamlit as st
+import time
+
+st.write("BOOTING APP ON RAILWAY...")
+time.sleep(5)
 
 # -------------------------
 # CONFIG
