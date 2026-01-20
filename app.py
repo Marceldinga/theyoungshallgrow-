@@ -190,7 +190,12 @@ app_state = load_app_state(
 
 sid = app_state.get("next_payout_index")
 
-c1.metric("Current Session ID", sid or "N/A")
+# Safety defaults (prevents NameError on Streamlit reruns)
+labels = labels if "labels" in locals() else []
+df_members = df_members if "df_members" in locals() else None
+label_to_id = label_to_id if "label_to_id" in locals() else {}
+label_to_name = label_to_name if "label_to_name" in locals() else {}
+
 c1.metric("Current Session ID", sid or "N/A")
 c2.metric("Members", f"{len(df_members):,}" if isinstance(df_members, pd.DataFrame) else "0")
 c3.metric("Next Payout Index", str(app_state.get("next_payout_index", "N/A")))
@@ -208,6 +213,7 @@ if labels:
     st.write("Selected member:", mname)
 else:
     st.warning("No members found in members_legacy (or table could not be read).")
+
 
 # ============================================================
 # PREVIEW TABLE
