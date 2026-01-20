@@ -1,11 +1,12 @@
 
-# app.py  ✅ COMPLETE SINGLE-FILE VERSION (uses members_legacy)
+# app.py ✅ COMPLETE SINGLE-FILE VERSION (uses members_legacy)
 from __future__ import annotations
 
 import os
 import streamlit as st
 import pandas as pd
 from supabase import create_client
+from postgrest.exceptions import APIError
 
 APP_BRAND = "theyoungshallgrow"
 
@@ -19,6 +20,7 @@ st.set_page_config(
 # SECRETS (Streamlit Cloud: set in App > Settings > Secrets)
 #   SUPABASE_URL = "..."
 #   SUPABASE_ANON_KEY = "..."
+#   SUPABASE_SCHEMA = "public"   # optional (use if tables not in public)
 # ============================================================
 def get_secret(key: str, default: str | None = None) -> str | None:
     # Prefer Streamlit secrets, fallback to environment variables
@@ -28,162 +30,149 @@ def get_secret(key: str, default: str | None = None) -> str | None:
 
 SUPABASE_URL = get_secret("SUPABASE_URL")
 SUPABASE_ANON_KEY = get_secret("SUPABASE_ANON_KEY")
+SUPABASE_SCHEMA = (get_secret("SUPABASE_SCHEMA", "public") or "public").strip()
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
     st.error("Missing SUPABASE_URL or SUPABASE_ANON_KEY in Streamlit Secrets / Environment.")
     st.stop()
+
+SUPABASE_URL = SUPABASE_URL.strip()
+SUPABASE_ANON_KEY = SUPABASE_ANON_KEY.strip()
 
 # ============================================================
 # CLIENT (cache_resource is OK for client object)
 # ============================================================
 @st.cache_resource
 def get_public_client(url: str, anon_key: str):
-    return create_client(url, anon_key)
+    return create_client(url.strip(), anon_key.strip())
 
 sb = get_public_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+
+# ============================================================
+# SAFE SELECT HELPER (prevents crash + shows real PostgREST error)
+# ============================================================
+def safe_select(
+    client,
+    table_name: str,
+    select_cols: str = "*",
+    schema: str = "public",
+    order_by: str | None = None,
+    order_desc: bool = False,
+    limit: int | None = None,
+):
+    """
+    Returns list[dict]. Never raises APIError; instead shows a useful error on screen.
+    """
+    try:
+        q = client.schema(schema).table(table_name).select(select_cols)
+        if order_by:
+            q = q.order(order_by, desc=order_desc)
+        if limit is not None:
+            q = q.limit(limit)
+        resp = q.execute()
+        return resp.data or []
+    except APIError as e:
+        st.error(f"Supabase APIError reading {schema}.{table_name}")
+        st.code(str(e), language="text")
+
+        # structured payload (usually includes: message, details, hint, code)
+        payload = e.args[0] if getattr(e, "args", None) else None
+        if payload:
+            st.write("Error payload:", payload)
+
+        msg = str(e).lower()
+        if "row level security" in msg or "permission denied" in msg or "rls" in msg:
+            st.warning(
+                f"RLS likely blocking reads on {schema}.{table_name}. "
+                f"Add a SELECT policy for anon/authenticated OR disable RLS for that table."
+            )
+        if "does not exist" in msg or "relation" in msg:
+            st.warning(
+                f"Table/view not found: {schema}.{table_name}. "
+                f"Confirm the table name and schema (try setting SUPABASE_SCHEMA in secrets)."
+            )
+        if "column" in msg and "does not exist" in msg:
+            st.warning("Column mismatch. Confirm your selected column names exist exactly.")
+        return []
+    except Exception as e:
+        st.error(f"Unexpected error reading {schema}.{table_name}: {e}")
+        return []
 
 # ============================================================
 # DATA LOADERS (cache_data must only take hashable primitives)
 # ============================================================
 @st.cache_data(ttl=90)
-from postgrest.exceptions import APIError
-
-@st.cache_data(ttl=90)
-def load_members_legacy(url: str, anon_key: str) -> tuple[list[str], dict, dict, pd.DataFrame]:
+def load_members_legacy(url: str, anon_key: str, schema: str) -> tuple[list[str], dict, dict, pd.DataFrame]:
     """
-    Source of truth: public.members_legacy
+    Source of truth: <schema>.members_legacy
 
     Expected columns (minimum):
       - legacy_member_id (int)
       - full_name (text)
-
-    Returns:
-      labels: list[str] (for selectbox)
-      label_to_id: dict[label -> legacy_member_id]
-      label_to_name: dict[label -> full_name]
-      df_members: DataFrame of members
     """
-    # Create a local client INSIDE the cached function (safe: url/key are primitives)
-    supabase = create_client(url.strip(), anon_key.strip())
+    client = create_client(url.strip(), anon_key.strip())
 
-    try:
-        # If your table is in a non-public schema, use:
-        # resp = supabase.schema("legacy").table("members_legacy").select("legacy_member_id,full_name").execute()
-        resp = (
-            supabase
-            .table("members_legacy")
-            .select("legacy_member_id, full_name")
-            .order("legacy_member_id", desc=False)
-            .execute()
-        )
+    rows = safe_select(
+        client=client,
+        table_name="members_legacy",
+        select_cols="legacy_member_id, full_name",
+        schema=schema,
+        order_by="legacy_member_id",
+        order_desc=False,
+        limit=None,
+    )
 
-        rows = resp.data or []
-        df_members = pd.DataFrame(rows)
+    df_members = pd.DataFrame(rows)
 
-        # Guardrails for missing columns
-        if df_members.empty:
-            # Return empty but valid structures so app doesn't crash
-            return [], {}, {}, pd.DataFrame(columns=["legacy_member_id", "full_name"])
+    if df_members.empty:
+        # Return empty but valid structures so app doesn't crash
+        empty = pd.DataFrame(columns=["legacy_member_id", "full_name"])
+        return [], {}, {}, empty
 
-        # Normalize columns just in case
-        df_members["legacy_member_id"] = pd.to_numeric(df_members["legacy_member_id"], errors="coerce").astype("Int64")
-        df_members["full_name"] = df_members["full_name"].astype(str)
+    # Normalize
+    df_members["legacy_member_id"] = pd.to_numeric(df_members["legacy_member_id"], errors="coerce").astype("Int64")
+    df_members["full_name"] = df_members["full_name"].astype(str)
+    df_members = df_members.dropna(subset=["legacy_member_id"]).copy()
+    df_members["legacy_member_id"] = df_members["legacy_member_id"].astype(int)
 
-        df_members = df_members.dropna(subset=["legacy_member_id"]).copy()
-        df_members["legacy_member_id"] = df_members["legacy_member_id"].astype(int)
+    # Labels
+    df_members["label"] = df_members.apply(
+        lambda r: f'{int(r["legacy_member_id"]):02d} • {r["full_name"]}',
+        axis=1,
+    )
 
-        # Create UI labels
-        df_members["label"] = df_members.apply(
-            lambda r: f'{int(r["legacy_member_id"]):02d} • {r["full_name"]}',
-            axis=1
-        )
+    labels = df_members["label"].tolist()
+    label_to_id = dict(zip(df_members["label"], df_members["legacy_member_id"]))
+    label_to_name = dict(zip(df_members["label"], df_members["full_name"]))
 
-        labels = df_members["label"].tolist()
-        label_to_id = dict(zip(df_members["label"], df_members["legacy_member_id"]))
-        label_to_name = dict(zip(df_members["label"], df_members["full_name"]))
-
-        return labels, label_to_id, label_to_name, df_members
-
-    except APIError as e:
-        # Show the REAL PostgREST error (this is what your traceback is hiding)
-        st.error("Supabase APIError while loading members_legacy.")
-        st.code(str(e), language="text")
-
-        # Also print structured fields if present
-        payload = None
-        if hasattr(e, "args") and e.args:
-            payload = e.args[0]
-        st.write("Error payload:", payload)
-
-        # Helpful hints based on common failures
-        msg = str(e).lower()
-        if "permission denied" in msg or "row level security" in msg or "rls" in msg:
-            st.warning(
-                "This looks like an RLS/policy issue. Either create a SELECT policy for public.members_legacy "
-                "or use a service_role key on the server (never expose service_role to browsers)."
-            )
-        if "does not exist" in msg or "relation" in msg:
-            st.warning(
-                "This looks like a table/schema mismatch. Confirm the table name is exactly 'members_legacy' "
-                "and whether it is in the 'public' schema (otherwise use supabase.schema('...').table(...))."
-            )
-        if "column" in msg and "does not exist" in msg:
-            st.warning(
-                "This looks like a column name mismatch. Confirm columns are exactly legacy_member_id and full_name."
-            )
-
-        raise
+    return labels, label_to_id, label_to_name, df_members
 
 
 @st.cache_data(ttl=90)
-def load_app_state(url: str, anon_key: str) -> dict:
-    """
-    Reads app_state table (single row expected).
-    If table is empty, returns {}.
-    """
-    sb_local = get_public_client(url, anon_key)
-
-    try:
-        resp = sb_local.table("app_state").select("*").limit(1).execute()
-        rows = resp.data or []
-        return rows[0] if rows else {}
-    except Exception:
-        # If table missing or blocked by RLS, just fail gracefully
-        return {}
+def load_app_state(url: str, anon_key: str, schema: str) -> dict:
+    client = create_client(url.strip(), anon_key.strip())
+    rows = safe_select(client, "app_state", "*", schema=schema, limit=1)
+    return rows[0] if rows else {}
 
 
 @st.cache_data(ttl=90)
-def load_current_session_id(url: str, anon_key: str) -> str | None:
-    """
-    Uses current_season_view if available, otherwise sessions_legacy heuristic.
-    Returns a string session/season id/name if found.
-    """
-    sb_local = get_public_client(url, anon_key)
+def load_current_session_id(url: str, anon_key: str, schema: str) -> str | None:
+    client = create_client(url.strip(), anon_key.strip())
 
-    # Try view first (you have current_season_view in your schema list)
-    try:
-        resp = sb_local.table("current_season_view").select("*").limit(1).execute()
-        rows = resp.data or []
-        if rows:
-            row = rows[0]
-            # try common keys
-            for k in ("session_id", "season_id", "current_session_id", "id", "season_name", "session_name"):
-                if k in row and row[k]:
-                    return str(row[k])
-    except Exception:
-        pass
+    # Try view first
+    rows = safe_select(client, "current_season_view", "*", schema=schema, limit=1)
+    if R := (R := (R[0] if R else None)):
+        for k in ("session_id", "season_id", "current_session_id", "id", "season_name", "session_name"):
+            if k in R and R[k]:
+                return str(R[k])
 
-    # Fallback: sessions_legacy (if you store an active row)
-    try:
-        resp = sb_local.table("sessions_legacy").select("*").order("id", desc=True).limit(1).execute()
-        rows = resp.data or []
-        if rows:
-            row = rows[0]
-            for k in ("id", "session_id", "season_id", "season_name", "session_name"):
-                if k in row and row[k]:
-                    return str(row[k])
-    except Exception:
-        pass
+    # Fallback: sessions_legacy
+    rows = safe_select(client, "sessions_legacy", "*", schema=schema, order_by="id", order_desc=True, limit=1)
+    if rows:
+        row = rows[0]
+        for k in ("id", "session_id", "season_id", "season_name", "session_name"):
+            if k in row and row[k]:
+                return str(row[k])
 
     return None
 
@@ -201,10 +190,9 @@ st.title(f"🏦 {APP_BRAND} • Bank Dashboard")
 # ============================================================
 # LOAD DATA
 # ============================================================
-sid = load_current_session_id(SUPABASE_URL, SUPABASE_ANON_KEY)
-app_state = load_app_state(SUPABASE_URL, SUPABASE_ANON_KEY)
-
-labels, label_to_id, label_to_name, df_members = load_members_legacy(SUPABASE_URL, SUPABASE_ANON_KEY)
+sid = load_current_session_id(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
+app_state = load_app_state(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
+labels, label_to_id, label_to_name, df_members = load_members_legacy(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
 
 # ============================================================
 # KPI CARDS
@@ -235,17 +223,22 @@ with st.expander("Member Registry (preview)", expanded=False):
     if isinstance(df_members, pd.DataFrame) and not df_members.empty:
         st.dataframe(df_members[["legacy_member_id", "full_name"]], use_container_width=True)
     else:
-        st.info("members_legacy is empty or could not be loaded (check RLS policies).")
+        st.info("members_legacy is empty or could not be loaded (check errors above / RLS / schema).")
 
 # ============================================================
-# QUICK RLS DEBUG HINT
+# TROUBLESHOOTING
 # ============================================================
 with st.expander("Troubleshooting (if Members still shows 0)"):
     st.markdown(
-        "If `members_legacy` has rows in Supabase but Streamlit still shows 0, "
-        "the most common cause is **Row Level Security (RLS)**.\n\n"
-        "Quick test:\n"
-        "- Ensure `members_legacy` has a SELECT policy for anon or authenticated users\n"
-        "- Or temporarily disable RLS on the table\n\n"
-        "After fixing RLS, click **Refresh data**."
+        f"""
+**Most common cause:** Row Level Security (RLS) is blocking anon reads.
+
+**Fix options:**
+1. In Supabase → Table Editor → `members_legacy` → **RLS Policies**  
+   Add a SELECT policy like: `USING (true)` (for anon/authenticated), OR  
+2. Disable RLS (not recommended for production public apps).
+
+**Schema tip:** Your app is currently reading from schema: `{SUPABASE_SCHEMA}`  
+If your legacy tables live in another schema, set `SUPABASE_SCHEMA` in Streamlit secrets.
+"""
     )
