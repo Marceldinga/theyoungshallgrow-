@@ -1,9 +1,5 @@
 
-# app.py ✅ SINGLE CLEAN UPDATED FILE (no duplicate imports, no debug import block)
-# - Uses both keys (ANON for reads, SERVICE for writes)
-# - Uses Sidebar navigation (Menu)
-# - Connects payout.py via: from payout import render_payouts
-
+# app.py ✅ SINGLE CLEAN UPDATED FILE WITH IMPORT DEBUG FOR payout.py
 from __future__ import annotations
 
 import os
@@ -11,9 +7,6 @@ import streamlit as st
 import pandas as pd
 from supabase import create_client
 from postgrest.exceptions import APIError
-
-# ✅ Connect payout module (ensure payout.py is in same folder and defines render_payouts)
-from payout import render_payouts
 
 APP_BRAND = "theyoungshallgrow"
 
@@ -67,6 +60,18 @@ with top_r:
         st.rerun()
 
 st.title(f"🏦 {APP_BRAND} • Bank Dashboard")
+
+# ============================================================
+# ✅ IMPORT payout.py SAFELY (SHOW REAL ERROR IF IT FAILS)
+# ============================================================
+render_payouts = None
+try:
+    from payout import render_payouts  # payout.py must exist in same folder
+except Exception as e:
+    st.error("❌ Failed to import payout.py (render_payouts).")
+    st.write("This usually means payout.py crashed during import (missing dependency or syntax error).")
+    st.code(str(e), language="text")
+    st.stop()
 
 # ============================================================
 # SAFE HELPERS
@@ -229,7 +234,6 @@ elif page == "Admin":
         st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY in secrets.")
         st.stop()
 
-    # Ensure app_state row exists (id=1)
     if st.button("✅ Initialize app_state (id=1)"):
         safe_upsert(sb_service, "app_state", {"id": 1, "next_payout_index": 1}, schema=SUPABASE_SCHEMA)
         st.cache_data.clear()
