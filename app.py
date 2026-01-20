@@ -1,10 +1,15 @@
 
+# app.py ✅ UPDATED (connects payout.py + keeps everything else)
+from __future__ import annotations
 
 import os
 import streamlit as st
 import pandas as pd
 from supabase import create_client
 from postgrest.exceptions import APIError
+
+# ✅ ADD THIS: connect payout module
+from payout import render_payouts
 
 APP_BRAND = "theyoungshallgrow"
 
@@ -62,8 +67,15 @@ st.title(f"🏦 {APP_BRAND} • Bank Dashboard")
 # ============================================================
 # SAFE HELPERS
 # ============================================================
-def safe_select(client, table_name: str, select_cols: str="*", schema: str="public",
-                order_by: str|None=None, order_desc: bool=False, limit: int|None=None) -> list[dict]:
+def safe_select(
+    client,
+    table_name: str,
+    select_cols: str = "*",
+    schema: str = "public",
+    order_by: str | None = None,
+    order_desc: bool = False,
+    limit: int | None = None,
+) -> list[dict]:
     try:
         q = client.schema(schema).table(table_name).select(select_cols)
         if order_by:
@@ -80,7 +92,7 @@ def safe_select(client, table_name: str, select_cols: str="*", schema: str="publ
         st.error(f"Unexpected error reading {schema}.{table_name}: {e}")
         return []
 
-def safe_upsert(client, table_name: str, payload: dict, schema: str="public"):
+def safe_upsert(client, table_name: str, payload: dict, schema: str = "public"):
     try:
         resp = client.schema(schema).table(table_name).upsert(payload).execute()
         return resp.data or []
@@ -127,7 +139,15 @@ def load_current_season_view(url: str, anon_key: str, schema: str) -> dict:
 @st.cache_data(ttl=60)
 def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFrame:
     client = create_client(url, anon_key)
-    rows = safe_select(client, "contributions_with_member", "*", schema=schema, order_by="created_at", order_desc=True, limit=200)
+    rows = safe_select(
+        client,
+        "contributions_with_member",
+        "*",
+        schema=schema,
+        order_by="created_at",
+        order_desc=True,
+        limit=200,
+    )
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 # ============================================================
@@ -139,10 +159,12 @@ page = st.sidebar.radio(
 )
 
 # ============================================================
-# DASHBOARD PAGE (keeps what you already have)
+# DASHBOARD PAGE
 # ============================================================
 if page == "Dashboard":
-    labels, label_to_id, label_to_name, df_members = load_members_legacy(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
+    labels, label_to_id, label_to_name, df_members = load_members_legacy(
+        SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA
+    )
     app_state = load_app_state(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
     season = load_current_season_view(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
 
@@ -168,7 +190,7 @@ if page == "Dashboard":
             st.info("members_legacy empty or not readable.")
 
 # ============================================================
-# CONTRIBUTIONS PAGE (uses contributions_with_member view)
+# CONTRIBUTIONS PAGE
 # ============================================================
 elif page == "Contributions":
     st.header("Contributions (View)")
@@ -179,21 +201,23 @@ elif page == "Contributions":
         st.dataframe(df, use_container_width=True)
 
 # ============================================================
-# PAYOUTS PAGE (placeholder – will call payout.py later)
+# ✅ PAYOUTS PAGE (NOW CONNECTED)
 # ============================================================
 elif page == "Payouts":
-    st.header("Payouts")
-    st.info("Next: we will wire payout rotation here using service key (members_legacy.position + app_state).")
+    if not sb_service:
+        st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY in secrets.")
+    else:
+        render_payouts(sb_service, SUPABASE_SCHEMA)
 
 # ============================================================
-# LOANS PAGE (placeholder – will call loans.py later)
+# LOANS PAGE (placeholder)
 # ============================================================
 elif page == "Loans":
     st.header("Loans")
     st.info("Next: we will wire loans here using service key (loan_payments, snapshots, history).")
 
 # ============================================================
-# ADMIN PAGE (service key actions)
+# ADMIN PAGE
 # ============================================================
 elif page == "Admin":
     st.header("Admin (Service Key)")
