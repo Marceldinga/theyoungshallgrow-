@@ -1,16 +1,62 @@
+
+# payout.py
+from __future__ import annotations
+
 import pandas as pd
 from datetime import date, timedelta
 
-from db import now_iso, current_session_id, EXPECTED_ACTIVE_MEMBERS, ALLOWED_CONTRIB_KINDS
-from db import fetch_one, next_unpaid_beneficiary
+# Import ONLY what exists in db.py
+from db import now_iso, current_session_id, fetch_one
 
+# -------------------------
+# CONFIG (PAYOUT RULES)
+# -------------------------
+EXPECTED_ACTIVE_MEMBERS = 17
 
 BASE_CONTRIBUTION = 500
 CONTRIBUTION_STEP = 500
 
+# Gate reads these kinds
+ALLOWED_CONTRIB_KINDS = ["paid", "contributed"]
+
 PAYOUT_SIG_REQUIRED = ["president", "beneficiary", "treasury", "surety"]
 
 
+# -------------------------
+# ROTATION HELPERS
+# -------------------------
+def next_unpaid_beneficiary(active_ids: list[int], already_paid_ids: set[int], start_idx: int) -> int:
+    """
+    Find the next beneficiary in rotation among active_ids,
+    skipping IDs already paid.
+    """
+    if not active_ids:
+        return int(start_idx)
+
+    active_sorted = sorted(set(int(x) for x in active_ids))
+    start_idx = int(start_idx)
+
+    # Clamp start index into active set range
+    if start_idx not in active_sorted:
+        # Choose the closest next active member >= start_idx, else wrap to first
+        bigger = [x for x in active_sorted if x >= start_idx]
+        start_idx = bigger[0] if bigger else active_sorted[0]
+
+    # Rotate through active members once
+    start_pos = active_sorted.index(start_idx)
+    rotation = active_sorted[start_pos:] + active_sorted[:start_pos]
+
+    for mid in rotation:
+        if mid not in already_paid_ids:
+            return int(mid)
+
+    # If everyone is already paid, return start_idx (fallback)
+    return int(start_idx)
+
+
+# -------------------------
+# SIGNATURES
+# -------------------------
 def get_signatures(c, entity_type: str, entity_id: int) -> pd.DataFrame:
     try:
         rows = (
@@ -36,6 +82,9 @@ def missing_roles(df_sig: pd.DataFrame, required_roles: list[str]) -> list[str]:
     return [r for r in required_roles if r not in signed]
 
 
+# -------------------------
+# CONTRIBUTIONS
+# -------------------------
 def fetch_session_contributions(c, session_id: str):
     resp = (
         c.table("contributions_legacy")
@@ -60,6 +109,9 @@ def build_contribution_summary(active_members, contrib_rows):
     ]
 
 
+# -------------------------
+# GATES
+# -------------------------
 def validate_gate_1(active_members):
     ok = (len(active_members) == EXPECTED_ACTIVE_MEMBERS)
     df = pd.DataFrame([{"member_id": mid, "member_name": name} for mid, name in active_members])
@@ -82,6 +134,9 @@ def validate_gate_3(summary_rows):
     return (pot > 0, pot)
 
 
+# -------------------------
+# PRECHECK + EXECUTE
+# -------------------------
 def payout_precheck_option_b(c, active_members, already_paid_ids: set[int], start_idx: int):
     session_id = current_session_id(c)
     if not session_id:
@@ -158,7 +213,7 @@ def execute_payout_option_b(c, active_members, already_paid_ids: set[int], start
     contrib_rows = fetch_session_contributions(c, session_id)
     summary_rows = build_contribution_summary(active_members, contrib_rows)
 
-    ok2, df_problems = validate_gate_2(summary_rows)
+    ok2, _df_problems = validate_gate_2(summary_rows)
     if not ok2:
         raise Exception("Payout blocked: contribution rules not met for all active members.")
 
