@@ -1,5 +1,5 @@
 
-# app.py ✅ SINGLE COMPLETE WORKING VERSION (Dashboard uses current_season_view fields correctly)
+# app.py ✅ COMPLETE WORKING VERSION (fixes get_rotation_state + dashboard rotation display)
 from __future__ import annotations
 
 import os
@@ -96,13 +96,19 @@ def get_rotation_state(sb, schema: str) -> dict:
     """
     Canonical rotation state:
       1) current_season_view
-      2) app_state
+      2) v_dashboard_rotation (optional)
+      3) app_state fallback
     """
-    season_rows = safe_select(sb, "current_season_view", "*", schema=schema, limit=1)
-    if season_rows:
-        return season_rows[0]
-    season_rows = safe_select(sb, "v_dashboard_rotation", "*", schema=schema, limit=1)
-    return state_rows[0] if state_rows else {}
+    rows = safe_select(sb, "current_season_view", "*", schema=schema, limit=1)
+    if rows:
+        return rows[0]
+
+    rows = safe_select(sb, "v_dashboard_rotation", "*", schema=schema, limit=1)
+    if rows:
+        return rows[0]
+
+    rows = safe_select(sb, "app_state", "*", schema=schema, limit=1)
+    return rows[0] if rows else {}
 
 # ============================================================
 # LOADERS
@@ -159,9 +165,19 @@ if page == "Dashboard":
     next_index = rotation.get("next_payout_index")
     next_date = rotation.get("next_payout_date")
 
-    # ✅ From your current_season_view screenshot:
-    beneficiary_id = rotation.get("legacy_member_id")
+    # Prefer current_season_view fields (your screenshots show these)
+    beneficiary_id = rotation.get("legacy_member_id") or rotation.get("id")
     beneficiary_name = rotation.get("next_beneficiary")
+
+    # If name not provided, derive from members_legacy
+    if not beneficiary_name and beneficiary_id:
+        try:
+            bid = int(beneficiary_id)
+            match = df_members[df_members["id"] == bid]
+            if not match.empty:
+                beneficiary_name = str(match.iloc[0]["name"])
+        except Exception:
+            pass
 
     beneficiary_label = f"{beneficiary_id} • {beneficiary_name}" if beneficiary_id and beneficiary_name else "—"
 
