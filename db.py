@@ -21,15 +21,19 @@ def now_iso() -> str:
 # -------------------------
 # SECRETS
 # -------------------------
-def get_secret(key: str, default: Any = None) -> Any:
-    """
-    Streamlit Cloud: st.secrets
-    Local dev: environment variables
-    """
-    try:
+def get_secret(key: str):
+    import os
+    import streamlit as st
+
+    # Railway (env vars)
+    if os.getenv(key):
+        return os.getenv(key)
+
+    # Streamlit Cloud (secrets)
+    if hasattr(st, "secrets") and key in st.secrets:
         return st.secrets[key]
-    except Exception:
-        return os.getenv(key, default)
+
+    return None
 
 
 # -------------------------
