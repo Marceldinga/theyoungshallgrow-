@@ -1,10 +1,11 @@
+
 # admin_panels.py
 import json
 import streamlit as st
 import pandas as pd
 from datetime import date
 
-from db import now_iso, fetch_one, current_session_id
+from db import now_iso, fetch_one, current_session_id, get_app_state  # ✅ added get_app_state
 from audit import audit
 from payout import (
     get_signatures,
@@ -102,13 +103,23 @@ def signature_box(
 # -------------------------
 # ADMIN DATA INSERT HELPERS
 # -------------------------
-def admin_upsert_contribution(c, session_id: str, member_id: int, amount: int, kind: str):
+def admin_upsert_contribution(
+    c,
+    session_id: str,
+    member_id: int,
+    amount: int,
+    kind: str,
+    payout_index: int,  # ✅ new param
+):
+    # Keep legacy uniqueness per session+member if you want
     c.table("contributions_legacy").delete().eq("session_id", session_id).eq("member_id", int(member_id)).execute()
+
     c.table("contributions_legacy").insert({
         "session_id": session_id,
         "member_id": int(member_id),
         "amount": int(amount),
         "kind": str(kind).lower().strip(),
+        "payout_index": int(payout_index),     # ✅ CRITICAL: tag rotation
         "created_at": now_iso(),
     }).execute()
 
@@ -153,13 +164,18 @@ def admin_add_foundation_payment(
 # ADMIN PANELS
 # -------------------------
 def render_admin_contributions_panel(c, member_labels, label_to_legacy_id, df_registry):
-    st.subheader("Contributions (Admin) — Current Session")
+    st.subheader("Contributions (Admin) — Current Rotation")
     session_id = current_session_id(c)
     if not session_id:
         st.error("No current session found in sessions_legacy.")
         return
 
+    # ✅ Current rotation index from app_state (single source of truth)
+    state = get_app_state(c)
+    current_rotation = int(state.get("next_payout_index") or 1)
+
     st.caption(f"Current session_id: {session_id}")
+    st.caption(f"Current rotation index: {current_rotation}")
     st.caption("Gate counts kind in ('paid','contributed'). Amount must be >=500 and multiple of 500.")
 
     col1, col2 = st.columns([1, 2])
@@ -176,8 +192,10 @@ def render_admin_contributions_panel(c, member_labels, label_to_legacy_id, df_re
                 st.error("Amount must be >= 500 and a multiple of 500.")
             else:
                 try:
-                    admin_upsert_contribution(c, session_id, mid, int(amt), kind)
-                    audit(c, "admin_contribution_saved", "ok", {"member_id": mid, "amount": int(amt), "kind": kind})
+                    admin_upsert_contribution(c, session_id, mid, int(amt), kind, payout_index=current_rotation)  # ✅
+                    audit(c, "admin_contribution_saved", "ok", {
+                        "member_id": mid, "amount": int(amt), "kind": kind, "payout_index": current_rotation
+                    })
                     st.success("Saved.")
                     st.rerun()
                 except Exception as e:
@@ -214,7 +232,7 @@ def render_admin_contributions_panel(c, member_labels, label_to_legacy_id, df_re
                         errors.append(f"Member {mid}: invalid amount {amt}")
                         continue
                     try:
-                        admin_upsert_contribution(c, session_id, mid, amt, bulk_kind)
+                        admin_upsert_contribution(c, session_id, mid, amt, bulk_kind, payout_index=current_rotation)  # ✅
                         saved += 1
                     except Exception as e:
                         errors.append(f"Member {mid}: {repr(e)}")
@@ -222,17 +240,19 @@ def render_admin_contributions_panel(c, member_labels, label_to_legacy_id, df_re
                 if errors:
                     st.error("Some rows failed:\n- " + "\n- ".join(errors))
                 if saved:
-                    audit(c, "admin_contribution_bulk_saved", "ok", {"rows_saved": saved, "kind": bulk_kind})
+                    audit(c, "admin_contribution_bulk_saved", "ok", {
+                        "rows_saved": saved, "kind": bulk_kind, "payout_index": current_rotation
+                    })
                     st.success(f"Saved {saved} rows.")
                     st.rerun()
 
     st.divider()
-    st.markdown("### Current Session Rows (what Gate reads)")
+    st.markdown("### Current Rotation Rows (strict pot uses payout_index)")
     try:
         rows = (
             c.table("contributions_legacy")
-             .select("member_id,amount,kind,created_at")
-             .eq("session_id", session_id)
+             .select("member_id,amount,kind,payout_index,created_at")
+             .eq("payout_index", current_rotation)  # ✅ show current rotation rows
              .in_("kind", ["paid", "contributed"])
              .order("member_id", desc=False)
              .limit(5000)
@@ -241,7 +261,7 @@ def render_admin_contributions_panel(c, member_labels, label_to_legacy_id, df_re
         )
         df = pd.DataFrame(rows)
         if df.empty:
-            st.warning("No paid/contributed contributions recorded for this session yet.")
+            st.warning("No paid/contributed contributions recorded for this rotation yet.")
         else:
             st.dataframe(df, use_container_width=True, hide_index=True)
     except Exception as e:
@@ -316,7 +336,7 @@ def render_admin_fines_panel(c, member_labels, label_to_legacy_id):
 
 def render_admin_loan_requests_workflow(c, actor_user_id: str):
     st.subheader("Loan Requests (Admin Workflow)")
-
+    # (unchanged)
     try:
         rows = (
             c.table("loan_requests")
@@ -391,7 +411,7 @@ def render_admin_loan_requests_workflow(c, actor_user_id: str):
 
 def render_admin_loan_repayments_panel(c, actor_user_id: str):
     st.subheader("Loan Repayments (Admin)")
-
+    # (unchanged)
     try:
         loans = (
             c.table("loans_legacy")
@@ -460,7 +480,7 @@ def render_admin_interest_accrual_panel(c, actor_user_id: str):
 
 
 # -------------------------
-# PAYOUT TAB (OPTION B)
+# PAYOUT TAB (OPTION B) - UPDATED GATE 3
 # -------------------------
 def render_payout_tab_option_b(
     c,
@@ -510,11 +530,27 @@ def render_payout_tab_option_b(
         st.warning("❌ Gate 2 failed:")
         st.dataframe(pre["df_problems"], use_container_width=True, hide_index=True)
 
-    st.markdown("### Gate 3: Pot total")
-    st.caption(f"Pot: {pre['pot']:,.0f}")
-    st.success("✅ Gate 3 passed." if pre["gate3_ok"] else "❌ Gate 3 failed (pot is zero).")
+    # ✅ Gate 3 uses strict rotation pot view (matches dashboard)
+    st.markdown("### Gate 3: Pot total (current rotation)")
+    try:
+        pot_row = (
+            c.table("v_contribution_pot")
+             .select("next_payout_index,next_payout_date,pot_amount,pot_status")
+             .single()
+             .execute()
+             .data
+        )
+        pot_amount = float(pot_row.get("pot_amount") or 0)
+        gate3_ok = pot_amount > 0
+        st.caption(f"Pot: {pot_amount:,.0f}")
+        st.caption(f"Rotation #{pot_row.get('next_payout_index')} • Payout: {pot_row.get('next_payout_date')} • {pot_row.get('pot_status')}")
+        st.success("✅ Gate 3 passed." if gate3_ok else "❌ Gate 3 failed (pot is zero).")
+    except Exception as e:
+        pot_amount = 0.0
+        gate3_ok = False
+        show_api_error(e, "Gate 3 failed: could not read v_contribution_pot")
 
-    payout_ready = bool(pre["gate1_ok"] and pre["gate2_ok"] and pre["gate3_ok"])
+    payout_ready = bool(pre["gate1_ok"] and pre["gate2_ok"] and gate3_ok)
 
     st.divider()
 
