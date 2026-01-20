@@ -1,41 +1,92 @@
 
-# payout.py
+# payout.py ✅ Njangi payout engine (SERVICE KEY)
 from __future__ import annotations
 
+from datetime import date, timedelta, datetime, timezone
 import pandas as pd
-from datetime import date, timedelta
-
-from db import now_iso, current_session_id, fetch_one
+import streamlit as st
+from postgrest.exceptions import APIError
 
 # -------------------------
-# CONFIG (PAYOUT RULES)
+# CONFIG (Njangi rules)
 # -------------------------
 EXPECTED_ACTIVE_MEMBERS = 17
-
 BASE_CONTRIBUTION = 500
 CONTRIBUTION_STEP = 500
-
-# Gate reads these kinds
 ALLOWED_CONTRIB_KINDS = ["paid", "contributed"]
-
 PAYOUT_SIG_REQUIRED = ["president", "beneficiary", "treasury", "surety"]
 
 
 # -------------------------
-# ROTATION HELPERS
+# small helpers
+# -------------------------
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def safe_select(sb, schema: str, table: str, cols: str="*", order_by: str|None=None,
+                desc: bool=False, limit: int|None=None, **filters) -> list[dict]:
+    try:
+        q = sb.schema(schema).table(table).select(cols)
+        for k, v in filters.items():
+            if v is None:
+                continue
+            # supports equality filters only
+            q = q.eq(k, v)
+        if order_by:
+            q = q.order(order_by, desc=desc)
+        if limit is not None:
+            q = q.limit(limit)
+        return q.execute().data or []
+    except APIError as e:
+        st.error(f"Supabase read error: {schema}.{table}")
+        st.code(str(e), language="text")
+        return []
+    except Exception as e:
+        st.error(f"Unexpected read error: {schema}.{table}: {e}")
+        return []
+
+def safe_single(sb, schema: str, table: str, cols: str="*", **filters) -> dict:
+    rows = safe_select(sb, schema, table, cols, limit=1, **filters)
+    return rows[0] if rows else {}
+
+def safe_insert(sb, schema: str, table: str, payload: dict) -> bool:
+    try:
+        sb.schema(schema).table(table).insert(payload).execute()
+        return True
+    except APIError as e:
+        st.error(f"Supabase insert error: {schema}.{table}")
+        st.code(str(e), language="text")
+        return False
+    except Exception as e:
+        st.error(f"Unexpected insert error: {schema}.{table}: {e}")
+        return False
+
+def safe_update(sb, schema: str, table: str, payload: dict, where: dict) -> bool:
+    try:
+        q = sb.schema(schema).table(table).update(payload)
+        for k, v in where.items():
+            q = q.eq(k, v)
+        q.execute()
+        return True
+    except APIError as e:
+        st.error(f"Supabase update error: {schema}.{table}")
+        st.code(str(e), language="text")
+        return False
+    except Exception as e:
+        st.error(f"Unexpected update error: {schema}.{table}: {e}")
+        return False
+
+
+# -------------------------
+# rotation helpers
 # -------------------------
 def next_unpaid_beneficiary(active_ids: list[int], already_paid_ids: set[int], start_idx: int) -> int:
-    """
-    Find the next beneficiary in rotation among active_ids,
-    skipping IDs already paid.
-    """
     if not active_ids:
         return int(start_idx)
 
     active_sorted = sorted(set(int(x) for x in active_ids))
     start_idx = int(start_idx)
 
-    # Clamp start index into active set range
     if start_idx not in active_sorted:
         bigger = [x for x in active_sorted if x >= start_idx]
         start_idx = bigger[0] if bigger else active_sorted[0]
@@ -51,27 +102,21 @@ def next_unpaid_beneficiary(active_ids: list[int], already_paid_ids: set[int], s
 
 
 # -------------------------
-# SIGNATURES
+# signatures
 # -------------------------
-def get_signatures(c, entity_type: str, entity_id: int) -> pd.DataFrame:
-    try:
-        rows = (
-            c.table("signatures")
-             .select("role,signer_name,signer_member_id,signed_at")
-             .eq("entity_type", entity_type)
-             .eq("entity_id", int(entity_id))
-             .order("signed_at", desc=False)
-             .limit(500)
-             .execute()
-             .data or []
-        )
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return pd.DataFrame(columns=["role", "signer_name", "signer_member_id", "signed_at"])
-        return df
-    except Exception:
+def get_signatures(sb, schema: str, entity_type: str, entity_id: int) -> pd.DataFrame:
+    rows = safe_select(
+        sb, schema, "signatures",
+        "role,signer_name,signer_member_id,signed_at",
+        order_by="signed_at",
+        desc=False,
+        entity_type=entity_type,
+        entity_id=int(entity_id),
+    )
+    df = pd.DataFrame(rows)
+    if df.empty:
         return pd.DataFrame(columns=["role", "signer_name", "signer_member_id", "signed_at"])
-
+    return df
 
 def missing_roles(df_sig: pd.DataFrame, required_roles: list[str]) -> list[str]:
     signed = set(df_sig["role"].tolist()) if df_sig is not None and not df_sig.empty else set()
@@ -79,25 +124,25 @@ def missing_roles(df_sig: pd.DataFrame, required_roles: list[str]) -> list[str]:
 
 
 # -------------------------
-# CONTRIBUTIONS (ROTATION-BASED)
+# contributions (rotation-based)
 # -------------------------
-def fetch_rotation_contributions(c, payout_index: int):
-    """
-    Pull contributions for the CURRENT rotation (strict).
-    """
-    resp = (
-        c.table("contributions_legacy")
-         .select("member_id,amount,kind,payout_index")
-         .eq("payout_index", int(payout_index))
-         .in_("kind", ALLOWED_CONTRIB_KINDS)
-         .limit(20000)
-         .execute()
-    )
-    return resp.data or []
+def fetch_rotation_contributions(sb, schema: str, payout_index: int) -> list[dict]:
+    try:
+        resp = (
+            sb.schema(schema)
+              .table("contributions_legacy")
+              .select("member_id,amount,kind,payout_index")
+              .eq("payout_index", int(payout_index))
+              .in_("kind", ALLOWED_CONTRIB_KINDS)
+              .limit(20000)
+              .execute()
+        )
+        return resp.data or []
+    except Exception:
+        return []
 
-
-def build_contribution_summary(active_members, contrib_rows):
-    per_member = {}
+def build_contribution_summary(active_members: list[tuple[int, str]], contrib_rows: list[dict]) -> list[dict]:
+    per_member: dict[int, float] = {}
     for r in contrib_rows:
         mid = int(r.get("member_id") or 0)
         per_member[mid] = per_member.get(mid, 0.0) + float(r.get("amount") or 0)
@@ -107,33 +152,10 @@ def build_contribution_summary(active_members, contrib_rows):
         for (mid, name) in active_members
     ]
 
-
-def fetch_current_rotation_pot(c):
-    """
-    Reads the canonical rotation pot from v_contribution_pot.
-    Returns (payout_index, payout_date, pot_amount).
-    """
-    row = (
-        c.table("v_contribution_pot")
-         .select("next_payout_index,next_payout_date,pot_amount")
-         .single()
-         .execute()
-         .data
-    )
-    idx = int(row.get("next_payout_index") or 1)
-    dt = row.get("next_payout_date")
-    pot = float(row.get("pot_amount") or 0)
-    return idx, dt, pot
-
-
-# -------------------------
-# GATES
-# -------------------------
-def validate_gate_1(active_members):
+def validate_gate_1(active_members: list[tuple[int, str]]):
     ok = (len(active_members) == EXPECTED_ACTIVE_MEMBERS)
     df = pd.DataFrame([{"member_id": mid, "member_name": name} for mid, name in active_members])
     return ok, len(active_members), df
-
 
 def validate_gate_2(summary_rows, base=BASE_CONTRIBUTION, step=CONTRIBUTION_STEP):
     problems = []
@@ -146,125 +168,145 @@ def validate_gate_2(summary_rows, base=BASE_CONTRIBUTION, step=CONTRIBUTION_STEP
     return (len(problems) == 0, pd.DataFrame(problems))
 
 
-def validate_gate_3_from_pot(pot_amount: float):
-    return (pot_amount > 0, float(pot_amount))
-
-
 # -------------------------
-# PRECHECK + EXECUTE
+# main render function (CONNECTS TO app.py)
 # -------------------------
-def payout_precheck_option_b(c, active_members, already_paid_ids: set[int], start_idx: int):
-    # Keep session_id for legacy display only (not used for pot)
-    session_id = current_session_id(c)
+def render_payouts(sb_service, schema: str):
+    st.header("Payouts (Njangi Rotation)")
 
-    active_ids_local = [mid for (mid, _) in active_members]
-    beneficiary_id = next_unpaid_beneficiary(active_ids_local, already_paid_ids, int(start_idx))
-    ben = fetch_one(c.table("member_registry").select("full_name").eq("legacy_member_id", int(beneficiary_id)))
-    beneficiary_name = (ben or {}).get("full_name") or f"Member {beneficiary_id}"
+    # ---- load members (YOUR REAL TABLE)
+    mrows = safe_select(sb_service, schema, "members_legacy", "id,name,position", order_by="id")
+    dfm = pd.DataFrame(mrows)
+    if dfm.empty:
+        st.warning("members_legacy is empty or not readable.")
+        return
 
-    gate1_ok, _count, df_members = validate_gate_1(active_members)
+    dfm["id"] = pd.to_numeric(dfm["id"], errors="coerce")
+    dfm = dfm.dropna(subset=["id"]).copy()
+    dfm["id"] = dfm["id"].astype(int)
+    dfm["name"] = dfm["name"].astype(str)
 
-    # Rotation pot (canonical)
-    rotation_idx, rotation_payout_date, pot_amount = fetch_current_rotation_pot(c)
+    active_members = [(int(r["id"]), str(r["name"])) for _, r in dfm.iterrows()]
+    active_ids = [mid for mid, _ in active_members]
 
-    # Rotation contributions summary for Gate 2
-    contrib_rows = fetch_rotation_contributions(c, rotation_idx)
+    # ---- get rotation index/date from current_season_view first (you have it), fallback to app_state
+    season = safe_single(sb_service, schema, "current_season_view", "*")
+    state = safe_single(sb_service, schema, "app_state", "*", id=1)
+
+    rotation_idx = int(season.get("next_payout_index") or state.get("next_payout_index") or 1)
+    rotation_date = season.get("next_payout_date") or state.get("next_payout_date")
+
+    # ---- pot (prefer v_contribution_pot if exists)
+    pot_row = safe_single(sb_service, schema, "v_contribution_pot", "*")
+    pot_amount = float(pot_row.get("pot_amount") or 0.0) if pot_row else 0.0
+    pot_idx = int(pot_row.get("next_payout_index") or rotation_idx) if pot_row else rotation_idx
+
+    # ---- already paid (this rotation index)
+    already_paid_ids: set[int] = set()
+    payouts = safe_select(sb_service, schema, "payouts_legacy", "member_id,payout_index", limit=20000)
+    for p in payouts:
+        if int(p.get("payout_index") or -1) == int(pot_idx):
+            try:
+                already_paid_ids.add(int(p.get("member_id")))
+            except Exception:
+                pass
+
+    # ---- choose beneficiary (uses member IDs rotation order; you can switch to position-based later)
+    start_idx = int(state.get("rotation_start_index") or 1)
+    beneficiary_id = next_unpaid_beneficiary(active_ids, already_paid_ids, start_idx)
+    beneficiary_name = dfm.loc[dfm["id"] == beneficiary_id, "name"].iloc[0] if beneficiary_id in set(dfm["id"]) else f"Member {beneficiary_id}"
+
+    # ---- gates
+    gate1_ok, member_count, df_gate1 = validate_gate_1(active_members)
+
+    contrib_rows = fetch_rotation_contributions(sb_service, schema, pot_idx)
     summary_rows = build_contribution_summary(active_members, contrib_rows)
-
     gate2_ok, df_problems = validate_gate_2(summary_rows)
-    gate3_ok, pot_amount2 = validate_gate_3_from_pot(pot_amount)
+    gate3_ok = (pot_amount > 0)
 
-    return {
-        "session_id": session_id,
-        "rotation_index": rotation_idx,
-        "rotation_payout_date": rotation_payout_date,
-        "gate1_ok": bool(gate1_ok),
-        "gate2_ok": bool(gate2_ok),
-        "gate3_ok": bool(gate3_ok),
-        "pot": float(pot_amount2),
-        "summary_rows": summary_rows,
-        "df_problems": df_problems,
-        "active_members_df": df_members,
-        "beneficiary_id": int(beneficiary_id),
-        "beneficiary_name": beneficiary_name,
-        "already_paid": sorted(list(already_paid_ids)),
-        "reason": "",
-    }
+    # ---- display
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rotation Index", str(pot_idx))
+    c2.metric("Payout Pot", f"{pot_amount:,.0f}")
+    c3.metric("Beneficiary", f"{beneficiary_id} • {beneficiary_name}")
+    c4.metric("Next Payout Date", str(rotation_date or "N/A"))
 
+    st.divider()
 
-def execute_payout_option_b(c, active_members, already_paid_ids: set[int], start_idx: int):
-    # Determine beneficiary
-    active_ids_local = [mid for (mid, _) in active_members]
-    beneficiary_id = next_unpaid_beneficiary(active_ids_local, already_paid_ids, int(start_idx))
-
-    ben = fetch_one(
-        c.table("member_registry")
-         .select("legacy_member_id,full_name")
-         .eq("legacy_member_id", int(beneficiary_id))
+    st.subheader("Gate Status")
+    st.write(
+        {
+            "Gate1 (member count == 17)": gate1_ok,
+            "Gate2 (everyone >=500 and multiple of 500)": gate2_ok,
+            "Gate3 (pot > 0)": gate3_ok,
+        }
     )
-    beneficiary_name = (ben or {}).get("full_name") or f"Member {beneficiary_id}"
 
-    # Gate 4 signatures required
-    payout_entity_id = int(beneficiary_id)
-    df_sig = get_signatures(c, "payout", payout_entity_id)
-    miss = missing_roles(df_sig, PAYOUT_SIG_REQUIRED)
-    if miss:
-        raise Exception("Payout blocked (missing signatures): " + ", ".join(miss))
+    with st.expander("Gate 1: Active members", expanded=False):
+        st.dataframe(df_gate1, use_container_width=True)
 
-    ok1, actual_count, _df_members = validate_gate_1(active_members)
-    if not ok1:
-        raise Exception(f"Payout blocked: active member count {actual_count} != {EXPECTED_ACTIVE_MEMBERS}.")
+    with st.expander("Gate 2: Contribution problems", expanded=False):
+        if df_problems is None or df_problems.empty:
+            st.success("No problems detected.")
+        else:
+            st.dataframe(df_problems, use_container_width=True)
 
-    # Canonical rotation pot
-    rotation_idx, rotation_payout_date, pot_amount = fetch_current_rotation_pot(c)
+    # ---- signature gate (optional but enforced if you click execute)
+    with st.expander("Gate 4: Signatures (required)", expanded=False):
+        df_sig = get_signatures(sb_service, schema, "payout", int(beneficiary_id))
+        st.dataframe(df_sig, use_container_width=True)
+        miss = missing_roles(df_sig, PAYOUT_SIG_REQUIRED)
+        if miss:
+            st.warning("Missing roles: " + ", ".join(miss))
+        else:
+            st.success("All required signatures are present.")
 
-    # Gate 2 check for current rotation
-    contrib_rows = fetch_rotation_contributions(c, rotation_idx)
-    summary_rows = build_contribution_summary(active_members, contrib_rows)
+    st.divider()
 
-    ok2, _df_problems = validate_gate_2(summary_rows)
-    if not ok2:
-        raise Exception("Payout blocked: contribution rules not met for all active members (current rotation).")
+    # ---- execute payout
+    st.subheader("Execute payout")
+    if st.button("✅ Execute payout now (Service Key)", use_container_width=True):
+        # Gate 4: signatures
+        df_sig = get_signatures(sb_service, schema, "payout", int(beneficiary_id))
+        miss = missing_roles(df_sig, PAYOUT_SIG_REQUIRED)
+        if miss:
+            st.error("Payout blocked (missing signatures): " + ", ".join(miss))
+            return
+        if not gate1_ok:
+            st.error(f"Payout blocked: active member count {member_count} != {EXPECTED_ACTIVE_MEMBERS}")
+            return
+        if not gate2_ok:
+            st.error("Payout blocked: contribution rules not met for all members.")
+            return
+        if not gate3_ok:
+            st.error("Payout blocked: pot is zero.")
+            return
 
-    ok3, pot_amount = validate_gate_3_from_pot(pot_amount)
-    if not ok3:
-        raise Exception("Payout blocked: pot is zero for current rotation.")
+        payout_payload = {
+            "member_id": int(beneficiary_id),
+            "member_name": str(beneficiary_name),
+            "payout_amount": float(pot_amount),
+            "payout_date": str(date.today()),
+            "payout_index": int(pot_idx),
+            "created_at": now_iso(),
+        }
 
-    # Log payout (include rotation index)
-    payout_payload = {
-        "member_id": int(beneficiary_id),
-        "member_name": str(beneficiary_name),
-        "payout_amount": float(pot_amount),
-        "payout_date": str(date.today()),
-        "payout_index": int(rotation_idx),
-        "created_at": now_iso(),
-    }
+        payout_logged = safe_insert(sb_service, schema, "payouts_legacy", payout_payload)
 
-    payout_logged = True
-    try:
-        c.table("payouts_legacy").insert(payout_payload).execute()
-    except Exception:
-        payout_logged = False
+        # advance rotation pointer: +1 index, +14 days
+        next_index = int(pot_idx) + 1
+        next_date = (date.today() + timedelta(days=14)).isoformat()
 
-    # Advance rotation pointer strictly (+1 index, +14 days)
-    c.table("app_state").update({
-        "next_payout_index": int(rotation_idx) + 1,
-        "next_payout_date": (date.fromisoformat(str(rotation_payout_date)) + timedelta(days=14)).isoformat()
-        if rotation_payout_date else (date.today() + timedelta(days=14)).isoformat(),
-    }).eq("id", 1).execute()
+        safe_update(
+            sb_service, schema, "app_state",
+            {
+                "next_payout_index": next_index,
+                "next_payout_date": next_date,
+                "updated_at": now_iso(),
+            },
+            where={"id": 1},
+        )
 
-    return {
-        "session_id": current_session_id(c),  # legacy (may change)
-        "rotation_index_paid_out": int(rotation_idx),
-        "beneficiary_legacy_member_id": int(beneficiary_id),
-        "beneficiary_name": beneficiary_name,
-        "pot_paid_out": float(pot_amount),
-        "payout_logged": payout_logged,
-        "next_payout_index": int(rotation_idx) + 1,
-        "next_payout_date": (date.fromisoformat(str(rotation_payout_date)) + timedelta(days=14)).isoformat()
-        if rotation_payout_date else (date.today() + timedelta(days=14)).isoformat(),
-        "contribution_summary": summary_rows,
-        "already_paid_members": sorted(list(already_paid_ids)),
-        "payout_signature_entity_id": payout_entity_id,
-        "payout_missing_signatures": [],
-    }
+        st.success(f"Payout executed for {beneficiary_name}. Logged={payout_logged}. Next index={next_index}")
+        st.cache_data.clear()
+        st.rerun()
