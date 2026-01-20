@@ -173,16 +173,28 @@ if page == "Dashboard":
     )
 
     rotation = get_rotation_state(sb_anon, SUPABASE_SCHEMA)
-
     next_index = rotation.get("next_payout_index")
-    next_date = rotation.get("next_payout_date")
-    next_beneficiary = rotation.get("next_beneficiary")
+next_date = rotation.get("next_payout_date")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Members", f"{len(df_members):,}")
-    c2.metric("Next Payout Index", str(next_index) if next_index is not None else "—")
-    c3.metric("Next Payout Date", str(next_date) if next_date else "—")
-    c4.metric("Next Beneficiary", str(next_beneficiary) if next_beneficiary else "—")
+# Derive beneficiary properly
+beneficiary_id = rotation.get("legacy_member_id")
+beneficiary_name = None
+
+if beneficiary_id:
+    match = df_members[df_members["id"] == int(beneficiary_id)]
+    if not match.empty:
+        beneficiary_name = match.iloc[0]["name"]
+
+beneficiary_label = (
+    f"{beneficiary_id} • {beneficiary_name}"
+    if beneficiary_id and beneficiary_name
+    else "—"
+)
+
+    
+c2.metric("Next Payout Index", str(next_index) if next_index is not None else "—")
+c3.metric("Next Payout Date", str(next_date) if next_date else "—")
+c4.metric("Next Beneficiary", beneficiary_label)
 
     st.divider()
 
