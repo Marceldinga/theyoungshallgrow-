@@ -1,5 +1,11 @@
 
-# app.py ✅ COMPLETE WORKING VERSION (fixes get_rotation_state + dashboard rotation display)
+# app.py ✅ SINGLE COMPLETE ORGANIZATIONAL-STANDARD VERSION
+# Key points:
+# - Dashboard reads ONLY from v_dashboard_rotation (anon-readable source of truth)
+# - No more guessing between current_season_view / app_state for dashboard KPIs
+# - Payouts & Admin still use service key
+# - Clean, deterministic behavior
+
 from __future__ import annotations
 
 import os
@@ -65,7 +71,7 @@ with right:
 st.title(f"🏦 {APP_BRAND} • Bank Dashboard")
 
 # ============================================================
-# SAFE HELPERS
+# SAFE QUERY HELPER
 # ============================================================
 def safe_select(
     client,
@@ -92,22 +98,15 @@ def safe_select(
         st.error(f"Unexpected error reading {schema}.{table_name}: {e}")
         return []
 
-def get_rotation_state(sb, schema: str) -> dict:
+# ============================================================
+# DASHBOARD STATE (SOURCE OF TRUTH)
+# ============================================================
+def get_dashboard_rotation(sb, schema: str) -> dict:
     """
-    Canonical rotation state:
-      1) current_season_view
-      2) v_dashboard_rotation (optional)
-      3) app_state fallback
+    Organizational standard:
+    Dashboard must read from ONE curated view that anon can read.
     """
-    rows = safe_select(sb, "current_season_view", "*", schema=schema, limit=1)
-    if rows:
-        return rows[0]
-
     rows = safe_select(sb, "v_dashboard_rotation", "*", schema=schema, limit=1)
-    if rows:
-        return rows[0]
-
-    rows = safe_select(sb, "app_state", "*", schema=schema, limit=1)
     return rows[0] if rows else {}
 
 # ============================================================
@@ -153,31 +152,20 @@ page = st.sidebar.radio(
 )
 
 # ============================================================
-# DASHBOARD
+# DASHBOARD (Reads v_dashboard_rotation only)
 # ============================================================
 if page == "Dashboard":
     labels, label_to_id, label_to_name, df_members = load_members_legacy(
         SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA
     )
 
-    rotation = get_rotation_state(sb_anon, SUPABASE_SCHEMA)
+    rot = get_dashboard_rotation(sb_anon, SUPABASE_SCHEMA)
 
-    next_index = rotation.get("next_payout_index")
-    next_date = rotation.get("next_payout_date")
-
-    # Prefer current_season_view fields (your screenshots show these)
-    beneficiary_id = rotation.get("legacy_member_id") or rotation.get("id")
-    beneficiary_name = rotation.get("next_beneficiary")
-
-    # If name not provided, derive from members_legacy
-    if not beneficiary_name and beneficiary_id:
-        try:
-            bid = int(beneficiary_id)
-            match = df_members[df_members["id"] == bid]
-            if not match.empty:
-                beneficiary_name = str(match.iloc[0]["name"])
-        except Exception:
-            pass
+    next_index = rot.get("next_payout_index")
+    next_date = rot.get("next_payout_date")
+    beneficiary_id = rot.get("legacy_member_id")
+    beneficiary_name = rot.get("next_beneficiary")
+    pot_amount = rot.get("pot_amount")  # optional (if you included it)
 
     beneficiary_label = f"{beneficiary_id} • {beneficiary_name}" if beneficiary_id and beneficiary_name else "—"
 
@@ -186,6 +174,9 @@ if page == "Dashboard":
     c2.metric("Next Payout Index", str(next_index) if next_index is not None else "—")
     c3.metric("Next Payout Date", str(next_date) if next_date else "—")
     c4.metric("Next Beneficiary", beneficiary_label)
+
+    if pot_amount is not None:
+        st.caption(f"Pot Amount (dashboard view): {float(pot_amount):,.0f}" if isinstance(pot_amount, (int, float)) else f"Pot Amount: {pot_amount}")
 
     st.divider()
 
@@ -214,7 +205,7 @@ elif page == "Contributions":
         st.dataframe(df, use_container_width=True)
 
 # ============================================================
-# PAYOUTS
+# PAYOUTS (SERVICE)
 # ============================================================
 elif page == "Payouts":
     if not sb_service:
@@ -223,14 +214,14 @@ elif page == "Payouts":
         render_payouts(sb_service, SUPABASE_SCHEMA)
 
 # ============================================================
-# LOANS
+# LOANS (placeholder)
 # ============================================================
 elif page == "Loans":
     st.header("Loans")
     st.info("Next step: implement render_loans() in loans.py (service key) and wire it here.")
 
 # ============================================================
-# ADMIN
+# ADMIN (SERVICE)
 # ============================================================
 elif page == "Admin":
     if not sb_service:
