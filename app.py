@@ -182,6 +182,15 @@ def load_current_session_id(SUPABASE_URL: str, SUPABASE_ANON_KEY: str, SUPABASE_
 # KPI CARDS
 # ============================================================
 c1, c2, c3 = st.columns(3)
+app_state = load_app_state(
+    SUPABASE_URL,
+    SUPABASE_ANON_KEY,
+    SUPABASE_SCHEMA
+)
+
+sid = app_state.get("next_payout_index")
+
+c1.metric("Current Session ID", sid or "N/A")
 c1.metric("Current Session ID", sid or "N/A")
 c2.metric("Members", f"{len(df_members):,}" if isinstance(df_members, pd.DataFrame) else "0")
 c3.metric("Next Payout Index", str(app_state.get("next_payout_index", "N/A")))
