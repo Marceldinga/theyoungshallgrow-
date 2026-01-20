@@ -101,7 +101,7 @@ def get_rotation_state(sb, schema: str) -> dict:
     season_rows = safe_select(sb, "current_season_view", "*", schema=schema, limit=1)
     if season_rows:
         return season_rows[0]
-    state_rows = safe_select(sb, "app_state", "*", schema=schema, limit=1)
+    season_rows = safe_select(sb, "v_dashboard_rotation", "*", schema=schema, limit=1)
     return state_rows[0] if state_rows else {}
 
 # ============================================================
