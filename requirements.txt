@@ -1,0 +1,5 @@
+streamlit
+pandas
+supabase
+reportlab
+python-dateutil
