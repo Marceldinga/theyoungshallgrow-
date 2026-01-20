@@ -51,10 +51,6 @@ def money(x):
     except Exception:
         return str(x)
 
-# ============================================================
-# CACHE WRAPPERS MUST NOT TAKE "client" AS A PARAM
-# ============================================================
-
 @st.cache_data(ttl=90)
 def cached_current_session_id() -> str | None:
     return current_session_id(sb_public)
