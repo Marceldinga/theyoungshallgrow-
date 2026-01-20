@@ -1,20 +1,11 @@
 
-# app.py  (Single updated code — fixes UnhashableParamError + adds refresh + safer unpack)
+# app.py  ✅ COMPLETE SINGLE-FILE VERSION (uses members_legacy)
 from __future__ import annotations
 
+import os
 import streamlit as st
 import pandas as pd
 from supabase import create_client
-
-# Import your helpers/loaders from db.py
-from db import (
-    get_secret,
-    authed_client,
-    schema_check_or_stop,
-    current_session_id,
-    get_app_state,
-    load_member_registry,
-)
 
 APP_BRAND = "theyoungshallgrow"
 
@@ -24,105 +15,149 @@ st.set_page_config(
     page_icon="🏦",
 )
 
-# -------------------------
-# SECRETS (single source of truth)
-# -------------------------
+# ============================================================
+# SECRETS (Streamlit Cloud: set in App > Settings > Secrets)
+#   SUPABASE_URL = "..."
+#   SUPABASE_ANON_KEY = "..."
+# ============================================================
+def get_secret(key: str, default: str | None = None) -> str | None:
+    # Prefer Streamlit secrets, fallback to environment variables
+    if key in st.secrets:
+        return str(st.secrets.get(key))
+    return os.getenv(key, default)
+
 SUPABASE_URL = get_secret("SUPABASE_URL")
 SUPABASE_ANON_KEY = get_secret("SUPABASE_ANON_KEY")
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_ANON_KEY")
+    st.error("Missing SUPABASE_URL or SUPABASE_ANON_KEY in Streamlit Secrets / Environment.")
+    st.stop()
 
-# -------------------------
-# CLIENTS
-# -------------------------
+# ============================================================
+# CLIENT (cache_resource is OK for client object)
+# ============================================================
 @st.cache_resource
 def get_public_client(url: str, anon_key: str):
-    # ✅ safe to cache (resource), not user-specific
     return create_client(url, anon_key)
 
-sb_public = get_public_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-
-# -------------------------
-# (OPTIONAL) Run schema check once
-# -------------------------
-@st.cache_resource
-def _run_schema_check_once(url: str, anon_key: str):
-    sb = get_public_client(url, anon_key)
-    schema_check_or_stop(sb)
-
-_run_schema_check_once(SUPABASE_URL, SUPABASE_ANON_KEY)
-
-# -------------------------
-# HELPERS
-# -------------------------
-def money(x):
-    try:
-        return f"{float(x):,.0f}"
-    except Exception:
-        return str(x)
+sb = get_public_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 # ============================================================
-# ✅ FIX: CACHE WRAPPERS MUST NOT TAKE "client" AS A PARAM
-#     (only primitives like url/key are OK)
+# DATA LOADERS (cache_data must only take hashable primitives)
 # ============================================================
-
 @st.cache_data(ttl=90)
-def cached_current_session_id(url: str, anon_key: str) -> str | None:
-    sb = get_public_client(url, anon_key)
-    return current_session_id(sb)
-
-@st.cache_data(ttl=90)
-def cached_app_state(url: str, anon_key: str) -> dict:
-    sb = get_public_client(url, anon_key)
-    return get_app_state(sb)
-
-@st.cache_data(ttl=90)
-def cached_member_registry(url: str, anon_key: str):
+def load_members_legacy(url: str, anon_key: str) -> tuple[list[str], dict, dict, pd.DataFrame]:
     """
+    Source of truth: public.members_legacy
+    Expected columns:
+      - legacy_member_id (int)
+      - full_name (text)
+
     Returns:
       labels, label_to_id, label_to_name, df_members
     """
-    sb = get_public_client(url, anon_key)
-    return load_member_registry(sb)
+    sb_local = get_public_client(url, anon_key)
 
-# -------------------------
-# AUTH (example placeholder)
-# -------------------------
-# If you already have login working, keep it.
-# The key rule:
-#   ✅ DO NOT cache authed_client()
-#   ✅ DO NOT pass authed client into @st.cache_data
-def get_authed_client_after_login(session_obj):
-    # ✅ no caching: token/user-specific
-    return authed_client(SUPABASE_URL, SUPABASE_ANON_KEY, session_obj)
+    # ✅ Only select what we need (faster + safer)
+    resp = sb_local.table("members_legacy") \
+        .select("legacy_member_id, full_name") \
+        .order("legacy_member_id") \
+        .execute()
 
-# -------------------------
-# TOP BAR ACTIONS
-# -------------------------
+    rows = resp.data or []
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        return [], {}, {}, pd.DataFrame()
+
+    # Build labels like "1 - Samgwaa Eric"
+    df["legacy_member_id"] = pd.to_numeric(df["legacy_member_id"], errors="coerce")
+    df = df.dropna(subset=["legacy_member_id"])
+    df["legacy_member_id"] = df["legacy_member_id"].astype(int)
+
+    df["full_name"] = df["full_name"].astype(str)
+    df["label"] = df["legacy_member_id"].astype(str) + " - " + df["full_name"]
+
+    labels = df["label"].tolist()
+    label_to_id = dict(zip(labels, df["legacy_member_id"].tolist()))
+    label_to_name = dict(zip(labels, df["full_name"].tolist()))
+    return labels, label_to_id, label_to_name, df
+
+
+@st.cache_data(ttl=90)
+def load_app_state(url: str, anon_key: str) -> dict:
+    """
+    Reads app_state table (single row expected).
+    If table is empty, returns {}.
+    """
+    sb_local = get_public_client(url, anon_key)
+
+    try:
+        resp = sb_local.table("app_state").select("*").limit(1).execute()
+        rows = resp.data or []
+        return rows[0] if rows else {}
+    except Exception:
+        # If table missing or blocked by RLS, just fail gracefully
+        return {}
+
+
+@st.cache_data(ttl=90)
+def load_current_session_id(url: str, anon_key: str) -> str | None:
+    """
+    Uses current_season_view if available, otherwise sessions_legacy heuristic.
+    Returns a string session/season id/name if found.
+    """
+    sb_local = get_public_client(url, anon_key)
+
+    # Try view first (you have current_season_view in your schema list)
+    try:
+        resp = sb_local.table("current_season_view").select("*").limit(1).execute()
+        rows = resp.data or []
+        if rows:
+            row = rows[0]
+            # try common keys
+            for k in ("session_id", "season_id", "current_session_id", "id", "season_name", "session_name"):
+                if k in row and row[k]:
+                    return str(row[k])
+    except Exception:
+        pass
+
+    # Fallback: sessions_legacy (if you store an active row)
+    try:
+        resp = sb_local.table("sessions_legacy").select("*").order("id", desc=True).limit(1).execute()
+        rows = resp.data or []
+        if rows:
+            row = rows[0]
+            for k in ("id", "session_id", "season_id", "season_name", "session_name"):
+                if k in row and row[k]:
+                    return str(row[k])
+    except Exception:
+        pass
+
+    return None
+
+# ============================================================
+# UI: TOP BAR ACTIONS
+# ============================================================
 bar1, bar2 = st.columns([1, 0.25])
 with bar2:
     if st.button("🔄 Refresh data", use_container_width=True):
-        # Clears ONLY data cache; keep resource cache (client) intact
         st.cache_data.clear()
         st.rerun()
 
-# -------------------------
-# MAIN UI
-# -------------------------
 st.title(f"🏦 {APP_BRAND} • Bank Dashboard")
 
-# Load cached public data (safe)
-sid = cached_current_session_id(SUPABASE_URL, SUPABASE_ANON_KEY)
-app_state = cached_app_state(SUPABASE_URL, SUPABASE_ANON_KEY)
+# ============================================================
+# LOAD DATA
+# ============================================================
+sid = load_current_session_id(SUPABASE_URL, SUPABASE_ANON_KEY)
+app_state = load_app_state(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-res = cached_member_registry(SUPABASE_URL, SUPABASE_ANON_KEY)
-if not res:
-    labels, label_to_id, label_to_name, df_members = [], {}, {}, pd.DataFrame()
-else:
-    labels, label_to_id, label_to_name, df_members = res
+labels, label_to_id, label_to_name, df_members = load_members_legacy(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-# Example top KPIs
+# ============================================================
+# KPI CARDS
+# ============================================================
 c1, c2, c3 = st.columns(3)
 c1.metric("Current Session ID", sid or "N/A")
 c2.metric("Members", f"{len(df_members):,}" if isinstance(df_members, pd.DataFrame) else "0")
@@ -130,25 +165,43 @@ c3.metric("Next Payout Index", str(app_state.get("next_payout_index", "N/A")))
 
 st.divider()
 
-# Example member selector
+# ============================================================
+# MEMBER SELECTOR
+# ============================================================
 if labels:
     pick = st.selectbox("Select member", labels)
     mid = label_to_id.get(pick)
+    mname = label_to_name.get(pick)
     st.write("Selected legacy_member_id:", mid)
+    st.write("Selected member:", mname)
 else:
-    st.warning("No members found in member_registry.")
+    st.warning("No members found in members_legacy (or table could not be read).")
 
-# Show members table
+# ============================================================
+# PREVIEW TABLE
+# ============================================================
 with st.expander("Member Registry (preview)", expanded=False):
     if isinstance(df_members, pd.DataFrame) and not df_members.empty:
-        st.dataframe(df_members, use_container_width=True)
+        st.dataframe(df_members[["legacy_member_id", "full_name"]], use_container_width=True)
     else:
-        st.info("member_registry is empty or could not be loaded.")
+        st.info("members_legacy is empty or could not be loaded (check RLS policies).")
 
-# ------------------------------------------------------------
-# IMPORTANT NOTES (already applied in this file)
-# ------------------------------------------------------------
-# ✅ @st.cache_resource: OK for public supabase client
-# ✅ @st.cache_data: cached_* functions do NOT take a client param
-# ✅ cached_* functions only accept primitives (url/key) and create/get client internally
-# ❌ Do not wrap schema_check_or_stop inside @st.cache_data (it uses st.error + raises)
+# ============================================================
+# QUICK RLS DEBUG HINT
+# ============================================================
+with st.expander("Troubleshooting (if Members still shows 0)"):
+    st.markdown(
+        """
+If `members_legacy` has rows in Supabase but Streamlit still shows 0, it’s usually **RLS**.
+
+**Quick test:** In Supabase, verify you have a SELECT policy for anon/auth (or temporarily disable RLS).
+
+Example policy idea (Supabase SQL editor):
+```sql
+-- allow read access (public dashboard)
+ALTER TABLE public.members_legacy ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "public_read_members_legacy"
+ON public.members_legacy
+FOR SELECT
+USING (true);
