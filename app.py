@@ -1,5 +1,12 @@
 
-# app.py ✅ UPDATED (fix Dashboard N/A by using ONE canonical rotation source)
+# app.py ✅ SINGLE COMPLETE VERSION (FIXES Dashboard N/A + clean routing + proper Admin panel call)
+# - Uses ONE canonical rotation state: current_season_view -> app_state
+# - Dashboard no longer shows N/A when Payouts shows values
+# - Calls your high-standard admin_panels.py render_admin()
+# - Keeps payouts connected (render_payouts)
+# - Keeps contributions view
+# - Avoids the earlier syntax mistake ({}dii)
+
 from __future__ import annotations
 
 import os
@@ -8,7 +15,7 @@ import pandas as pd
 from supabase import create_client
 from postgrest.exceptions import APIError
 
-# ✅ Import panels
+# Panels
 from admin_panels import render_admin
 from payout import render_payouts
 
@@ -55,10 +62,10 @@ sb_anon = get_anon_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 sb_service = get_service_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_SERVICE_KEY else None
 
 # ============================================================
-# TOP BAR ACTIONS
+# TOP BAR
 # ============================================================
-top_l, top_r = st.columns([1, 0.25])
-with top_r:
+left, right = st.columns([1, 0.25])
+with right:
     if st.button("🔄 Refresh data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -93,18 +100,27 @@ def safe_select(
         st.error(f"Unexpected error reading {schema}.{table_name}: {e}")
         return []
 
+def safe_single(
+    client,
+    table_name: str,
+    select_cols: str = "*",
+    schema: str = "public",
+) -> dict:
+    rows = safe_select(client, table_name, select_cols, schema=schema, limit=1)
+    return rows[0] if rows else {}
+
 def get_rotation_state(sb, schema: str) -> dict:
     """
     ✅ Canonical rotation state:
-    Prefer current_season_view; fallback to app_state (id=1).
+      1) current_season_view (preferred)
+      2) app_state (fallback)
     This fixes Dashboard showing N/A while Payouts shows real values.
     """
-    season = safe_select(sb, "current_season_view", "*", schema=schema, limit=1)
-    if season:
-        return season[0]
-
-    state = safe_select(sb, "app_state", "*", schema=schema, limit=1)
-    return state[0] if state else {}
+    season_rows = safe_select(sb, "current_season_view", "*", schema=schema, limit=1)
+    if season_rows:
+        return season_rows[0]
+    state_rows = safe_select(sb, "app_state", "*", schema=schema, limit=1)
+    return state_rows[0] if state_rows else {}
 
 # ============================================================
 # LOADERS
@@ -149,7 +165,7 @@ page = st.sidebar.radio(
 )
 
 # ============================================================
-# DASHBOARD (FIXED)
+# DASHBOARD (FIXED: reads canonical rotation state)
 # ============================================================
 if page == "Dashboard":
     labels, label_to_id, label_to_name, df_members = load_members_legacy(
@@ -184,7 +200,7 @@ if page == "Dashboard":
             st.info("members_legacy empty or not readable.")
 
 # ============================================================
-# CONTRIBUTIONS
+# CONTRIBUTIONS (VIEW)
 # ============================================================
 elif page == "Contributions":
     st.header("Contributions (View)")
@@ -208,10 +224,10 @@ elif page == "Payouts":
 # ============================================================
 elif page == "Loans":
     st.header("Loans")
-    st.info("Next step: wire render_loans() in loans.py (service key).")
+    st.info("Next step: implement render_loans() in loans.py (service key) and wire it here.")
 
 # ============================================================
-# ADMIN (HIGH-STANDARD)
+# ADMIN (HIGH STANDARD)
 # ============================================================
 elif page == "Admin":
     if not sb_service:
