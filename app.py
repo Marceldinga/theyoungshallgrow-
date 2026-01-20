@@ -190,7 +190,6 @@ with st.expander("Member Registry (preview)", expanded=False):
 # QUICK RLS DEBUG HINT
 # ============================================================
 with st.expander("Troubleshooting (if Members still shows 0)"):
-    with st.expander("Troubleshooting (if Members still shows 0)"):
     st.markdown(
         "If `members_legacy` has rows in Supabase but Streamlit still shows 0, "
         "the most common cause is **Row Level Security (RLS)**.\n\n"
