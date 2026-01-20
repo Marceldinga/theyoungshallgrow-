@@ -190,18 +190,12 @@ with st.expander("Member Registry (preview)", expanded=False):
 # QUICK RLS DEBUG HINT
 # ============================================================
 with st.expander("Troubleshooting (if Members still shows 0)"):
+    with st.expander("Troubleshooting (if Members still shows 0)"):
     st.markdown(
-        """
-If `members_legacy` has rows in Supabase but Streamlit still shows 0, it’s usually **RLS**.
-
-**Quick test:** In Supabase, verify you have a SELECT policy for anon/auth (or temporarily disable RLS).
-
-Example policy idea (Supabase SQL editor):
-```sql
--- allow read access (public dashboard)
-ALTER TABLE public.members_legacy ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY "public_read_members_legacy"
-ON public.members_legacy
-FOR SELECT
-USING (true);
+        "If `members_legacy` has rows in Supabase but Streamlit still shows 0, "
+        "the most common cause is **Row Level Security (RLS)**.\n\n"
+        "Quick test:\n"
+        "- Ensure `members_legacy` has a SELECT policy for anon or authenticated users\n"
+        "- Or temporarily disable RLS on the table\n\n"
+        "After fixing RLS, click **Refresh data**."
+    )
