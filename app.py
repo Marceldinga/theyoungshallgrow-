@@ -1,12 +1,5 @@
 
-# app.py ✅ SINGLE COMPLETE VERSION (FIXES Dashboard N/A + clean routing + proper Admin panel call)
-# - Uses ONE canonical rotation state: current_season_view -> app_state
-# - Dashboard no longer shows N/A when Payouts shows values
-# - Calls your high-standard admin_panels.py render_admin()
-# - Keeps payouts connected (render_payouts)
-# - Keeps contributions view
-# - Avoids the earlier syntax mistake ({}dii)
-
+# app.py ✅ SINGLE COMPLETE FIXED VERSION (Dashboard shows beneficiary/index/date correctly)
 from __future__ import annotations
 
 import os
@@ -15,7 +8,6 @@ import pandas as pd
 from supabase import create_client
 from postgrest.exceptions import APIError
 
-# Panels
 from admin_panels import render_admin
 from payout import render_payouts
 
@@ -100,21 +92,11 @@ def safe_select(
         st.error(f"Unexpected error reading {schema}.{table_name}: {e}")
         return []
 
-def safe_single(
-    client,
-    table_name: str,
-    select_cols: str = "*",
-    schema: str = "public",
-) -> dict:
-    rows = safe_select(client, table_name, select_cols, schema=schema, limit=1)
-    return rows[0] if rows else {}
-
 def get_rotation_state(sb, schema: str) -> dict:
     """
-    ✅ Canonical rotation state:
-      1) current_season_view (preferred)
-      2) app_state (fallback)
-    This fixes Dashboard showing N/A while Payouts shows real values.
+    Canonical rotation state:
+      1) current_season_view
+      2) app_state
     """
     season_rows = safe_select(sb, "current_season_view", "*", schema=schema, limit=1)
     if season_rows:
@@ -165,7 +147,7 @@ page = st.sidebar.radio(
 )
 
 # ============================================================
-# DASHBOARD (FIXED: reads canonical rotation state)
+# DASHBOARD (FIXED)
 # ============================================================
 if page == "Dashboard":
     labels, label_to_id, label_to_name, df_members = load_members_legacy(
@@ -173,34 +155,31 @@ if page == "Dashboard":
     )
 
     rotation = get_rotation_state(sb_anon, SUPABASE_SCHEMA)
+
     next_index = rotation.get("next_payout_index")
-next_date = rotation.get("next_payout_date")
+    next_date = rotation.get("next_payout_date")
 
-rotation = get_rotation_state(sb_anon, SUPABASE_SCHEMA)
+    # ✅ current_season_view provides legacy_member_id (not next_beneficiary)
+    beneficiary_id = rotation.get("legacy_member_id")
+    beneficiary_name = None
 
-next_index = rotation.get("next_payout_index")
-next_date = rotation.get("next_payout_date")
+    if beneficiary_id is not None and str(beneficiary_id).strip() != "":
+        try:
+            bid = int(beneficiary_id)
+            match = df_members[df_members["id"] == bid]
+            if not match.empty:
+                beneficiary_name = str(match.iloc[0]["name"])
+        except Exception:
+            pass
 
-# ✅ beneficiary comes from current_season_view.legacy_member_id
-beneficiary_id = rotation.get("legacy_member_id")
-beneficiary_name = None
+    beneficiary_label = f"{beneficiary_id} • {beneficiary_name}" if beneficiary_id and beneficiary_name else "—"
 
-if beneficiary_id is not None and str(beneficiary_id).strip() != "":
-    try:
-        bid = int(beneficiary_id)
-        match = df_members[df_members["id"] == bid]
-        if not match.empty:
-            beneficiary_name = str(match.iloc[0]["name"])
-    except Exception:
-        pass
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Members", f"{len(df_members):,}")
+    c2.metric("Next Payout Index", str(next_index) if next_index is not None else "—")
+    c3.metric("Next Payout Date", str(next_date) if next_date else "—")
+    c4.metric("Next Beneficiary", beneficiary_label)
 
-beneficiary_label = f"{beneficiary_id} • {beneficiary_name}" if beneficiary_id and beneficiary_name else "—"
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Members", f"{len(df_members):,}")
-c2.metric("Next Payout Index", str(next_index) if next_index is not None else "—")
-c3.metric("Next Payout Date", str(next_date) if next_date else "—")
-c4.metric("Next Beneficiary", beneficiary_label)
     st.divider()
 
     if labels:
