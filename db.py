@@ -1,6 +1,4 @@
 
-# db.py  (Railway-safe helpers for Supabase + Streamlit; no cached funcs here)
-from __future__ import annotations
 
 import os
 from typing import Any, Dict, Tuple, List, Optional
@@ -23,7 +21,7 @@ def get_secret(name: str, default: str | None = None) -> str | None:
         return v
 
     try:
-        import streamlit as st  # local import to avoid hard dependency outside Streamlit
+        import streamlit as st  # local import
 
         if name in st.secrets and str(st.secrets.get(name, "")).strip() != "":
             return str(st.secrets[name])
@@ -38,17 +36,16 @@ def get_secret(name: str, default: str | None = None) -> str | None:
 # ============================================================
 def public_client(url: str, anon_key: str):
     """Public (anon) client; do NOT cache here (cache in app.py only)."""
-    return create_client(url, anon_key)
+    return create_client(url.strip(), anon_key.strip())
+
+
+def service_client(url: str, service_key: str):
+    """Service-role client (bypasses RLS). Use ONLY server-side."""
+    return create_client(url.strip(), service_key.strip())
 
 
 def authed_client(url: str, anon_key: str, session_obj: Any):
-    """
-    Create an authed Supabase client using a user session after login.
-    session_obj can be:
-      - an object/dict with access_token (recommended)
-      - or a raw access token string
-    """
-    sb = create_client(url, anon_key)
+    sb = create_client(url.strip(), anon_key.strip())
 
     token: Optional[str] = None
     if isinstance(session_obj, str):
@@ -61,8 +58,7 @@ def authed_client(url: str, anon_key: str, session_obj: Any):
     if not token:
         raise ValueError("Missing access_token in session_obj. Cannot create authed client.")
 
-    # supabase-py supports setting auth with the access token
-    sb.auth.set_session(token, None)  # refresh token optional; None is ok if you don't store it
+    sb.auth.set_session(token, None)
     return sb
 
 
@@ -70,13 +66,6 @@ def authed_client(url: str, anon_key: str, session_obj: Any):
 # DATA LOADERS (NO streamlit calls inside; return safe values)
 # ============================================================
 def _safe_execute(resp: Any) -> List[Dict[str, Any]]:
-    """
-    Normalizes supabase-py execute() response into a list[dict].
-    Works across versions where execute returns:
-      - object with .data
-      - dict with "data"
-      - list directly
-    """
     if resp is None:
         return []
     if isinstance(resp, list):
@@ -89,11 +78,6 @@ def _safe_execute(resp: Any) -> List[Dict[str, Any]]:
 
 
 def current_session_id(c) -> str | None:
-    """
-    Reads current 'session' identifier from your legacy sessions table.
-    Adjust the table/column names if your schema differs.
-    """
-    # Try a few common patterns safely.
     # 1) app_state.current_session_id
     try:
         rows = _safe_execute(c.table("app_state").select("current_session_id").limit(1).execute())
@@ -102,7 +86,7 @@ def current_session_id(c) -> str | None:
     except Exception:
         pass
 
-    # 2) sessions_legacy: latest row by id or created_at
+    # 2) sessions_legacy: latest row
     for order_col in ("created_at", "id", "session_id"):
         try:
             rows = _safe_execute(
@@ -113,7 +97,6 @@ def current_session_id(c) -> str | None:
                 .execute()
             )
             if rows:
-                # common column names
                 for k in ("session_id", "id", "season_id", "legacy_session_id"):
                     if rows[0].get(k) is not None:
                         return str(rows[0][k])
@@ -124,10 +107,6 @@ def current_session_id(c) -> str | None:
 
 
 def get_app_state(c) -> Dict[str, Any]:
-    """
-    Loads app_state row (expects next_payout_index, etc.).
-    Returns {} if missing.
-    """
     try:
         rows = _safe_execute(c.table("app_state").select("*").limit(1).execute())
         return rows[0] if rows else {}
@@ -135,60 +114,47 @@ def get_app_state(c) -> Dict[str, Any]:
         return {}
 
 
-def load_member_registry(c) -> Tuple[List[str], Dict[str, int], Dict[str, str], pd.DataFrame]:
+# ============================================================
+# ✅ FIXED: MEMBERS LOADER (members_legacy uses id + name)
+# ============================================================
+def load_members_legacy(c) -> Tuple[List[str], Dict[str, int], Dict[str, str], pd.DataFrame]:
     """
-    Loads member_registry and returns:
+    Loads public.members_legacy and returns:
       labels: list[str] (used for selectbox)
-      label_to_id: dict[label -> legacy_member_id]
-      label_to_name: dict[label -> full_name]
+      label_to_id: dict[label -> id]
+      label_to_name: dict[label -> name]
       df_members: pd.DataFrame
+
+    Confirmed columns:
+      - id (bigint)
+      - name (text)
     """
     try:
         rows = _safe_execute(
-            c.table("member_registry")
-            .select("*")
-            .order("legacy_member_id", desc=False)
+            c.table("members_legacy")
+            .select("id,name,position,phone,has_benefits,contributed,foundation_contrib,loan_due,payout_total,total_fines_accumulated")
+            .order("id", desc=False)
             .execute()
         )
     except Exception:
         rows = []
 
-    df = pd.DataFrame(rows) if rows else pd.DataFrame()
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["id", "name"])
 
     labels: List[str] = []
     label_to_id: Dict[str, int] = {}
     label_to_name: Dict[str, str] = {}
 
-    if not df.empty:
-        # Make sure legacy_member_id exists
-        if "legacy_member_id" not in df.columns:
-            # Try fallback column name
-            if "member_id" in df.columns:
-                df = df.rename(columns={"member_id": "legacy_member_id"})
+    if not df.empty and "id" in df.columns and "name" in df.columns:
+        df["id"] = pd.to_numeric(df["id"], errors="coerce")
+        df = df.dropna(subset=["id"]).copy()
+        df["id"] = df["id"].astype(int)
+        df["name"] = df["name"].astype(str)
 
-        # Build a display name
-        def _build_name(r: pd.Series) -> str:
-            for key in ("full_name", "name", "member_name"):
-                if key in r and pd.notna(r[key]) and str(r[key]).strip():
-                    return str(r[key]).strip()
-            first = str(r.get("first_name", "") or "").strip()
-            last = str(r.get("last_name", "") or "").strip()
-            nm = (first + " " + last).strip()
-            return nm if nm else "Member"
+        df["label"] = df.apply(lambda r: f'{int(r["id"]):02d} • {r["name"]}', axis=1)
 
-        if "legacy_member_id" in df.columns:
-            for _, r in df.iterrows():
-                mid = r.get("legacy_member_id")
-                if pd.isna(mid):
-                    continue
-                try:
-                    mid_int = int(mid)
-                except Exception:
-                    continue
-                name = _build_name(r)
-                label = f"{mid_int:02d} • {name}"
-                labels.append(label)
-                label_to_id[label] = mid_int
-                label_to_name[label] = name
+        labels = df["label"].tolist()
+        label_to_id = dict(zip(df["label"], df["id"]))
+        label_to_name = dict(zip(df["label"], df["name"]))
 
     return labels, label_to_id, label_to_name, df
