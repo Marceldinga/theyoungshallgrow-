@@ -1,5 +1,5 @@
 
-# app.py ✅ SINGLE CLEAN UPDATED FILE (correct render_admin placement)
+# app.py ✅ UPDATED (fix Dashboard N/A by using ONE canonical rotation source)
 from __future__ import annotations
 
 import os
@@ -93,6 +93,19 @@ def safe_select(
         st.error(f"Unexpected error reading {schema}.{table_name}: {e}")
         return []
 
+def get_rotation_state(sb, schema: str) -> dict:
+    """
+    ✅ Canonical rotation state:
+    Prefer current_season_view; fallback to app_state (id=1).
+    This fixes Dashboard showing N/A while Payouts shows real values.
+    """
+    season = safe_select(sb, "current_season_view", "*", schema=schema, limit=1)
+    if season:
+        return season[0]
+
+    state = safe_select(sb, "app_state", "*", schema=schema, limit=1)
+    return state[0] if state else {}
+
 # ============================================================
 # LOADERS
 # ============================================================
@@ -112,18 +125,6 @@ def load_members_legacy(url: str, anon_key: str, schema: str):
     label_to_id = dict(zip(df["label"], df["id"]))
     label_to_name = dict(zip(df["label"], df["name"]))
     return labels, label_to_id, label_to_name, df
-
-@st.cache_data(ttl=60)
-def load_current_season_view(url: str, anon_key: str, schema: str) -> dict:
-    client = create_client(url, anon_key)
-    rows = safe_select(client, "current_season_view", "*", schema=schema, limit=1)
-    return rows[0] if rows else {}
-
-@st.cache_data(ttl=60)
-def load_app_state(url: str, anon_key: str, schema: str) -> dict:
-    client = create_client(url, anon_key)
-    rows = safe_select(client, "app_state", "*", schema=schema, limit=1)
-    return rows[0] if rows else {}
 
 @st.cache_data(ttl=60)
 def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFrame:
@@ -148,21 +149,24 @@ page = st.sidebar.radio(
 )
 
 # ============================================================
-# DASHBOARD
+# DASHBOARD (FIXED)
 # ============================================================
 if page == "Dashboard":
     labels, label_to_id, label_to_name, df_members = load_members_legacy(
         SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA
     )
 
-    season = load_current_season_view(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
-    state = load_app_state(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
+    rotation = get_rotation_state(sb_anon, SUPABASE_SCHEMA)
+
+    next_index = rotation.get("next_payout_index")
+    next_date = rotation.get("next_payout_date")
+    next_beneficiary = rotation.get("next_beneficiary")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Members", f"{len(df_members):,}")
-    c2.metric("Next Payout Index", str(season.get("next_payout_index") or state.get("next_payout_index") or "N/A"))
-    c3.metric("Next Payout Date", str(season.get("next_payout_date") or state.get("next_payout_date") or "N/A"))
-    c4.metric("Next Beneficiary", str(season.get("next_beneficiary") or "N/A"))
+    c2.metric("Next Payout Index", str(next_index) if next_index is not None else "—")
+    c3.metric("Next Payout Date", str(next_date) if next_date else "—")
+    c4.metric("Next Beneficiary", str(next_beneficiary) if next_beneficiary else "—")
 
     st.divider()
 
@@ -207,7 +211,7 @@ elif page == "Loans":
     st.info("Next step: wire render_loans() in loans.py (service key).")
 
 # ============================================================
-# ✅ ADMIN (NOW CALLS YOUR HIGH-STANDARD admin_panels.py)
+# ADMIN (HIGH-STANDARD)
 # ============================================================
 elif page == "Admin":
     if not sb_service:
