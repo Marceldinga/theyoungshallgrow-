@@ -14,7 +14,8 @@ time.sleep(5)
 # -------------------------
 APP_BRAND = "theyoungshallgrow"
 APP_VERSION = "v2.5-fast"
-
+if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_ANON_KEY")
 st.set_page_config(
     page_title=f"{APP_BRAND} • Bank Dashboard",
     layout="wide",
