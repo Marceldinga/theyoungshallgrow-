@@ -104,14 +104,14 @@ def load_members_legacy(url: str, anon_key: str, schema: str) -> tuple[list[str]
 
     Expected columns (minimum):
       - legacy_member_id (int)
-      - full_name (text)
+      - name (text)
     """
     client = create_client(url.strip(), anon_key.strip())
 
     rows = safe_select(
         client=client,
         table_name="members_legacy",
-        select_cols="legacy_member_id, full_name",
+        select_cols="legacy_member_id, name",
         schema=schema,
         order_by="legacy_member_id",
         order_desc=False,
@@ -122,24 +122,24 @@ def load_members_legacy(url: str, anon_key: str, schema: str) -> tuple[list[str]
 
     if df_members.empty:
         # Return empty but valid structures so app doesn't crash
-        empty = pd.DataFrame(columns=["legacy_member_id", "full_name"])
+        empty = pd.DataFrame(columns=["legacy_member_id", "name"])
         return [], {}, {}, empty
 
     # Normalize
     df_members["legacy_member_id"] = pd.to_numeric(df_members["legacy_member_id"], errors="coerce").astype("Int64")
-    df_members["full_name"] = df_members["full_name"].astype(str)
+    df_members["name"] = df_members["name"].astype(str)
     df_members = df_members.dropna(subset=["legacy_member_id"]).copy()
     df_members["legacy_member_id"] = df_members["legacy_member_id"].astype(int)
 
     # Labels
     df_members["label"] = df_members.apply(
-        lambda r: f'{int(r["legacy_member_id"]):02d} • {r["full_name"]}',
+        lambda r: f'{int(r["legacy_member_id"]):02d} • {r["name"]}',
         axis=1,
     )
 
     labels = df_members["label"].tolist()
     label_to_id = dict(zip(df_members["label"], df_members["legacy_member_id"]))
-    label_to_name = dict(zip(df_members["label"], df_members["full_name"]))
+    label_to_name = dict(zip(df_members["label"], df_members["name"]))
 
     return labels, label_to_id, label_to_name, df_members
 
@@ -220,7 +220,7 @@ else:
 # ============================================================
 with st.expander("Member Registry (preview)", expanded=False):
     if isinstance(df_members, pd.DataFrame) and not df_members.empty:
-        st.dataframe(df_members[["legacy_member_id", "full_name"]], use_container_width=True)
+        st.dataframe(df_members[["legacy_member_id", "name"]], use_container_width=True)
     else:
         st.info("members_legacy is empty or could not be loaded (check errors above / RLS / schema).")
 
