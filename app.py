@@ -46,42 +46,93 @@ sb = get_public_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 # DATA LOADERS (cache_data must only take hashable primitives)
 # ============================================================
 @st.cache_data(ttl=90)
+from postgrest.exceptions import APIError
+
+@st.cache_data(ttl=90)
 def load_members_legacy(url: str, anon_key: str) -> tuple[list[str], dict, dict, pd.DataFrame]:
     """
     Source of truth: public.members_legacy
-    Expected columns:
+
+    Expected columns (minimum):
       - legacy_member_id (int)
       - full_name (text)
 
     Returns:
-      labels, label_to_id, label_to_name, df_members
+      labels: list[str] (for selectbox)
+      label_to_id: dict[label -> legacy_member_id]
+      label_to_name: dict[label -> full_name]
+      df_members: DataFrame of members
     """
-    sb_local = get_public_client(url, anon_key)
+    # Create a local client INSIDE the cached function (safe: url/key are primitives)
+    supabase = create_client(url.strip(), anon_key.strip())
 
-    # ✅ Only select what we need (faster + safer)
-    resp = sb_local.table("members_legacy") \
-        .select("legacy_member_id, full_name") \
-        .order("legacy_member_id") \
-        .execute()
+    try:
+        # If your table is in a non-public schema, use:
+        # resp = supabase.schema("legacy").table("members_legacy").select("legacy_member_id,full_name").execute()
+        resp = (
+            supabase
+            .table("members_legacy")
+            .select("legacy_member_id, full_name")
+            .order("legacy_member_id", desc=False)
+            .execute()
+        )
 
-    rows = resp.data or []
-    df = pd.DataFrame(rows)
+        rows = resp.data or []
+        df_members = pd.DataFrame(rows)
 
-    if df.empty:
-        return [], {}, {}, pd.DataFrame()
+        # Guardrails for missing columns
+        if df_members.empty:
+            # Return empty but valid structures so app doesn't crash
+            return [], {}, {}, pd.DataFrame(columns=["legacy_member_id", "full_name"])
 
-    # Build labels like "1 - Samgwaa Eric"
-    df["legacy_member_id"] = pd.to_numeric(df["legacy_member_id"], errors="coerce")
-    df = df.dropna(subset=["legacy_member_id"])
-    df["legacy_member_id"] = df["legacy_member_id"].astype(int)
+        # Normalize columns just in case
+        df_members["legacy_member_id"] = pd.to_numeric(df_members["legacy_member_id"], errors="coerce").astype("Int64")
+        df_members["full_name"] = df_members["full_name"].astype(str)
 
-    df["full_name"] = df["full_name"].astype(str)
-    df["label"] = df["legacy_member_id"].astype(str) + " - " + df["full_name"]
+        df_members = df_members.dropna(subset=["legacy_member_id"]).copy()
+        df_members["legacy_member_id"] = df_members["legacy_member_id"].astype(int)
 
-    labels = df["label"].tolist()
-    label_to_id = dict(zip(labels, df["legacy_member_id"].tolist()))
-    label_to_name = dict(zip(labels, df["full_name"].tolist()))
-    return labels, label_to_id, label_to_name, df
+        # Create UI labels
+        df_members["label"] = df_members.apply(
+            lambda r: f'{int(r["legacy_member_id"]):02d} • {r["full_name"]}',
+            axis=1
+        )
+
+        labels = df_members["label"].tolist()
+        label_to_id = dict(zip(df_members["label"], df_members["legacy_member_id"]))
+        label_to_name = dict(zip(df_members["label"], df_members["full_name"]))
+
+        return labels, label_to_id, label_to_name, df_members
+
+    except APIError as e:
+        # Show the REAL PostgREST error (this is what your traceback is hiding)
+        st.error("Supabase APIError while loading members_legacy.")
+        st.code(str(e), language="text")
+
+        # Also print structured fields if present
+        payload = None
+        if hasattr(e, "args") and e.args:
+            payload = e.args[0]
+        st.write("Error payload:", payload)
+
+        # Helpful hints based on common failures
+        msg = str(e).lower()
+        if "permission denied" in msg or "row level security" in msg or "rls" in msg:
+            st.warning(
+                "This looks like an RLS/policy issue. Either create a SELECT policy for public.members_legacy "
+                "or use a service_role key on the server (never expose service_role to browsers)."
+            )
+        if "does not exist" in msg or "relation" in msg:
+            st.warning(
+                "This looks like a table/schema mismatch. Confirm the table name is exactly 'members_legacy' "
+                "and whether it is in the 'public' schema (otherwise use supabase.schema('...').table(...))."
+            )
+        if "column" in msg and "does not exist" in msg:
+            st.warning(
+                "This looks like a column name mismatch. Confirm columns are exactly legacy_member_id and full_name."
+            )
+
+        raise
 
 
 @st.cache_data(ttl=90)
