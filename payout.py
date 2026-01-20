@@ -5,7 +5,6 @@ from __future__ import annotations
 import pandas as pd
 from datetime import date, timedelta
 
-# Import ONLY what exists in db.py
 from db import now_iso, current_session_id, fetch_one
 
 # -------------------------
@@ -38,11 +37,9 @@ def next_unpaid_beneficiary(active_ids: list[int], already_paid_ids: set[int], s
 
     # Clamp start index into active set range
     if start_idx not in active_sorted:
-        # Choose the closest next active member >= start_idx, else wrap to first
         bigger = [x for x in active_sorted if x >= start_idx]
         start_idx = bigger[0] if bigger else active_sorted[0]
 
-    # Rotate through active members once
     start_pos = active_sorted.index(start_idx)
     rotation = active_sorted[start_pos:] + active_sorted[:start_pos]
 
@@ -50,7 +47,6 @@ def next_unpaid_beneficiary(active_ids: list[int], already_paid_ids: set[int], s
         if mid not in already_paid_ids:
             return int(mid)
 
-    # If everyone is already paid, return start_idx (fallback)
     return int(start_idx)
 
 
@@ -83,13 +79,16 @@ def missing_roles(df_sig: pd.DataFrame, required_roles: list[str]) -> list[str]:
 
 
 # -------------------------
-# CONTRIBUTIONS
+# CONTRIBUTIONS (ROTATION-BASED)
 # -------------------------
-def fetch_session_contributions(c, session_id: str):
+def fetch_rotation_contributions(c, payout_index: int):
+    """
+    Pull contributions for the CURRENT rotation (strict).
+    """
     resp = (
         c.table("contributions_legacy")
-         .select("member_id,amount,kind")
-         .eq("session_id", session_id)
+         .select("member_id,amount,kind,payout_index")
+         .eq("payout_index", int(payout_index))
          .in_("kind", ALLOWED_CONTRIB_KINDS)
          .limit(20000)
          .execute()
@@ -107,6 +106,24 @@ def build_contribution_summary(active_members, contrib_rows):
         {"member_id": mid, "member_name": name, "contributed": float(per_member.get(mid, 0.0))}
         for (mid, name) in active_members
     ]
+
+
+def fetch_current_rotation_pot(c):
+    """
+    Reads the canonical rotation pot from v_contribution_pot.
+    Returns (payout_index, payout_date, pot_amount).
+    """
+    row = (
+        c.table("v_contribution_pot")
+         .select("next_payout_index,next_payout_date,pot_amount")
+         .single()
+         .execute()
+         .data
+    )
+    idx = int(row.get("next_payout_index") or 1)
+    dt = row.get("next_payout_date")
+    pot = float(row.get("pot_amount") or 0)
+    return idx, dt, pot
 
 
 # -------------------------
@@ -129,31 +146,16 @@ def validate_gate_2(summary_rows, base=BASE_CONTRIBUTION, step=CONTRIBUTION_STEP
     return (len(problems) == 0, pd.DataFrame(problems))
 
 
-def validate_gate_3(summary_rows):
-    pot = sum(float(r.get("contributed") or 0) for r in summary_rows)
-    return (pot > 0, pot)
+def validate_gate_3_from_pot(pot_amount: float):
+    return (pot_amount > 0, float(pot_amount))
 
 
 # -------------------------
 # PRECHECK + EXECUTE
 # -------------------------
 def payout_precheck_option_b(c, active_members, already_paid_ids: set[int], start_idx: int):
+    # Keep session_id for legacy display only (not used for pot)
     session_id = current_session_id(c)
-    if not session_id:
-        return {
-            "session_id": None,
-            "gate1_ok": False,
-            "gate2_ok": False,
-            "gate3_ok": False,
-            "pot": 0.0,
-            "summary_rows": [],
-            "df_problems": pd.DataFrame(),
-            "active_members_df": pd.DataFrame(),
-            "beneficiary_id": None,
-            "beneficiary_name": None,
-            "already_paid": sorted(list(already_paid_ids)),
-            "reason": "No current session found in sessions_legacy.",
-        }
 
     active_ids_local = [mid for (mid, _) in active_members]
     beneficiary_id = next_unpaid_beneficiary(active_ids_local, already_paid_ids, int(start_idx))
@@ -162,18 +164,24 @@ def payout_precheck_option_b(c, active_members, already_paid_ids: set[int], star
 
     gate1_ok, _count, df_members = validate_gate_1(active_members)
 
-    contrib_rows = fetch_session_contributions(c, session_id)
+    # Rotation pot (canonical)
+    rotation_idx, rotation_payout_date, pot_amount = fetch_current_rotation_pot(c)
+
+    # Rotation contributions summary for Gate 2
+    contrib_rows = fetch_rotation_contributions(c, rotation_idx)
     summary_rows = build_contribution_summary(active_members, contrib_rows)
 
     gate2_ok, df_problems = validate_gate_2(summary_rows)
-    gate3_ok, pot_amount = validate_gate_3(summary_rows)
+    gate3_ok, pot_amount2 = validate_gate_3_from_pot(pot_amount)
 
     return {
         "session_id": session_id,
+        "rotation_index": rotation_idx,
+        "rotation_payout_date": rotation_payout_date,
         "gate1_ok": bool(gate1_ok),
         "gate2_ok": bool(gate2_ok),
         "gate3_ok": bool(gate3_ok),
-        "pot": float(pot_amount),
+        "pot": float(pot_amount2),
         "summary_rows": summary_rows,
         "df_problems": df_problems,
         "active_members_df": df_members,
@@ -185,10 +193,7 @@ def payout_precheck_option_b(c, active_members, already_paid_ids: set[int], star
 
 
 def execute_payout_option_b(c, active_members, already_paid_ids: set[int], start_idx: int):
-    session_id = current_session_id(c)
-    if not session_id:
-        raise Exception("No current session found in sessions_legacy.")
-
+    # Determine beneficiary
     active_ids_local = [mid for (mid, _) in active_members]
     beneficiary_id = next_unpaid_beneficiary(active_ids_local, already_paid_ids, int(start_idx))
 
@@ -210,22 +215,28 @@ def execute_payout_option_b(c, active_members, already_paid_ids: set[int], start
     if not ok1:
         raise Exception(f"Payout blocked: active member count {actual_count} != {EXPECTED_ACTIVE_MEMBERS}.")
 
-    contrib_rows = fetch_session_contributions(c, session_id)
+    # Canonical rotation pot
+    rotation_idx, rotation_payout_date, pot_amount = fetch_current_rotation_pot(c)
+
+    # Gate 2 check for current rotation
+    contrib_rows = fetch_rotation_contributions(c, rotation_idx)
     summary_rows = build_contribution_summary(active_members, contrib_rows)
 
     ok2, _df_problems = validate_gate_2(summary_rows)
     if not ok2:
-        raise Exception("Payout blocked: contribution rules not met for all active members.")
+        raise Exception("Payout blocked: contribution rules not met for all active members (current rotation).")
 
-    ok3, pot_amount = validate_gate_3(summary_rows)
+    ok3, pot_amount = validate_gate_3_from_pot(pot_amount)
     if not ok3:
-        raise Exception("Payout blocked: pot is zero.")
+        raise Exception("Payout blocked: pot is zero for current rotation.")
 
+    # Log payout (include rotation index)
     payout_payload = {
         "member_id": int(beneficiary_id),
         "member_name": str(beneficiary_name),
         "payout_amount": float(pot_amount),
         "payout_date": str(date.today()),
+        "payout_index": int(rotation_idx),
         "created_at": now_iso(),
     }
 
@@ -235,25 +246,23 @@ def execute_payout_option_b(c, active_members, already_paid_ids: set[int], start
     except Exception:
         payout_logged = False
 
-    # Advance rotation pointer
-    nxt_raw = int(beneficiary_id) + 1
-    if active_ids_local and nxt_raw > max(active_ids_local):
-        nxt_raw = min(active_ids_local)
-
-    next_date = (date.today() + timedelta(days=14)).isoformat()
+    # Advance rotation pointer strictly (+1 index, +14 days)
     c.table("app_state").update({
-        "next_payout_index": int(nxt_raw),
-        "next_payout_date": str(next_date),
+        "next_payout_index": int(rotation_idx) + 1,
+        "next_payout_date": (date.fromisoformat(str(rotation_payout_date)) + timedelta(days=14)).isoformat()
+        if rotation_payout_date else (date.today() + timedelta(days=14)).isoformat(),
     }).eq("id", 1).execute()
 
     return {
-        "session_id": session_id,
+        "session_id": current_session_id(c),  # legacy (may change)
+        "rotation_index_paid_out": int(rotation_idx),
         "beneficiary_legacy_member_id": int(beneficiary_id),
         "beneficiary_name": beneficiary_name,
         "pot_paid_out": float(pot_amount),
         "payout_logged": payout_logged,
-        "next_payout_index": int(nxt_raw),
-        "next_payout_date": next_date,
+        "next_payout_index": int(rotation_idx) + 1,
+        "next_payout_date": (date.fromisoformat(str(rotation_payout_date)) + timedelta(days=14)).isoformat()
+        if rotation_payout_date else (date.today() + timedelta(days=14)).isoformat(),
         "contribution_summary": summary_rows,
         "already_paid_members": sorted(list(already_paid_ids)),
         "payout_signature_entity_id": payout_entity_id,
