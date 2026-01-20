@@ -146,39 +146,24 @@ page = st.sidebar.radio(
     ["Dashboard", "Contributions", "Payouts", "Loans", "Admin"],
 )
 
-# ============================================================
-# DASHBOARD (FIXED)
-# ============================================================
-if page == "Dashboard":
-    labels, label_to_id, label_to_name, df_members = load_members_legacy(
-        SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA
-    )
+rotation = get_rotation_state(sb_anon, SUPABASE_SCHEMA)
 
-    rotation = get_rotation_state(sb_anon, SUPABASE_SCHEMA)
+next_index = rotation.get("next_payout_index")
+next_date = rotation.get("next_payout_date")
 
-    next_index = rotation.get("next_payout_index")
-    next_date = rotation.get("next_payout_date")
+# ✅ Canonical beneficiary fields from current_season_view
+beneficiary_id = rotation.get("legacy_member_id")
+beneficiary_name = rotation.get("next_beneficiary")
 
-    # ✅ current_season_view provides legacy_member_id (not next_beneficiary)
-    beneficiary_id = rotation.get("legacy_member_id")
-    beneficiary_name = None
+if beneficiary_id and beneficiary_name:
+    beneficiary_label = f"{beneficiary_id} • {beneficiary_name}"
+else:
+    beneficiary_label = "—"
 
-    if beneficiary_id is not None and str(beneficiary_id).strip() != "":
-        try:
-            bid = int(beneficiary_id)
-            match = df_members[df_members["id"] == bid]
-            if not match.empty:
-                beneficiary_name = str(match.iloc[0]["name"])
-        except Exception:
-            pass
-
-    beneficiary_label = f"{beneficiary_id} • {beneficiary_name}" if beneficiary_id and beneficiary_name else "—"
-
-    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Members", f"{len(df_members):,}")
-    c2.metric("Next Payout Index", str(next_index) if next_index is not None else "—")
-    c3.metric("Next Payout Date", str(next_date) if next_date else "—")
-    c4.metric("Next Beneficiary", beneficiary_label)
+c2.metric("Next Payout Index", str(next_index) if next_index is not None else "—")
+c3.metric("Next Payout Date", str(next_date) if next_date else "—")
+c4.metric("Next Beneficiary", beneficiary_label)
 
     st.divider()
 
