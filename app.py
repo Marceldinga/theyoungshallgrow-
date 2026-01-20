@@ -1,5 +1,5 @@
 
-# app.py ✅ SINGLE COMPLETE FIXED VERSION (Dashboard shows beneficiary/index/date correctly)
+# app.py ✅ SINGLE COMPLETE WORKING VERSION (Dashboard uses current_season_view fields correctly)
 from __future__ import annotations
 
 import os
@@ -146,24 +146,30 @@ page = st.sidebar.radio(
     ["Dashboard", "Contributions", "Payouts", "Loans", "Admin"],
 )
 
-rotation = get_rotation_state(sb_anon, SUPABASE_SCHEMA)
+# ============================================================
+# DASHBOARD
+# ============================================================
+if page == "Dashboard":
+    labels, label_to_id, label_to_name, df_members = load_members_legacy(
+        SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA
+    )
 
-next_index = rotation.get("next_payout_index")
-next_date = rotation.get("next_payout_date")
+    rotation = get_rotation_state(sb_anon, SUPABASE_SCHEMA)
 
-# ✅ Canonical beneficiary fields from current_season_view
-beneficiary_id = rotation.get("legacy_member_id")
-beneficiary_name = rotation.get("next_beneficiary")
+    next_index = rotation.get("next_payout_index")
+    next_date = rotation.get("next_payout_date")
 
-if beneficiary_id and beneficiary_name:
-    beneficiary_label = f"{beneficiary_id} • {beneficiary_name}"
-else:
-    beneficiary_label = "—"
+    # ✅ From your current_season_view screenshot:
+    beneficiary_id = rotation.get("legacy_member_id")
+    beneficiary_name = rotation.get("next_beneficiary")
 
+    beneficiary_label = f"{beneficiary_id} • {beneficiary_name}" if beneficiary_id and beneficiary_name else "—"
+
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Members", f"{len(df_members):,}")
-c2.metric("Next Payout Index", str(next_index) if next_index is not None else "—")
-c3.metric("Next Payout Date", str(next_date) if next_date else "—")
-c4.metric("Next Beneficiary", beneficiary_label)
+    c2.metric("Next Payout Index", str(next_index) if next_index is not None else "—")
+    c3.metric("Next Payout Date", str(next_date) if next_date else "—")
+    c4.metric("Next Beneficiary", beneficiary_label)
 
     st.divider()
 
@@ -208,7 +214,7 @@ elif page == "Loans":
     st.info("Next step: implement render_loans() in loans.py (service key) and wire it here.")
 
 # ============================================================
-# ADMIN (HIGH STANDARD)
+# ADMIN
 # ============================================================
 elif page == "Admin":
     if not sb_service:
