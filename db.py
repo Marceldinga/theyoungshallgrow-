@@ -1,4 +1,3 @@
-
 # app.py  (Single updated code — fixes UnhashableParamError)
 from __future__ import annotations
 
