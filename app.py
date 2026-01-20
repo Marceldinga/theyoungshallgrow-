@@ -156,7 +156,6 @@ def load_app_state(url: str, anon_key: str, schema: str) -> dict:
 
 
 @st.cache_data(ttl=90)
-import streamlit as st
 from supabase import create_client
 
 @st.cache_data(ttl=30)
