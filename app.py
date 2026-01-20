@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import os
+from admin_panels import render_admin
+# ...
+elif page == "Admin":
+    render_admin(sb_service=sb_service, schema=SUPABASE_SCHEMA, actor_email="admin@yourorg.com")
 import streamlit as st
 import pandas as pd
 from supabase import create_client
