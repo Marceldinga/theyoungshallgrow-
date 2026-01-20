@@ -51,7 +51,7 @@ def money(x):
     except Exception:
         return str(x)
 
-@st.cache_data(ttl=90)
+@st.cache_data(ttl=90 I'm)
 def load_kpis(client):
     return client.rpc("dashboard_kpis").execute().data
 
