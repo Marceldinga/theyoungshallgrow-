@@ -1,8 +1,6 @@
 
-# payout.py (minimal)
-import streamlit as st
-
-def render_payouts(sb_service, schema: str):
-    st.header("Payouts")
-    st.success("✅ payout.py connected successfully!")
-    st.write("Schema:", schema)
+elif page == "Payouts":
+    if not sb_service:
+        st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY in secrets.")
+    else:
+        render_payouts(sb_service, SUPABASE_SCHEMA)
