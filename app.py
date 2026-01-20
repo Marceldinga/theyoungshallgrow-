@@ -1,63 +1,55 @@
+
+# app.py (fixed for Railway + Streamlit Cloud)
+
+import os
 import streamlit as st
-import time
+import pandas as pd
+from supabase import create_client
 
-st.write("BOOTING APP ON RAILWAY...")
-time.sleep(1)
+from db import get_secret, authed_client  # ✅ use db.py functions only
 
-from db import get_secret
-
-# 🔑 DEFINE FIRST
-SUPABASE_URL = get_secret("SUPABASE_URL")
-SUPABASE_ANON_KEY = get_secret("SUPABASE_ANON_KEY")
-
-# ✅ THEN CHECK
-if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_ANON_KEY")
 # -------------------------
 # CONFIG
 # -------------------------
 APP_BRAND = "theyoungshallgrow"
 APP_VERSION = "v2.5-fast"
-if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_ANON_KEY")
+
 st.set_page_config(
     page_title=f"{APP_BRAND} • Bank Dashboard",
     layout="wide",
-    page_icon="🏦"
+    page_icon="🏦",
 )
 
 # -------------------------
-# SECRETS
+# SECRETS (single source of truth)
 # -------------------------
-SUPABASE_URL = st.secrets.get("SUPABASE_URL") or os.getenv("SUPABASE_URL")
-SUPABASE_ANON_KEY = st.secrets.get("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_ANON_KEY")
+SUPABASE_URL = get_secret("SUPABASE_URL")
+SUPABASE_ANON_KEY = get_secret("SUPABASE_ANON_KEY")
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-    st.error("Missing Supabase secrets.")
-    st.stop()
+    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_ANON_KEY")
 
 # -------------------------
-# CLIENTS (CACHED)
+# CLIENTS
 # -------------------------
 @st.cache_resource
 def get_public_client():
+    # ✅ safe to cache (not user-specific)
     return create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
 sb_public = get_public_client()
 
-@st.cache_resource
-def get_authed_client(access_token: str):
-    return create_client(
-        SUPABASE_URL,
-        SUPABASE_ANON_KEY,
-        options={"global": {"headers": {"Authorization": f"Bearer {access_token}"}}},
-    )
+# ❌ DO NOT create/cache get_authed_client() here
+# ✅ use authed_client(...) from db.py AFTER login
 
 # -------------------------
 # HELPERS
 # -------------------------
 def money(x):
-    return f"{float(x):,.0f}"
+    try:
+        return f"{float(x):,.0f}"
+    except Exception:
+        return str(x)
 
 @st.cache_data(ttl=90)
 def load_kpis(client):
@@ -101,15 +93,22 @@ with st.sidebar:
                     st.rerun()
                 except Exception as e:
                     st.error("Login failed")
-                    st.code(e)
+                    st.code(repr(e))
         else:
             if st.button("Create account", use_container_width=True):
-                sb_public.auth.sign_up({"email": email, "password": password})
-                st.success("Account created. Login now.")
+                try:
+                    sb_public.auth.sign_up({"email": email, "password": password})
+                    st.success("Account created. Login now.")
+                except Exception as e:
+                    st.error("Sign up failed")
+                    st.code(repr(e))
     else:
         st.success(st.session_state.session.user.email)
         if st.button("Logout", use_container_width=True):
-            sb_public.auth.sign_out()
+            try:
+                sb_public.auth.sign_out()
+            except Exception:
+                pass
             st.session_state.session = None
             st.rerun()
 
@@ -118,14 +117,15 @@ if st.session_state.session is None:
     st.stop()
 
 # -------------------------
-# AUTHED CLIENT
+# AUTHED CLIENT (NO CACHE)
 # -------------------------
-client = get_authed_client(st.session_state.session.access_token)
+client = authed_client(SUPABASE_URL, SUPABASE_ANON_KEY, st.session_state.session)
+
 user_id = st.session_state.session.user.id
 user_email = st.session_state.session.user.email
 
 # -------------------------
-# PROFILE CHECK (CACHED)
+# PROFILE CHECK
 # -------------------------
 @st.cache_data(ttl=300)
 def get_profile(client, user_id):
@@ -144,11 +144,11 @@ if not profile:
     st.error("Profile missing. Admin approval required.")
     st.stop()
 
-if not profile["approved"]:
+if not profile.get("approved", False):
     st.warning("Account not approved yet.")
     st.stop()
 
-admin_mode = profile["role"] == "admin"
+admin_mode = str(profile.get("role", "")).lower().strip() == "admin"
 
 # -------------------------
 # TOP BAR
@@ -174,48 +174,33 @@ kpis = load_kpis(client)
 # -------------------------
 cols = st.columns(8)
 
-cols[0].metric("Contribution Pot", money(kpis["pot_amount"]))
-cols[1].metric("All-time Contributions", money(kpis["total_contributions"]))
-cols[2].metric("Foundation Total", money(kpis["foundation_total"]))
+cols[0].metric("Contribution Pot", money(kpis.get("pot_amount", 0)))
+cols[1].metric("All-time Contributions", money(kpis.get("total_contributions", 0)))
+cols[2].metric("Foundation Total", money(kpis.get("foundation_total", 0)))
 
-loan = kpis["loan_stats"]
-cols[3].metric("Active Loans", loan["active_count"])
-cols[4].metric("Total Due", money(loan["total_due"]))
-cols[5].metric("Principal", money(loan["principal"]))
-cols[6].metric("Interest", money(loan["interest"]))
+loan = kpis.get("loan_stats", {}) or {}
+cols[3].metric("Active Loans", str(loan.get("active_count", 0)))
+cols[4].metric("Total Due", money(loan.get("total_due", 0)))
+cols[5].metric("Principal", money(loan.get("principal", 0)))
+cols[6].metric("Interest", money(loan.get("interest", 0)))
 
-fines = kpis["fines"]
-cols[7].metric("Unpaid Fines", money(fines["unpaid"]))
+fines = kpis.get("fines", {}) or {}
+cols[7].metric("Unpaid Fines", money(fines.get("unpaid", 0)))
 
 st.divider()
 
 # -------------------------
 # TABS
 # -------------------------
-tabs = st.tabs(
-    [
-        "Overview",
-        "Members",
-        "Audit Log",
-    ]
-)
+tabs = st.tabs(["Overview", "Members", "Audit Log"])
 
-# -------------------------
-# OVERVIEW
-# -------------------------
 with tabs[0]:
     st.success("Dashboard loaded from cached KPIs (fast).")
 
-# -------------------------
-# MEMBERS (CACHED)
-# -------------------------
 with tabs[1]:
     df_members = load_registry(client)
     st.dataframe(df_members, use_container_width=True, hide_index=True)
 
-# -------------------------
-# AUDIT LOG (LAZY)
-# -------------------------
 with tabs[2]:
     if st.checkbox("Load audit log"):
         df_audit = pd.DataFrame(
