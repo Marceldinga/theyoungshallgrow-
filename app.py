@@ -1,5 +1,4 @@
-
-# app.py ✅ CLEAN (Railway-safe secrets + Audit + Health + Loans import safe)
+# app.py ✅ CLEAN (Railway-safe secrets + Audit + Health + Loans import safe) — UPDATED (Streamlit width=)
 from __future__ import annotations
 
 import os
@@ -78,7 +77,7 @@ sb_service = get_service_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_
 # ============================================================
 left, right = st.columns([1, 0.25])
 with right:
-    if st.button("🔄 Refresh data", use_container_width=True):
+    if st.button("🔄 Refresh data", width="stretch"):
         st.cache_data.clear()
         st.rerun()
 
@@ -207,7 +206,7 @@ if page == "Dashboard":
 
     with st.expander("Member Registry (preview)", expanded=False):
         if not df_members.empty:
-            st.dataframe(df_members[["id", "name", "position"]], use_container_width=True)
+            st.dataframe(df_members[["id", "name", "position"]], width="stretch")
         else:
             st.info("members_legacy empty or not readable.")
 
@@ -221,7 +220,7 @@ elif page == "Contributions":
         st.info("No contributions found (or view not readable).")
         st.caption("Confirm contributions_with_member exists and GRANT SELECT to anon.")
     else:
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width="stretch")
 
 # ============================================================
 # PAYOUTS
