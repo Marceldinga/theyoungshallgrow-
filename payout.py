@@ -1,11 +1,8 @@
 
 # payout.py ✅ COMPLETE UPDATED SINGLE FILE (Njangi payout engine – SERVICE KEY)
-# Works with your schema:
-# - members_legacy (id, name, position)
-# - app_state (id=1, next_payout_index, next_payout_date, rotation_start_index, rotation_start_date)
-# - contributions_legacy (member_id, amount, kind, payout_index)
-# - payouts_legacy (member_id, member_name, payout_amount, payout_date, payout_index, created_at)  [optional but recommended]
-# - current_season_view / v_contribution_pot / signatures are OPTIONAL (will gracefully fallback if missing)
+# - Fix: signatures are read from public.signatures (matches your Supabase SQL)
+# - Fix: signatures entity_id uses payout_index (rotation_idx)
+# - Adds: small debug expander (safe: prints no secrets)
 
 from __future__ import annotations
 
@@ -25,12 +22,15 @@ ALLOWED_CONTRIB_KINDS = ["paid", "contributed"]
 # Required roles for payout signatures (if enforced)
 PAYOUT_SIG_REQUIRED = ["president", "beneficiary", "treasury", "surety"]
 
+SIGNATURES_SCHEMA = "public"  # ✅ signatures confirmed in public.signatures
+
 
 # -------------------------
 # Helpers
 # -------------------------
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def safe_select(
     sb,
@@ -55,7 +55,6 @@ def safe_select(
         resp = q.execute()
         return resp.data or []
     except APIError as e:
-        # Show readable error, but don’t crash the page
         st.error(f"Supabase read error: {schema}.{table}")
         st.code(str(e), language="text")
         return []
@@ -63,9 +62,11 @@ def safe_select(
         st.error(f"Unexpected read error: {schema}.{table}: {e}")
         return []
 
+
 def safe_single(sb, schema: str, table: str, cols: str = "*", **eq_filters) -> dict:
     rows = safe_select(sb, schema, table, cols, limit=1, **eq_filters)
     return rows[0] if rows else {}
+
 
 def safe_insert(sb, schema: str, table: str, payload: dict) -> bool:
     try:
@@ -78,6 +79,7 @@ def safe_insert(sb, schema: str, table: str, payload: dict) -> bool:
     except Exception as e:
         st.error(f"Unexpected insert error: {schema}.{table}: {e}")
         return False
+
 
 def safe_update(sb, schema: str, table: str, payload: dict, where: dict) -> bool:
     try:
@@ -124,12 +126,15 @@ def next_unpaid_beneficiary(active_ids: list[int], already_paid_ids: set[int], s
 
 # -------------------------
 # Signatures (OPTIONAL table)
-# IMPORTANT: entity_id MUST be payout_index (rotation index), NOT beneficiary_id
+# IMPORTANT:
+# - entity_id MUST be payout_index (rotation index)
+# - signatures are in public.signatures (confirmed by your SQL screenshots)
 # -------------------------
-def get_signatures(sb, schema: str, entity_type: str, entity_id: int) -> pd.DataFrame:
-    # signatures table is optional; if missing, return empty (and you can choose to not enforce)
+def get_signatures(sb, entity_type: str, entity_id: int) -> pd.DataFrame:
     rows = safe_select(
-        sb, schema, "signatures",
+        sb,
+        SIGNATURES_SCHEMA,          # ✅ force public
+        "signatures",
         "role,signer_name,signer_member_id,signed_at,entity_type,entity_id",
         order_by="signed_at",
         desc=False,
@@ -141,6 +146,7 @@ def get_signatures(sb, schema: str, entity_type: str, entity_id: int) -> pd.Data
         return pd.DataFrame(columns=["role", "signer_name", "signer_member_id", "signed_at", "entity_type", "entity_id"])
     return df
 
+
 def missing_roles(df_sig: pd.DataFrame, required_roles: list[str]) -> list[str]:
     signed = set(df_sig["role"].tolist()) if df_sig is not None and not df_sig.empty else set()
     return [r for r in required_roles if r not in signed]
@@ -150,9 +156,6 @@ def missing_roles(df_sig: pd.DataFrame, required_roles: list[str]) -> list[str]:
 # Contributions checks
 # -------------------------
 def fetch_rotation_contributions(sb, schema: str, payout_index: int) -> list[dict]:
-    """
-    Reads contributions for a given payout_index.
-    """
     try:
         resp = (
             sb.schema(schema)
@@ -167,6 +170,7 @@ def fetch_rotation_contributions(sb, schema: str, payout_index: int) -> list[dic
     except Exception:
         return []
 
+
 def build_contribution_summary(active_members: list[tuple[int, str]], contrib_rows: list[dict]) -> list[dict]:
     per_member: dict[int, float] = {}
     for r in contrib_rows:
@@ -178,10 +182,12 @@ def build_contribution_summary(active_members: list[tuple[int, str]], contrib_ro
         for (mid, name) in active_members
     ]
 
+
 def validate_gate_1(active_members: list[tuple[int, str]]):
     ok = (len(active_members) == EXPECTED_ACTIVE_MEMBERS)
     df = pd.DataFrame([{"member_id": mid, "member_name": name} for mid, name in active_members])
     return ok, len(active_members), df
+
 
 def validate_gate_2(summary_rows, base=BASE_CONTRIBUTION, step=CONTRIBUTION_STEP):
     problems = []
@@ -198,11 +204,6 @@ def validate_gate_2(summary_rows, base=BASE_CONTRIBUTION, step=CONTRIBUTION_STEP
 # Pot calculation (tries view first, falls back to sum)
 # -------------------------
 def compute_pot(sb, schema: str, payout_index: int) -> float:
-    """
-    Prefer v_contribution_pot if it exists; else sum contributions_legacy for payout_index.
-    NOTE: If your v_contribution_pot is NOT keyed by payout_index, it might be global.
-    """
-    # Try view (optional)
     pot_row = safe_single(sb, schema, "v_contribution_pot", "*")
     if pot_row:
         try:
@@ -210,7 +211,6 @@ def compute_pot(sb, schema: str, payout_index: int) -> float:
         except Exception:
             pass
 
-    # Fallback: sum contributions rows
     contrib_rows = fetch_rotation_contributions(sb, schema, payout_index)
     total = 0.0
     for r in contrib_rows:
@@ -241,7 +241,6 @@ def render_payouts(sb_service, schema: str):
     active_ids = [mid for mid, _ in active_members]
 
     # ---------- Load state ----------
-    # Prefer current_season_view if it exists (optional)
     season = safe_single(sb_service, schema, "current_season_view", "*")
     state = safe_single(sb_service, schema, "app_state", "*", id=1)
 
@@ -284,6 +283,12 @@ def render_payouts(sb_service, schema: str):
     c3.metric("Beneficiary", f"{beneficiary_id} • {beneficiary_name}")
     c4.metric("Next Payout Date", str(rotation_date or "N/A"))
 
+    # ---------- Debug (safe) ----------
+    with st.expander("🔎 Debug (safe)", expanded=False):
+        st.write("Data schema:", schema)
+        st.write("Signatures schema (forced):", SIGNATURES_SCHEMA)
+        st.write("Rotation index (payout_index):", rotation_idx)
+
     st.divider()
 
     st.subheader("Gate Status")
@@ -311,8 +316,8 @@ def render_payouts(sb_service, schema: str):
     st.subheader("Signatures (optional gate)")
     st.caption("If your signatures table is in use, you can enforce required roles before payout.")
 
-    # ✅ FIX: signatures are keyed by payout_index (rotation_idx), NOT beneficiary_id
-    df_sig = get_signatures(sb_service, schema, "payout", int(rotation_idx))
+    # ✅ Signatures keyed by payout_index (rotation_idx), and read from public.signatures
+    df_sig = get_signatures(sb_service, "payout", int(rotation_idx))
 
     if df_sig.empty:
         st.info("No signatures recorded (or signatures table not in use).")
@@ -338,7 +343,6 @@ def render_payouts(sb_service, schema: str):
     st.caption("This will insert into payouts_legacy and advance app_state.next_payout_index/date (+14 days).")
 
     if st.button("✅ Execute payout now (Service Key)", use_container_width=True):
-        # Gate checks
         if enforce_signatures:
             if df_sig.empty:
                 st.error("Payout blocked: No signatures present.")
@@ -358,7 +362,6 @@ def render_payouts(sb_service, schema: str):
             st.error("Payout blocked: pot is zero.")
             return
 
-        # Log payout (payouts_legacy is expected; if missing, we still advance pointer)
         payout_payload = {
             "member_id": int(beneficiary_id),
             "member_name": str(beneficiary_name),
@@ -370,7 +373,6 @@ def render_payouts(sb_service, schema: str):
 
         payout_logged = safe_insert(sb_service, schema, "payouts_legacy", payout_payload)
 
-        # Advance pointer (bi-weekly)
         next_index = int(rotation_idx) + 1
         next_date = (date.today() + timedelta(days=14)).isoformat()
 
