@@ -1,12 +1,13 @@
 
 # payout.py ✅ COMPLETE UPDATED SINGLE FILE (Njangi payout engine – SERVICE KEY)
-# - Fix: signatures are read from public.signatures (matches your Supabase SQL)
+# - Fix: signatures read from public.signatures (matches Supabase SQL)
 # - Fix: signatures entity_id uses payout_index (rotation_idx)
-# - Adds: small debug expander (safe: prints no secrets)
+# - Adds: HARD STOP if service client is missing + runtime checks (safe)
 
 from __future__ import annotations
 
 from datetime import date, timedelta, datetime, timezone
+import os
 import pandas as pd
 import streamlit as st
 from postgrest.exceptions import APIError
@@ -101,9 +102,6 @@ def safe_update(sb, schema: str, table: str, payload: dict, where: dict) -> bool
 # Rotation helpers
 # -------------------------
 def next_unpaid_beneficiary(active_ids: list[int], already_paid_ids: set[int], start_id: int) -> int:
-    """
-    Rotation across member IDs (id). Uses start_id as the start pointer.
-    """
     if not active_ids:
         return int(start_id)
 
@@ -126,14 +124,13 @@ def next_unpaid_beneficiary(active_ids: list[int], already_paid_ids: set[int], s
 
 # -------------------------
 # Signatures (OPTIONAL table)
-# IMPORTANT:
 # - entity_id MUST be payout_index (rotation index)
-# - signatures are in public.signatures (confirmed by your SQL screenshots)
+# - signatures are in public.signatures
 # -------------------------
 def get_signatures(sb, entity_type: str, entity_id: int) -> pd.DataFrame:
     rows = safe_select(
         sb,
-        SIGNATURES_SCHEMA,          # ✅ force public
+        SIGNATURES_SCHEMA,  # ✅ force public
         "signatures",
         "role,signer_name,signer_member_id,signed_at,entity_type,entity_id",
         order_by="signed_at",
@@ -143,7 +140,9 @@ def get_signatures(sb, entity_type: str, entity_id: int) -> pd.DataFrame:
     )
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["role", "signer_name", "signer_member_id", "signed_at", "entity_type", "entity_id"])
+        return pd.DataFrame(
+            columns=["role", "signer_name", "signer_member_id", "signed_at", "entity_type", "entity_id"]
+        )
     return df
 
 
@@ -159,12 +158,12 @@ def fetch_rotation_contributions(sb, schema: str, payout_index: int) -> list[dic
     try:
         resp = (
             sb.schema(schema)
-              .table("contributions_legacy")
-              .select("member_id,amount,kind,payout_index")
-              .eq("payout_index", int(payout_index))
-              .in_("kind", ALLOWED_CONTRIB_KINDS)
-              .limit(20000)
-              .execute()
+            .table("contributions_legacy")
+            .select("member_id,amount,kind,payout_index")
+            .eq("payout_index", int(payout_index))
+            .in_("kind", ALLOWED_CONTRIB_KINDS)
+            .limit(20000)
+            .execute()
         )
         return resp.data or []
     except Exception:
@@ -223,6 +222,36 @@ def compute_pot(sb, schema: str, payout_index: int) -> float:
 # -------------------------
 def render_payouts(sb_service, schema: str):
     st.header("Payouts (Njangi Rotation)")
+
+    # ✅ HARD STOP: we must have service client for signatures/payout actions
+    if sb_service is None:
+        st.error("FATAL: Supabase SERVICE ROLE client is NOT active (sb_service is None).")
+        st.caption("Fix: ensure SUPABASE_SERVICE_KEY is set in Streamlit Secrets and reboot the app.")
+        st.stop()
+
+    # ✅ Runtime key presence check (does not print secrets)
+    with st.expander("🔎 Runtime Check (safe)", expanded=False):
+        st.write("sb_service is None:", sb_service is None)
+        st.write("ENV has SUPABASE_URL:", bool(os.getenv("SUPABASE_URL")))
+        st.write("ENV has SUPABASE_ANON_KEY:", bool(os.getenv("SUPABASE_ANON_KEY")))
+        st.write("ENV has SUPABASE_SERVICE_KEY:", bool(os.getenv("SUPABASE_SERVICE_KEY")))
+        st.write("Data schema:", schema)
+        st.write("Signatures schema forced:", SIGNATURES_SCHEMA)
+
+        # Try a raw read to prove access (top 5)
+        try:
+            test = (
+                sb_service.schema(SIGNATURES_SCHEMA)
+                .table("signatures")
+                .select("entity_type,entity_id,role,signer_name,signed_at")
+                .order("signed_at", desc=True)
+                .limit(5)
+                .execute()
+            )
+            st.write("Raw signatures rows returned:", len(test.data or []))
+        except Exception as e:
+            st.error("Raw signatures query failed")
+            st.code(str(e), language="text")
 
     # ---------- Load members ----------
     mrows = safe_select(sb_service, schema, "members_legacy", "id,name,position", order_by="id")
@@ -283,12 +312,6 @@ def render_payouts(sb_service, schema: str):
     c3.metric("Beneficiary", f"{beneficiary_id} • {beneficiary_name}")
     c4.metric("Next Payout Date", str(rotation_date or "N/A"))
 
-    # ---------- Debug (safe) ----------
-    with st.expander("🔎 Debug (safe)", expanded=False):
-        st.write("Data schema:", schema)
-        st.write("Signatures schema (forced):", SIGNATURES_SCHEMA)
-        st.write("Rotation index (payout_index):", rotation_idx)
-
     st.divider()
 
     st.subheader("Gate Status")
@@ -316,7 +339,6 @@ def render_payouts(sb_service, schema: str):
     st.subheader("Signatures (optional gate)")
     st.caption("If your signatures table is in use, you can enforce required roles before payout.")
 
-    # ✅ Signatures keyed by payout_index (rotation_idx), and read from public.signatures
     df_sig = get_signatures(sb_service, "payout", int(rotation_idx))
 
     if df_sig.empty:
