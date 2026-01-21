@@ -1,4 +1,3 @@
-
 # loans.py ✅ UPDATED / IMPORT-SAFE / ORGANIZATIONAL STANDARD (All features + Loan Statement PDF)
 from __future__ import annotations
 
