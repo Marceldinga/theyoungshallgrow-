@@ -1,7 +1,17 @@
 
+# db.py
+# ============================================================
+# Database helpers for Njangi system
+# - Secrets handling (Railway / Streamlit Cloud / local)
+# - Supabase client factories
+# - Safe data loaders (NO Streamlit UI calls here)
+# - Canonical helpers reused across app.py, loans.py, payout.py
+# ============================================================
+
+from __future__ import annotations
 
 import os
-from typing import Any, Dict, Tuple, List, Optional
+from typing import Any, Dict, List, Tuple, Optional
 
 import pandas as pd
 from supabase import create_client
@@ -13,15 +23,15 @@ from supabase import create_client
 def get_secret(name: str, default: str | None = None) -> str | None:
     """
     Railway-safe secret getter:
-    - Prefer environment variables (Railway)
-    - Fallback to Streamlit secrets (local / Streamlit Cloud)
+    - Prefer environment variables (Railway, Docker, prod)
+    - Fallback to Streamlit secrets (Streamlit Cloud / local)
     """
     v = os.getenv(name)
     if v is not None and str(v).strip() != "":
         return v
 
     try:
-        import streamlit as st  # local import
+        import streamlit as st  # local import to avoid hard dependency
 
         if name in st.secrets and str(st.secrets.get(name, "")).strip() != "":
             return str(st.secrets[name])
@@ -32,19 +42,31 @@ def get_secret(name: str, default: str | None = None) -> str | None:
 
 
 # ============================================================
-# CLIENTS
+# CLIENT FACTORIES
 # ============================================================
 def public_client(url: str, anon_key: str):
-    """Public (anon) client; do NOT cache here (cache in app.py only)."""
+    """
+    Public (anon) Supabase client.
+    - Used for dashboard + read-only views
+    - RLS enforced
+    """
     return create_client(url.strip(), anon_key.strip())
 
 
 def service_client(url: str, service_key: str):
-    """Service-role client (bypasses RLS). Use ONLY server-side."""
+    """
+    Service-role Supabase client.
+    - Bypasses RLS
+    - Use ONLY for admin / server-side operations
+    """
     return create_client(url.strip(), service_key.strip())
 
 
 def authed_client(url: str, anon_key: str, session_obj: Any):
+    """
+    Authenticated client using a user session (access token).
+    Useful if you later add per-user auth.
+    """
     sb = create_client(url.strip(), anon_key.strip())
 
     token: Optional[str] = None
@@ -63,24 +85,46 @@ def authed_client(url: str, anon_key: str, session_obj: Any):
 
 
 # ============================================================
-# DATA LOADERS (NO streamlit calls inside; return safe values)
+# INTERNAL SAFE EXECUTE
 # ============================================================
 def _safe_execute(resp: Any) -> List[Dict[str, Any]]:
+    """
+    Normalizes Supabase responses into list[dict].
+    Handles:
+      - list
+      - dict with 'data'
+      - object with .data
+    """
     if resp is None:
         return []
+
     if isinstance(resp, list):
         return resp
+
     if isinstance(resp, dict):
         data = resp.get("data")
         return data if isinstance(data, list) else []
+
     data = getattr(resp, "data", None)
     return data if isinstance(data, list) else []
 
 
+# ============================================================
+# CANONICAL STATE HELPERS
+# ============================================================
 def current_session_id(c) -> str | None:
+    """
+    Returns the current Njangi session/season identifier.
+    Tries multiple safe fallbacks.
+    """
     # 1) app_state.current_session_id
     try:
-        rows = _safe_execute(c.table("app_state").select("current_session_id").limit(1).execute())
+        rows = _safe_execute(
+            c.table("app_state")
+            .select("current_session_id")
+            .limit(1)
+            .execute()
+        )
         if rows and rows[0].get("current_session_id") is not None:
             return str(rows[0]["current_session_id"])
     except Exception:
@@ -107,32 +151,52 @@ def current_session_id(c) -> str | None:
 
 
 def get_app_state(c) -> Dict[str, Any]:
+    """
+    Returns the singleton app_state row (id=1 by convention).
+    Safe fallback to {}.
+    """
     try:
-        rows = _safe_execute(c.table("app_state").select("*").limit(1).execute())
+        rows = _safe_execute(
+            c.table("app_state")
+            .select("*")
+            .limit(1)
+            .execute()
+        )
         return rows[0] if rows else {}
     except Exception:
         return {}
 
 
 # ============================================================
-# ✅ FIXED: MEMBERS LOADER (members_legacy uses id + name)
+# MEMBERS LOADER (members_legacy)
 # ============================================================
 def load_members_legacy(c) -> Tuple[List[str], Dict[str, int], Dict[str, str], pd.DataFrame]:
     """
     Loads public.members_legacy and returns:
-      labels: list[str] (used for selectbox)
+      labels: list[str]              -> for selectbox
       label_to_id: dict[label -> id]
       label_to_name: dict[label -> name]
       df_members: pd.DataFrame
 
-    Confirmed columns:
+    Expected / known columns (superset-safe):
       - id (bigint)
       - name (text)
+      - position
+      - phone
+      - has_benefits
+      - contributed
+      - foundation_contrib
+      - loan_due
+      - payout_total
+      - total_fines_accumulated
     """
     try:
         rows = _safe_execute(
             c.table("members_legacy")
-            .select("id,name,position,phone,has_benefits,contributed,foundation_contrib,loan_due,payout_total,total_fines_accumulated")
+            .select(
+                "id,name,position,phone,has_benefits,contributed,"
+                "foundation_contrib,loan_due,payout_total,total_fines_accumulated"
+            )
             .order("id", desc=False)
             .execute()
         )
