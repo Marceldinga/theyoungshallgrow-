@@ -12,6 +12,27 @@ from admin_panels import render_admin
 from payout import render_payouts
 from audit_panel import render_audit
 from health_panel import render_health
+import os
+import streamlit as st
+
+def get_secret(key: str, default=None):
+    # 1) Railway/Prod: read environment variables
+    v = os.getenv(key)
+    if v not in (None, ""):
+        return v
+
+    # 2) Local/dev: only try Streamlit secrets if they exist
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+SUPABASE_URL = get_secret("SUPABASE_URL")
+SUPABASE_KEY = get_secret("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    st.error("Missing SUPABASE_URL / SUPABASE_KEY. Add them in Railway → Variables.")
+    st.stop()
 
 # ✅ Loans UI (safe import)
 try:
