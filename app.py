@@ -1,5 +1,5 @@
 
-# app.py ✅ CLEAN (Loans import fixed + Audit + Health)
+# app.py ✅ CLEAN (Railway-safe secrets + Audit + Health + Loans import safe)
 from __future__ import annotations
 
 import os
@@ -12,27 +12,6 @@ from admin_panels import render_admin
 from payout import render_payouts
 from audit_panel import render_audit
 from health_panel import render_health
-import os
-import streamlit as st
-
-def get_secret(key: str, default=None):
-    # 1) Railway/Prod: read environment variables
-    v = os.getenv(key)
-    if v not in (None, ""):
-        return v
-
-    # 2) Local/dev: only try Streamlit secrets if they exist
-    try:
-        return st.secrets.get(key, default)
-    except Exception:
-        return default
-
-SUPABASE_URL = get_secret("SUPABASE_URL")
-SUPABASE_KEY = get_secret("SUPABASE_KEY")
-
-if not SUPABASE_URL or not SUPABASE_KEY:
-    st.error("Missing SUPABASE_URL / SUPABASE_KEY. Add them in Railway → Variables.")
-    st.stop()
 
 # ✅ Loans UI (safe import)
 try:
@@ -49,12 +28,20 @@ st.set_page_config(
 )
 
 # ============================================================
-# SECRETS
+# SECRETS (Railway-safe)
 # ============================================================
 def get_secret(key: str, default: str | None = None) -> str | None:
-    if key in st.secrets:
-        return str(st.secrets.get(key))
-    return os.getenv(key, default)
+    # 1) Production: environment variables (Railway Variables)
+    v = os.getenv(key)
+    if v not in (None, ""):
+        return v
+
+    # 2) Local/dev: Streamlit secrets (only if available)
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
 
 SUPABASE_URL = (get_secret("SUPABASE_URL") or "").strip()
 SUPABASE_ANON_KEY = (get_secret("SUPABASE_ANON_KEY") or "").strip()
@@ -62,11 +49,12 @@ SUPABASE_SERVICE_KEY = (get_secret("SUPABASE_SERVICE_KEY") or "").strip()
 SUPABASE_SCHEMA = (get_secret("SUPABASE_SCHEMA", "public") or "public").strip()
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-    st.error("Missing SUPABASE_URL or SUPABASE_ANON_KEY in Streamlit Secrets / Environment.")
+    st.error("Missing SUPABASE_URL or SUPABASE_ANON_KEY. Set Railway Variables or Streamlit Secrets.")
     st.stop()
 
 if not SUPABASE_SERVICE_KEY:
     st.warning("SUPABASE_SERVICE_KEY not set. Admin/Loans/Payout write features will be disabled.")
+
 
 # ============================================================
 # CLIENTS
@@ -75,12 +63,15 @@ if not SUPABASE_SERVICE_KEY:
 def get_anon_client(url: str, anon_key: str):
     return create_client(url.strip(), anon_key.strip())
 
+
 @st.cache_resource
 def get_service_client(url: str, service_key: str):
     return create_client(url.strip(), service_key.strip())
 
+
 sb_anon = get_anon_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 sb_service = get_service_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_SERVICE_KEY else None
+
 
 # ============================================================
 # TOP BAR
@@ -92,6 +83,7 @@ with right:
         st.rerun()
 
 st.title(f"🏦 {APP_BRAND} • Bank Dashboard")
+
 
 # ============================================================
 # SAFE QUERY HELPER
@@ -121,9 +113,11 @@ def safe_select(
         st.error(f"Unexpected error reading {schema}.{table_name}: {e}")
         return []
 
+
 def get_dashboard_rotation(sb, schema: str) -> dict:
     rows = safe_select(sb, "v_dashboard_rotation", "*", schema=schema, limit=1)
     return rows[0] if rows else {}
+
 
 # ============================================================
 # LOADERS
@@ -133,17 +127,22 @@ def load_members_legacy(url: str, anon_key: str, schema: str):
     client = create_client(url, anon_key)
     rows = safe_select(client, "members_legacy", "id,name,position", schema=schema, order_by="id")
     df = pd.DataFrame(rows)
+
     if df.empty:
         return [], {}, {}, pd.DataFrame(columns=["id", "name", "position"])
+
     df["id"] = pd.to_numeric(df["id"], errors="coerce")
     df = df.dropna(subset=["id"]).copy()
     df["id"] = df["id"].astype(int)
     df["name"] = df["name"].astype(str)
     df["label"] = df.apply(lambda r: f'{int(r["id"]):02d} • {r["name"]}', axis=1)
+
     labels = df["label"].tolist()
     label_to_id = dict(zip(df["label"], df["id"]))
     label_to_name = dict(zip(df["label"], df["name"]))
+
     return labels, label_to_id, label_to_name, df
+
 
 @st.cache_data(ttl=60)
 def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFrame:
@@ -158,6 +157,7 @@ def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFram
         limit=200,
     )
     return pd.DataFrame(rows) if rows else pd.DataFrame()
+
 
 # ============================================================
 # NAVIGATION
@@ -228,7 +228,7 @@ elif page == "Contributions":
 # ============================================================
 elif page == "Payouts":
     if not sb_service:
-        st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY in secrets.")
+        st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY in Railway Variables / Secrets.")
     else:
         render_payouts(sb_service, SUPABASE_SCHEMA)
 
@@ -237,11 +237,11 @@ elif page == "Payouts":
 # ============================================================
 elif page == "Loans":
     if not sb_service:
-        st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY in secrets.")
+        st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY in Railway Variables / Secrets.")
     else:
         if render_loans is None:
             st.error("Loans UI not available. loans.py failed to import or does not define render_loans().")
-            st.caption("Open Streamlit logs to see the import error inside loans.py.")
+            st.caption("Open logs to see the import error inside loans.py.")
         else:
             render_loans(sb_service, SUPABASE_SCHEMA, actor_user_id="admin")
 
@@ -250,7 +250,7 @@ elif page == "Loans":
 # ============================================================
 elif page == "Admin":
     if not sb_service:
-        st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY in secrets.")
+        st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY in Railway Variables / Secrets.")
     else:
         render_admin(sb_service=sb_service, schema=SUPABASE_SCHEMA, actor_email="admin@yourorg.com")
 
