@@ -16,6 +16,7 @@ from postgrest.exceptions import APIError
 
 from admin_panels import render_admin
 from payout import render_payouts
+from loans import render_loans
 
 # ✅ New panels
 from audit_panel import render_audit
