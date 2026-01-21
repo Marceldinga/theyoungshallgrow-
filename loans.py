@@ -1,14 +1,36 @@
 
-# loans.py ✅ ORGANIZATIONAL STANDARD (All requested features)
+# loans.py ✅ COMPLETE / ORGANIZATIONAL STANDARD (All features + Loan Statement PDF)
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 import streamlit as st
 import pandas as pd
 
-from db import now_iso, fetch_one
+# --- Safe imports for core helpers (fallback if db.py doesn't include them)
+try:
+    from db import now_iso, fetch_one
+except Exception:
+    def now_iso() -> str:
+        return datetime.utcnow().isoformat()
+
+    def fetch_one(q):
+        # q is a supabase query builder; execute and return first row
+        try:
+            resp = q.limit(1).execute()
+            rows = getattr(resp, "data", None) or []
+            return rows[0] if rows else None
+        except Exception:
+            return None
+
 from audit import audit
 from payout import get_signatures, missing_roles
+
+# PDF utilities (must exist in pdfs.py)
+try:
+    from pdfs import make_member_loan_statement_pdf, make_loan_statements_zip
+except Exception:
+    make_member_loan_statement_pdf = None
+    make_loan_statements_zip = None
 
 LOAN_SIG_REQUIRED = ["borrower", "surety", "treasury"]
 MONTHLY_INTEREST_RATE = 0.05
@@ -168,7 +190,7 @@ def approve_loan_request(c, request_id: int, actor_user_id: str):
 
     # Issue loan
     issued = now_iso()
-    due_date = (date.today() + timedelta(days=30)).isoformat()  # standard monthly cycle
+    due_date = (date.today() + timedelta(days=30)).isoformat()  # monthly cycle
 
     loan_payload = {
         "member_id": member_id,
@@ -219,9 +241,6 @@ def deny_loan_request(c, request_id: int, reason: str, actor_user_id: str):
 # MAKER–CHECKER PAYMENTS (pending -> confirm/reject)
 # ============================================================
 def record_loan_payment_pending(c, loan_legacy_id: int, amount: float, paid_on: str, recorded_by: str):
-    """
-    Maker step: record payment as pending. Does NOT reduce balance yet.
-    """
     c.table("loan_payments").insert({
         "loan_legacy_id": int(loan_legacy_id),
         "amount": float(amount),
@@ -233,9 +252,6 @@ def record_loan_payment_pending(c, loan_legacy_id: int, amount: float, paid_on: 
 
 
 def confirm_loan_payment(c, payment_id: int, confirmer: str):
-    """
-    Checker step: confirm payment and apply it to the loan totals.
-    """
     pay = fetch_one(
         c.table("loan_payments")
         .select("payment_id,loan_legacy_id,amount,status,paid_on")
@@ -248,9 +264,7 @@ def confirm_loan_payment(c, payment_id: int, confirmer: str):
 
     loan_id = int(pay["loan_legacy_id"])
     amt = float(pay["amount"])
-    paid_on = str(pay.get("paid_on") or "")
 
-    # Apply to loan
     loan = fetch_one(
         c.table("loans_legacy")
         .select("id,status,balance,total_due")
@@ -273,7 +287,6 @@ def confirm_loan_payment(c, payment_id: int, confirmer: str):
         "updated_at": now_iso(),
     }).eq("id", loan_id).execute()
 
-    # Mark payment confirmed
     c.table("loan_payments").update({
         "status": "confirmed",
         "confirmed_by": confirmer,
@@ -304,12 +317,8 @@ def reject_loan_payment(c, payment_id: int, rejecter: str, reason: str):
 # INTEREST ACCRUAL (Idempotent)
 # ============================================================
 def accrue_monthly_interest(c, actor_user_id: str):
-    """
-    Applies 5% interest once per month (idempotent via snapshot_month unique index).
-    """
     month = _month_key()
 
-    # If snapshot already exists => don't accrue again
     existing = (
         c.table("loan_interest_snapshots")
         .select("id,snapshot_month")
@@ -319,7 +328,7 @@ def accrue_monthly_interest(c, actor_user_id: str):
         .data or []
     )
     if existing:
-        return 0, 0.0  # already done for this month
+        return 0, 0.0
 
     loans = (
         c.table("loans_legacy")
@@ -355,7 +364,6 @@ def accrue_monthly_interest(c, actor_user_id: str):
         updated += 1
         interest_added_total += interest
 
-    # Snapshot
     lifetime_interest_total = sum(float(r.get("total_interest_generated") or 0) for r in loans)
     c.table("loan_interest_snapshots").insert({
         "snapshot_date": str(date.today()),
@@ -381,7 +389,6 @@ def accrue_monthly_interest(c, actor_user_id: str):
 def compute_dpd(loan_row: dict, last_paid_on: date | None) -> int:
     due = _to_date(loan_row.get("due_date"))
     if not due:
-        # fallback: issued_at + 30d
         issued = _to_date(loan_row.get("issued_at"))
         if issued:
             due = issued + timedelta(days=30)
@@ -392,7 +399,6 @@ def compute_dpd(loan_row: dict, last_paid_on: date | None) -> int:
     if today <= due:
         return 0
 
-    # if paid after due, treat as current; else DPD
     if last_paid_on and last_paid_on >= due:
         return 0
 
@@ -450,7 +456,6 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
     # ---------------- Requests
     with tab_req:
         st.subheader("Loan Requests (Maker–Checker Approval)")
-
         try:
             req_rows = (
                 sb_service.schema(schema)
@@ -470,7 +475,6 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
             st.info("No loan requests found.")
         else:
             st.dataframe(df_req, use_container_width=True, hide_index=True)
-
             pending = df_req[df_req["status"].astype(str) == "pending"].copy()
             if pending.empty:
                 st.success("No pending requests.")
@@ -523,7 +527,6 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
     # ---------------- Record Payment (Maker)
     with tab_pay:
         st.subheader("Record Payment (Maker) → PENDING")
-
         loan_id = st.number_input("loan_legacy_id", min_value=1, step=1, value=1, key="loan_pay_loan_id")
         amount = st.number_input("amount", min_value=0.0, step=50.0, value=100.0, key="loan_pay_amount")
         paid_on = st.date_input("paid_on", value=date.today(), key="loan_pay_date")
@@ -534,7 +537,9 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
             else:
                 try:
                     record_loan_payment_pending(sb_service, int(loan_id), float(amount), str(paid_on), recorded_by=actor_user_id)
-                    audit(sb_service, "loan_payment_recorded_pending", "ok", {"loan_id": int(loan_id), "amount": float(amount), "paid_on": str(paid_on)}, actor_user_id=actor_user_id)
+                    audit(sb_service, "loan_payment_recorded_pending", "ok",
+                          {"loan_id": int(loan_id), "amount": float(amount), "paid_on": str(paid_on)},
+                          actor_user_id=actor_user_id)
                     st.success("Payment recorded as PENDING. A checker must confirm it.")
                     st.rerun()
                 except Exception as e:
@@ -543,7 +548,6 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
     # ---------------- Confirm Payments (Checker)
     with tab_confirm:
         st.subheader("Confirm / Reject Payments (Checker)")
-
         pending = (
             sb_service.schema(schema)
             .table("loan_payments")
@@ -619,11 +623,9 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
     # ---------------- Delinquency
     with tab_dpd:
         st.subheader("Delinquency (DPD)")
-
         if df_loans.empty:
             st.info("No loans.")
         else:
-            # last confirmed payment date per loan
             last_paid = {}
             if not df_pay.empty:
                 try:
@@ -656,19 +658,138 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
                 })
 
             df_dpd = pd.DataFrame(rows)
-            st.dataframe(df_dpd.sort_values(["bucket","dpd"], ascending=[True,False]), use_container_width=True, hide_index=True)
+            st.dataframe(df_dpd.sort_values(["bucket", "dpd"], ascending=[True, False]), use_container_width=True, hide_index=True)
 
-    # ---------------- Loan Statement Preview
+    # ---------------- Loan Statement (Preview + PDF + ZIP)
     with tab_stmt:
-        st.subheader("Member Loan Statement (Preview)")
+        st.subheader("Loan Statement (Preview + PDF Download)")
+
+        # cycle info (optional)
+        try:
+            rot_rows = (
+                sb_service.schema(schema)
+                .table("v_dashboard_rotation")
+                .select("next_payout_index,next_payout_date")
+                .limit(1)
+                .execute()
+                .data or []
+            )
+            rot = rot_rows[0] if rot_rows else {}
+        except Exception:
+            rot = {}
+
+        cycle_info = {
+            "payout_index": rot.get("next_payout_index"),
+            "payout_date": rot.get("next_payout_date"),
+            "cycle_start": None,
+            "cycle_end": None,
+        }
 
         member_id = st.number_input("member_id", min_value=1, step=1, value=1, key="stmt_member_id")
+
         if st.button("Load Statement", use_container_width=True, key="stmt_load"):
-            loans = fetch_member_loans(sb_service, schema, int(member_id))
+            st.session_state["stmt_loaded_member_id"] = int(member_id)
+
+        loaded_mid = st.session_state.get("stmt_loaded_member_id")
+        if loaded_mid:
+            # member info
+            try:
+                mrow = (
+                    sb_service.schema(schema)
+                    .table("members_legacy")
+                    .select("id,name,position")
+                    .eq("id", int(loaded_mid))
+                    .limit(1)
+                    .execute()
+                    .data or []
+                )
+                mrow = mrow[0] if mrow else {}
+            except Exception:
+                mrow = {}
+
+            member = {
+                "member_id": int(loaded_mid),
+                "member_name": mrow.get("name") or f"Member {loaded_mid}",
+                "position": mrow.get("position"),
+            }
+
+            loans = fetch_member_loans(sb_service, schema, int(loaded_mid))
             loan_ids = [int(l["id"]) for l in loans if l.get("id") is not None]
             payments = fetch_member_payments_for_loans(sb_service, schema, loan_ids)
 
             st.markdown("### Loans")
             st.dataframe(pd.DataFrame(loans), use_container_width=True, hide_index=True)
+
             st.markdown("### Payments")
             st.dataframe(pd.DataFrame(payments), use_container_width=True, hide_index=True)
+
+            st.divider()
+            st.markdown("### Download PDF")
+
+            if make_member_loan_statement_pdf is None:
+                st.warning("PDF engine not available. Ensure pdfs.py defines make_member_loan_statement_pdf.")
+            else:
+                pdf_bytes = make_member_loan_statement_pdf(
+                    brand="theyoungshallgrow",
+                    member=member,
+                    cycle_info=cycle_info,
+                    loans=loans,
+                    payments=payments,
+                    currency="$",
+                    logo_path="assets/logo.png",
+                )
+                st.download_button(
+                    "⬇️ Download Loan Statement (PDF)",
+                    pdf_bytes,
+                    file_name=f"loan_statement_{member['member_id']:02d}_{str(member['member_name']).replace(' ', '_')}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key="dl_member_loan_statement_pdf",
+                )
+
+        st.divider()
+        st.markdown("### Admin: Download ALL Loan Statements (ZIP)")
+
+        if make_loan_statements_zip is None:
+            st.info("ZIP builder not available. Ensure pdfs.py defines make_loan_statements_zip.")
+        else:
+            if st.button("📦 Build ZIP for all members", use_container_width=True, key="dl_all_loan_zip_btn"):
+                all_members = (
+                    sb_service.schema(schema)
+                    .table("members_legacy")
+                    .select("id,name,position")
+                    .order("id", desc=False)
+                    .limit(5000)
+                    .execute()
+                    .data or []
+                )
+
+                member_statements = []
+                for m in all_members:
+                    mid = int(m["id"])
+                    mloans = fetch_member_loans(sb_service, schema, mid)
+                    mids = [int(l["id"]) for l in mloans if l.get("id") is not None]
+                    mpay = fetch_member_payments_for_loans(sb_service, schema, mids)
+
+                    member_statements.append({
+                        "member": {"member_id": mid, "member_name": m.get("name"), "position": m.get("position")},
+                        "loans": mloans,
+                        "payments": mpay,
+                    })
+
+                zip_bytes = make_loan_statements_zip(
+                    brand="theyoungshallgrow",
+                    cycle_info=cycle_info,
+                    member_statements=member_statements,
+                    currency="$",
+                    logo_path="assets/logo.png",
+                )
+
+                st.download_button(
+                    "⬇️ Download All Loan Statements (ZIP)",
+                    zip_bytes,
+                    file_name=f"loan_statements_index_{cycle_info.get('payout_index') or 'current'}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                    key="dl_all_loan_statements_zip",
+                    )
