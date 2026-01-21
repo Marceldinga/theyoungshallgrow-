@@ -1,11 +1,5 @@
 
-# app.py ✅ UPDATED (adds Loans UI + Audit + Health, keeps your current structure)
-# - Dashboard reads ONLY from v_dashboard_rotation (anon view)
-# - Contributions reads contributions_with_member (anon view)
-# - Payouts / Loans / Admin / Audit use service key
-# - Health page checks important tables/views and reports PASS/FAIL
-# NOTE: create two new files: audit_panel.py and health_panel.py (I provided earlier)
-
+# app.py ✅ CLEAN (Loans import fixed + Audit + Health)
 from __future__ import annotations
 
 import os
@@ -16,13 +10,10 @@ from postgrest.exceptions import APIError
 
 from admin_panels import render_admin
 from payout import render_payouts
-from loans import render_loans
-
-# ✅ New panels
 from audit_panel import render_audit
 from health_panel import render_health
 
-# ✅ Loans UI (requires updated loans.py with render_loans)
+# ✅ Loans UI (safe import)
 try:
     from loans import render_loans
 except Exception:
@@ -109,14 +100,7 @@ def safe_select(
         st.error(f"Unexpected error reading {schema}.{table_name}: {e}")
         return []
 
-# ============================================================
-# DASHBOARD STATE (SOURCE OF TRUTH)
-# ============================================================
 def get_dashboard_rotation(sb, schema: str) -> dict:
-    """
-    Organizational standard:
-    Dashboard must read from ONE curated view that anon can read.
-    """
     rows = safe_select(sb, "v_dashboard_rotation", "*", schema=schema, limit=1)
     return rows[0] if rows else {}
 
@@ -171,7 +155,6 @@ if page == "Dashboard":
     )
 
     rot = get_dashboard_rotation(sb_anon, SUPABASE_SCHEMA)
-
     next_index = rot.get("next_payout_index")
     next_date = rot.get("next_payout_date")
     beneficiary_id = rot.get("legacy_member_id")
@@ -187,11 +170,10 @@ if page == "Dashboard":
     c4.metric("Next Beneficiary", beneficiary_label)
 
     if pot_amount is not None:
-        st.caption(
-            f"Pot Amount (dashboard view): {float(pot_amount):,.0f}"
-            if isinstance(pot_amount, (int, float))
-            else f"Pot Amount: {pot_amount}"
-        )
+        try:
+            st.caption(f"Pot Amount (dashboard view): {float(pot_amount):,.0f}")
+        except Exception:
+            st.caption(f"Pot Amount: {pot_amount}")
 
     st.divider()
 
@@ -209,7 +191,7 @@ if page == "Dashboard":
             st.info("members_legacy empty or not readable.")
 
 # ============================================================
-# CONTRIBUTIONS (VIEW)
+# CONTRIBUTIONS
 # ============================================================
 elif page == "Contributions":
     st.header("Contributions (View)")
@@ -221,7 +203,7 @@ elif page == "Contributions":
         st.dataframe(df, use_container_width=True)
 
 # ============================================================
-# PAYOUTS (SERVICE)
+# PAYOUTS
 # ============================================================
 elif page == "Payouts":
     if not sb_service:
@@ -230,19 +212,20 @@ elif page == "Payouts":
         render_payouts(sb_service, SUPABASE_SCHEMA)
 
 # ============================================================
-# LOANS (SERVICE)
+# LOANS
 # ============================================================
 elif page == "Loans":
     if not sb_service:
         st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY in secrets.")
     else:
         if render_loans is None:
-            st.info("Loans UI not available. Ensure loans.py defines render_loans(sb_service, schema, actor_user_id).")
+            st.error("Loans UI not available. loans.py failed to import or does not define render_loans().")
+            st.caption("Open Streamlit logs to see the import error inside loans.py.")
         else:
             render_loans(sb_service, SUPABASE_SCHEMA, actor_user_id="admin")
 
 # ============================================================
-# ADMIN (SERVICE)
+# ADMIN
 # ============================================================
 elif page == "Admin":
     if not sb_service:
@@ -251,13 +234,13 @@ elif page == "Admin":
         render_admin(sb_service=sb_service, schema=SUPABASE_SCHEMA, actor_email="admin@yourorg.com")
 
 # ============================================================
-# AUDIT / MEETING MINUTES (SERVICE)
+# AUDIT
 # ============================================================
 elif page == "Audit":
     render_audit(sb_service=sb_service, schema=SUPABASE_SCHEMA)
 
 # ============================================================
-# HEALTH CHECK (ANON + SERVICE)
+# HEALTH
 # ============================================================
 elif page == "Health":
     render_health(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
