@@ -7,7 +7,6 @@ import streamlit as st
 import pandas as pd
 
 from rbac import Actor, require, allowed_sections, ROLE_ADMIN, ROLE_TREASURY, ROLE_MEMBER
-
 import loans_core as core
 
 # Optional PDFs
@@ -24,6 +23,7 @@ except Exception:
     def audit(*args, **kwargs):
         return None
 
+
 def _actor_from_session(default_user_id: str) -> Actor:
     # Simple RBAC UI for now (works without auth). Later you can replace with real login.
     with st.sidebar.expander("🔐 Role (temporary)", expanded=False):
@@ -36,6 +36,7 @@ def _actor_from_session(default_user_id: str) -> Actor:
         member_id=(int(member_id) if int(member_id) > 0 else None),
         name=(name.strip() or None),
     )
+
 
 def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
     actor = _actor_from_session(actor_user_id)
@@ -65,22 +66,26 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
 
     st.divider()
 
-    # Mobile-safe menu with RBAC
+    # ============================================================
+    # ✅ Mobile-safe menu with RBAC (FIXED: no manual session_state set)
+    # ============================================================
     sections = allowed_sections(actor.role)
     if not sections:
         st.warning("No sections available for your role.")
         return
 
+    # Initialize only once
     if "loans_menu" not in st.session_state:
-        st.session_state.loans_menu = sections[0]
+        st.session_state["loans_menu"] = sections[0]
 
     section = st.selectbox(
         "Loans menu",
         sections,
-        index=sections.index(st.session_state.loans_menu) if st.session_state.loans_menu in sections else 0,
+        index=sections.index(st.session_state["loans_menu"]) if st.session_state["loans_menu"] in sections else 0,
         key="loans_menu",
     )
-    st.session_state.loans_menu = section
+    # ✅ DO NOT assign st.session_state["loans_menu"] = section
+    # The widget owns it.
 
     # ---- Requests ----
     if section == "Requests":
@@ -397,8 +402,11 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
         if df_dpd.empty:
             st.success("No active delinquent loans detected.")
         else:
-            st.dataframe(df_dpd.sort_values(["bucket", "dpd"], ascending=[True, False]),
-                         use_container_width=True, hide_index=True)
+            st.dataframe(
+                df_dpd.sort_values(["bucket", "dpd"], ascending=[True, False]),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     # ---- Loan Statement ----
     elif section == "Loan Statement":
@@ -467,7 +475,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
                     loans=mloans,
                     payments=mpay,
                     currency="$",
-                    logo_path=None,  # set your logo path if you have assets/logo.png
+                    logo_path=None,
                 )
                 st.download_button(
                     "⬇️ Download Loan Statement (PDF)",
@@ -528,4 +536,4 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
                         mime="application/zip",
                         use_container_width=True,
                         key="dl_all_loan_statements_zip",
-                        )
+                )
