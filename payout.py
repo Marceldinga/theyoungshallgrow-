@@ -21,6 +21,8 @@ EXPECTED_ACTIVE_MEMBERS = 17
 BASE_CONTRIBUTION = 500
 CONTRIBUTION_STEP = 500
 ALLOWED_CONTRIB_KINDS = ["paid", "contributed"]
+
+# Required roles for payout signatures (if enforced)
 PAYOUT_SIG_REQUIRED = ["president", "beneficiary", "treasury", "surety"]
 
 
@@ -29,10 +31,6 @@ PAYOUT_SIG_REQUIRED = ["president", "beneficiary", "treasury", "surety"]
 # -------------------------
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-def _is_table_missing_error(e: Exception) -> bool:
-    msg = str(e).lower()
-    return ("does not exist" in msg) or ("relation" in msg)
 
 def safe_select(
     sb,
@@ -126,12 +124,13 @@ def next_unpaid_beneficiary(active_ids: list[int], already_paid_ids: set[int], s
 
 # -------------------------
 # Signatures (OPTIONAL table)
+# IMPORTANT: entity_id MUST be payout_index (rotation index), NOT beneficiary_id
 # -------------------------
 def get_signatures(sb, schema: str, entity_type: str, entity_id: int) -> pd.DataFrame:
     # signatures table is optional; if missing, return empty (and you can choose to not enforce)
     rows = safe_select(
         sb, schema, "signatures",
-        "role,signer_name,signer_member_id,signed_at",
+        "role,signer_name,signer_member_id,signed_at,entity_type,entity_id",
         order_by="signed_at",
         desc=False,
         entity_type=entity_type,
@@ -139,7 +138,7 @@ def get_signatures(sb, schema: str, entity_type: str, entity_id: int) -> pd.Data
     )
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["role", "signer_name", "signer_member_id", "signed_at"])
+        return pd.DataFrame(columns=["role", "signer_name", "signer_member_id", "signed_at", "entity_type", "entity_id"])
     return df
 
 def missing_roles(df_sig: pd.DataFrame, required_roles: list[str]) -> list[str]:
@@ -201,6 +200,7 @@ def validate_gate_2(summary_rows, base=BASE_CONTRIBUTION, step=CONTRIBUTION_STEP
 def compute_pot(sb, schema: str, payout_index: int) -> float:
     """
     Prefer v_contribution_pot if it exists; else sum contributions_legacy for payout_index.
+    NOTE: If your v_contribution_pot is NOT keyed by payout_index, it might be global.
     """
     # Try view (optional)
     pot_row = safe_single(sb, schema, "v_contribution_pot", "*")
@@ -310,16 +310,23 @@ def render_payouts(sb_service, schema: str):
     # ---------- Signatures (OPTIONAL enforcement) ----------
     st.subheader("Signatures (optional gate)")
     st.caption("If your signatures table is in use, you can enforce required roles before payout.")
-    df_sig = get_signatures(sb_service, schema, "payout", int(beneficiary_id))
+
+    # ✅ FIX: signatures are keyed by payout_index (rotation_idx), NOT beneficiary_id
+    df_sig = get_signatures(sb_service, schema, "payout", int(rotation_idx))
+
     if df_sig.empty:
         st.info("No signatures recorded (or signatures table not in use).")
     else:
+        st.success(f"{len(df_sig)} signature(s) recorded for payout #{rotation_idx}")
         st.dataframe(df_sig, use_container_width=True)
 
     missing = missing_roles(df_sig, PAYOUT_SIG_REQUIRED) if not df_sig.empty else PAYOUT_SIG_REQUIRED
     enforce_signatures = st.toggle("Enforce signatures before payout", value=False)
+
     if enforce_signatures:
-        if missing:
+        if df_sig.empty:
+            st.warning("No signatures found for this payout index.")
+        elif missing:
             st.warning("Missing roles: " + ", ".join(missing))
         else:
             st.success("All required signatures are present.")
