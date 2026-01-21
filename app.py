@@ -1,10 +1,10 @@
 
-# app.py ✅ SINGLE COMPLETE ORGANIZATIONAL-STANDARD VERSION
-# Key points:
-# - Dashboard reads ONLY from v_dashboard_rotation (anon-readable source of truth)
-# - No more guessing between current_season_view / app_state for dashboard KPIs
-# - Payouts & Admin still use service key
-# - Clean, deterministic behavior
+# app.py ✅ UPDATED (adds Loans UI + Audit + Health, keeps your current structure)
+# - Dashboard reads ONLY from v_dashboard_rotation (anon view)
+# - Contributions reads contributions_with_member (anon view)
+# - Payouts / Loans / Admin / Audit use service key
+# - Health page checks important tables/views and reports PASS/FAIL
+# NOTE: create two new files: audit_panel.py and health_panel.py (I provided earlier)
 
 from __future__ import annotations
 
@@ -16,6 +16,16 @@ from postgrest.exceptions import APIError
 
 from admin_panels import render_admin
 from payout import render_payouts
+
+# ✅ New panels
+from audit_panel import render_audit
+from health_panel import render_health
+
+# ✅ Loans UI (requires updated loans.py with render_loans)
+try:
+    from loans import render_loans
+except Exception:
+    render_loans = None
 
 APP_BRAND = "theyoungshallgrow"
 
@@ -43,7 +53,7 @@ if not SUPABASE_URL or not SUPABASE_ANON_KEY:
     st.stop()
 
 if not SUPABASE_SERVICE_KEY:
-    st.warning("SUPABASE_SERVICE_KEY not set. Admin write features will be disabled.")
+    st.warning("SUPABASE_SERVICE_KEY not set. Admin/Loans/Payout write features will be disabled.")
 
 # ============================================================
 # CLIENTS
@@ -148,11 +158,11 @@ def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFram
 # ============================================================
 page = st.sidebar.radio(
     "Menu",
-    ["Dashboard", "Contributions", "Payouts", "Loans", "Admin"],
+    ["Dashboard", "Contributions", "Payouts", "Loans", "Admin", "Audit", "Health"],
 )
 
 # ============================================================
-# DASHBOARD (Reads v_dashboard_rotation only)
+# DASHBOARD
 # ============================================================
 if page == "Dashboard":
     labels, label_to_id, label_to_name, df_members = load_members_legacy(
@@ -165,7 +175,7 @@ if page == "Dashboard":
     next_date = rot.get("next_payout_date")
     beneficiary_id = rot.get("legacy_member_id")
     beneficiary_name = rot.get("next_beneficiary")
-    pot_amount = rot.get("pot_amount")  # optional (if you included it)
+    pot_amount = rot.get("pot_amount")
 
     beneficiary_label = f"{beneficiary_id} • {beneficiary_name}" if beneficiary_id and beneficiary_name else "—"
 
@@ -176,7 +186,11 @@ if page == "Dashboard":
     c4.metric("Next Beneficiary", beneficiary_label)
 
     if pot_amount is not None:
-        st.caption(f"Pot Amount (dashboard view): {float(pot_amount):,.0f}" if isinstance(pot_amount, (int, float)) else f"Pot Amount: {pot_amount}")
+        st.caption(
+            f"Pot Amount (dashboard view): {float(pot_amount):,.0f}"
+            if isinstance(pot_amount, (int, float))
+            else f"Pot Amount: {pot_amount}"
+        )
 
     st.divider()
 
@@ -201,6 +215,7 @@ elif page == "Contributions":
     df = load_contributions_view(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
     if df.empty:
         st.info("No contributions found (or view not readable).")
+        st.caption("Confirm contributions_with_member exists and GRANT SELECT to anon.")
     else:
         st.dataframe(df, use_container_width=True)
 
@@ -214,11 +229,16 @@ elif page == "Payouts":
         render_payouts(sb_service, SUPABASE_SCHEMA)
 
 # ============================================================
-# LOANS (placeholder)
+# LOANS (SERVICE)
 # ============================================================
 elif page == "Loans":
-    st.header("Loans")
-    st.info("Next step: implement render_loans() in loans.py (service key) and wire it here.")
+    if not sb_service:
+        st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY in secrets.")
+    else:
+        if render_loans is None:
+            st.info("Loans UI not available. Ensure loans.py defines render_loans(sb_service, schema, actor_user_id).")
+        else:
+            render_loans(sb_service, SUPABASE_SCHEMA, actor_user_id="admin")
 
 # ============================================================
 # ADMIN (SERVICE)
@@ -228,3 +248,15 @@ elif page == "Admin":
         st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY in secrets.")
     else:
         render_admin(sb_service=sb_service, schema=SUPABASE_SCHEMA, actor_email="admin@yourorg.com")
+
+# ============================================================
+# AUDIT / MEETING MINUTES (SERVICE)
+# ============================================================
+elif page == "Audit":
+    render_audit(sb_service=sb_service, schema=SUPABASE_SCHEMA)
+
+# ============================================================
+# HEALTH CHECK (ANON + SERVICE)
+# ============================================================
+elif page == "Health":
+    render_health(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
