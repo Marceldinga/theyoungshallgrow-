@@ -1,9 +1,10 @@
+
 # audit_panel.py
 from __future__ import annotations
 
 import streamlit as st
 import pandas as pd
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 
 
 def _safe_select(sb_service, schema: str, table: str, cols: str = "*", limit: int = 500):
@@ -23,12 +24,6 @@ def _safe_select(sb_service, schema: str, table: str, cols: str = "*", limit: in
         st.error(f"Failed reading {schema}.{table}")
         st.code(str(e), language="text")
         return []
-
-
-def _to_iso(d: date, end_of_day: bool = False) -> str:
-    if not end_of_day:
-        return f"{d.isoformat()}T00:00:00"
-    return f"{d.isoformat()}T23:59:59"
 
 
 def render_audit(sb_service, schema: str):
@@ -52,7 +47,7 @@ def render_audit(sb_service, schema: str):
     start = date.today() - timedelta(days=int(days_back))
     end = date.today()
 
-    # Pull a larger window then filter in pandas (simpler + robust)
+    # Pull a larger window then filter in pandas
     rows = _safe_select(sb_service, schema, "audit_log", "*", limit=2000)
     df = pd.DataFrame(rows)
 
@@ -60,17 +55,28 @@ def render_audit(sb_service, schema: str):
         st.info("No audit_log entries found (or audit_log not readable).")
         return
 
-    # Parse created_at safely
+    # ============================================================
+    # ✅ FIX: timezone-safe datetime parsing + filtering
+    # ============================================================
     if "created_at" in df.columns:
-        df["created_at_dt"] = pd.to_datetime(df["created_at"], errors="coerce")
-        df = df[df["created_at_dt"].notna()].copy()
-        df = df[(df["created_at_dt"] >= pd.Timestamp(start)) & (df["created_at_dt"] <= pd.Timestamp(end) + pd.Timedelta(days=1))]
+        # Force UTC to avoid tz-aware vs tz-naive comparison crash
+        df["created_at_dt"] = pd.to_datetime(df["created_at"], errors="coerce", utc=True)
+        df = df.dropna(subset=["created_at_dt"]).copy()
+
+        # Convert start/end to UTC too
+        start_dt = pd.to_datetime(start, utc=True)
+        end_dt = pd.to_datetime(end, utc=True) + pd.Timedelta(days=1)  # include end date
+
+        df = df[(df["created_at_dt"] >= start_dt) & (df["created_at_dt"] <= end_dt)]
+        df = df.sort_values("created_at_dt", ascending=False)
     else:
         st.warning("audit_log has no created_at column. Cannot filter by date reliably.")
 
+    # Status filter
     if status_filter != "all" and "status" in df.columns:
         df = df[df["status"].astype(str).str.lower() == status_filter]
 
+    # Action contains filter
     if action_contains.strip() and "action" in df.columns:
         s = action_contains.strip().lower()
         df = df[df["action"].astype(str).str.lower().str.contains(s)]
