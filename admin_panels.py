@@ -1,5 +1,4 @@
-
-# admin_panels.py ✅ ORGANIZATIONAL STANDARD ADMIN PANEL (SERVICE KEY)
+# admin_panels.py ✅ ORGANIZATIONAL STANDARD ADMIN PANEL (SERVICE KEY) — UPDATED (Streamlit width=)
 from __future__ import annotations
 
 from datetime import datetime, timezone, date
@@ -173,7 +172,7 @@ def panel_rotation_state(sb_service, schema: str, actor_email: str):
 
     confirm = st.checkbox("I confirm this override is intentional and approved.")
 
-    if st.button("💾 Save Rotation Override", use_container_width=True):
+    if st.button("💾 Save Rotation Override", width="stretch"):
         if not confirm:
             st.error("Confirmation required.")
             return
@@ -230,7 +229,7 @@ def panel_contributions(sb_service, schema: str, actor_email: str):
         mid = int(label_to_id[pick])
         mname = str(label_to_name[pick])
 
-        if st.button("✅ Save Contribution", use_container_width=True, key="contrib_save"):
+        if st.button("✅ Save Contribution", width="stretch", key="contrib_save"):
             if not is_multiple_of_500(int(amt)):
                 st.error("Amount must be >= 500 and multiple of 500.")
                 return
@@ -271,7 +270,7 @@ def panel_contributions(sb_service, schema: str, actor_email: str):
         edited = st.data_editor(
             df_bulk,
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
             column_config={
                 "amount": st.column_config.NumberColumn("amount", step=500, min_value=0),
             },
@@ -279,7 +278,7 @@ def panel_contributions(sb_service, schema: str, actor_email: str):
         )
         bulk_kind = st.selectbox("Bulk kind", ["paid", "contributed"], index=0, key="contrib_bulk_kind")
 
-        if st.button("✅ Save Bulk Contributions", use_container_width=True, key="contrib_bulk_save"):
+        if st.button("✅ Save Bulk Contributions", width="stretch", key="contrib_bulk_save"):
             errors = []
             saved = 0
             for _, r in edited.iterrows():
@@ -332,7 +331,7 @@ def panel_contributions(sb_service, schema: str, actor_email: str):
     if df.empty:
         st.info("No contributions recorded for this payout_index yet.")
     else:
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width="stretch", hide_index=True)
 
 
 def panel_fines(sb_service, schema: str, actor_email: str):
@@ -356,7 +355,7 @@ def panel_fines(sb_service, schema: str, actor_email: str):
     if status == "paid":
         paid_at = st.date_input("Paid at", value=date.today(), key="fine_paid_at").isoformat()
 
-    if st.button("✅ Save Fine", use_container_width=True):
+    if st.button("✅ Save Fine", width="stretch"):
         if amount <= 0:
             st.error("Fine amount must be > 0.")
             return
@@ -393,7 +392,7 @@ def panel_fines(sb_service, schema: str, actor_email: str):
     st.divider()
     st.markdown("### Recent fines")
     rows = safe_select(sb_service, schema, "fines_legacy", "*", order_by="created_at", desc=True, limit=300)
-    st.dataframe(pd.DataFrame(rows) if rows else pd.DataFrame(), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows) if rows else pd.DataFrame(), width="stretch", hide_index=True)
 
 
 def panel_foundation(sb_service, schema: str, actor_email: str):
@@ -414,7 +413,7 @@ def panel_foundation(sb_service, schema: str, actor_email: str):
     date_paid = st.date_input("date_paid", value=date.today(), key="foundation_date_paid").isoformat()
     notes = st.text_input("notes (optional)", value="", key="foundation_notes")
 
-    if st.button("✅ Save Foundation Payment", use_container_width=True):
+    if st.button("✅ Save Foundation Payment", width="stretch"):
         payload = {
             "member_id": mid,
             "amount_paid": float(amount_paid),
@@ -446,7 +445,7 @@ def panel_foundation(sb_service, schema: str, actor_email: str):
     st.divider()
     st.markdown("### Recent foundation payments")
     rows = safe_select(sb_service, schema, "foundation_payments_legacy", "*", order_by="created_at", desc=True, limit=300)
-    st.dataframe(pd.DataFrame(rows) if rows else pd.DataFrame(), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows) if rows else pd.DataFrame(), width="stretch", hide_index=True)
 
 
 # ============================================================
@@ -467,7 +466,7 @@ def render_admin(sb_service, schema: str, actor_email: str = ""):
 
     # Top-level meeting admin: initialize state
     st.markdown("### System Initialization")
-    if st.button("✅ Initialize app_state (id=1)", use_container_width=True):
+    if st.button("✅ Initialize app_state (id=1)", width="stretch"):
         ok = safe_upsert(sb_service, schema, "app_state", {"id": 1, "next_payout_index": 1, "updated_at": now_iso()})
         if ok:
             audit_log(
