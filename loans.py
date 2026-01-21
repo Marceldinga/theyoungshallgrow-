@@ -996,4 +996,4 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
                     mime="application/zip",
                     use_container_width=True,
                     key="dl_all_loan_statements_zip",
-        )
+                )
