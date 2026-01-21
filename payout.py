@@ -1,8 +1,8 @@
 
 # payout.py ✅ COMPLETE UPDATED SINGLE FILE (Njangi payout engine – SERVICE KEY)
-# - Fix: signatures read from public.signatures (matches Supabase SQL)
-# - Fix: signatures entity_id uses payout_index (rotation_idx)
-# - Adds: HARD STOP if service client is missing + runtime checks (safe)
+# - Signatures are read from public.signatures
+# - Signatures entity_id uses payout_index (rotation_idx)
+# - Runtime self-diagnosis: proves service key + shows why signatures look empty
 
 from __future__ import annotations
 
@@ -12,23 +12,15 @@ import pandas as pd
 import streamlit as st
 from postgrest.exceptions import APIError
 
-# -------------------------
-# CONFIG (Njangi rules)
-# -------------------------
 EXPECTED_ACTIVE_MEMBERS = 17
 BASE_CONTRIBUTION = 500
 CONTRIBUTION_STEP = 500
 ALLOWED_CONTRIB_KINDS = ["paid", "contributed"]
 
-# Required roles for payout signatures (if enforced)
 PAYOUT_SIG_REQUIRED = ["president", "beneficiary", "treasury", "surety"]
+SIGNATURES_SCHEMA = "public"
 
-SIGNATURES_SCHEMA = "public"  # ✅ signatures confirmed in public.signatures
 
-
-# -------------------------
-# Helpers
-# -------------------------
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -98,9 +90,6 @@ def safe_update(sb, schema: str, table: str, payload: dict, where: dict) -> bool
         return False
 
 
-# -------------------------
-# Rotation helpers
-# -------------------------
 def next_unpaid_beneficiary(active_ids: list[int], already_paid_ids: set[int], start_id: int) -> int:
     if not active_ids:
         return int(start_id)
@@ -122,15 +111,10 @@ def next_unpaid_beneficiary(active_ids: list[int], already_paid_ids: set[int], s
     return int(start_id)
 
 
-# -------------------------
-# Signatures (OPTIONAL table)
-# - entity_id MUST be payout_index (rotation index)
-# - signatures are in public.signatures
-# -------------------------
 def get_signatures(sb, entity_type: str, entity_id: int) -> pd.DataFrame:
     rows = safe_select(
         sb,
-        SIGNATURES_SCHEMA,  # ✅ force public
+        SIGNATURES_SCHEMA,
         "signatures",
         "role,signer_name,signer_member_id,signed_at,entity_type,entity_id",
         order_by="signed_at",
@@ -151,9 +135,6 @@ def missing_roles(df_sig: pd.DataFrame, required_roles: list[str]) -> list[str]:
     return [r for r in required_roles if r not in signed]
 
 
-# -------------------------
-# Contributions checks
-# -------------------------
 def fetch_rotation_contributions(sb, schema: str, payout_index: int) -> list[dict]:
     try:
         resp = (
@@ -199,9 +180,6 @@ def validate_gate_2(summary_rows, base=BASE_CONTRIBUTION, step=CONTRIBUTION_STEP
     return (len(problems) == 0, pd.DataFrame(problems))
 
 
-# -------------------------
-# Pot calculation (tries view first, falls back to sum)
-# -------------------------
 def compute_pot(sb, schema: str, payout_index: int) -> float:
     pot_row = safe_single(sb, schema, "v_contribution_pot", "*")
     if pot_row:
@@ -217,70 +195,34 @@ def compute_pot(sb, schema: str, payout_index: int) -> float:
     return float(total)
 
 
-# -------------------------
-# Main UI (called from app.py)
-# -------------------------
 def render_payouts(sb_service, schema: str):
     st.header("Payouts (Njangi Rotation)")
 
-    # ✅ HARD STOP: we must have service client for signatures/payout actions
+    # HARD STOP: service client must exist
     if sb_service is None:
-        st.error("FATAL: Supabase SERVICE ROLE client is NOT active (sb_service is None).")
+        st.error("FATAL: SERVICE ROLE client is NOT active (sb_service is None).")
         st.caption("Fix: ensure SUPABASE_SERVICE_KEY is set in Streamlit Secrets and reboot the app.")
         st.stop()
 
-    # ✅ Runtime key presence check (does not print secrets)
-    with st.expander("🔎 Runtime Check (safe)", expanded=False):
-        st.write("sb_service is None:", sb_service is None)
-        st.write("ENV has SUPABASE_URL:", bool(os.getenv("SUPABASE_URL")))
-        st.write("ENV has SUPABASE_ANON_KEY:", bool(os.getenv("SUPABASE_ANON_KEY")))
-        st.write("ENV has SUPABASE_SERVICE_KEY:", bool(os.getenv("SUPABASE_SERVICE_KEY")))
-        st.write("Data schema:", schema)
-        st.write("Signatures schema forced:", SIGNATURES_SCHEMA)
+    # Load state early so debug can print rotation_idx
+    season = safe_single(sb_service, schema, "current_season_view", "*")
+    state = safe_single(sb_service, schema, "app_state", "*", id=1)
+    rotation_idx = int(season.get("next_payout_index") or state.get("next_payout_index") or 1)
+    start_id = int(state.get("rotation_start_index") or 1)
 
-        # Try a raw read to prove access (top 5)
-        try:
-            test = (
-                sb_service.schema(SIGNATURES_SCHEMA)
-                .table("signatures")
-                .select("entity_type,entity_id,role,signer_name,signed_at")
-                .order("signed_at", desc=True)
-                .limit(5)
-                .execute()
-            )
-            st.write("Raw signatures rows returned:", len(test.data or []))
-        except Exception as e:
-            st.error("Raw signatures query failed")
-            st.code(str(e), language="text")
-
-    # ---------- Load members ----------
+    # Load members early for beneficiary debug
     mrows = safe_select(sb_service, schema, "members_legacy", "id,name,position", order_by="id")
     dfm = pd.DataFrame(mrows)
-
     if dfm.empty:
         st.warning("members_legacy is empty or not readable.")
         return
-
     dfm["id"] = pd.to_numeric(dfm["id"], errors="coerce")
     dfm = dfm.dropna(subset=["id"]).copy()
     dfm["id"] = dfm["id"].astype(int)
     dfm["name"] = dfm["name"].astype(str)
+    active_ids = dfm["id"].tolist()
 
-    active_members = [(int(r["id"]), str(r["name"])) for _, r in dfm.iterrows()]
-    active_ids = [mid for mid, _ in active_members]
-
-    # ---------- Load state ----------
-    season = safe_single(sb_service, schema, "current_season_view", "*")
-    state = safe_single(sb_service, schema, "app_state", "*", id=1)
-
-    rotation_idx = int(season.get("next_payout_index") or state.get("next_payout_index") or 1)
-    rotation_date = season.get("next_payout_date") or state.get("next_payout_date")
-    start_id = int(state.get("rotation_start_index") or 1)
-
-    # ---------- Compute pot ----------
-    pot_amount = compute_pot(sb_service, schema, rotation_idx)
-
-    # ---------- Find already-paid members for this payout_index ----------
+    # already paid ids for this payout index
     already_paid_ids: set[int] = set()
     payouts_rows = safe_select(sb_service, schema, "payouts_legacy", "member_id,payout_index", limit=20000)
     for p in payouts_rows:
@@ -290,14 +232,69 @@ def render_payouts(sb_service, schema: str):
             except Exception:
                 pass
 
-    # ---------- Choose beneficiary ----------
     beneficiary_id = next_unpaid_beneficiary(active_ids, already_paid_ids, start_id)
     try:
         beneficiary_name = dfm.loc[dfm["id"] == beneficiary_id, "name"].iloc[0]
     except Exception:
         beneficiary_name = f"Member {beneficiary_id}"
 
-    # ---------- Gates ----------
+    # ✅ Runtime Check OPEN by default
+    with st.expander("🔎 Runtime Check (safe)", expanded=True):
+        st.write("ENV has SUPABASE_URL:", bool(os.getenv("SUPABASE_URL")))
+        st.write("ENV has SUPABASE_ANON_KEY:", bool(os.getenv("SUPABASE_ANON_KEY")))
+        st.write("ENV has SUPABASE_SERVICE_KEY:", bool(os.getenv("SUPABASE_SERVICE_KEY")))
+        st.write("Data schema:", schema)
+        st.write("Signatures schema forced:", SIGNATURES_SCHEMA)
+        st.write("rotation_idx (payout_index):", rotation_idx)
+        st.write("beneficiary_id (member_id):", beneficiary_id)
+        st.write("rotation_start_index:", start_id)
+        st.write("already_paid_ids for this payout_index:", sorted(list(already_paid_ids))[:50])
+
+        # Raw signatures read
+        try:
+            raw = (
+                sb_service.schema(SIGNATURES_SCHEMA)
+                .table("signatures")
+                .select("entity_type,entity_id,role,signer_name,signed_at")
+                .order("signed_at", desc=True)
+                .limit(5)
+                .execute()
+            )
+            raw_count = len(raw.data or [])
+            st.write("Raw signatures rows returned:", raw_count)
+        except Exception as e:
+            st.error("Raw signatures query failed")
+            st.code(str(e), language="text")
+            raw_count = -1
+
+        # Filtered signatures read
+        try:
+            filt = (
+                sb_service.schema(SIGNATURES_SCHEMA)
+                .table("signatures")
+                .select("entity_type,entity_id,role,signer_name,signed_at")
+                .eq("entity_type", "payout")
+                .eq("entity_id", int(rotation_idx))
+                .execute()
+            )
+            filt_count = len(filt.data or [])
+            st.write(f"Filtered rows for payout_index={rotation_idx}:", filt_count)
+        except Exception as e:
+            st.error("Filtered signatures query failed")
+            st.code(str(e), language="text")
+            filt_count = -1
+
+        if raw_count == 0 and filt_count == 0:
+            st.warning(
+                "Signatures queries returned 0 rows. This usually means you are NOT using service_role at runtime, "
+                "or RLS is blocking SELECT on public.signatures."
+            )
+
+    # Continue with normal page content (rest of your UI can remain the same)
+    rotation_date = season.get("next_payout_date") or state.get("next_payout_date")
+    pot_amount = compute_pot(sb_service, schema, rotation_idx)
+
+    active_members = [(int(r["id"]), str(r["name"])) for _, r in dfm.iterrows()]
     gate1_ok, member_count, df_gate1 = validate_gate_1(active_members)
 
     contrib_rows = fetch_rotation_contributions(sb_service, schema, rotation_idx)
@@ -305,7 +302,6 @@ def render_payouts(sb_service, schema: str):
     gate2_ok, df_problems = validate_gate_2(summary_rows)
     gate3_ok = (float(pot_amount) > 0)
 
-    # ---------- Display header KPIs ----------
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Rotation Index", str(rotation_idx))
     c2.metric("Pot Amount", f"{float(pot_amount):,.0f}")
@@ -314,30 +310,8 @@ def render_payouts(sb_service, schema: str):
 
     st.divider()
 
-    st.subheader("Gate Status")
-    st.write(
-        {
-            "Gate1 (member count == 17)": gate1_ok,
-            "Gate2 (everyone >=500 and multiple of 500)": gate2_ok,
-            "Gate3 (pot > 0)": gate3_ok,
-        }
-    )
-
-    with st.expander("Gate 1: Active members", expanded=False):
-        st.dataframe(df_gate1, use_container_width=True)
-
-    with st.expander("Gate 2: Contribution summary (this rotation)", expanded=False):
-        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
-
-    with st.expander("Gate 2: Contribution problems", expanded=False):
-        if df_problems is None or df_problems.empty:
-            st.success("No problems detected.")
-        else:
-            st.dataframe(df_problems, use_container_width=True)
-
-    # ---------- Signatures (OPTIONAL enforcement) ----------
     st.subheader("Signatures (optional gate)")
-    st.caption("If your signatures table is in use, you can enforce required roles before payout.")
+    st.caption("Signatures are checked for payout_index (rotation_idx).")
 
     df_sig = get_signatures(sb_service, "payout", int(rotation_idx))
 
@@ -360,7 +334,6 @@ def render_payouts(sb_service, schema: str):
 
     st.divider()
 
-    # ---------- Execute payout ----------
     st.subheader("Execute payout")
     st.caption("This will insert into payouts_legacy and advance app_state.next_payout_index/date (+14 days).")
 
