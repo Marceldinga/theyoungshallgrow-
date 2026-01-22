@@ -1,4 +1,4 @@
-# loans_core.py ✅ UPDATED (legacy loans schema + UUID-safe requester_user_id + strict signature check)
+# loans_core.py ✅ UPDATED (legacy loans schema + UUID-safe requester_user_id + strict signature check + uses public.repayments)
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
@@ -9,6 +9,9 @@ import pandas as pd
 
 MONTHLY_INTEREST_RATE = 0.05
 LOAN_SIG_REQUIRED = ["borrower", "surety", "treasury"]
+
+# ✅ Your DB table name for payments
+PAYMENTS_TABLE = "repayments"
 
 
 def now_iso() -> str:
@@ -118,7 +121,6 @@ def insert_signature(
     except Exception:
         pass
 
-    # Upsert prevents duplicates
     sb.schema(schema).table("signatures").upsert(payload).execute()
 
 
@@ -248,7 +250,6 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_user_id: str) -
         raise ValueError("Approval blocked. Missing/invalid signatures: " + ", ".join(miss))
 
     borrower_id = int(req.get("requester_member_id") or 0)
-    borrower_name = str(req.get("requester_name") or "").strip()
     surety_id = int(req.get("surety_member_id") or 0)
     surety_name = str(req.get("surety_name") or "").strip()
     amount = float(req.get("amount") or 0)
@@ -265,7 +266,6 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_user_id: str) -
 
     ts = now_iso()
 
-    # ✅ Insert into loans_legacy using YOUR real schema requirements
     loan_payload = {
         "borrower_member_id": borrower_id,      # NOT NULL in your DB
         "member_id": borrower_id,               # keep aligned (legacy)
@@ -286,7 +286,6 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_user_id: str) -
         raise RuntimeError("Loan creation failed.")
     loan_id = int(loan_row["id"])
 
-    # Mark request approved (use your actual columns if they exist)
     sb.schema(schema).table("loan_requests").update({
         "status": "approved",
         "decided_at": ts,
@@ -306,28 +305,30 @@ def deny_loan_request(sb, schema: str, request_id: int, reason: str):
 
 
 # ============================================================
-# PAYMENTS (maker-checker)
+# PAYMENTS (maker-checker)  ✅ TABLE = public.repayments
+# Expected columns (minimum): id, loan_legacy_id, amount, paid_on, status, created_at
+# Additional optional columns: recorded_by, note, confirmed_by, confirmed_at, rejected_by, rejected_at, reject_reason
 # ============================================================
 def record_payment_pending(sb, schema: str, loan_legacy_id: int, amount: float, paid_on: str, recorded_by: str):
     if amount <= 0:
         raise ValueError("Amount must be > 0.")
-    sb.schema(schema).table("loan_payments").insert({
+
+    sb.schema(schema).table(PAYMENTS_TABLE).insert({
         "loan_legacy_id": int(loan_legacy_id),
         "amount": float(amount),
         "paid_on": str(paid_on),
         "status": "pending",
-        "recorded_by": recorded_by,
+        "recorded_by": str(recorded_by),
         "note": "Recorded pending",
         "created_at": now_iso(),
     }).execute()
 
 
 def _get_payment(sb, schema: str, payment_id: int) -> dict:
-    pay = fetch_one(sb.schema(schema).table("loan_payments").select("*").eq("payment_id", int(payment_id)))
+    # ✅ repayments uses id (not payment_id)
+    pay = fetch_one(sb.schema(schema).table(PAYMENTS_TABLE).select("*").eq("id", int(payment_id)))
     if not pay:
-        pay = fetch_one(sb.schema(schema).table("loan_payments").select("*").eq("id", int(payment_id)))
-    if not pay:
-        raise RuntimeError("Payment not found.")
+        raise RuntimeError("Repayment not found.")
     return pay
 
 
@@ -355,12 +356,11 @@ def confirm_payment(sb, schema: str, payment_id: int, confirmer: str):
         "updated_at": now_iso(),
     }).eq("id", loan_id).execute()
 
-    key_col = "payment_id" if "payment_id" in pay else "id"
-    sb.schema(schema).table("loan_payments").update({
+    sb.schema(schema).table(PAYMENTS_TABLE).update({
         "status": "confirmed",
-        "confirmed_by": confirmer,
+        "confirmed_by": str(confirmer),
         "confirmed_at": now_iso(),
-    }).eq(key_col, int(payment_id)).execute()
+    }).eq("id", int(payment_id)).execute()
 
 
 def reject_payment(sb, schema: str, payment_id: int, rejecter: str, reason: str):
@@ -368,19 +368,16 @@ def reject_payment(sb, schema: str, payment_id: int, rejecter: str, reason: str)
     if str(pay.get("status") or "").lower().strip() != "pending":
         raise ValueError("Only pending payments can be rejected.")
 
-    key_col = "payment_id" if "payment_id" in pay else "id"
-    sb.schema(schema).table("loan_payments").update({
+    sb.schema(schema).table(PAYMENTS_TABLE).update({
         "status": "rejected",
-        "rejected_by": rejecter,
+        "rejected_by": str(rejecter),
         "rejected_at": now_iso(),
         "reject_reason": str(reason or "").strip(),
-    }).eq(key_col, int(payment_id)).execute()
+    }).eq("id", int(payment_id)).execute()
 
 
 # ============================================================
 # INTEREST (idempotent snapshot)
-# NOTE: Your DB already has legacy interest functions/triggers.
-# This Python version only updates columns that exist in your loans_legacy.
 # ============================================================
 def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, float]:
     month = _month_key()
