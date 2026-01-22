@@ -1,4 +1,4 @@
-# payout.py  ✅ COMPLETE FIX (bi-weekly rotation + session-scoped pot + signatures enforced)
+# payout.py  ✅ COMPLETE FIX + CLEAN UI (bi-weekly rotation + session-scoped pot + signatures enforced)
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
@@ -539,8 +539,18 @@ def _safe_select_schema(
         return []
 
 
+def _member_name_by_id(df_members: pd.DataFrame, mid: int) -> str:
+    try:
+        row = df_members.loc[df_members["id"] == int(mid)]
+        if not row.empty:
+            return str(row.iloc[0].get("name") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
 def render_payouts(sb_service, schema: str):
-    st.header("Payouts • Option B (Bi-weekly Rotation)")
+    st.title("Payouts • Option B (Bi-weekly Rotation)")
     st.caption("Session-scoped pot • Signatures enforced • Double-pay protection • Rotation advance")
 
     members = _safe_select_schema(
@@ -552,65 +562,75 @@ def render_payouts(sb_service, schema: str):
         return
 
     dfm["id"] = pd.to_numeric(dfm["id"], errors="coerce").fillna(-1).astype(int)
+    dfm["name"] = dfm.get("name", "").astype(str)
+
     active_ids = [int(x) for x in dfm["id"].tolist() if int(x) > 0]
 
     sid = get_rotation_id(sb_service)
+    beneficiary_id = resolve_beneficiary_id(active_ids, sid) if sid else 0
+    beneficiary_name = _member_name_by_id(dfm, beneficiary_id)
 
-    c1, c2, c3 = st.columns(3)
+    beneficiary_label = "—"
+    if beneficiary_id:
+        beneficiary_label = f"{beneficiary_id:02d} • {beneficiary_name}" if beneficiary_name else str(beneficiary_id)
+
+    comp = compliance_for_payout(sb_service, active_ids, sid if sid else 0)
+    pre = payout_precheck_option_b(sb_service, active_ids)
+
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Active Members", str(len(active_ids)))
-    c2.metric("Current Rotation ID", str(sid) if sid else "—")
-    c3.metric("Base Contribution", f"{BASE_CONTRIBUTION:,}")
+    c2.metric("Rotation ID", str(sid) if sid else "—")
+    c3.metric("Current Beneficiary", beneficiary_label)
+    c4.metric("Pot (this rotation)", f"{float(comp.get('contrib_total', 0.0)):,.0f}")
 
     st.divider()
 
-    comp = compliance_for_payout(sb_service, active_ids, sid if sid else 0)
+    # Clean status messages
+    if comp.get("gate1_ok"):
+        st.success(comp.get("gate1_msg", "Gate 1 OK"))
+    else:
+        st.error(comp.get("gate1_msg", "Gate 1 failed"))
 
-    st.subheader("Gate Status")
-
-    with st.expander("Gate 1: Active members", expanded=False):
-        (st.success if comp.get("gate1_ok") else st.error)(comp.get("gate1_msg", "—"))
-
-    with st.expander("Gate 2: Contribution summary (this rotation)", expanded=True):
-        st.write(comp.get("gate2_summary", {}))
-        st.caption("This reflects ONLY the current session/rotation (not all-time).")
-
-    with st.expander("Gate 2: Contribution problems", expanded=True):
-        probs = comp.get("gate2_problems", []) or []
-        if probs:
-            for p in probs:
-                st.error(p)
-        else:
-            st.success("No contribution problems detected for this rotation/session.")
+    if comp.get("gate2_ok"):
+        summ = comp.get("gate2_summary", {}) or {}
+        st.success(
+            f"Contributions OK • Contributors: {summ.get('contributors', 0)} • "
+            f"Rows: {summ.get('rows', 0)} • Total: {float(comp.get('contrib_total', 0.0)):,.0f}"
+        )
+    else:
+        st.error("Contribution problems detected for this rotation.")
+        for p in (comp.get("gate2_problems", []) or []):
+            st.warning(str(p))
 
     st.subheader("Signatures")
     if _table_exists(sb_service, "signatures"):
-        st.caption(f"Required roles: {PAYOUT_SIG_REQUIRED}")
-        if comp.get("signatures_ok"):
+        missing = comp.get("signatures_missing", []) or []
+        if not missing:
             st.success("All required payout signatures are present.")
         else:
-            st.warning(comp.get("signatures_msg", "Missing signatures"))
+            st.warning("Missing required signatures: " + ", ".join(missing))
+            st.caption(f"Required roles: {PAYOUT_SIG_REQUIRED}")
     else:
         st.info("signatures table not found — signature enforcement skipped.")
 
     st.divider()
 
-    pre = payout_precheck_option_b(sb_service, active_ids)
+    # Execute button (no JSON output)
+    disabled = not bool(pre.get("ok"))
+    if st.button("✅ Execute Payout (Option B)", disabled=disabled, use_container_width=True):
+        res = execute_payout_option_b(sb_service, active_ids, actor_user_id="admin")
+        if res.get("ok"):
+            st.success(
+                f"Payout complete ✅  Beneficiary={res['beneficiary_id']}  "
+                f"Amount={float(res['amount_paid']):,.0f}  NextIndex={res.get('next_payout_index')}"
+            )
+            st.rerun()
+        else:
+            st.error(res.get("reason", "Payout failed"))
 
-    left, right = st.columns([1, 1])
-    with left:
-        st.write("Precheck:")
+    # Optional debug hidden
+    with st.expander("Debug details (optional)", expanded=False):
+        st.write("Precheck JSON:")
         st.json(pre)
-
-    with right:
-        disabled = not bool(pre.get("ok"))
-        if st.button("✅ Execute Payout (Option B)", disabled=disabled, use_container_width=True):
-            res = execute_payout_option_b(sb_service, active_ids, actor_user_id="admin")
-            if res.get("ok"):
-                st.success(
-                    f"Payout complete ✅  Beneficiary={res['beneficiary_id']}  "
-                    f"Amount={float(res['amount_paid']):,.0f}  NextIndex={res.get('next_payout_index')}"
-                )
-                st.rerun()
-            else:
-                st.error(res.get("reason", "Payout failed"))
-                st.json(res)
+        st.write("Gate details JSON:")
+        st.json(comp)
