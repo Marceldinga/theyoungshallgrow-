@@ -1,4 +1,4 @@
-# loans_ui.py ✅ UPDATED (uses public.repayments instead of loan_payments)
+# loans_ui.py ✅ UPDATED (uses public.repayments + SAFE ordering if paid_on doesn't exist)
 from __future__ import annotations
 
 from datetime import date
@@ -23,6 +23,14 @@ try:
 except Exception:
     def audit(*args, **kwargs):
         return None
+
+# Optional PostgREST error class
+try:
+    from postgrest.exceptions import APIError
+except Exception:
+    APIError = Exception
+
+PAYMENTS_TABLE = "repayments"
 
 
 def _is_uuid(s: str) -> bool:
@@ -65,6 +73,70 @@ def _actor_from_session(default_user_id: str) -> Actor:
         member_id=(int(member_id) if int(member_id) > 0 else None),
         name=(name.strip() or None),
     )
+
+
+# ============================================================
+# ✅ SAFE READ HELPERS FOR repayments
+# - Some DBs use paid_at instead of paid_on
+# - Avoid crashing on order() if column missing
+# ============================================================
+def _safe_ordered_query(q):
+    for col in ["paid_on", "paid_at", "created_at", "id"]:
+        try:
+            return q.order(col, desc=True).execute().data or []
+        except Exception:
+            continue
+    return q.execute().data or []
+
+
+def get_pending_repayments(sb_service, schema: str, limit: int = 500) -> list[dict]:
+    q = (
+        sb_service.schema(schema).table(PAYMENTS_TABLE)
+        .select("*")
+        .eq("status", "pending")
+        .limit(int(limit))
+    )
+    return _safe_ordered_query(q)
+
+
+def get_repayments_for_loan_ids(sb_service, schema: str, loan_ids: list[int], limit: int = 5000) -> list[dict]:
+    if not loan_ids:
+        return []
+    # NOTE: if your column is not loan_legacy_id, this will error and show message.
+    q = (
+        sb_service.schema(schema).table(PAYMENTS_TABLE)
+        .select("*")
+        .in_("loan_legacy_id", loan_ids)
+        .limit(int(limit))
+    )
+    try:
+        return _safe_ordered_query(q)
+    except Exception as e:
+        st.error("repayments table exists, but the column name for linking to loans is different from 'loan_legacy_id'.")
+        st.code(str(e), language="text")
+        st.stop()
+
+
+def get_repayments_for_dpd(sb_service, schema: str, limit: int = 20000) -> pd.DataFrame:
+    """
+    Fetch minimal columns for DPD. We ask for both paid_on and paid_at.
+    If one doesn't exist, PostgREST may error; so we fallback to '*'.
+    """
+    try:
+        q = (
+            sb_service.schema(schema).table(PAYMENTS_TABLE)
+            .select("loan_legacy_id,status,paid_on,paid_at")
+            .limit(int(limit))
+        )
+        rows = q.execute().data or []
+        return pd.DataFrame(rows)
+    except Exception:
+        rows = (
+            sb_service.schema(schema).table(PAYMENTS_TABLE)
+            .select("*").limit(int(limit))
+            .execute().data or []
+        )
+        return pd.DataFrame(rows)
 
 
 def render_loans(sb_service, schema: str, actor_user_id: str = ""):
@@ -413,11 +485,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
         require(actor.role, "confirm_payment")
         st.subheader("Confirm Payments (Checker)")
 
-        pending = (
-            sb_service.schema(schema).table("repayments")
-            .select("*").eq("status", "pending").order("paid_on", desc=True).limit(500)
-            .execute().data or []
-        )
+        pending = get_pending_repayments(sb_service, schema, limit=500)
         dfp = pd.DataFrame(pending)
         if dfp.empty:
             st.success("No pending payments.")
@@ -445,11 +513,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
         require(actor.role, "reject_payment")
         st.subheader("Reject Payments (Checker)")
 
-        pending = (
-            sb_service.schema(schema).table("repayments")
-            .select("*").eq("status", "pending").order("paid_on", desc=True).limit(500)
-            .execute().data or []
-        )
+        pending = get_pending_repayments(sb_service, schema, limit=500)
         dfp = pd.DataFrame(pending)
         if dfp.empty:
             st.success("No pending payments to reject.")
@@ -514,21 +578,22 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
             st.info("No loans found.")
             return
 
-        pays = (
-            sb_service.schema(schema).table("repayments")
-            .select("loan_legacy_id,status,paid_on")
-            .limit(20000).execute().data or []
-        )
-        df_pay = pd.DataFrame(pays)
+        df_pay = get_repayments_for_dpd(sb_service, schema, limit=20000)
 
         last_paid: dict[int, date] = {}
         if not df_pay.empty:
-            df_pay["paid_on_dt"] = pd.to_datetime(df_pay["paid_on"], errors="coerce")
+            paid_col = "paid_on" if "paid_on" in df_pay.columns else ("paid_at" if "paid_at" in df_pay.columns else None)
+            if paid_col:
+                df_pay["paid_on_dt"] = pd.to_datetime(df_pay[paid_col], errors="coerce")
+            else:
+                df_pay["paid_on_dt"] = pd.NaT
+
             df_pay = df_pay[df_pay["status"].astype(str).str.lower() == "confirmed"]
-            for loan_id, grp in df_pay.groupby("loan_legacy_id"):
-                mx = grp["paid_on_dt"].max()
-                if pd.notna(mx):
-                    last_paid[int(loan_id)] = mx.date()
+            if "loan_legacy_id" in df_pay.columns:
+                for loan_id, grp in df_pay.groupby("loan_legacy_id"):
+                    mx = grp["paid_on_dt"].max()
+                    if pd.notna(mx):
+                        last_paid[int(loan_id)] = mx.date()
 
         rows = []
         for r in df_loans.to_dict("records"):
@@ -604,14 +669,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                 .execute().data or []
             )
             loan_ids = [int(l["id"]) for l in mloans if l.get("id") is not None]
-            mpay = []
-            if loan_ids:
-                mpay = (
-                    sb_service.schema(schema).table("repayments")
-                    .select("*").in_("loan_legacy_id", loan_ids)
-                    .order("paid_on", desc=True).limit(5000)
-                    .execute().data or []
-                )
+            mpay = get_repayments_for_loan_ids(sb_service, schema, loan_ids, limit=5000)
 
             st.markdown("### Loans")
             st.dataframe(pd.DataFrame(mloans), use_container_width=True, hide_index=True)
@@ -664,14 +722,8 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                             .limit(5000).execute().data or []
                         )
                         loan_ids = [int(l["id"]) for l in mloans if l.get("id") is not None]
-                        mpay = []
-                        if loan_ids:
-                            mpay = (
-                                sb_service.schema(schema).table("repayments")
-                                .select("*").in_("loan_legacy_id", loan_ids)
-                                .order("paid_on", desc=True).limit(5000)
-                                .execute().data or []
-                            )
+                        mpay = get_repayments_for_loan_ids(sb_service, schema, loan_ids, limit=5000)
+
                         member_statements.append({
                             "member": {"member_id": member_id, "member_name": m.get("name"), "position": m.get("position")},
                             "loans": mloans,
