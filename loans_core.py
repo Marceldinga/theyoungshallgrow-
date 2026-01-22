@@ -1,16 +1,15 @@
-# loans_core.py ✅ UPDATED (legacy loans schema + UUID-safe requester_user_id + strict signature check + uses public.repayments)
+# loans_core.py ✅ UPDATED (legacy loans schema + UUID-safe requester_user_id + strict signature check
+#                        + uses public.repayments + auto-detect loan link column + safe paid date column)
+
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
-from typing import Any
+from datetime import date, datetime, timezone
 import uuid
-
 import pandas as pd
 
 MONTHLY_INTEREST_RATE = 0.05
-LOAN_SIG_REQUIRED = ["borrower", "surety", "treasury"]
+LOAN_SIG_REQUIRED = ["borrower", "surety", "treasurer"]
 
-# ✅ Your DB table name for payments
 PAYMENTS_TABLE = "repayments"
 
 
@@ -46,14 +45,44 @@ def fetch_one(query) -> dict | None:
 
 
 # ============================================================
+# REPAYMENTS: auto-detect columns (loan link + paid date)
+# ============================================================
+def _detect_repayment_loan_link_col(sb, schema: str) -> str:
+    candidates = [
+        "loan_id",
+        "loan",
+        "loan_fk",
+        "loan_ref",
+        "loan_legacy",
+        "loan_legacy_fk",
+        "loan_legacy_id",
+        "loan_pk",
+    ]
+    for col in candidates:
+        try:
+            sb.schema(schema).table(PAYMENTS_TABLE).select(f"id,{col}").limit(1).execute()
+            return col
+        except Exception:
+            continue
+    raise RuntimeError("Could not detect repayments → loans link column (e.g., loan_id/loan_fk/loan_ref).")
+
+
+def _detect_repayment_paid_col(sb, schema: str) -> str:
+    candidates = ["paid_on", "paid_at", "paid_date", "created_at"]
+    for col in candidates:
+        try:
+            sb.schema(schema).table(PAYMENTS_TABLE).select(f"id,{col}").limit(1).execute()
+            return col
+        except Exception:
+            continue
+    # worst-case fallback (no ordering required)
+    return "id"
+
+
+# ============================================================
 # SIGNATURES  (table: public.signatures)
-# Your DB has: role, signer_name, signer_member_id, signed_at, entity_id
 # ============================================================
 def sig_df(sb, schema: str, entity_type: str, entity_id: int) -> pd.DataFrame:
-    """
-    We ignore entity_type because your signatures table DOES NOT have entity_kind/entity_type columns.
-    It only has entity_id, and your UI uses entity_id=request_id for loan signatures.
-    """
     try:
         rows = (
             sb.schema(schema)
@@ -76,11 +105,6 @@ def sig_df(sb, schema: str, entity_type: str, entity_id: int) -> pd.DataFrame:
 
 
 def missing_roles(df_sig: pd.DataFrame, required_roles: list[str]) -> list[str]:
-    """
-    REQUIRED means:
-    - role exists
-    - signer_member_id is NOT NULL (prevents treasury NULL problem)
-    """
     if df_sig is None or df_sig.empty:
         return required_roles
 
@@ -102,11 +126,6 @@ def insert_signature(
     signer_name: str,
     signer_member_id: int | None,
 ):
-    """
-    Uses UPSERT to avoid duplicate key errors when a role signs twice.
-    Assumes unique constraint exists on (entity_id, role) or (entity_type, entity_id, role) depending on your DB.
-    We'll send entity_type anyway (if column exists, it will store; if not, Supabase will error).
-    """
     payload = {
         "entity_id": int(entity_id),
         "role": str(role).strip().lower(),
@@ -174,7 +193,6 @@ def create_loan_request(
     if amount <= 0:
         raise ValueError("Amount must be > 0.")
 
-    # Ensure requester_user_id is valid UUID string
     if requester_user_id is None or str(requester_user_id).strip() == "":
         requester_user_id = str(uuid.uuid4())
     else:
@@ -243,7 +261,6 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_user_id: str) -
     if str(req.get("status") or "").lower().strip() != "pending":
         raise ValueError("Only pending requests can be approved.")
 
-    # Strict signatures (roles must exist AND signer_member_id not null)
     df_sig = sig_df(sb, schema, "loan", int(request_id))
     miss = missing_roles(df_sig, LOAN_SIG_REQUIRED)
     if miss:
@@ -267,12 +284,12 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_user_id: str) -
     ts = now_iso()
 
     loan_payload = {
-        "borrower_member_id": borrower_id,      # NOT NULL in your DB
-        "member_id": borrower_id,               # keep aligned (legacy)
+        "borrower_member_id": borrower_id,
+        "member_id": borrower_id,
         "surety_member_id": surety_id,
         "surety_name": surety_name or None,
         "borrow_date": str(date.today()),
-        "principal": float(amount),             # NOT NULL
+        "principal": float(amount),
         "principal_current": float(amount),
         "interest_rate_monthly": MONTHLY_INTEREST_RATE,
         "interest_start_at": ts,
@@ -305,27 +322,29 @@ def deny_loan_request(sb, schema: str, request_id: int, reason: str):
 
 
 # ============================================================
-# PAYMENTS (maker-checker)  ✅ TABLE = public.repayments
-# Expected columns (minimum): id, loan_legacy_id, amount, paid_on, status, created_at
-# Additional optional columns: recorded_by, note, confirmed_by, confirmed_at, rejected_by, rejected_at, reject_reason
+# PAYMENTS (maker-checker) ✅ TABLE = public.repayments (unknown loan link col)
 # ============================================================
 def record_payment_pending(sb, schema: str, loan_legacy_id: int, amount: float, paid_on: str, recorded_by: str):
     if amount <= 0:
         raise ValueError("Amount must be > 0.")
 
-    sb.schema(schema).table(PAYMENTS_TABLE).insert({
-        "loan_legacy_id": int(loan_legacy_id),
+    link_col = _detect_repayment_loan_link_col(sb, schema)
+    paid_col = _detect_repayment_paid_col(sb, schema)
+
+    payload = {
+        link_col: int(loan_legacy_id),
         "amount": float(amount),
-        "paid_on": str(paid_on),
+        paid_col: str(paid_on),
         "status": "pending",
         "recorded_by": str(recorded_by),
         "note": "Recorded pending",
         "created_at": now_iso(),
-    }).execute()
+    }
+
+    sb.schema(schema).table(PAYMENTS_TABLE).insert(payload).execute()
 
 
 def _get_payment(sb, schema: str, payment_id: int) -> dict:
-    # ✅ repayments uses id (not payment_id)
     pay = fetch_one(sb.schema(schema).table(PAYMENTS_TABLE).select("*").eq("id", int(payment_id)))
     if not pay:
         raise RuntimeError("Repayment not found.")
@@ -337,7 +356,9 @@ def confirm_payment(sb, schema: str, payment_id: int, confirmer: str):
     if str(pay.get("status") or "").lower().strip() != "pending":
         raise ValueError("Only pending payments can be confirmed.")
 
-    loan_id = int(pay.get("loan_legacy_id") or 0)
+    link_col = _detect_repayment_loan_link_col(sb, schema)
+    loan_id = int(pay.get(link_col) or 0)
+
     amt = float(pay.get("amount") or 0)
     if loan_id <= 0 or amt <= 0:
         raise ValueError("Invalid payment record.")
