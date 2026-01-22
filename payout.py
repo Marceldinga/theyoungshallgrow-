@@ -1,14 +1,27 @@
 # payout.py  ✅ COMPLETE FIX (bi-weekly rotation + session-scoped pot + signatures enforced)
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional, Tuple, Set
 
 import pandas as pd
 import streamlit as st
 
 # Import ONLY what exists in your db.py
-from db import now_iso, current_session_id, fetch_one
+from db import current_session_id, fetch_one
+
+
+# ============================================================
+# TIME (local to payout.py so we don't depend on db.now_iso)
+# ============================================================
+def now_iso() -> str:
+    """UTC ISO timestamp with Z suffix."""
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 # ============================================================
@@ -80,7 +93,7 @@ def _first_existing_table(c, candidates: list[str]) -> Optional[str]:
 def _session_window_from_sessions_table(c, sid: int) -> Optional[Tuple[str, str]]:
     """
     If sessions_legacy has (id, start_date, end_date) or similar,
-    we use it to scope contributions when session_id column does not exist.
+    scope contributions by that window when session_id doesn't exist.
     Returns ISO strings [start, end].
     """
     rows = _safe_select(c, "sessions_legacy", filters=[("id", "eq", sid)], limit=1)
@@ -132,10 +145,6 @@ def _fallback_biweekly_window() -> Tuple[str, str]:
 # SIGNATURES (enforced)
 # ============================================================
 def get_signatures(c, context: str, ref_id: int) -> list[dict]:
-    """
-    Expected signatures table layout:
-      signatures: {context, ref_id, role, member_id, signed_at, created_at}
-    """
     SIGNATURES_TABLE = "signatures"
     if not _table_exists(c, SIGNATURES_TABLE):
         return []
@@ -197,11 +206,6 @@ def next_rotation_pointer(active_ids: list[int], current_pointer: int) -> int:
 # CONTRIBUTIONS (STRICTLY THIS SESSION)
 # ============================================================
 def contributions_for_current_session(c, sid: int) -> pd.DataFrame:
-    """
-    Preferred: contributions_legacy has session_id
-    Fallback: sessions_legacy window
-    Last resort: last 14 days
-    """
     table = _first_existing_table(c, ["contributions_legacy", "contributions"])
     if not table:
         return pd.DataFrame([])
@@ -400,13 +404,7 @@ def payout_precheck_option_b(c, active_ids: list[int]) -> dict:
             "details": comp,
         }
 
-    return {
-        "ok": True,
-        "sid": sid,
-        "beneficiary_id": beneficiary_id,
-        "pot_total": float(comp["contrib_total"]),
-        "details": comp,
-    }
+    return {"ok": True, "sid": sid, "beneficiary_id": beneficiary_id, "pot_total": float(comp["contrib_total"]), "details": comp}
 
 
 def _update_app_state_next_index(c, next_idx: int) -> None:
@@ -461,14 +459,7 @@ def execute_payout_option_b(c, active_ids: list[int], actor_user_id: str | None 
     nxt = next_rotation_pointer(active_ids, sid)
     _update_app_state_next_index(c, nxt)
 
-    return {
-        "ok": True,
-        "sid": sid,
-        "beneficiary_id": beneficiary_id,
-        "amount_paid": pot_total,
-        "next_payout_index": nxt,
-        "payout_table": t,
-    }
+    return {"ok": True, "sid": sid, "beneficiary_id": beneficiary_id, "amount_paid": pot_total, "next_payout_index": nxt, "payout_table": t}
 
 
 # ============================================================
@@ -498,7 +489,6 @@ def render_payouts(sb_service, schema: str):
     st.header("Payouts • Option B (Bi-weekly Rotation)")
     st.caption("Session-scoped pot • Signatures enforced • Double-pay protection • Rotation advance")
 
-    # Load members
     members = _safe_select_schema(sb_service, schema, "members_legacy", "id,name,position", limit=2000, order_col="id", desc=False)
     dfm = pd.DataFrame(members or [])
     if dfm.empty:
@@ -508,7 +498,6 @@ def render_payouts(sb_service, schema: str):
     dfm["id"] = pd.to_numeric(dfm["id"], errors="coerce").fillna(-1).astype(int)
     active_ids = [int(x) for x in dfm["id"].tolist() if int(x) > 0]
 
-    # session id pointer
     try:
         sid = int(current_session_id(sb_service) or 0)
     except Exception:
@@ -521,16 +510,12 @@ def render_payouts(sb_service, schema: str):
 
     st.divider()
 
-    # Gates
     comp = compliance_for_payout(sb_service, active_ids, sid if sid else 0)
 
     st.subheader("Gate Status")
 
     with st.expander("Gate 1: Active members", expanded=False):
-        if comp.get("gate1_ok"):
-            st.success(comp.get("gate1_msg", "OK"))
-        else:
-            st.error(comp.get("gate1_msg", "Failed"))
+        (st.success if comp.get("gate1_ok") else st.error)(comp.get("gate1_msg", "—"))
 
     with st.expander("Gate 2: Contribution summary (this rotation)", expanded=True):
         st.write(comp.get("gate2_summary", {}))
@@ -556,7 +541,6 @@ def render_payouts(sb_service, schema: str):
 
     st.divider()
 
-    # Precheck + Execute
     pre = payout_precheck_option_b(sb_service, active_ids)
 
     left, right = st.columns([1, 1])
