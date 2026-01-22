@@ -1,10 +1,13 @@
-# loans_core.py ✅ COMPLETE UPDATED
+# loans_core.py ✅ COMPLETE UPDATED (includes interest duplicate-key fix)
 # Fixes:
 # - signatures.entity_type NOT NULL for statement signing (STATEMENT_ENTITY_TYPE)
 # - Repayments schema locked (repayments: loan_id + paid_at, no status)
 # - Legacy repayments insert into loan_repayments_legacy:
 #     * filters payload keys when possible
 #     * retries by removing missing columns (fixes PGRST204 schema-cache errors)
+# - ✅ Interest accrual duplicate-key fix:
+#     * checks snapshot_month OR snapshot_date (today)
+#     * uses upsert for snapshot row (prevents unique constraint errors)
 #
 # Works with loans_ui.py + rbac.py updated permissions.
 
@@ -466,9 +469,6 @@ def reject_payment(sb, schema: str, payment_id: int, rejecter: str, reason: str)
 
 # ============================================================
 # ✅ LEGACY REPAYMENTS INSERT (Admin dashboard)
-# Table: loan_repayments_legacy
-# - Filters payload keys when possible
-# - Retries by removing missing columns if PostgREST complains
 # ============================================================
 def insert_legacy_loan_repayment(
     sb,
@@ -501,17 +501,14 @@ def insert_legacy_loan_repayment(
         "method": str(method).strip() if method else None,
         "note": str(note).strip() if note else None,
         "notes": str(note).strip() if note else None,
-        # may or may not exist in table
         "recorded_by": actor_user_id,
         "actor_user_id": actor_user_id,
         "updated_at": now_iso(),
     }
     payload = {k: v for k, v in payload.items() if v is not None}
 
-    # try filter by inferred columns (works when table already has rows)
     payload = filter_payload_to_existing_columns(sb, schema, table, payload)
 
-    # ✅ PostgREST schema-cache can still complain; retry dropping missing columns
     for _ in range(6):
         try:
             res = sb.schema(schema).table(table).insert(payload).execute()
@@ -525,14 +522,17 @@ def insert_legacy_loan_repayment(
 
 
 # ============================================================
-# INTEREST (idempotent snapshot)
+# INTEREST (idempotent snapshot) ✅ duplicate-key safe
 # ============================================================
 def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, float]:
     month = _month_key()
+    today_str = str(date.today())
+
+    # ✅ Already ran this month OR already has a snapshot today -> no-op
     existing = (
         sb.schema(schema).table("loan_interest_snapshots")
-        .select("id,snapshot_month")
-        .eq("snapshot_month", month)
+        .select("id,snapshot_month,snapshot_date")
+        .or_(f"snapshot_month.eq.{month},snapshot_date.eq.{today_str}")
         .limit(1).execute().data or []
     )
     if existing:
@@ -546,6 +546,7 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, f
 
     updated = 0
     interest_added_total = 0.0
+    ts = now_iso()
 
     for r in loans:
         if str(r.get("status") or "").lower().strip() not in ("active", "open"):
@@ -563,7 +564,6 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, f
         total_interest_generated = float(r.get("total_interest_generated") or 0) + interest
         unpaid_interest = float(r.get("unpaid_interest") or 0) + interest
 
-        ts = now_iso()
         sb.schema(schema).table("loans_legacy").update({
             "accrued_interest": accrued_interest,
             "total_interest_generated": total_interest_generated,
@@ -576,12 +576,27 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, f
         interest_added_total += interest
 
     lifetime_interest_total = sum(float(r.get("total_interest_generated") or 0) for r in loans)
-    sb.schema(schema).table("loan_interest_snapshots").insert({
-        "snapshot_date": str(date.today()),
+
+    # ✅ Use upsert to avoid unique constraint errors (snapshot_date unique)
+    snapshot_payload = {
+        "snapshot_date": today_str,
         "snapshot_month": month,
         "lifetime_interest_generated": float(lifetime_interest_total),
-        "created_at": now_iso(),
-    }).execute()
+        "created_at": ts,
+        "actor_user_id": actor_user_id,  # may not exist; drop if PostgREST complains
+    }
+
+    # Try to insert/upsert, drop missing columns if needed
+    for _ in range(6):
+        try:
+            sb.schema(schema).table("loan_interest_snapshots").upsert(snapshot_payload).execute()
+            break
+        except Exception as e:
+            new_payload, changed = _drop_missing_column_from_postgrest_error(snapshot_payload, e)
+            if changed:
+                snapshot_payload = new_payload
+                continue
+            raise
 
     return updated, interest_added_total
 
