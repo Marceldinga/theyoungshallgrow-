@@ -1,9 +1,17 @@
-# loans_ui.py ✅ COMPLETE UPDATED (RBAC fixed + Record Payment fixed + Legacy repayment safe)
+# loans_ui.py ✅ COMPLETE UPDATED
 # Fixes:
-# - PermissionError: requests/ledger/interest/delinquency (RBAC perms now match rbac.py)
-# - Record Payment: "Loan not found for repayment" (now selects an existing loan_id)
-# - Keeps: Requests, Ledger, Record Payment, Confirm/Reject (info), Interest, Delinquency,
-#          Loan Statement (with signature + SAFE PDF), Loan Repayment (Legacy)
+# - Permission errors (RBAC perms now match rbac.py)
+# - Delinquency NaT crash (safe loan_id parsing)
+# - Record Payment "Loan not found" (select existing loan)
+# Includes:
+# - Requests (create + list + signatures + admin approve/deny)
+# - Ledger (loans_legacy table)
+# - Record Payment (repayments insert via core.record_payment_pending)
+# - Confirm/Reject (schema locked; UI explains)
+# - Interest (core.accrue_monthly_interest)
+# - Delinquency (simple DPD)
+# - Loan Statement (digital signature + SAFE PDF call)
+# - Loan Repayment (Legacy) insert into loan_repayments_legacy
 
 from __future__ import annotations
 
@@ -126,28 +134,14 @@ def get_repayments_for_loan_ids(sb_service, schema: str, loan_ids: list[int], li
     )
 
 
-def get_repayments_for_member(sb_service, schema: str, member_id: int, limit: int = 5000) -> list[dict]:
-    return (
-        sb_service.schema(schema).table(PAYMENTS_TABLE)
-        .select("*")
-        .eq("member_id", int(member_id))
-        .order(REPAY_DATE_COL, desc=True)
-        .limit(int(limit))
-        .execute().data
-        or []
-    )
-
-
 # ============================================================
 # Requests UI
 # ============================================================
 def _render_requests(sb_service, schema: str, actor: Actor):
-    # ✅ RBAC matches rbac.py
-    require(actor.role, "submit_request")  # members/admin/treasury
+    require(actor.role, "submit_request")
 
     st.subheader("Requests")
 
-    # Load members (id + name)
     members = (
         sb_service.schema(schema).table("members_legacy")
         .select("id,name")
@@ -172,12 +166,13 @@ def _render_requests(sb_service, schema: str, actor: Actor):
     with st.form("loan_request_create", clear_on_submit=True):
         borrower_pick = st.selectbox("Borrower", labels, key="req_borrower")
         surety_pick = st.selectbox("Surety", labels, key="req_surety")
-        amount = st.number_input("Amount", min_value=0.0, step=50.0, value=0.0)
+        amount = st.number_input("Amount", min_value=0.0, step=50.0, value=0.0, key="req_amount")
         ok = st.form_submit_button("Submit request", use_container_width=True)
 
     if ok:
         borrower_id = int(label_to_id[borrower_pick])
         surety_id = int(label_to_id[surety_pick])
+
         if borrower_id == surety_id:
             st.error("Borrower and surety must be different.")
         elif float(amount) <= 0:
@@ -217,11 +212,10 @@ def _render_requests(sb_service, schema: str, actor: Actor):
     pick_req = st.selectbox("Select request ID", req_ids, key="req_pick")
 
     st.markdown("### Signatures for this request")
-    st.caption("Signatures are stored in public.signatures with entity_type='loan' and entity_id=request_id.")
+    st.caption("Required signatures for approval: borrower + surety + treasury.")
     df_sig = core.sig_df(sb_service, schema, "loan", int(pick_req))
     st.dataframe(df_sig, use_container_width=True, hide_index=True)
 
-    # Signature UI
     require(actor.role, "sign_request")
     roles_allowed = ["borrower", "surety", "treasury"]
     sig_role = st.selectbox("Role to sign as", roles_allowed, key="req_sig_role")
@@ -251,9 +245,9 @@ def _render_requests(sb_service, schema: str, actor: Actor):
 
     st.divider()
 
-    # Admin actions
     if actor.role in (ROLE_ADMIN, ROLE_TREASURY):
         require(actor.role, "approve_deny")
+
         st.markdown("### Admin actions")
         c1, c2 = st.columns(2)
 
@@ -285,7 +279,6 @@ def _render_requests(sb_service, schema: str, actor: Actor):
 # Ledger UI
 # ============================================================
 def _render_ledger(sb_service, schema: str, actor: Actor):
-    # ✅ RBAC matches rbac.py
     require(actor.role, "view_ledger")
 
     st.subheader("Ledger (loans_legacy)")
@@ -305,7 +298,7 @@ def _render_ledger(sb_service, schema: str, actor: Actor):
 
 
 # ============================================================
-# Record payment UI (FIXED: select existing loan)
+# Record payment UI (select existing loan)
 # ============================================================
 def _render_record_payment(sb_service, schema: str, actor: Actor):
     require(actor.role, "record_payment")
@@ -356,25 +349,8 @@ def _render_record_payment(sb_service, schema: str, actor: Actor):
             st.error("Failed to record payment.")
             st.exception(e)
 
-    st.divider()
-    st.markdown("### Recent repayments (latest 200)")
-    rows = (
-        sb_service.schema(schema).table("repayments")
-        .select("*")
-        .order("paid_at", desc=True)
-        .limit(200)
-        .execute().data
-        or []
-    )
-    dfr = _safe_df(rows)
-    if dfr.empty:
-        st.info("No repayments found.")
-    else:
-        st.dataframe(dfr, use_container_width=True, hide_index=True)
-
 
 def _render_confirm_payments(sb_service, schema: str, actor: Actor):
-    # RBAC uses confirm_payment, but schema does not support status changes
     require(actor.role, "confirm_payment")
     st.subheader("Confirm Payments")
     st.info("Not supported: repayments table is schema-locked (no status/confirmed_by/confirmed_at).")
@@ -393,7 +369,7 @@ def _render_interest(sb_service, schema: str, actor: Actor):
     require(actor.role, "accrue_interest")
 
     st.subheader("Interest")
-    st.caption("Applies monthly interest (idempotent via loan_interest_snapshots).")
+    st.caption("Applies monthly interest (idempotent; duplicate-safe).")
 
     if st.button("➕ Accrue monthly interest", use_container_width=True, key="accrue_interest_btn"):
         try:
@@ -406,7 +382,7 @@ def _render_interest(sb_service, schema: str, actor: Actor):
 
 
 # ============================================================
-# Delinquency UI (simple DPD)
+# Delinquency UI (DPD) — FIXED NaT crash
 # ============================================================
 def _render_delinquency(sb_service, schema: str, actor: Actor):
     require(actor.role, "view_delinquency")
@@ -435,12 +411,17 @@ def _render_delinquency(sb_service, schema: str, actor: Actor):
         or []
     )
     dfr = _safe_df(reps)
+
     last_paid_map: dict[int, date] = {}
     if not dfr.empty:
         dfr["paid_at"] = pd.to_datetime(dfr["paid_at"], errors="coerce")
         dfr = dfr.dropna(subset=["paid_at"]).sort_values("paid_at", ascending=False)
+
         for _, r in dfr.iterrows():
-            lid = int(r.get("loan_id") or 0)
+            lid = pd.to_numeric(r.get("loan_id"), errors="coerce")
+            if pd.isna(lid):
+                continue
+            lid = int(lid)
             if lid and lid not in last_paid_map:
                 last_paid_map[lid] = r["paid_at"].date()
 
@@ -644,7 +625,6 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
     k3.metric("Monthly interest", "5%")
     st.divider()
 
-    # Menu (from RBAC)
     sections = allowed_sections(actor.role) or []
     if not sections:
         st.warning("No sections available for your role.")
@@ -655,7 +635,6 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
 
     section = st.selectbox("Loans menu", sections, key="loans_menu")
 
-    # ROUTES
     if section == "Requests":
         _render_requests(sb_service, schema, actor); return
     if section == "Ledger":
