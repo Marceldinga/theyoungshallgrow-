@@ -1,10 +1,9 @@
-# app.py ✅ CLEAN + UPDATED (Minutes & Attendance upgraded: PDFs + Bulk attendance + Summaries + session_number link)
+# app.py ✅ CLEAN + UPDATED (uses dashboard_panel.py upgraded dashboard)
 # - Railway-safe secrets
 # - Safe imports (Audit / Health / Loans + PDFs)
-# - Dashboard fixed (uses dashboard_next_view.current_pot)
-# - Loans entry works with your current loans.py wrapper (show_loans or render_loans)
-# - Adds ✅ Minutes & Attendance (Legacy): meeting_minutes_legacy + meeting_attendance_legacy
-# - Upgrades: link to session_number, minutes PDF, attendance PDF, mark-all-present, summaries tab
+# - ✅ Dashboard now rendered by dashboard_panel.render_dashboard (beautiful standard dashboard)
+# - Loans entry works with loans.py wrapper (show_loans or render_loans)
+# - Minutes & Attendance upgraded: PDFs + Bulk attendance + Summaries + session_number link
 # - Avoids crashes if a module is missing
 
 from __future__ import annotations
@@ -21,6 +20,9 @@ from payout import render_payouts
 from audit_panel import render_audit
 from health_panel import render_health
 
+# ✅ Dashboard (upgraded UI)
+from dashboard_panel import render_dashboard
+
 # ✅ Optional PDFs (safe)
 try:
     from pdfs import make_minutes_pdf, make_attendance_pdf
@@ -29,9 +31,6 @@ except Exception:
     make_attendance_pdf = None
 
 # ✅ Loans UI (safe import)
-# Support both patterns:
-#  - loans.py defines show_loans(...)
-#  - loans.py defines render_loans(...)
 try:
     import loans as loans_entry
 except Exception:
@@ -99,7 +98,7 @@ with right:
 st.title(f"🏦 {APP_BRAND} • Bank Dashboard")
 
 # ============================================================
-# SAFE QUERY HELPER
+# SAFE QUERY HELPER (used by Minutes & Attendance page)
 # ============================================================
 def safe_select(
     client,
@@ -127,14 +126,13 @@ def safe_select(
         return []
 
 
-# ✅ Canonical dashboard source
 def get_dashboard_next(sb, schema: str) -> dict:
     rows = safe_select(sb, "dashboard_next_view", "*", schema=schema, limit=1)
     return rows[0] if rows else {}
 
 
 # ============================================================
-# LOADERS
+# LOADERS (used by Minutes & Attendance page)
 # ============================================================
 @st.cache_data(ttl=90)
 def load_members_legacy(url: str, anon_key: str, schema: str):
@@ -174,7 +172,7 @@ def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFram
 
 
 # ============================================================
-# NAVIGATION ✅ UPDATED (adds Minutes & Attendance)
+# NAVIGATION
 # ============================================================
 page = st.sidebar.radio(
     "Menu",
@@ -192,47 +190,10 @@ page = st.sidebar.radio(
 )
 
 # ============================================================
-# DASHBOARD ✅ FIXED
+# DASHBOARD (✅ upgraded view in dashboard_panel.py)
 # ============================================================
 if page == "Dashboard":
-    labels, label_to_id, label_to_name, df_members = load_members_legacy(
-        SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA
-    )
-
-    dash = get_dashboard_next(sb_anon, SUPABASE_SCHEMA)
-
-    next_index = dash.get("next_payout_index")
-    next_date = dash.get("next_payout_date")
-    next_beneficiary = dash.get("next_beneficiary")
-    current_pot = dash.get("current_pot")
-    session_number = dash.get("session_number")
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Members", f"{len(df_members):,}")
-    c2.metric("Next Payout Index", str(next_index) if next_index is not None else "—")
-    c3.metric("Next Payout Date", str(next_date) if next_date else "—")
-    c4.metric("Next Beneficiary", str(next_beneficiary) if next_beneficiary else "—")
-
-    try:
-        st.caption(f"Pot Amount (this session): {float(current_pot or 0):,.0f}")
-    except Exception:
-        st.caption(f"Pot Amount (this session): {current_pot}")
-
-    st.caption(f"Current session #: {session_number if session_number is not None else '—'}")
-    st.divider()
-
-    if labels:
-        pick = st.selectbox("Select member", labels, key="dash_member_pick")
-        st.write("Selected member id:", label_to_id.get(pick))
-        st.write("Selected member:", label_to_name.get(pick))
-    else:
-        st.warning("No members found in members_legacy.")
-
-    with st.expander("Member Registry (preview)", expanded=False):
-        if not df_members.empty:
-            st.dataframe(df_members[["id", "name", "position"]], use_container_width=True, hide_index=True)
-        else:
-            st.info("members_legacy empty or not readable.")
+    render_dashboard(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
 
 # ============================================================
 # CONTRIBUTIONS
@@ -273,7 +234,7 @@ elif page == "Loans":
                 loans_fn(sb_service, SUPABASE_SCHEMA, actor_user_id="admin")
 
 # ============================================================
-# ✅ Minutes & Attendance (Legacy) — UPGRADED
+# Minutes & Attendance (Legacy) — upgraded
 # ============================================================
 elif page == "Minutes & Attendance":
     st.header("📝 Meeting Minutes & ✅ Attendance (Legacy)")
@@ -282,7 +243,6 @@ elif page == "Minutes & Attendance":
         st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY to enable writing minutes & attendance.")
         st.stop()
 
-    # RBAC-lite (temporary switch)
     with st.sidebar.expander("🔐 Role (Minutes/Attendance)", expanded=False):
         role = st.selectbox("Role", ["admin", "treasury", "member"], index=0, key="ma_role")
     can_write = role in ("admin", "treasury")
