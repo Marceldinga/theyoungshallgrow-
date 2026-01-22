@@ -8,7 +8,7 @@ import uuid
 import pandas as pd
 
 MONTHLY_INTEREST_RATE = 0.05
-LOAN_SIG_REQUIRED = ["borrower", "surety", "treasurer"]
+LOAN_SIG_REQUIRED = ["borrower", "surety", "treasury"]
 
 PAYMENTS_TABLE = "repayments"
 
