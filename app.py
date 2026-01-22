@@ -1,4 +1,4 @@
-# app.py ✅ CLEAN (Railway-safe secrets + Audit + Health + Loans import safe) — UPDATED (Streamlit width=)
+# app.py ✅ CLEAN (Railway-safe secrets + Audit + Health + Loans import safe) — UPDATED
 from __future__ import annotations
 
 import os
@@ -77,8 +77,9 @@ sb_service = get_service_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_
 # ============================================================
 left, right = st.columns([1, 0.25])
 with right:
-    if st.button("🔄 Refresh data", width="stretch"):
+    if st.button("🔄 Refresh data", use_container_width=True):
         st.cache_data.clear()
+        st.cache_resource.clear()
         st.rerun()
 
 st.title(f"🏦 {APP_BRAND} • Bank Dashboard")
@@ -206,7 +207,7 @@ if page == "Dashboard":
 
     with st.expander("Member Registry (preview)", expanded=False):
         if not df_members.empty:
-            st.dataframe(df_members[["id", "name", "position"]], width="stretch")
+            st.dataframe(df_members[["id", "name", "position"]], use_container_width=True)
         else:
             st.info("members_legacy empty or not readable.")
 
@@ -220,7 +221,7 @@ elif page == "Contributions":
         st.info("No contributions found (or view not readable).")
         st.caption("Confirm contributions_with_member exists and GRANT SELECT to anon.")
     else:
-        st.dataframe(df, width="stretch")
+        st.dataframe(df, use_container_width=True)
 
 # ============================================================
 # PAYOUTS
@@ -257,7 +258,10 @@ elif page == "Admin":
 # AUDIT
 # ============================================================
 elif page == "Audit":
-    render_audit(sb_service=sb_service, schema=SUPABASE_SCHEMA)
+    if not sb_service:
+        st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY in Railway Variables / Secrets.")
+    else:
+        render_audit(sb_service=sb_service, schema=SUPABASE_SCHEMA)
 
 # ============================================================
 # HEALTH
