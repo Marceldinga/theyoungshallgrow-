@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 
 # Import ONLY what exists in your db.py
-from db import current_session_id, fetch_one
+from db import current_session_id
 
 
 # ============================================================
@@ -139,6 +139,44 @@ def _fallback_biweekly_window() -> Tuple[str, str]:
     end = datetime.utcnow().replace(microsecond=0)
     start = end - timedelta(days=13)
     return (start.isoformat(), end.isoformat())
+
+
+# ============================================================
+# ROTATION ID (safe int) ✅ FIX UUID current_session_id
+# ============================================================
+def get_rotation_id(c) -> int:
+    """
+    Returns numeric rotation pointer for payout.
+    Prefers app_state.next_payout_index.
+    Ignores UUID current_session_id values.
+    """
+    # 1) Prefer app_state.next_payout_index
+    try:
+        rows = _safe_select(c, "app_state", limit=1)
+        if rows:
+            v = rows[0].get("next_payout_index")
+            if v is not None and str(v).strip() != "":
+                try:
+                    return int(v)
+                except Exception:
+                    pass
+
+            # If current_session_id is numeric, allow it
+            v2 = rows[0].get("current_session_id")
+            if v2 is not None and str(v2).strip().isdigit():
+                return int(v2)
+    except Exception:
+        pass
+
+    # 2) Fallback to db.current_session_id (may be uuid)
+    try:
+        raw = current_session_id(c)
+        if raw is not None and str(raw).strip().isdigit():
+            return int(raw)
+    except Exception:
+        pass
+
+    return 0
 
 
 # ============================================================
@@ -379,9 +417,12 @@ def compliance_for_payout(c, active_ids: list[int], sid: int) -> dict:
 # PAYOUT EXECUTION (Option B)
 # ============================================================
 def payout_precheck_option_b(c, active_ids: list[int]) -> dict:
-    sid = int(current_session_id(c) or 0)
+    sid = get_rotation_id(c)
     if sid <= 0:
-        return {"ok": False, "reason": "No current session_id. app_state.next_payout_index is missing."}
+        return {
+            "ok": False,
+            "reason": "No numeric rotation id found. Ensure app_state.next_payout_index is set to an integer.",
+        }
 
     comp = compliance_for_payout(c, active_ids, sid)
 
@@ -404,7 +445,13 @@ def payout_precheck_option_b(c, active_ids: list[int]) -> dict:
             "details": comp,
         }
 
-    return {"ok": True, "sid": sid, "beneficiary_id": beneficiary_id, "pot_total": float(comp["contrib_total"]), "details": comp}
+    return {
+        "ok": True,
+        "sid": sid,
+        "beneficiary_id": beneficiary_id,
+        "pot_total": float(comp["contrib_total"]),
+        "details": comp,
+    }
 
 
 def _update_app_state_next_index(c, next_idx: int) -> None:
@@ -459,7 +506,14 @@ def execute_payout_option_b(c, active_ids: list[int], actor_user_id: str | None 
     nxt = next_rotation_pointer(active_ids, sid)
     _update_app_state_next_index(c, nxt)
 
-    return {"ok": True, "sid": sid, "beneficiary_id": beneficiary_id, "amount_paid": pot_total, "next_payout_index": nxt, "payout_table": t}
+    return {
+        "ok": True,
+        "sid": sid,
+        "beneficiary_id": beneficiary_id,
+        "amount_paid": pot_total,
+        "next_payout_index": nxt,
+        "payout_table": t,
+    }
 
 
 # ============================================================
@@ -489,7 +543,9 @@ def render_payouts(sb_service, schema: str):
     st.header("Payouts • Option B (Bi-weekly Rotation)")
     st.caption("Session-scoped pot • Signatures enforced • Double-pay protection • Rotation advance")
 
-    members = _safe_select_schema(sb_service, schema, "members_legacy", "id,name,position", limit=2000, order_col="id", desc=False)
+    members = _safe_select_schema(
+        sb_service, schema, "members_legacy", "id,name,position", limit=2000, order_col="id", desc=False
+    )
     dfm = pd.DataFrame(members or [])
     if dfm.empty:
         st.error("members_legacy is empty or not readable.")
@@ -498,14 +554,11 @@ def render_payouts(sb_service, schema: str):
     dfm["id"] = pd.to_numeric(dfm["id"], errors="coerce").fillna(-1).astype(int)
     active_ids = [int(x) for x in dfm["id"].tolist() if int(x) > 0]
 
-    try:
-        sid = int(current_session_id(sb_service) or 0)
-    except Exception:
-        sid = 0
+    sid = get_rotation_id(sb_service)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Active Members", str(len(active_ids)))
-    c2.metric("Current Session ID", str(sid) if sid else "—")
+    c2.metric("Current Rotation ID", str(sid) if sid else "—")
     c3.metric("Base Contribution", f"{BASE_CONTRIBUTION:,}")
 
     st.divider()
