@@ -1,205 +1,156 @@
-# dashboard_panel.py ✅ COMPLETE FULL FILE (SAFE + FIXED)
-# Fixes: TypeError safe_select() got unexpected keyword 'meeting_date'
-# Self-contained: does NOT import safe_select from db/app.
-# Dashboard sections are optional: missing tables/views won't crash.
+# dashboard_panel.py ✅ COMPLETE – VIEW DRIVEN DASHBOARD
+# Uses ONLY SQL views (no manual calculations)
+# Safe: missing views never crash the app
 
 from __future__ import annotations
-
-from datetime import date
 import streamlit as st
 import pandas as pd
 
 
-# ============================================================
-# SAFE SELECT (supports filters!)
-# ============================================================
+# ------------------------------------------------------------
+# Safe select (supports filters but dashboard mostly doesn't need them)
+# ------------------------------------------------------------
 def safe_select(
-    sb_client,
+    sb,
     schema: str,
     table: str,
     cols: str = "*",
-    limit: int | None = 500,
-    order_by: str | None = None,
-    order_desc: bool = True,
-    **filters,  # ✅ meeting_date=..., legacy_member_id=..., etc.
-) -> list[dict]:
-    """
-    Safe Supabase select with optional equality filters.
-    Returns [] on any error so dashboard never crashes.
-    """
+    limit: int | None = 1,
+):
     try:
-        q = sb_client.schema(schema).table(table).select(cols)
-
-        # equality filters
-        for k, v in (filters or {}).items():
-            if v is None:
-                continue
-            q = q.eq(k, v)
-
-        if order_by:
-            q = q.order(order_by, desc=order_desc)
-
-        if limit is not None:
-            q = q.limit(int(limit))
-
-        res = q.execute()
-        return res.data or []
+        q = sb.schema(schema).table(table).select(cols)
+        if limit:
+            q = q.limit(limit)
+        return q.execute().data or []
     except Exception:
         return []
 
 
-def _to_df(rows) -> pd.DataFrame:
+def as_df(rows):
     return pd.DataFrame(rows or [])
 
 
-def _money(x) -> str:
-    try:
-        return f"{float(x):,.0f}"
-    except Exception:
-        return str(x)
-
-
-def _safe_int(x, default=None):
-    try:
-        if x is None or x == "":
-            return default
-        return int(x)
-    except Exception:
-        return default
-
-
-# ============================================================
-# MAIN DASHBOARD
-# ============================================================
+# ------------------------------------------------------------
+# DASHBOARD
+# ------------------------------------------------------------
 def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     st.markdown("## 📊 Dashboard")
-    st.caption("Safe KPIs and quick snapshots. Missing tables/views won’t crash the app.")
 
-    # ---------------------------------------------------------
-    # 1) Session snapshot view (optional)
-    # ---------------------------------------------------------
-    dash_rows = safe_select(sb_anon, schema, "dashboard_next_view", "*", limit=1)
-    dash = dash_rows[0] if dash_rows else {}
+    # =========================================================
+    # 1️⃣ CORE ROTATION / SESSION INFO
+    # =========================================================
+    rot = safe_select(sb_anon, schema, "v_dashboard_rotation")
+    rot = rot[0] if rot else {}
 
-    session_number = dash.get("session_number")
-    next_payout_index = dash.get("next_payout_index")
-    next_payout_name = dash.get("next_payout_name")
-    session_start = dash.get("session_start") or dash.get("start_date")
-    session_end = dash.get("session_end") or dash.get("end_date")
-
-    # ---------------------------------------------------------
-    # 2) Member count (optional)
-    # ---------------------------------------------------------
-    members = safe_select(sb_anon, schema, "members_legacy", "id", limit=2000, order_by="id", order_desc=False)
-    member_count = len(members) if members else None
-
-    # ---------------------------------------------------------
-    # 3) Attendance check (today) ✅ fixes your crash
-    # ---------------------------------------------------------
-    today_str = str(date.today())
-    att_today = safe_select(
-        sb_anon,
-        schema,
-        "meeting_attendance_legacy",
-        "id",
-        limit=1,
-        meeting_date=today_str,  # ✅ supported
-    )
-
-    # ---------------------------------------------------------
-    # KPI CARDS
-    # ---------------------------------------------------------
     c1, c2, c3, c4 = st.columns(4)
 
-    c1.metric("Session #", str(session_number) if session_number is not None else "—")
-    c2.metric("Members", str(member_count) if member_count is not None else "—")
-    c3.metric("Next Payout Index", str(next_payout_index) if next_payout_index is not None else "—")
-    c4.metric("Next Beneficiary", str(next_payout_name) if next_payout_name else "—")
+    c1.metric("Session #", rot.get("session_number", "—"))
+    c2.metric("Next Payout Index", rot.get("next_payout_index", "—"))
+    c3.metric("Next Beneficiary", rot.get("next_beneficiary", "—"))
 
-    if session_start and session_end:
-        st.caption(f"🗓️ Session Window: {session_start} → {session_end}")
-
-    st.divider()
-
-    # ---------------------------------------------------------
-    # ATTENDANCE + CONTRIBUTIONS SNAPSHOTS
-    # ---------------------------------------------------------
-    left, right = st.columns([1, 1])
-
-    with left:
-        st.markdown("### ✅ Attendance")
-        if att_today:
-            st.success(f"Attendance exists for today: {today_str}")
-        else:
-            st.info(f"No attendance record found for today: {today_str}")
-
-        rows_att = safe_select(
-            sb_anon,
-            schema,
-            "meeting_attendance_legacy",
-            "meeting_date,session_number,legacy_member_id,member_name,status,note,created_by",
-            limit=80,
-            order_by="meeting_date",
-            order_desc=True,
-        )
-        dfa = _to_df(rows_att)
-        if dfa.empty:
-            st.caption("No attendance rows (or table not readable).")
-        else:
-            st.dataframe(dfa, use_container_width=True, hide_index=True)
-
-    with right:
-        st.markdown("### 💰 Latest Contributions")
-        rows_contrib = safe_select(
-            sb_anon,
-            schema,
-            "contributions_with_member",
-            "*",
-            limit=60,
-            order_by="created_at",
-            order_desc=True,
-        )
-        dfc = _to_df(rows_contrib)
-        if dfc.empty:
-            st.info("No contributions rows found (or view not readable).")
-            st.caption("Confirm contributions_with_member exists + anon has SELECT grants.")
-        else:
-            if "amount" in dfc.columns:
-                try:
-                    total = pd.to_numeric(dfc["amount"], errors="coerce").fillna(0).sum()
-                    st.metric("Total (latest rows)", _money(total))
-                except Exception:
-                    pass
-            st.dataframe(dfc, use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    # ---------------------------------------------------------
-    # RECENT MINUTES (optional)
-    # ---------------------------------------------------------
-    st.markdown("### 📝 Recent Minutes")
-    rows_min = safe_select(
-        sb_anon,
-        schema,
-        "meeting_minutes_legacy",
-        "id,meeting_date,session_number,title,tags,created_by",
-        limit=20,
-        order_by="meeting_date",
-        order_desc=True,
-    )
-    dfm = _to_df(rows_min)
-    if dfm.empty:
-        st.caption("No minutes found (or meeting_minutes_legacy not readable).")
+    if rot.get("session_start") and rot.get("session_end"):
+        c4.metric("Session Window", f"{rot['session_start']} → {rot['session_end']}")
     else:
-        st.dataframe(dfm, use_container_width=True, hide_index=True)
+        c4.metric("Session Window", "—")
 
     st.divider()
 
-    # ---------------------------------------------------------
-    # ADMIN / SERVICE KEY STATUS
-    # ---------------------------------------------------------
-    st.markdown("### 🔐 Admin / Service Key")
+    # =========================================================
+    # 2️⃣ POT & CONTRIBUTIONS
+    # =========================================================
+    pot = safe_select(sb_anon, schema, "v_current_pot")
+    pot = pot[0] if pot else {}
+
+    cycle = safe_select(sb_anon, schema, "v_current_cycle_contributions")
+    cycle = cycle[0] if cycle else {}
+
+    p1, p2, p3 = st.columns(3)
+    p1.metric("Current Pot", pot.get("current_pot", "—"))
+    p2.metric("Cycle Contributions", cycle.get("cycle_total", "—"))
+    p3.metric("Members Paid", cycle.get("members_paid", "—"))
+
+    st.divider()
+
+    # =========================================================
+    # 3️⃣ PAYOUT STATUS
+    # =========================================================
+    payout_day = safe_select(sb_anon, schema, "v_is_payout_day")
+    payout_day = payout_day[0] if payout_day else {}
+
+    payout_status = safe_select(sb_anon, schema, "v_payout_status_current")
+    payout_status = payout_status[0] if payout_status else {}
+
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Is Payout Day", "YES" if payout_day.get("is_payout_day") else "NO")
+    s2.metric("Payout Ready", payout_status.get("ready", "—"))
+    s3.metric("Missing Signatures", payout_status.get("missing_signatures", "—"))
+
+    st.divider()
+
+    # =========================================================
+    # 4️⃣ KPIs
+    # =========================================================
+    kpi_cycle = as_df(safe_select(sb_anon, schema, "v_kpi_current_cycle", limit=50))
+    kpi_member = as_df(safe_select(sb_anon, schema, "v_kpi_member_cycle", limit=50))
+
+    st.markdown("### 📈 KPIs – Current Cycle")
+    if not kpi_cycle.empty:
+        st.dataframe(kpi_cycle, use_container_width=True, hide_index=True)
+    else:
+        st.info("No KPI data for current cycle.")
+
+    st.markdown("### 👤 KPIs – Per Member")
+    if not kpi_member.empty:
+        st.dataframe(kpi_member, use_container_width=True, hide_index=True)
+    else:
+        st.info("No member KPI data.")
+
+    st.divider()
+
+    # =========================================================
+    # 5️⃣ ATTENDANCE SUMMARY
+    # =========================================================
+    att_day = as_df(safe_select(sb_anon, schema, "v_attendance_daily_summary", limit=120))
+    att_mem = as_df(safe_select(sb_anon, schema, "v_attendance_member_summary", limit=200))
+
+    st.markdown("### ✅ Attendance – Daily Summary")
+    if not att_day.empty:
+        st.dataframe(att_day, use_container_width=True, hide_index=True)
+    else:
+        st.info("No attendance summary data.")
+
+    st.markdown("### 👥 Attendance – Member Summary")
+    if not att_mem.empty:
+        st.dataframe(att_mem, use_container_width=True, hide_index=True)
+    else:
+        st.info("No member attendance summary.")
+
+    st.divider()
+
+    # =========================================================
+    # 6️⃣ LOANS (RISK / DPD)
+    # =========================================================
+    loan_dpd = as_df(safe_select(sb_anon, schema, "v_loan_dpd", limit=200))
+    loan_aging = as_df(safe_select(sb_anon, schema, "v_loan_aging_legacy", limit=200))
+
+    st.markdown("### 💳 Loan Risk (DPD)")
+    if not loan_dpd.empty:
+        st.dataframe(loan_dpd, use_container_width=True, hide_index=True)
+    else:
+        st.info("No DPD data.")
+
+    st.markdown("### 📅 Loan Aging")
+    if not loan_aging.empty:
+        st.dataframe(loan_aging, use_container_width=True, hide_index=True)
+    else:
+        st.info("No loan aging data.")
+
+    st.divider()
+
+    # =========================================================
+    # 7️⃣ SERVICE STATUS
+    # =========================================================
     if sb_service is None:
-        st.warning("SUPABASE_SERVICE_KEY missing → Admin/Write features disabled.")
+        st.warning("Admin / write actions disabled (SERVICE KEY missing).")
     else:
-        st.success("Service client available → Admin/Write features enabled.")
+        st.success("Admin / write actions enabled.")
