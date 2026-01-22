@@ -1,4 +1,4 @@
-# loans_ui.py ✅ UPDATED (Streamlit: use_container_width=True, RBAC + UUID-safe requester_user_id)
+# loans_ui.py ✅ UPDATED (uses public.repayments instead of loan_payments)
 from __future__ import annotations
 
 from datetime import date
@@ -348,7 +348,6 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
             key_prefix="loan_sig",
         )
 
-        # ✅ Treasury signer_member_id should be the treasury actor's member_id (if provided)
         treasury_signer_mid = actor.member_id if actor.role == ROLE_TREASURY else None
         treasury_default_name = (actor.name or "Treasury") if actor.role == ROLE_TREASURY else "Treasury"
 
@@ -413,8 +412,9 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
     elif section == "Confirm Payments":
         require(actor.role, "confirm_payment")
         st.subheader("Confirm Payments (Checker)")
+
         pending = (
-            sb_service.schema(schema).table("loan_payments")
+            sb_service.schema(schema).table("repayments")
             .select("*").eq("status", "pending").order("paid_on", desc=True).limit(500)
             .execute().data or []
         )
@@ -423,15 +423,15 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
             st.success("No pending payments.")
         else:
             st.dataframe(dfp, use_container_width=True, hide_index=True)
-            pid_default = int(dfp.iloc[0].get("payment_id") or dfp.iloc[0].get("id") or 1)
-            pid = st.number_input("payment_id to confirm", min_value=1, step=1, value=pid_default, key="pay_confirm_id")
+            pid_default = int(dfp.iloc[0].get("id") or 1)
+            pid = st.number_input("repayment id to confirm", min_value=1, step=1, value=pid_default, key="pay_confirm_id")
 
             if st.button("✅ Confirm Selected Payment", use_container_width=True, key="pay_confirm_btn"):
                 try:
                     core.confirm_payment(sb_service, schema, int(pid), confirmer=actor.user_id)
                     audit(
                         sb_service, "loan_payment_confirmed", "ok",
-                        {"payment_id": int(pid)}, actor_user_id=actor.user_id
+                        {"repayment_id": int(pid)}, actor_user_id=actor.user_id
                     )
                     st.success("Confirmed and applied.")
                     st.rerun()
@@ -444,8 +444,9 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
     elif section == "Reject Payments":
         require(actor.role, "reject_payment")
         st.subheader("Reject Payments (Checker)")
+
         pending = (
-            sb_service.schema(schema).table("loan_payments")
+            sb_service.schema(schema).table("repayments")
             .select("*").eq("status", "pending").order("paid_on", desc=True).limit(500)
             .execute().data or []
         )
@@ -454,8 +455,8 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
             st.success("No pending payments to reject.")
         else:
             st.dataframe(dfp, use_container_width=True, hide_index=True)
-            pid_default = int(dfp.iloc[0].get("payment_id") or dfp.iloc[0].get("id") or 1)
-            pid = st.number_input("payment_id to reject", min_value=1, step=1, value=pid_default, key="pay_reject_id")
+            pid_default = int(dfp.iloc[0].get("id") or 1)
+            pid = st.number_input("repayment id to reject", min_value=1, step=1, value=pid_default, key="pay_reject_id")
             reason = st.text_input("Reject reason", value="Invalid reference", key="pay_reject_reason")
 
             if st.button("❌ Reject Selected Payment", use_container_width=True, key="pay_reject_btn"):
@@ -463,7 +464,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                     core.reject_payment(sb_service, schema, int(pid), rejecter=actor.user_id, reason=reason)
                     audit(
                         sb_service, "loan_payment_rejected", "ok",
-                        {"payment_id": int(pid), "reason": reason}, actor_user_id=actor.user_id
+                        {"repayment_id": int(pid), "reason": reason}, actor_user_id=actor.user_id
                     )
                     st.success("Rejected.")
                     st.rerun()
@@ -514,7 +515,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
             return
 
         pays = (
-            sb_service.schema(schema).table("loan_payments")
+            sb_service.schema(schema).table("repayments")
             .select("loan_legacy_id,status,paid_on")
             .limit(20000).execute().data or []
         )
@@ -606,7 +607,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
             mpay = []
             if loan_ids:
                 mpay = (
-                    sb_service.schema(schema).table("loan_payments")
+                    sb_service.schema(schema).table("repayments")
                     .select("*").in_("loan_legacy_id", loan_ids)
                     .order("paid_on", desc=True).limit(5000)
                     .execute().data or []
@@ -666,7 +667,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                         mpay = []
                         if loan_ids:
                             mpay = (
-                                sb_service.schema(schema).table("loan_payments")
+                                sb_service.schema(schema).table("repayments")
                                 .select("*").in_("loan_legacy_id", loan_ids)
                                 .order("paid_on", desc=True).limit(5000)
                                 .execute().data or []
