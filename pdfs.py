@@ -1,11 +1,10 @@
-
 from __future__ import annotations
 
 from io import BytesIO
 from datetime import datetime, timezone
 import os
 import zipfile
-from typing import Dict, List, Any, Optional
+from typing import List, Optional, Dict, Any
 
 from reportlab.lib.pagesizes import LETTER
 from reportlab.pdfgen import canvas
@@ -32,32 +31,22 @@ def make_member_loan_statement_pdf(
     payments: List[dict],
     currency: str = "$",
     logo_path: str = "assets/logo.png",
+    statement_signature: Optional[Dict[str, Any]] = None,  # ✅ NEW
 ) -> bytes:
     """
-    member: {
-      "member_id": int, "member_name": str, "position": int|None
-    }
-    cycle_info: {
-      "payout_index": int|None, "payout_date": str|None,
-      "cycle_start": str|None, "cycle_end": str|None
-    }
-    loans: list of dicts, each ideally contains:
-      - id (loan_id)
-      - status
-      - principal (or amount/issued_amount)
-      - balance (or principal_current)
-      - total_due (optional)
-      - issued_at (optional)
-      - interest_percent (optional; if not present assume 5)
-    payments: list of dicts, each ideally contains:
-      - loan_id (or loan_legacy_id)
-      - amount
-      - paid_at/paid_on
-      - note (optional)
+    statement_signature (optional):
+      {
+        "role": "member_statement",
+        "signer_name": str,
+        "signer_member_id": int,
+        "signed_at": str,
+        "entity_id": int
+      }
     """
     buf = BytesIO()
     pdf = canvas.Canvas(buf, pagesize=LETTER)
     width, height = LETTER
+    left = 1 * inch
 
     # Logo
     if logo_path and os.path.exists(logo_path):
@@ -84,43 +73,43 @@ def make_member_loan_statement_pdf(
     # Member block
     y = height - 1.5 * inch
     pdf.setFont("Helvetica-Bold", 11)
-    pdf.drawString(1 * inch, y, "Member")
+    pdf.drawString(left, y, "Member")
     y -= 0.22 * inch
     pdf.setFont("Helvetica", 10)
-    pdf.drawString(1 * inch, y, f"ID: {member.get('member_id')}    Name: {member.get('member_name')}")
+    pdf.drawString(left, y, f"ID: {member.get('member_id')}    Name: {member.get('member_name')}")
     y -= 0.18 * inch
     if member.get("position") is not None:
-        pdf.drawString(1 * inch, y, f"Position: {member.get('position')}")
+        pdf.drawString(left, y, f"Position: {member.get('position')}")
         y -= 0.18 * inch
 
     # Cycle block
     y -= 0.10 * inch
     pdf.setFont("Helvetica-Bold", 11)
-    pdf.drawString(1 * inch, y, "Cycle")
+    pdf.drawString(left, y, "Cycle")
     y -= 0.22 * inch
     pdf.setFont("Helvetica", 10)
-    pdf.drawString(1 * inch, y, f"Payout Index: {cycle_info.get('payout_index')}")
+    pdf.drawString(left, y, f"Payout Index: {cycle_info.get('payout_index')}")
     y -= 0.18 * inch
-    pdf.drawString(1 * inch, y, f"Payout Date: {cycle_info.get('payout_date') or 'N/A'}")
+    pdf.drawString(left, y, f"Payout Date: {cycle_info.get('payout_date') or 'N/A'}")
     y -= 0.18 * inch
 
     # Loans summary
     y -= 0.10 * inch
     pdf.setFont("Helvetica-Bold", 11)
-    pdf.drawString(1 * inch, y, "Loans Summary")
+    pdf.drawString(left, y, "Loans Summary")
     y -= 0.22 * inch
-    pdf.setFont("Helvetica", 10)
 
     if not loans:
-        pdf.drawString(1 * inch, y, "No active loans on record for this member.")
+        pdf.setFont("Helvetica", 10)
+        pdf.drawString(left, y, "No loans on record for this member.")
         y -= 0.18 * inch
     else:
         # Table header
         pdf.setFont("Helvetica-Bold", 9)
-        pdf.drawString(1 * inch, y, "Loan ID")
-        pdf.drawString(2.1 * inch, y, "Status")
-        pdf.drawRightString(4.7 * inch, y, "Principal")
-        pdf.drawRightString(6.8 * inch, y, "Balance")
+        pdf.drawString(left, y, "Loan ID")
+        pdf.drawString(left + 1.1 * inch, y, "Status")
+        pdf.drawRightString(left + 3.7 * inch, y, "Principal")
+        pdf.drawRightString(left + 5.8 * inch, y, "Balance")
         y -= 0.18 * inch
         pdf.setFont("Helvetica", 9)
 
@@ -129,10 +118,10 @@ def make_member_loan_statement_pdf(
                 pdf.showPage()
                 y = height - 1.0 * inch
                 pdf.setFont("Helvetica-Bold", 9)
-                pdf.drawString(1 * inch, y, "Loan ID")
-                pdf.drawString(2.1 * inch, y, "Status")
-                pdf.drawRightString(4.7 * inch, y, "Principal")
-                pdf.drawRightString(6.8 * inch, y, "Balance")
+                pdf.drawString(left, y, "Loan ID")
+                pdf.drawString(left + 1.1 * inch, y, "Status")
+                pdf.drawRightString(left + 3.7 * inch, y, "Principal")
+                pdf.drawRightString(left + 5.8 * inch, y, "Balance")
                 y -= 0.18 * inch
                 pdf.setFont("Helvetica", 9)
 
@@ -141,27 +130,27 @@ def make_member_loan_statement_pdf(
             principal = ln.get("principal") or ln.get("amount") or ln.get("issued_amount") or 0
             balance = ln.get("balance") or ln.get("principal_current") or ln.get("total_due") or 0
 
-            pdf.drawString(1 * inch, y, str(loan_id))
-            pdf.drawString(2.1 * inch, y, status[:14])
-            pdf.drawRightString(4.7 * inch, y, _money(principal, currency))
-            pdf.drawRightString(6.8 * inch, y, _money(balance, currency))
+            pdf.drawString(left, y, str(loan_id))
+            pdf.drawString(left + 1.1 * inch, y, status[:14])
+            pdf.drawRightString(left + 3.7 * inch, y, _money(principal, currency))
+            pdf.drawRightString(left + 5.8 * inch, y, _money(balance, currency))
             y -= 0.16 * inch
 
     # Payments section
     y -= 0.20 * inch
     pdf.setFont("Helvetica-Bold", 11)
-    pdf.drawString(1 * inch, y, "Payments (Recent)")
+    pdf.drawString(left, y, "Payments (Recent)")
     y -= 0.22 * inch
-    pdf.setFont("Helvetica", 9)
 
     if not payments:
-        pdf.drawString(1 * inch, y, "No payments recorded.")
+        pdf.setFont("Helvetica", 10)
+        pdf.drawString(left, y, "No payments recorded.")
         y -= 0.18 * inch
     else:
         pdf.setFont("Helvetica-Bold", 9)
-        pdf.drawString(1 * inch, y, "Date")
-        pdf.drawString(2.2 * inch, y, "Loan")
-        pdf.drawRightString(6.8 * inch, y, "Amount")
+        pdf.drawString(left, y, "Date")
+        pdf.drawString(left + 1.2 * inch, y, "Loan")
+        pdf.drawRightString(left + 5.8 * inch, y, "Amount")
         y -= 0.18 * inch
         pdf.setFont("Helvetica", 9)
 
@@ -170,31 +159,47 @@ def make_member_loan_statement_pdf(
                 pdf.showPage()
                 y = height - 1.0 * inch
                 pdf.setFont("Helvetica-Bold", 9)
-                pdf.drawString(1 * inch, y, "Date")
-                pdf.drawString(2.2 * inch, y, "Loan")
-                pdf.drawRightString(6.8 * inch, y, "Amount")
+                pdf.drawString(left, y, "Date")
+                pdf.drawString(left + 1.2 * inch, y, "Loan")
+                pdf.drawRightString(left + 5.8 * inch, y, "Amount")
                 y -= 0.18 * inch
                 pdf.setFont("Helvetica", 9)
 
-            dt = str(p.get("paid_at") or p.get("paid_on") or "")[:10] or "—"
+            dt = str(p.get("paid_at") or p.get("paid_on") or p.get("created_at") or "")[:10] or "—"
             loan_id = p.get("loan_id") or p.get("loan_legacy_id") or "—"
             amt = p.get("amount") or 0
 
-            pdf.drawString(1 * inch, y, dt)
-            pdf.drawString(2.2 * inch, y, str(loan_id))
-            pdf.drawRightString(6.8 * inch, y, _money(amt, currency))
+            pdf.drawString(left, y, dt)
+            pdf.drawString(left + 1.2 * inch, y, str(loan_id))
+            pdf.drawRightString(left + 5.8 * inch, y, _money(amt, currency))
             y -= 0.16 * inch
 
-    # Signature lines (optional for member statements)
+    # Acknowledgement / Signature
     y -= 0.35 * inch
     pdf.setFont("Helvetica-Bold", 11)
-    pdf.drawString(1 * inch, y, "Acknowledgement (Optional)")
-    y -= 0.35 * inch
-    pdf.setFont("Helvetica", 10)
-    pdf.line(1 * inch, y, 3.7 * inch, y)
-    pdf.drawString(1 * inch, y - 0.18 * inch, "Member Signature")
-    pdf.line(4.1 * inch, y, 6.8 * inch, y)
-    pdf.drawString(4.1 * inch, y - 0.18 * inch, "Date")
+    pdf.drawString(left, y, "Acknowledgement (Optional)")
+    y -= 0.28 * inch
+
+    if statement_signature:
+        signer = str(statement_signature.get("signer_name", "") or "")
+        signed_at = str(statement_signature.get("signed_at", "") or "")[:19]
+
+        pdf.setFont("Helvetica-Bold", 10)
+        pdf.drawString(left, y, "Digitally Signed")
+        y -= 0.18 * inch
+
+        pdf.setFont("Helvetica", 10)
+        pdf.drawString(left, y, f"Signer: {signer}")
+        y -= 0.18 * inch
+        pdf.drawString(left, y, f"Signed at: {signed_at} UTC")
+        y -= 0.18 * inch
+    else:
+        pdf.setFont("Helvetica", 10)
+        pdf.line(left, y, left + 2.7 * inch, y)
+        pdf.drawString(left, y - 0.18 * inch, "Member Signature")
+        pdf.line(left + 3.1 * inch, y, left + 5.8 * inch, y)
+        pdf.drawString(left + 3.1 * inch, y - 0.18 * inch, "Date")
+        y -= 0.35 * inch
 
     pdf.showPage()
     pdf.save()
@@ -214,7 +219,8 @@ def make_loan_statements_zip(
       {
         "member": {"member_id":..., "member_name":..., "position":...},
         "loans": [...],
-        "payments": [...]
+        "payments": [...],
+        "statement_signature": {...}   # optional
       }
     Returns ZIP bytes containing one PDF per member with loans/payments.
     """
@@ -233,9 +239,14 @@ def make_loan_statements_zip(
                 payments=ms.get("payments") or [],
                 currency=currency,
                 logo_path=logo_path,
+                statement_signature=ms.get("statement_signature"),  # ✅ optional
             )
 
-            filename = f"loan_statement_{int(mid):02d}_{mname[:30]}.pdf" if mid is not None else f"loan_statement_{mname[:30]}.pdf"
+            filename = (
+                f"loan_statement_{int(mid):02d}_{mname[:30]}.pdf"
+                if mid is not None
+                else f"loan_statement_{mname[:30]}.pdf"
+            )
             zf.writestr(filename, pdf_bytes)
 
     zbuf.seek(0)
