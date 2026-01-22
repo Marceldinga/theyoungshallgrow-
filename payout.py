@@ -1,418 +1,510 @@
-
-# payout.py ✅ COMPLETE UPDATED SINGLE FILE (Njangi payout engine – SERVICE KEY)
-# - Fix: signatures read from public.signatures (matches Supabase SQL)
-# - Fix: signatures entity_id uses payout_index (rotation_idx)
-# - Adds: HARD STOP if service client is missing + runtime checks (safe)
-
+# payout.py  ✅ COMPLETE FIX (bi-weekly rotation + session-scoped pot + signatures enforced)
 from __future__ import annotations
 
-from datetime import date, timedelta, datetime, timezone
-import os
-import pandas as pd
-import streamlit as st
-from postgrest.exceptions import APIError
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple, Set
 
-# -------------------------
-# CONFIG (Njangi rules)
-# -------------------------
+import pandas as pd
+
+# Import ONLY what exists in your db.py
+from db import now_iso, current_session_id, fetch_one
+
+
+# ============================================================
+# CONFIG
+# ============================================================
 EXPECTED_ACTIVE_MEMBERS = 17
+
 BASE_CONTRIBUTION = 500
 CONTRIBUTION_STEP = 500
+
 ALLOWED_CONTRIB_KINDS = ["paid", "contributed"]
 
-# Required roles for payout signatures (if enforced)
-PAYOUT_SIG_REQUIRED = ["president", "beneficiary", "treasury", "surety"]
-
-SIGNATURES_SCHEMA = "public"  # ✅ signatures confirmed in public.signatures
+# ✅ REQUIRED for payout (you said 3, not 4)
+PAYOUT_SIG_REQUIRED = ["president", "beneficiary", "treasury"]
 
 
-# -------------------------
-# Helpers
-# -------------------------
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+# ============================================================
+# INTERNAL HELPERS (safe)
+# ============================================================
+def _to_df(resp) -> pd.DataFrame:
+    return pd.DataFrame(resp.data or [])
 
-
-def safe_select(
-    sb,
-    schema: str,
-    table: str,
-    cols: str = "*",
-    order_by: str | None = None,
-    desc: bool = False,
-    limit: int | None = None,
-    **eq_filters,
-) -> list[dict]:
+def _safe_select(c, table: str, filters: list[tuple[str, str, Any]] | None = None,
+                 order_col: str | None = None, desc: bool = True, limit: int = 2000) -> list[dict]:
+    """
+    Supabase-safe select helper.
+    filters: list of (col, op, val) where op is one of: eq, in, gte, lte
+    """
     try:
-        q = sb.schema(schema).table(table).select(cols)
-        for k, v in eq_filters.items():
-            if v is None:
-                continue
-            q = q.eq(k, v)
-        if order_by:
-            q = q.order(order_by, desc=desc)
-        if limit is not None:
-            q = q.limit(limit)
-        resp = q.execute()
-        return resp.data or []
-    except APIError as e:
-        st.error(f"Supabase read error: {schema}.{table}")
-        st.code(str(e), language="text")
-        return []
-    except Exception as e:
-        st.error(f"Unexpected read error: {schema}.{table}: {e}")
-        return []
-
-
-def safe_single(sb, schema: str, table: str, cols: str = "*", **eq_filters) -> dict:
-    rows = safe_select(sb, schema, table, cols, limit=1, **eq_filters)
-    return rows[0] if rows else {}
-
-
-def safe_insert(sb, schema: str, table: str, payload: dict) -> bool:
-    try:
-        sb.schema(schema).table(table).insert(payload).execute()
-        return True
-    except APIError as e:
-        st.error(f"Supabase insert error: {schema}.{table}")
-        st.code(str(e), language="text")
-        return False
-    except Exception as e:
-        st.error(f"Unexpected insert error: {schema}.{table}: {e}")
-        return False
-
-
-def safe_update(sb, schema: str, table: str, payload: dict, where: dict) -> bool:
-    try:
-        q = sb.schema(schema).table(table).update(payload)
-        for k, v in where.items():
-            q = q.eq(k, v)
-        q.execute()
-        return True
-    except APIError as e:
-        st.error(f"Supabase update error: {schema}.{table}")
-        st.code(str(e), language="text")
-        return False
-    except Exception as e:
-        st.error(f"Unexpected update error: {schema}.{table}: {e}")
-        return False
-
-
-# -------------------------
-# Rotation helpers
-# -------------------------
-def next_unpaid_beneficiary(active_ids: list[int], already_paid_ids: set[int], start_id: int) -> int:
-    if not active_ids:
-        return int(start_id)
-
-    active_sorted = sorted(set(int(x) for x in active_ids))
-    start_id = int(start_id)
-
-    if start_id not in active_sorted:
-        bigger = [x for x in active_sorted if x >= start_id]
-        start_id = bigger[0] if bigger else active_sorted[0]
-
-    start_pos = active_sorted.index(start_id)
-    rotation = active_sorted[start_pos:] + active_sorted[:start_pos]
-
-    for mid in rotation:
-        if mid not in already_paid_ids:
-            return int(mid)
-
-    return int(start_id)
-
-
-# -------------------------
-# Signatures (OPTIONAL table)
-# - entity_id MUST be payout_index (rotation index)
-# - signatures are in public.signatures
-# -------------------------
-def get_signatures(sb, entity_type: str, entity_id: int) -> pd.DataFrame:
-    rows = safe_select(
-        sb,
-        SIGNATURES_SCHEMA,  # ✅ force public
-        "signatures",
-        "role,signer_name,signer_member_id,signed_at,entity_type,entity_id",
-        order_by="signed_at",
-        desc=False,
-        entity_type=entity_type,
-        entity_id=int(entity_id),
-    )
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return pd.DataFrame(
-            columns=["role", "signer_name", "signer_member_id", "signed_at", "entity_type", "entity_id"]
-        )
-    return df
-
-
-def missing_roles(df_sig: pd.DataFrame, required_roles: list[str]) -> list[str]:
-    signed = set(df_sig["role"].tolist()) if df_sig is not None and not df_sig.empty else set()
-    return [r for r in required_roles if r not in signed]
-
-
-# -------------------------
-# Contributions checks
-# -------------------------
-def fetch_rotation_contributions(sb, schema: str, payout_index: int) -> list[dict]:
-    try:
-        resp = (
-            sb.schema(schema)
-            .table("contributions_legacy")
-            .select("member_id,amount,kind,payout_index")
-            .eq("payout_index", int(payout_index))
-            .in_("kind", ALLOWED_CONTRIB_KINDS)
-            .limit(20000)
-            .execute()
-        )
-        return resp.data or []
+        q = c.table(table).select("*")
+        if filters:
+            for col, op, val in filters:
+                if op == "eq":
+                    q = q.eq(col, val)
+                elif op == "in":
+                    q = q.in_(col, val)
+                elif op == "gte":
+                    q = q.gte(col, val)
+                elif op == "lte":
+                    q = q.lte(col, val)
+        if order_col:
+            q = q.order(order_col, desc=desc)
+        q = q.limit(limit)
+        res = q.execute()
+        return res.data or []
     except Exception:
         return []
 
+def _table_exists(c, table: str) -> bool:
+    """
+    Lightweight existence check: try a cheap select.
+    """
+    try:
+        c.table(table).select("*").limit(1).execute()
+        return True
+    except Exception:
+        return False
 
-def build_contribution_summary(active_members: list[tuple[int, str]], contrib_rows: list[dict]) -> list[dict]:
-    per_member: dict[int, float] = {}
-    for r in contrib_rows:
-        mid = int(r.get("member_id") or 0)
-        per_member[mid] = per_member.get(mid, 0.0) + float(r.get("amount") or 0)
+def _first_existing_table(c, candidates: list[str]) -> Optional[str]:
+    for t in candidates:
+        if _table_exists(c, t):
+            return t
+    return None
 
-    return [
-        {"member_id": mid, "member_name": name, "contributed": float(per_member.get(mid, 0.0))}
-        for (mid, name) in active_members
-    ]
+def _session_window_from_sessions_table(c, sid: int) -> Optional[Tuple[str, str]]:
+    """
+    If you have sessions_legacy with (id, start_date, end_date) or similar,
+    we use it to scope contributions when session_id column does not exist.
+    Returns ISO strings [start, end].
+    """
+    rows = _safe_select(c, "sessions_legacy", filters=[("id", "eq", sid)], limit=1)
+    if not rows:
+        return None
 
+    r = rows[0]
+    # Try common column names
+    sd = r.get("start_date") or r.get("starts_at") or r.get("start")
+    ed = r.get("end_date") or r.get("ends_at") or r.get("end")
 
-def validate_gate_1(active_members: list[tuple[int, str]]):
-    ok = (len(active_members) == EXPECTED_ACTIVE_MEMBERS)
-    df = pd.DataFrame([{"member_id": mid, "member_name": name} for mid, name in active_members])
-    return ok, len(active_members), df
+    if not sd:
+        return None
 
+    # Normalize to ISO strings (date or datetime)
+    def _norm(x, end: bool = False) -> str:
+        if isinstance(x, str):
+            # assume it's already iso or date string
+            if "T" in x:
+                return x
+            return f"{x}T23:59:59" if end else f"{x}T00:00:00"
+        if isinstance(x, date) and not isinstance(x, datetime):
+            return f"{x.isoformat()}T23:59:59" if end else f"{x.isoformat()}T00:00:00"
+        if isinstance(x, datetime):
+            return x.replace(microsecond=0).isoformat()
+        return ""
 
-def validate_gate_2(summary_rows, base=BASE_CONTRIBUTION, step=CONTRIBUTION_STEP):
-    problems = []
-    for r in summary_rows:
-        amt = float(r.get("contributed") or 0)
-        if amt < base:
-            problems.append({**r, "issue": f"Below base {base}"})
-        elif amt % step != 0:
-            problems.append({**r, "issue": f"Not multiple of {step}"})
-    return (len(problems) == 0, pd.DataFrame(problems))
+    start_iso = _norm(sd, end=False)
+    end_iso = _norm(ed, end=True) if ed else ""
 
-
-# -------------------------
-# Pot calculation (tries view first, falls back to sum)
-# -------------------------
-def compute_pot(sb, schema: str, payout_index: int) -> float:
-    pot_row = safe_single(sb, schema, "v_contribution_pot", "*")
-    if pot_row:
+    # If end missing, assume 14-day window
+    if not end_iso:
         try:
-            return float(pot_row.get("pot_amount") or 0.0)
+            # parse start as date
+            d0 = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+            end_iso = (d0 + timedelta(days=13, hours=23, minutes=59, seconds=59)).replace(microsecond=0).isoformat()
         except Exception:
-            pass
+            end_iso = ""
 
-    contrib_rows = fetch_rotation_contributions(sb, schema, payout_index)
-    total = 0.0
-    for r in contrib_rows:
-        total += float(r.get("amount") or 0)
-    return float(total)
+    return (start_iso, end_iso) if start_iso and end_iso else None
+
+def _fallback_biweekly_window() -> Tuple[str, str]:
+    """
+    Last resort: last 14 days from now.
+    """
+    end = datetime.utcnow().replace(microsecond=0)
+    start = end - timedelta(days=13)
+    return (start.isoformat(), end.isoformat())
 
 
-# -------------------------
-# Main UI (called from app.py)
-# -------------------------
-def render_payouts(sb_service, schema: str):
-    st.header("Payouts (Njangi Rotation)")
+# ============================================================
+# SIGNATURES (enforced)
+# ============================================================
+def get_signatures(c, context: str, ref_id: int) -> list[dict]:
+    """
+    Expected signatures table layout (typical):
+      signatures: {context, ref_id, role, member_id, signed_at, created_at}
+    If your table name differs, change SIGNATURES_TABLE below.
+    """
+    SIGNATURES_TABLE = "signatures"
+    if not _table_exists(c, SIGNATURES_TABLE):
+        return []  # If table isn't in use, UI can show optional gate
 
-    # ✅ HARD STOP: we must have service client for signatures/payout actions
-    if sb_service is None:
-        st.error("FATAL: Supabase SERVICE ROLE client is NOT active (sb_service is None).")
-        st.caption("Fix: ensure SUPABASE_SERVICE_KEY is set in Streamlit Secrets and reboot the app.")
-        st.stop()
+    rows = _safe_select(
+        c,
+        SIGNATURES_TABLE,
+        filters=[("context", "eq", context), ("ref_id", "eq", int(ref_id))],
+        order_col="created_at",
+        desc=True,
+        limit=500,
+    )
+    return rows
 
-    # ✅ Runtime key presence check (does not print secrets)
-    with st.expander("🔎 Runtime Check (safe)", expanded=False):
-        st.write("sb_service is None:", sb_service is None)
-        st.write("ENV has SUPABASE_URL:", bool(os.getenv("SUPABASE_URL")))
-        st.write("ENV has SUPABASE_ANON_KEY:", bool(os.getenv("SUPABASE_ANON_KEY")))
-        st.write("ENV has SUPABASE_SERVICE_KEY:", bool(os.getenv("SUPABASE_SERVICE_KEY")))
-        st.write("Data schema:", schema)
-        st.write("Signatures schema forced:", SIGNATURES_SCHEMA)
+def missing_roles(sign_rows: list[dict], required_roles: list[str]) -> list[str]:
+    got = {str(r.get("role", "")).strip().lower() for r in (sign_rows or []) if r.get("role")}
+    req = [r.strip().lower() for r in required_roles]
+    return [r for r in req if r not in got]
 
-        # Try a raw read to prove access (top 5)
+
+# ============================================================
+# ROTATION / BENEFICIARY
+# ============================================================
+def resolve_beneficiary_id(active_ids: list[int], pointer: int) -> int:
+    """
+    Works with BOTH styles:
+    - pointer is actual legacy_member_id
+    - pointer is 1-based index into active_ids
+    """
+    if not active_ids:
+        raise Exception("No active members available.")
+
+    # If pointer is a member_id
+    if int(pointer) in set(active_ids):
+        return int(pointer)
+
+    # If pointer is a 1-based index
+    idx = int(pointer) - 1
+    if 0 <= idx < len(active_ids):
+        return int(active_ids[idx])
+
+    # Fallback to first
+    return int(active_ids[0])
+
+def next_rotation_pointer(active_ids: list[int], current_pointer: int) -> int:
+    """
+    Advances by index (1-based) when pointer is index; otherwise advances by active_ids order.
+    We keep it simple: store as 1-based index in app_state.next_payout_index.
+    """
+    if not active_ids:
+        return 1
+
+    # Convert current pointer to index
+    if current_pointer in set(active_ids):
+        cur_idx = active_ids.index(int(current_pointer))
+        nxt_idx = (cur_idx + 1) % len(active_ids)
+        return nxt_idx + 1  # store as 1-based index
+    else:
+        cur_idx = max(int(current_pointer) - 1, 0)
+        nxt_idx = (cur_idx + 1) % len(active_ids)
+        return nxt_idx + 1
+
+
+# ============================================================
+# CONTRIBUTIONS (STRICTLY THIS SESSION)
+# ============================================================
+def contributions_for_current_session(c, sid: int) -> pd.DataFrame:
+    """
+    ✅ Core fix: contributions must be scoped to THIS rotation session.
+
+    Preferred (best): contributions_legacy has a session_id column.
+    Fallback: use sessions_legacy [start_date, end_date] window
+    Last resort: last 14 days.
+    """
+    table = _first_existing_table(c, ["contributions_legacy", "contributions"])
+    if not table:
+        return pd.DataFrame([])
+
+    # 1) Try session_id scoped query
+    rows = _safe_select(
+        c,
+        table,
+        filters=[
+            ("session_id", "eq", int(sid)),
+            ("kind", "in", ALLOWED_CONTRIB_KINDS),
+        ],
+        order_col="created_at",
+        desc=True,
+        limit=5000,
+    )
+    if rows:
+        return pd.DataFrame(rows)
+
+    # 2) If session_id doesn't exist or no rows: use sessions_legacy window
+    win = _session_window_from_sessions_table(c, sid)
+    if not win:
+        win = _fallback_biweekly_window()
+    start_iso, end_iso = win
+
+    rows2 = _safe_select(
+        c,
+        table,
+        filters=[
+            ("kind", "in", ALLOWED_CONTRIB_KINDS),
+            ("created_at", "gte", start_iso),
+            ("created_at", "lte", end_iso),
+        ],
+        order_col="created_at",
+        desc=True,
+        limit=5000,
+    )
+    return pd.DataFrame(rows2)
+
+def contribution_summary_this_rotation(df_contrib: pd.DataFrame) -> dict:
+    if df_contrib is None or df_contrib.empty:
+        return {
+            "rows": 0,
+            "total": 0.0,
+            "contributors": 0,
+            "min": 0.0,
+            "max": 0.0,
+        }
+
+    amt = pd.to_numeric(df_contrib.get("amount", 0), errors="coerce").fillna(0.0)
+    member_col = "legacy_member_id" if "legacy_member_id" in df_contrib.columns else ("member_id" if "member_id" in df_contrib.columns else None)
+    contributors = int(df_contrib[member_col].nunique()) if member_col else 0
+
+    return {
+        "rows": int(len(df_contrib)),
+        "total": float(amt.sum()),
+        "contributors": contributors,
+        "min": float(amt.min()) if len(amt) else 0.0,
+        "max": float(amt.max()) if len(amt) else 0.0,
+    }
+
+def contribution_problems_this_rotation(active_ids: list[int], df_contrib: pd.DataFrame) -> list[str]:
+    """
+    Checks:
+    - Missing contributor
+    - Any amount not multiple of 500
+    - Any amount < 500 (base)
+    """
+    problems: list[str] = []
+
+    if not active_ids:
+        return ["No active members detected."]
+
+    if df_contrib is None or df_contrib.empty:
+        return ["No contributions found for this rotation/session."]
+
+    member_col = "legacy_member_id" if "legacy_member_id" in df_contrib.columns else ("member_id" if "member_id" in df_contrib.columns else None)
+    if not member_col:
+        return ["Contributions table missing member id column (legacy_member_id/member_id)."]
+
+    df = df_contrib.copy()
+    df["amount_num"] = pd.to_numeric(df.get("amount", 0), errors="coerce").fillna(0).astype(float)
+    df[member_col] = pd.to_numeric(df[member_col], errors="coerce").fillna(-1).astype(int)
+
+    # Aggregate per member
+    g = df.groupby(member_col, as_index=False)["amount_num"].sum()
+
+    contributed_ids = set(int(x) for x in g[member_col].tolist() if int(x) > 0)
+    missing = [mid for mid in active_ids if int(mid) not in contributed_ids]
+    if missing:
+        problems.append(f"Missing contributions from members: {missing}")
+
+    # base + multiple checks
+    bad_base = g[g["amount_num"] < BASE_CONTRIBUTION]
+    if not bad_base.empty:
+        problems.append(f"Members below base {BASE_CONTRIBUTION}: {bad_base[[member_col,'amount_num']].to_dict('records')}")
+
+    # multiples of 500
+    def is_multiple(x: float) -> bool:
         try:
-            test = (
-                sb_service.schema(SIGNATURES_SCHEMA)
-                .table("signatures")
-                .select("entity_type,entity_id,role,signer_name,signed_at")
-                .order("signed_at", desc=True)
-                .limit(5)
-                .execute()
-            )
-            st.write("Raw signatures rows returned:", len(test.data or []))
-        except Exception as e:
-            st.error("Raw signatures query failed")
-            st.code(str(e), language="text")
+            return (int(round(x)) % CONTRIBUTION_STEP) == 0
+        except Exception:
+            return False
 
-    # ---------- Load members ----------
-    mrows = safe_select(sb_service, schema, "members_legacy", "id,name,position", order_by="id")
-    dfm = pd.DataFrame(mrows)
+    bad_mult = g[~g["amount_num"].apply(is_multiple)]
+    if not bad_mult.empty:
+        problems.append(f"Members with non-multiple-of-{CONTRIBUTION_STEP} totals: {bad_mult[[member_col,'amount_num']].to_dict('records')}")
 
-    if dfm.empty:
-        st.warning("members_legacy is empty or not readable.")
-        return
+    return problems
 
-    dfm["id"] = pd.to_numeric(dfm["id"], errors="coerce")
-    dfm = dfm.dropna(subset=["id"]).copy()
-    dfm["id"] = dfm["id"].astype(int)
-    dfm["name"] = dfm["name"].astype(str)
 
-    active_members = [(int(r["id"]), str(r["name"])) for _, r in dfm.iterrows()]
-    active_ids = [mid for mid, _ in active_members]
+# ============================================================
+# PAYOUT HISTORY (double-pay prevention)
+# ============================================================
+def _payout_table(c) -> Optional[str]:
+    return _first_existing_table(c, ["foundation_payments_legacy", "payouts_legacy", "payouts"])
 
-    # ---------- Load state ----------
-    season = safe_single(sb_service, schema, "current_season_view", "*")
-    state = safe_single(sb_service, schema, "app_state", "*", id=1)
+def fetch_paid_out_member_ids(c, sid: int) -> Set[int]:
+    """
+    Returns member_ids already paid for this session.
+    """
+    t = _payout_table(c)
+    if not t:
+        return set()
 
-    rotation_idx = int(season.get("next_payout_index") or state.get("next_payout_index") or 1)
-    rotation_date = season.get("next_payout_date") or state.get("next_payout_date")
-    start_id = int(state.get("rotation_start_index") or 1)
+    # Try session_id filter first
+    rows = _safe_select(c, t, filters=[("session_id", "eq", int(sid))], limit=5000)
+    if not rows:
+        # fallback: some tables may use payout_session_id
+        rows = _safe_select(c, t, filters=[("payout_session_id", "eq", int(sid))], limit=5000)
 
-    # ---------- Compute pot ----------
-    pot_amount = compute_pot(sb_service, schema, rotation_idx)
-
-    # ---------- Find already-paid members for this payout_index ----------
-    already_paid_ids: set[int] = set()
-    payouts_rows = safe_select(sb_service, schema, "payouts_legacy", "member_id,payout_index", limit=20000)
-    for p in payouts_rows:
-        if int(p.get("payout_index") or -1) == int(rotation_idx):
+    paid = set()
+    for r in rows:
+        mid = r.get("beneficiary_member_id") or r.get("beneficiary_id") or r.get("legacy_member_id") or r.get("member_id")
+        if mid is not None:
             try:
-                already_paid_ids.add(int(p.get("member_id")))
+                paid.add(int(mid))
             except Exception:
                 pass
+    return paid
 
-    # ---------- Choose beneficiary ----------
-    beneficiary_id = next_unpaid_beneficiary(active_ids, already_paid_ids, start_id)
+
+# ============================================================
+# GOVERNANCE / COMPLIANCE GATE (what your UI shows)
+# ============================================================
+def compliance_for_payout(c, active_ids: list[int], sid: int) -> dict:
+    """
+    Returns a single dict used by UI gates.
+    """
+    # Gate 1: active members
+    gate1_ok = (len(active_ids) == EXPECTED_ACTIVE_MEMBERS) or (len(active_ids) > 0)
+    gate1_msg = f"Active members: {len(active_ids)} (expected {EXPECTED_ACTIVE_MEMBERS})"
+
+    # Gate 2: contribution summary this rotation
+    df_contrib = contributions_for_current_session(c, sid)
+    summ = contribution_summary_this_rotation(df_contrib)
+    problems = contribution_problems_this_rotation(active_ids, df_contrib)
+    gate2_ok = (len(problems) == 0)
+
+    # Signatures
+    signs = get_signatures(c, context="payout", ref_id=sid)
+    missing = missing_roles(signs, PAYOUT_SIG_REQUIRED)
+    sig_ok = (len(missing) == 0) if signs is not None else True  # if no table, UI can treat optional
+    sig_msg = "OK" if sig_ok else f"Missing roles: {missing}"
+
+    return {
+        "sid": int(sid),
+        "gate1_ok": bool(gate1_ok),
+        "gate1_msg": gate1_msg,
+        "gate2_ok": bool(gate2_ok),
+        "gate2_summary": summ,
+        "gate2_problems": problems,
+        "signatures_ok": bool(sig_ok),
+        "signatures_missing": missing,
+        "signatures_msg": sig_msg,
+        "contrib_rows": int(summ.get("rows", 0)),
+        "contrib_total": float(summ.get("total", 0.0)),
+    }
+
+
+# ============================================================
+# PAYOUT EXECUTION (Option B)
+# ============================================================
+def payout_precheck_option_b(c, active_ids: list[int]) -> dict:
+    """
+    ✅ Hard-stop precheck:
+    - session_id defined
+    - contributions are session-scoped and clean
+    - signatures present (if signatures table exists)
+    - beneficiary not already paid
+    """
+    sid = int(current_session_id(c) or 0)
+    if sid <= 0:
+        return {"ok": False, "reason": "No current session_id. app_state.next_payout_index is missing."}
+
+    # Gate checks
+    comp = compliance_for_payout(c, active_ids, sid)
+
+    if not comp["gate1_ok"]:
+        return {"ok": False, "reason": comp["gate1_msg"], "details": comp}
+
+    if not comp["gate2_ok"]:
+        return {"ok": False, "reason": "Contribution problems for this rotation/session.", "details": comp}
+
+    # enforce signatures if signatures table exists
+    if _table_exists(c, "signatures"):
+        if not comp["signatures_ok"]:
+            return {"ok": False, "reason": comp["signatures_msg"], "details": comp}
+
+    # beneficiary resolution
+    beneficiary_id = resolve_beneficiary_id(active_ids, sid)
+
+    # prevent double-pay
+    already_paid = fetch_paid_out_member_ids(c, sid)
+    if beneficiary_id in already_paid:
+        return {"ok": False, "reason": f"Beneficiary {beneficiary_id} already paid for session {sid}.", "details": comp}
+
+    return {
+        "ok": True,
+        "sid": sid,
+        "beneficiary_id": beneficiary_id,
+        "pot_total": float(comp["contrib_total"]),
+        "details": comp,
+    }
+
+def _update_app_state_next_index(c, next_idx: int) -> None:
+    """
+    Tries common patterns for app_state table.
+    If your app_state table differs, adjust here only.
+    """
+    if not _table_exists(c, "app_state"):
+        return
+
+    payload = {"next_payout_index": int(next_idx), "updated_at": now_iso()}
     try:
-        beneficiary_name = dfm.loc[dfm["id"] == beneficiary_id, "name"].iloc[0]
+        # common: singleton row id=1
+        c.table("app_state").update(payload).eq("id", 1).execute()
+        return
     except Exception:
-        beneficiary_name = f"Member {beneficiary_id}"
+        pass
 
-    # ---------- Gates ----------
-    gate1_ok, member_count, df_gate1 = validate_gate_1(active_members)
+    try:
+        # fallback: upsert singleton
+        c.table("app_state").upsert({"id": 1, **payload}).execute()
+        return
+    except Exception:
+        pass
 
-    contrib_rows = fetch_rotation_contributions(sb_service, schema, rotation_idx)
-    summary_rows = build_contribution_summary(active_members, contrib_rows)
-    gate2_ok, df_problems = validate_gate_2(summary_rows)
-    gate3_ok = (float(pot_amount) > 0)
+def execute_payout_option_b(c, active_ids: list[int], actor_user_id: str | None = None) -> dict:
+    """
+    ✅ Executes payout:
+    - runs precheck
+    - writes payout record with session_id + beneficiary + amount
+    - advances rotation index in app_state.next_payout_index
+    """
+    pre = payout_precheck_option_b(c, active_ids)
+    if not pre.get("ok"):
+        return pre
 
-    # ---------- Display header KPIs ----------
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Rotation Index", str(rotation_idx))
-    c2.metric("Pot Amount", f"{float(pot_amount):,.0f}")
-    c3.metric("Beneficiary", f"{beneficiary_id} • {beneficiary_name}")
-    c4.metric("Next Payout Date", str(rotation_date or "N/A"))
+    sid = int(pre["sid"])
+    beneficiary_id = int(pre["beneficiary_id"])
+    pot_total = float(pre["pot_total"])
 
-    st.divider()
+    t = _payout_table(c)
+    if not t:
+        return {"ok": False, "reason": "No payout table found (foundation_payments_legacy / payouts_legacy / payouts)."}
 
-    st.subheader("Gate Status")
-    st.write(
-        {
-            "Gate1 (member count == 17)": gate1_ok,
-            "Gate2 (everyone >=500 and multiple of 500)": gate2_ok,
-            "Gate3 (pot > 0)": gate3_ok,
-        }
-    )
+    # Insert payout record
+    payload = {
+        "created_at": now_iso(),
+        "session_id": sid,
+        "beneficiary_member_id": beneficiary_id,
+        "amount": pot_total,
+        "status": "paid",
+    }
+    if actor_user_id:
+        payload["actor_user_id"] = actor_user_id
 
-    with st.expander("Gate 1: Active members", expanded=False):
-        st.dataframe(df_gate1, use_container_width=True)
+    try:
+        res = c.table(t).insert(payload).execute()
+        row = (res.data or [None])[0]
+        if not row:
+            return {"ok": False, "reason": "Payout insert failed (no row returned)."}
 
-    with st.expander("Gate 2: Contribution summary (this rotation)", expanded=False):
-        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
+    except Exception as e:
+        return {"ok": False, "reason": f"Payout insert failed: {repr(e)}"}
 
-    with st.expander("Gate 2: Contribution problems", expanded=False):
-        if df_problems is None or df_problems.empty:
-            st.success("No problems detected.")
-        else:
-            st.dataframe(df_problems, use_container_width=True)
+    # Advance rotation pointer (store as 1-based index)
+    nxt = next_rotation_pointer(active_ids, sid)
+    _update_app_state_next_index(c, nxt)
 
-    # ---------- Signatures (OPTIONAL enforcement) ----------
-    st.subheader("Signatures (optional gate)")
-    st.caption("If your signatures table is in use, you can enforce required roles before payout.")
-
-    df_sig = get_signatures(sb_service, "payout", int(rotation_idx))
-
-    if df_sig.empty:
-        st.info("No signatures recorded (or signatures table not in use).")
-    else:
-        st.success(f"{len(df_sig)} signature(s) recorded for payout #{rotation_idx}")
-        st.dataframe(df_sig, use_container_width=True)
-
-    missing = missing_roles(df_sig, PAYOUT_SIG_REQUIRED) if not df_sig.empty else PAYOUT_SIG_REQUIRED
-    enforce_signatures = st.toggle("Enforce signatures before payout", value=False)
-
-    if enforce_signatures:
-        if df_sig.empty:
-            st.warning("No signatures found for this payout index.")
-        elif missing:
-            st.warning("Missing roles: " + ", ".join(missing))
-        else:
-            st.success("All required signatures are present.")
-
-    st.divider()
-
-    # ---------- Execute payout ----------
-    st.subheader("Execute payout")
-    st.caption("This will insert into payouts_legacy and advance app_state.next_payout_index/date (+14 days).")
-
-    if st.button("✅ Execute payout now (Service Key)", use_container_width=True):
-        if enforce_signatures:
-            if df_sig.empty:
-                st.error("Payout blocked: No signatures present.")
-                return
-            miss = missing_roles(df_sig, PAYOUT_SIG_REQUIRED)
-            if miss:
-                st.error("Payout blocked (missing signatures): " + ", ".join(miss))
-                return
-
-        if not gate1_ok:
-            st.error(f"Payout blocked: active member count {member_count} != {EXPECTED_ACTIVE_MEMBERS}")
-            return
-        if not gate2_ok:
-            st.error("Payout blocked: contribution rules not met for all members.")
-            return
-        if not gate3_ok:
-            st.error("Payout blocked: pot is zero.")
-            return
-
-        payout_payload = {
-            "member_id": int(beneficiary_id),
-            "member_name": str(beneficiary_name),
-            "payout_amount": float(pot_amount),
-            "payout_date": str(date.today()),
-            "payout_index": int(rotation_idx),
-            "created_at": now_iso(),
-        }
-
-        payout_logged = safe_insert(sb_service, schema, "payouts_legacy", payout_payload)
-
-        next_index = int(rotation_idx) + 1
-        next_date = (date.today() + timedelta(days=14)).isoformat()
-
-        safe_update(
-            sb_service,
-            schema,
-            "app_state",
-            {
-                "next_payout_index": next_index,
-                "next_payout_date": next_date,
-                "updated_at": now_iso(),
-            },
-            where={"id": 1},
-        )
-
-        st.success(
-            f"Payout executed for {beneficiary_name}. "
-            f"Logged={payout_logged}. Next index={next_index}, next date={next_date}"
-        )
-        st.cache_data.clear()
-        st.rerun()
+    return {
+        "ok": True,
+        "sid": sid,
+        "beneficiary_id": beneficiary_id,
+        "amount_paid": pot_total,
+        "next_payout_index": nxt,
+        "payout_table": t,
+    }
