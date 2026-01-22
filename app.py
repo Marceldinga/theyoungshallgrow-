@@ -4,6 +4,7 @@
 # - ✅ Dashboard now rendered by dashboard_panel.render_dashboard (beautiful standard dashboard)
 # - Loans entry works with loans.py wrapper (show_loans or render_loans)
 # - Minutes & Attendance upgraded: PDFs + Bulk attendance + Summaries + session_number link
+# - ✅ FIXED: safe_select now supports filters like meeting_date=...
 # - Avoids crashes if a module is missing
 
 from __future__ import annotations
@@ -99,6 +100,7 @@ st.title(f"🏦 {APP_BRAND} • Bank Dashboard")
 
 # ============================================================
 # SAFE QUERY HELPER (used by Minutes & Attendance page)
+# ✅ FIXED: supports filters like meeting_date=...
 # ============================================================
 def safe_select(
     client,
@@ -108,15 +110,25 @@ def safe_select(
     order_by: str | None = None,
     order_desc: bool = False,
     limit: int | None = None,
+    **filters,  # ✅ allow meeting_date=..., legacy_member_id=..., etc.
 ) -> list[dict]:
     try:
         q = client.schema(schema).table(table_name).select(select_cols)
+
+        # ✅ Apply equality filters
+        for col, val in (filters or {}).items():
+            if val is None:
+                continue
+            q = q.eq(col, val)
+
         if order_by:
             q = q.order(order_by, desc=order_desc)
         if limit is not None:
             q = q.limit(limit)
+
         resp = q.execute()
         return resp.data or []
+
     except APIError as e:
         st.error(f"Supabase APIError reading {schema}.{table_name}")
         st.code(str(e), language="text")
