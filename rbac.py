@@ -1,5 +1,14 @@
+# rbac.py ✅ COMPLETE UPDATED (matches your existing permission names)
+# Fixes your errors:
+# - Permission denied: requests/ledger/interest/delinquency for role 'admin'
+# - Aligns loans_ui.py require(...) calls with the PERMISSIONS you already use
+#
+# Key idea:
+# loans_ui.py should call require(role, "<one of these perms>"):
+#   view_ledger, submit_request, sign_request, approve_deny,
+#   record_payment, confirm_payment, reject_payment, accrue_interest,
+#   view_delinquency, loan_statement, download_all_statements, legacy_loan_repayment
 
-# rbac.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -24,6 +33,7 @@ PERMISSIONS: dict[str, set[str]] = {
         "view_delinquency",
         "loan_statement",
         "download_all_statements",
+        "legacy_loan_repayment",   # ✅ NEW: legacy repayments insert screen
     },
     ROLE_TREASURY: {
         "view_ledger",
@@ -36,13 +46,17 @@ PERMISSIONS: dict[str, set[str]] = {
         "view_delinquency",
         "loan_statement",
         "download_all_statements",
+        "legacy_loan_repayment",   # ✅ allow treasury too
     },
     ROLE_MEMBER: {
         "submit_request",
         "sign_request",
         "loan_statement",
+        # Optional: allow members to view ledger read-only (comment in if you want)
+        # "view_ledger",
     },
 }
+
 
 @dataclass(frozen=True)
 class Actor:
@@ -103,21 +117,33 @@ def allowed_sections(actor_role: str) -> list[str]:
     perms = PERMISSIONS.get(normalize_role(actor_role), set())
     sections: list[str] = []
 
-    if "submit_request" in perms or "sign_request" in perms:
+    # Requests screen exists if user can submit/sign/approve
+    if {"submit_request", "sign_request", "approve_deny"} & perms:
         sections.append("Requests")
+
     if "view_ledger" in perms:
         sections.append("Ledger")
+
     if "record_payment" in perms:
         sections.append("Record Payment")
+
     if "confirm_payment" in perms:
         sections.append("Confirm Payments")
+
     if "reject_payment" in perms:
         sections.append("Reject Payments")
+
     if "accrue_interest" in perms:
         sections.append("Interest")
+
     if "view_delinquency" in perms:
         sections.append("Delinquency")
+
     if "loan_statement" in perms:
         sections.append("Loan Statement")
+
+    # Legacy repayment insert (admin/treasury)
+    if "legacy_loan_repayment" in perms:
+        sections.append("Loan Repayment (Legacy)")
 
     return sections
