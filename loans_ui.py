@@ -1,12 +1,13 @@
-# loans_ui.py ✅ COMPLETE UPDATED
+# loans_ui.py ✅ COMPLETE UPDATED (uses loan_repayments for loan-linked payments)
 # Fixes:
-# - Permission errors (RBAC perms now match rbac.py)
+# - Permission errors (RBAC perms match rbac.py)
 # - Delinquency NaT crash (safe loan_id parsing)
 # - Record Payment "Loan not found" (select existing loan)
+# - ✅ Writes/reads loan repayments from loan_repayments (NOT historical repayments table)
 # Includes:
 # - Requests (create + list + signatures + admin approve/deny)
 # - Ledger (loans_legacy table)
-# - Record Payment (repayments insert via core.record_payment_pending)
+# - Record Payment (loan_repayments insert via core.record_payment_pending)
 # - Confirm/Reject (schema locked; UI explains)
 # - Interest (core.accrue_monthly_interest)
 # - Delinquency (simple DPD)
@@ -39,7 +40,8 @@ except Exception:
     def audit(*args, **kwargs):
         return None
 
-PAYMENTS_TABLE = "repayments"
+# ✅ Loan-linked repayments table (strict)
+PAYMENTS_TABLE = "loan_repayments"
 REPAY_LINK_COL = "loan_id"
 REPAY_DATE_COL = "paid_at"
 
@@ -118,7 +120,7 @@ def _build_statement_pdf(member: dict, mloans: list[dict], mpay: list[dict], sta
 
 
 # ============================================================
-# Repayments read helpers (locked schema)
+# Repayments read helpers (loan_repayments)
 # ============================================================
 def get_repayments_for_loan_ids(sb_service, schema: str, loan_ids: list[int], limit: int = 5000) -> list[dict]:
     if not loan_ids:
@@ -298,16 +300,16 @@ def _render_ledger(sb_service, schema: str, actor: Actor):
 
 
 # ============================================================
-# Record payment UI (select existing loan)
+# Record payment UI (loan_repayments)
 # ============================================================
 def _render_record_payment(sb_service, schema: str, actor: Actor):
     require(actor.role, "record_payment")
 
-    st.subheader("Record Payment (repayments)")
+    st.subheader("Record Payment (loan_repayments)")
 
     loans = (
         sb_service.schema(schema).table("loans_legacy")
-        .select("id,member_id,status,total_due,principal,principal_current")
+        .select("id,member_id,status,total_due,principal,principal_current,unpaid_interest")
         .order("id", desc=True)
         .limit(2000)
         .execute().data
@@ -318,19 +320,21 @@ def _render_record_payment(sb_service, schema: str, actor: Actor):
         st.warning("No loans found in loans_legacy. Cannot record repayment.")
         return
 
-    df["label"] = df.apply(
-        lambda r: (
-            f"Loan {int(r['id'])} • Member {r.get('member_id')} • "
-            f"{str(r.get('status') or '')} • Due {float(r.get('total_due') or 0):,.0f}"
-        ),
-        axis=1,
-    )
+    # show balance info in label
+    def _lbl(r):
+        due = float(r.get("total_due") or 0)
+        pc = float(r.get("principal_current") or r.get("principal") or 0)
+        ui = float(r.get("unpaid_interest") or 0)
+        return f"Loan {int(r['id'])} • Member {r.get('member_id')} • {str(r.get('status') or '')} • Principal {pc:,.0f} • Interest {ui:,.0f} • Due {due:,.0f}"
+
+    df["label"] = df.apply(_lbl, axis=1)
+
     pick = st.selectbox("Select loan", df["label"].tolist(), key="pay_pick_loan")
     loan_id = int(df[df["label"] == pick].iloc[0]["id"])
 
     amount = st.number_input("Amount", min_value=0.0, step=50.0, value=0.0, key="pay_amt")
     paid_on = st.date_input("Paid date", value=date.today(), key="pay_date")
-    notes = st.text_input("Notes (optional)", value="Repayment recorded", key="pay_notes")
+    note = st.text_input("Note (optional)", value="Loan repayment", key="pay_note")
 
     if st.button("💾 Save payment", use_container_width=True, key="pay_save"):
         try:
@@ -341,25 +345,57 @@ def _render_record_payment(sb_service, schema: str, actor: Actor):
                 amount=float(amount),
                 paid_at=_to_iso(paid_on),
                 recorded_by=str(actor.user_id),
-                notes=notes,
+                notes=note,  # core will map to 'note' column in loan_repayments
             )
             audit(sb_service, "loan_payment_recorded", "ok", {"loan_id": int(loan_id), "amount": float(amount)}, actor_user_id=actor.user_id)
-            st.success("Payment inserted into repayments.")
+            st.success("Payment inserted into loan_repayments and loan balance updated.")
+            st.rerun()
         except Exception as e:
             st.error("Failed to record payment.")
             st.exception(e)
+
+    st.divider()
+    st.markdown("### Recent loan_repayments for this loan")
+    try:
+        rows = (
+            sb_service.schema(schema).table(PAYMENTS_TABLE)
+            .select("*")
+            .eq("loan_id", int(loan_id))
+            .order("paid_at", desc=True)
+            .limit(200)
+            .execute().data
+            or []
+        )
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.warning("Could not load loan_repayments.")
+        st.exception(e)
+
+    st.divider()
+    st.markdown("### Loan balance (after payments)")
+    try:
+        loan_now = (
+            sb_service.schema(schema).table("loans_legacy")
+            .select("id,status,principal,principal_current,unpaid_interest,total_due,updated_at")
+            .eq("id", int(loan_id)).limit(1)
+            .execute().data or []
+        )
+        if loan_now:
+            st.json(loan_now[0])
+    except Exception:
+        pass
 
 
 def _render_confirm_payments(sb_service, schema: str, actor: Actor):
     require(actor.role, "confirm_payment")
     st.subheader("Confirm Payments")
-    st.info("Not supported: repayments table is schema-locked (no status/confirmed_by/confirmed_at).")
+    st.info("Not supported: you are using loan_repayments (direct inserts). Maker-checker requires a separate pending table.")
 
 
 def _render_reject_payments(sb_service, schema: str, actor: Actor):
     require(actor.role, "reject_payment")
     st.subheader("Reject Payments")
-    st.info("Not supported: repayments table is schema-locked (no status/rejected_by/rejected_at).")
+    st.info("Not supported: you are using loan_repayments (direct inserts). Maker-checker requires a separate pending table.")
 
 
 # ============================================================
@@ -382,7 +418,7 @@ def _render_interest(sb_service, schema: str, actor: Actor):
 
 
 # ============================================================
-# Delinquency UI (DPD) — FIXED NaT crash
+# Delinquency UI (DPD) — reads loan_repayments
 # ============================================================
 def _render_delinquency(sb_service, schema: str, actor: Actor):
     require(actor.role, "view_delinquency")
@@ -403,7 +439,7 @@ def _render_delinquency(sb_service, schema: str, actor: Actor):
         return
 
     reps = (
-        sb_service.schema(schema).table("repayments")
+        sb_service.schema(schema).table(PAYMENTS_TABLE)
         .select("loan_id,paid_at")
         .order("paid_at", desc=True)
         .limit(20000)
@@ -485,7 +521,7 @@ def _render_statement(sb_service, schema: str, actor: Actor):
 
     st.markdown("### Loans")
     st.dataframe(pd.DataFrame(mloans), use_container_width=True, hide_index=True)
-    st.markdown("### Repayments")
+    st.markdown("### Loan Repayments (loan_repayments)")
     st.dataframe(pd.DataFrame(mpay), use_container_width=True, hide_index=True)
 
     st.divider()
@@ -603,7 +639,6 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
 
     st.header("Loans (Organizational Standard)")
 
-    # KPIs
     loans_all = (
         sb_service.schema(schema).table("loans_legacy")
         .select("id,status,total_due")
