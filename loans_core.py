@@ -1,8 +1,8 @@
-# loans_core.py ✅ UPDATED (schema LOCKED to your repayments + loans_legacy)
+# loans_core.py ✅ UPDATED (adds Digital Statement Signing + keeps schema locked)
 # - repayments columns (confirmed): id, loan_id, member_id, amount, paid_at, amount_paid, notes, created_at, ...
 # - NO repayments.status, NO paid_on, NO confirmed_by/confirmed_at
-# - So: maker-checker confirm/reject is NOT supported unless you add those columns.
-# - This core keeps: requests + signatures + approval + interest + simple repayment insert.
+# - maker-checker confirm/reject is NOT supported unless you add those columns.
+# - Adds: statement digital signature helpers (store in public.signatures)
 
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ LOAN_SIG_REQUIRED = ["borrower", "surety", "treasury"]
 PAYMENTS_TABLE = "repayments"
 REPAY_LINK_COL = "loan_id"   # ✅ confirmed
 REPAY_DATE_COL = "paid_at"   # ✅ confirmed
+
+STATEMENT_SIG_ROLE = "member_statement"  # ✅ fixed role for statement signing
 
 
 def now_iso() -> str:
@@ -111,6 +113,52 @@ def insert_signature(
         pass
 
     sb.schema(schema).table("signatures").upsert(payload).execute()
+    return True
+
+
+# ============================================================
+# ✅ DIGITAL STATEMENT SIGNING (Loan Statement)
+# Store signature in public.signatures with:
+#   entity_id = loan_id
+#   role      = 'member_statement'
+# ============================================================
+def insert_statement_signature(
+    sb,
+    schema: str,
+    loan_id: int,
+    signer_member_id: int,
+    signer_name: str,
+):
+    if int(loan_id) <= 0:
+        raise ValueError("Invalid loan_id.")
+    if int(signer_member_id) <= 0:
+        raise ValueError("Invalid signer_member_id.")
+    if not str(signer_name).strip():
+        raise ValueError("Signer name is required.")
+
+    payload = {
+        "entity_id": int(loan_id),
+        "role": STATEMENT_SIG_ROLE,
+        "signer_name": str(signer_name).strip(),
+        "signer_member_id": int(signer_member_id),
+        "signed_at": now_iso(),
+    }
+
+    sb.schema(schema).table("signatures").upsert(payload).execute()
+    return True
+
+
+def get_statement_signature(sb, schema: str, loan_id: int) -> dict | None:
+    rows = (
+        sb.schema(schema).table("signatures")
+        .select("role,signer_name,signer_member_id,signed_at,entity_id")
+        .eq("entity_id", int(loan_id))
+        .eq("role", STATEMENT_SIG_ROLE)
+        .order("signed_at", desc=True)
+        .limit(1)
+        .execute().data or []
+    )
+    return rows[0] if rows else None
 
 
 # ============================================================
@@ -131,7 +179,7 @@ def member_loan_limit(sb, schema: str, member_id: int) -> float:
 
 def has_active_loan(sb, schema: str, member_id: int) -> bool:
     """
-    Your loans_legacy.status default is 'open'. Treat open + active as active.
+    loans_legacy.status default is 'open'. Treat open + active as active.
     """
     rows = (
         sb.schema(schema)
@@ -157,7 +205,7 @@ def create_loan_request(
     surety_id: int,
     surety_name: str,
     amount: float,
-    requester_user_id: str | None = None,  # DB expects uuid NOT NULL
+    requester_user_id: str | None = None,
 ) -> int:
     if borrower_id <= 0 or surety_id <= 0:
         raise ValueError("Invalid borrower/surety.")
@@ -257,16 +305,16 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_user_id: str) -
     ts = now_iso()
 
     loan_payload = {
-        "borrower_member_id": borrower_id,   # NOT NULL
-        "member_id": borrower_id,            # legacy link
-        "surety_member_id": surety_id,       # NOT NULL
+        "borrower_member_id": borrower_id,
+        "member_id": borrower_id,
+        "surety_member_id": surety_id,
         "surety_name": surety_name or None,
         "borrow_date": str(date.today()),
-        "principal": float(amount),          # NOT NULL
+        "principal": float(amount),
         "principal_current": float(amount),
         "interest_rate_monthly": MONTHLY_INTEREST_RATE,
         "interest_start_at": ts,
-        "status": "open",                    # ✅ match your table default/meaning
+        "status": "open",
         "updated_at": ts,
     }
 
@@ -308,14 +356,13 @@ def record_payment_pending(
 ):
     """
     Inserts a repayment row.
-    NOTE: Your repayments table has NO status, no maker-checker fields.
+    NOTE: repayments table has NO status/maker-checker fields.
     """
     if amount <= 0:
         raise ValueError("Amount must be > 0.")
     if int(loan_id) <= 0:
         raise ValueError("Invalid loan_id.")
 
-    # Pull loan info to fill repayment member fields (since repayments has member_id NOT NULL)
     loan = fetch_one(
         sb.schema(schema).table("loans_legacy")
         .select("id,member_id,borrower_member_id,borrower_name")
@@ -326,28 +373,26 @@ def record_payment_pending(
 
     member_id = int(loan.get("member_id") or 0)
     if member_id <= 0:
-        raise RuntimeError("Loan has invalid member_id; cannot insert repayment (repayments.member_id is NOT NULL).")
+        raise RuntimeError("Loan has invalid member_id; repayments.member_id is NOT NULL.")
 
     payload = {
         REPAY_LINK_COL: int(loan_id),
         "member_id": int(member_id),
         "amount": float(amount),
         REPAY_DATE_COL: str(paid_at),
-        # these exist in your table (nullable)
         "borrower_member_id": loan.get("borrower_member_id"),
         "borrower_name": loan.get("borrower_name"),
         "notes": str(notes or "Repayment recorded").strip() or None,
         "created_at": now_iso(),
     }
 
-    # amount_paid exists and default is 0; if you want, set it equal to amount
+    # Optional: set amount_paid = amount (otherwise DB default 0)
     # payload["amount_paid"] = float(amount)
 
     sb.schema(schema).table(PAYMENTS_TABLE).insert(payload).execute()
     return True
 
 
-# Maker-checker stubs (repayments table does not support these fields)
 def confirm_payment(sb, schema: str, payment_id: int, confirmer: str):
     raise RuntimeError("confirm_payment not supported: repayments table has no status/confirmed_by/confirmed_at columns.")
 
@@ -418,7 +463,7 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, f
 
 
 # ============================================================
-# DELINQUENCY (kept for fallback; SQL view is preferred)
+# DELINQUENCY (fallback; SQL view is preferred)
 # ============================================================
 def compute_dpd(loan_row: dict, last_paid_on: date | None) -> int:
     due = _to_date(loan_row.get("due_date"))
