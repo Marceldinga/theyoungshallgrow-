@@ -1,8 +1,6 @@
-# loans_core.py ✅ UPDATED (adds Digital Statement Signing + keeps schema locked)
-# - repayments columns (confirmed): id, loan_id, member_id, amount, paid_at, amount_paid, notes, created_at, ...
-# - NO repayments.status, NO paid_on, NO confirmed_by/confirmed_at
-# - maker-checker confirm/reject is NOT supported unless you add those columns.
-# - Adds: statement digital signature helpers (store in public.signatures)
+# loans_core.py ✅ UPDATED (fixes signatures.entity_type NOT NULL for statement signing)
+# - Adds STATEMENT_ENTITY_TYPE and writes it on insert + filters on read
+# - Keeps repayments schema locked (loan_id + paid_at, no status)
 
 from __future__ import annotations
 
@@ -17,7 +15,8 @@ PAYMENTS_TABLE = "repayments"
 REPAY_LINK_COL = "loan_id"   # ✅ confirmed
 REPAY_DATE_COL = "paid_at"   # ✅ confirmed
 
-STATEMENT_SIG_ROLE = "member_statement"  # ✅ fixed role for statement signing
+STATEMENT_SIG_ROLE = "member_statement"   # ✅ fixed role for statement signing
+STATEMENT_ENTITY_TYPE = "loan_statement"  # ✅ REQUIRED: signatures.entity_type is NOT NULL
 
 
 def now_iso() -> str:
@@ -55,11 +54,16 @@ def fetch_one(query) -> dict | None:
 # SIGNATURES  (table: public.signatures)
 # ============================================================
 def sig_df(sb, schema: str, entity_type: str, entity_id: int) -> pd.DataFrame:
+    """
+    NOTE: Your signatures table REQUIRES entity_type (NOT NULL),
+    so we filter by entity_type here.
+    """
     try:
         rows = (
             sb.schema(schema)
             .table("signatures")
-            .select("role,signer_name,signer_member_id,signed_at,entity_id")
+            .select("entity_type,role,signer_name,signer_member_id,signed_at,entity_id")
+            .eq("entity_type", str(entity_type))
             .eq("entity_id", int(entity_id))
             .order("signed_at", desc=False)
             .limit(500)
@@ -72,7 +76,7 @@ def sig_df(sb, schema: str, entity_type: str, entity_id: int) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["role", "signer_name", "signer_member_id", "signed_at", "entity_id"])
+        return pd.DataFrame(columns=["entity_type", "role", "signer_name", "signer_member_id", "signed_at", "entity_id"])
     return df
 
 
@@ -98,20 +102,17 @@ def insert_signature(
     signer_name: str,
     signer_member_id: int | None,
 ):
+    """
+    Generic signature insert. entity_type is REQUIRED in your DB.
+    """
     payload = {
+        "entity_type": str(entity_type),  # ✅ REQUIRED
         "entity_id": int(entity_id),
         "role": str(role).strip().lower(),
         "signer_name": str(signer_name).strip(),
         "signer_member_id": int(signer_member_id) if signer_member_id is not None else None,
         "signed_at": now_iso(),
     }
-
-    # If signatures table has entity_type, store it; otherwise ignore
-    try:
-        payload["entity_type"] = str(entity_type)
-    except Exception:
-        pass
-
     sb.schema(schema).table("signatures").upsert(payload).execute()
     return True
 
@@ -119,8 +120,9 @@ def insert_signature(
 # ============================================================
 # ✅ DIGITAL STATEMENT SIGNING (Loan Statement)
 # Store signature in public.signatures with:
-#   entity_id = loan_id
-#   role      = 'member_statement'
+#   entity_type = 'loan_statement'
+#   entity_id   = loan_id
+#   role        = 'member_statement'
 # ============================================================
 def insert_statement_signature(
     sb,
@@ -137,6 +139,7 @@ def insert_statement_signature(
         raise ValueError("Signer name is required.")
 
     payload = {
+        "entity_type": STATEMENT_ENTITY_TYPE,     # ✅ REQUIRED (NOT NULL)
         "entity_id": int(loan_id),
         "role": STATEMENT_SIG_ROLE,
         "signer_name": str(signer_name).strip(),
@@ -151,7 +154,8 @@ def insert_statement_signature(
 def get_statement_signature(sb, schema: str, loan_id: int) -> dict | None:
     rows = (
         sb.schema(schema).table("signatures")
-        .select("role,signer_name,signer_member_id,signed_at,entity_id")
+        .select("entity_type,role,signer_name,signer_member_id,signed_at,entity_id")
+        .eq("entity_type", STATEMENT_ENTITY_TYPE)  # ✅
         .eq("entity_id", int(loan_id))
         .eq("role", STATEMENT_SIG_ROLE)
         .order("signed_at", desc=True)
@@ -178,9 +182,6 @@ def member_loan_limit(sb, schema: str, member_id: int) -> float:
 
 
 def has_active_loan(sb, schema: str, member_id: int) -> bool:
-    """
-    loans_legacy.status default is 'open'. Treat open + active as active.
-    """
     rows = (
         sb.schema(schema)
         .table("loans_legacy")
@@ -354,10 +355,6 @@ def record_payment_pending(
     recorded_by: str | None = None,
     notes: str | None = None,
 ):
-    """
-    Inserts a repayment row.
-    NOTE: repayments table has NO status/maker-checker fields.
-    """
     if amount <= 0:
         raise ValueError("Amount must be > 0.")
     if int(loan_id) <= 0:
@@ -385,9 +382,6 @@ def record_payment_pending(
         "notes": str(notes or "Repayment recorded").strip() or None,
         "created_at": now_iso(),
     }
-
-    # Optional: set amount_paid = amount (otherwise DB default 0)
-    # payload["amount_paid"] = float(amount)
 
     sb.schema(schema).table(PAYMENTS_TABLE).insert(payload).execute()
     return True
