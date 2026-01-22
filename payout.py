@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Optional, Tuple, Set
 
 import pandas as pd
+import streamlit as st
 
 # Import ONLY what exists in your db.py
 from db import now_iso, current_session_id, fetch_one
@@ -27,11 +28,14 @@ PAYOUT_SIG_REQUIRED = ["president", "beneficiary", "treasury"]
 # ============================================================
 # INTERNAL HELPERS (safe)
 # ============================================================
-def _to_df(resp) -> pd.DataFrame:
-    return pd.DataFrame(resp.data or [])
-
-def _safe_select(c, table: str, filters: list[tuple[str, str, Any]] | None = None,
-                 order_col: str | None = None, desc: bool = True, limit: int = 2000) -> list[dict]:
+def _safe_select(
+    c,
+    table: str,
+    filters: list[tuple[str, str, Any]] | None = None,
+    order_col: str | None = None,
+    desc: bool = True,
+    limit: int = 2000,
+) -> list[dict]:
     """
     Supabase-safe select helper.
     filters: list of (col, op, val) where op is one of: eq, in, gte, lte
@@ -56,15 +60,15 @@ def _safe_select(c, table: str, filters: list[tuple[str, str, Any]] | None = Non
     except Exception:
         return []
 
+
 def _table_exists(c, table: str) -> bool:
-    """
-    Lightweight existence check: try a cheap select.
-    """
+    """Lightweight existence check: try a cheap select."""
     try:
         c.table(table).select("*").limit(1).execute()
         return True
     except Exception:
         return False
+
 
 def _first_existing_table(c, candidates: list[str]) -> Optional[str]:
     for t in candidates:
@@ -72,9 +76,10 @@ def _first_existing_table(c, candidates: list[str]) -> Optional[str]:
             return t
     return None
 
+
 def _session_window_from_sessions_table(c, sid: int) -> Optional[Tuple[str, str]]:
     """
-    If you have sessions_legacy with (id, start_date, end_date) or similar,
+    If sessions_legacy has (id, start_date, end_date) or similar,
     we use it to scope contributions when session_id column does not exist.
     Returns ISO strings [start, end].
     """
@@ -83,17 +88,14 @@ def _session_window_from_sessions_table(c, sid: int) -> Optional[Tuple[str, str]
         return None
 
     r = rows[0]
-    # Try common column names
     sd = r.get("start_date") or r.get("starts_at") or r.get("start")
     ed = r.get("end_date") or r.get("ends_at") or r.get("end")
 
     if not sd:
         return None
 
-    # Normalize to ISO strings (date or datetime)
     def _norm(x, end: bool = False) -> str:
         if isinstance(x, str):
-            # assume it's already iso or date string
             if "T" in x:
                 return x
             return f"{x}T23:59:59" if end else f"{x}T00:00:00"
@@ -109,18 +111,18 @@ def _session_window_from_sessions_table(c, sid: int) -> Optional[Tuple[str, str]
     # If end missing, assume 14-day window
     if not end_iso:
         try:
-            # parse start as date
             d0 = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-            end_iso = (d0 + timedelta(days=13, hours=23, minutes=59, seconds=59)).replace(microsecond=0).isoformat()
+            end_iso = (
+                d0 + timedelta(days=13, hours=23, minutes=59, seconds=59)
+            ).replace(microsecond=0).isoformat()
         except Exception:
             end_iso = ""
 
     return (start_iso, end_iso) if start_iso and end_iso else None
 
+
 def _fallback_biweekly_window() -> Tuple[str, str]:
-    """
-    Last resort: last 14 days from now.
-    """
+    """Last resort: last 14 days from now."""
     end = datetime.utcnow().replace(microsecond=0)
     start = end - timedelta(days=13)
     return (start.isoformat(), end.isoformat())
@@ -131,15 +133,14 @@ def _fallback_biweekly_window() -> Tuple[str, str]:
 # ============================================================
 def get_signatures(c, context: str, ref_id: int) -> list[dict]:
     """
-    Expected signatures table layout (typical):
+    Expected signatures table layout:
       signatures: {context, ref_id, role, member_id, signed_at, created_at}
-    If your table name differs, change SIGNATURES_TABLE below.
     """
     SIGNATURES_TABLE = "signatures"
     if not _table_exists(c, SIGNATURES_TABLE):
-        return []  # If table isn't in use, UI can show optional gate
+        return []
 
-    rows = _safe_select(
+    return _safe_select(
         c,
         SIGNATURES_TABLE,
         filters=[("context", "eq", context), ("ref_id", "eq", int(ref_id))],
@@ -147,7 +148,7 @@ def get_signatures(c, context: str, ref_id: int) -> list[dict]:
         desc=True,
         limit=500,
     )
-    return rows
+
 
 def missing_roles(sign_rows: list[dict], required_roles: list[str]) -> list[str]:
     got = {str(r.get("role", "")).strip().lower() for r in (sign_rows or []) if r.get("role")}
@@ -167,31 +168,25 @@ def resolve_beneficiary_id(active_ids: list[int], pointer: int) -> int:
     if not active_ids:
         raise Exception("No active members available.")
 
-    # If pointer is a member_id
     if int(pointer) in set(active_ids):
         return int(pointer)
 
-    # If pointer is a 1-based index
     idx = int(pointer) - 1
     if 0 <= idx < len(active_ids):
         return int(active_ids[idx])
 
-    # Fallback to first
     return int(active_ids[0])
 
+
 def next_rotation_pointer(active_ids: list[int], current_pointer: int) -> int:
-    """
-    Advances by index (1-based) when pointer is index; otherwise advances by active_ids order.
-    We keep it simple: store as 1-based index in app_state.next_payout_index.
-    """
+    """Advance by 1 in the active_ids order; store pointer as 1-based index."""
     if not active_ids:
         return 1
 
-    # Convert current pointer to index
     if current_pointer in set(active_ids):
         cur_idx = active_ids.index(int(current_pointer))
         nxt_idx = (cur_idx + 1) % len(active_ids)
-        return nxt_idx + 1  # store as 1-based index
+        return nxt_idx + 1
     else:
         cur_idx = max(int(current_pointer) - 1, 0)
         nxt_idx = (cur_idx + 1) % len(active_ids)
@@ -203,24 +198,19 @@ def next_rotation_pointer(active_ids: list[int], current_pointer: int) -> int:
 # ============================================================
 def contributions_for_current_session(c, sid: int) -> pd.DataFrame:
     """
-    ✅ Core fix: contributions must be scoped to THIS rotation session.
-
-    Preferred (best): contributions_legacy has a session_id column.
-    Fallback: use sessions_legacy [start_date, end_date] window
-    Last resort: last 14 days.
+    Preferred: contributions_legacy has session_id
+    Fallback: sessions_legacy window
+    Last resort: last 14 days
     """
     table = _first_existing_table(c, ["contributions_legacy", "contributions"])
     if not table:
         return pd.DataFrame([])
 
-    # 1) Try session_id scoped query
+    # 1) session_id scoped
     rows = _safe_select(
         c,
         table,
-        filters=[
-            ("session_id", "eq", int(sid)),
-            ("kind", "in", ALLOWED_CONTRIB_KINDS),
-        ],
+        filters=[("session_id", "eq", int(sid)), ("kind", "in", ALLOWED_CONTRIB_KINDS)],
         order_col="created_at",
         desc=True,
         limit=5000,
@@ -228,10 +218,8 @@ def contributions_for_current_session(c, sid: int) -> pd.DataFrame:
     if rows:
         return pd.DataFrame(rows)
 
-    # 2) If session_id doesn't exist or no rows: use sessions_legacy window
-    win = _session_window_from_sessions_table(c, sid)
-    if not win:
-        win = _fallback_biweekly_window()
+    # 2) window scoped
+    win = _session_window_from_sessions_table(c, sid) or _fallback_biweekly_window()
     start_iso, end_iso = win
 
     rows2 = _safe_select(
@@ -248,18 +236,17 @@ def contributions_for_current_session(c, sid: int) -> pd.DataFrame:
     )
     return pd.DataFrame(rows2)
 
+
 def contribution_summary_this_rotation(df_contrib: pd.DataFrame) -> dict:
     if df_contrib is None or df_contrib.empty:
-        return {
-            "rows": 0,
-            "total": 0.0,
-            "contributors": 0,
-            "min": 0.0,
-            "max": 0.0,
-        }
+        return {"rows": 0, "total": 0.0, "contributors": 0, "min": 0.0, "max": 0.0}
 
     amt = pd.to_numeric(df_contrib.get("amount", 0), errors="coerce").fillna(0.0)
-    member_col = "legacy_member_id" if "legacy_member_id" in df_contrib.columns else ("member_id" if "member_id" in df_contrib.columns else None)
+    member_col = (
+        "legacy_member_id"
+        if "legacy_member_id" in df_contrib.columns
+        else ("member_id" if "member_id" in df_contrib.columns else None)
+    )
     contributors = int(df_contrib[member_col].nunique()) if member_col else 0
 
     return {
@@ -270,13 +257,8 @@ def contribution_summary_this_rotation(df_contrib: pd.DataFrame) -> dict:
         "max": float(amt.max()) if len(amt) else 0.0,
     }
 
+
 def contribution_problems_this_rotation(active_ids: list[int], df_contrib: pd.DataFrame) -> list[str]:
-    """
-    Checks:
-    - Missing contributor
-    - Any amount not multiple of 500
-    - Any amount < 500 (base)
-    """
     problems: list[str] = []
 
     if not active_ids:
@@ -285,7 +267,11 @@ def contribution_problems_this_rotation(active_ids: list[int], df_contrib: pd.Da
     if df_contrib is None or df_contrib.empty:
         return ["No contributions found for this rotation/session."]
 
-    member_col = "legacy_member_id" if "legacy_member_id" in df_contrib.columns else ("member_id" if "member_id" in df_contrib.columns else None)
+    member_col = (
+        "legacy_member_id"
+        if "legacy_member_id" in df_contrib.columns
+        else ("member_id" if "member_id" in df_contrib.columns else None)
+    )
     if not member_col:
         return ["Contributions table missing member id column (legacy_member_id/member_id)."]
 
@@ -293,7 +279,6 @@ def contribution_problems_this_rotation(active_ids: list[int], df_contrib: pd.Da
     df["amount_num"] = pd.to_numeric(df.get("amount", 0), errors="coerce").fillna(0).astype(float)
     df[member_col] = pd.to_numeric(df[member_col], errors="coerce").fillna(-1).astype(int)
 
-    # Aggregate per member
     g = df.groupby(member_col, as_index=False)["amount_num"].sum()
 
     contributed_ids = set(int(x) for x in g[member_col].tolist() if int(x) > 0)
@@ -301,12 +286,12 @@ def contribution_problems_this_rotation(active_ids: list[int], df_contrib: pd.Da
     if missing:
         problems.append(f"Missing contributions from members: {missing}")
 
-    # base + multiple checks
     bad_base = g[g["amount_num"] < BASE_CONTRIBUTION]
     if not bad_base.empty:
-        problems.append(f"Members below base {BASE_CONTRIBUTION}: {bad_base[[member_col,'amount_num']].to_dict('records')}")
+        problems.append(
+            f"Members below base {BASE_CONTRIBUTION}: {bad_base[[member_col,'amount_num']].to_dict('records')}"
+        )
 
-    # multiples of 500
     def is_multiple(x: float) -> bool:
         try:
             return (int(round(x)) % CONTRIBUTION_STEP) == 0
@@ -315,7 +300,9 @@ def contribution_problems_this_rotation(active_ids: list[int], df_contrib: pd.Da
 
     bad_mult = g[~g["amount_num"].apply(is_multiple)]
     if not bad_mult.empty:
-        problems.append(f"Members with non-multiple-of-{CONTRIBUTION_STEP} totals: {bad_mult[[member_col,'amount_num']].to_dict('records')}")
+        problems.append(
+            f"Members with non-multiple-of-{CONTRIBUTION_STEP} totals: {bad_mult[[member_col,'amount_num']].to_dict('records')}"
+        )
 
     return problems
 
@@ -326,23 +313,24 @@ def contribution_problems_this_rotation(active_ids: list[int], df_contrib: pd.Da
 def _payout_table(c) -> Optional[str]:
     return _first_existing_table(c, ["foundation_payments_legacy", "payouts_legacy", "payouts"])
 
+
 def fetch_paid_out_member_ids(c, sid: int) -> Set[int]:
-    """
-    Returns member_ids already paid for this session.
-    """
     t = _payout_table(c)
     if not t:
         return set()
 
-    # Try session_id filter first
     rows = _safe_select(c, t, filters=[("session_id", "eq", int(sid))], limit=5000)
     if not rows:
-        # fallback: some tables may use payout_session_id
         rows = _safe_select(c, t, filters=[("payout_session_id", "eq", int(sid))], limit=5000)
 
     paid = set()
     for r in rows:
-        mid = r.get("beneficiary_member_id") or r.get("beneficiary_id") or r.get("legacy_member_id") or r.get("member_id")
+        mid = (
+            r.get("beneficiary_member_id")
+            or r.get("beneficiary_id")
+            or r.get("legacy_member_id")
+            or r.get("member_id")
+        )
         if mid is not None:
             try:
                 paid.add(int(mid))
@@ -352,26 +340,20 @@ def fetch_paid_out_member_ids(c, sid: int) -> Set[int]:
 
 
 # ============================================================
-# GOVERNANCE / COMPLIANCE GATE (what your UI shows)
+# GOVERNANCE / COMPLIANCE
 # ============================================================
 def compliance_for_payout(c, active_ids: list[int], sid: int) -> dict:
-    """
-    Returns a single dict used by UI gates.
-    """
-    # Gate 1: active members
     gate1_ok = (len(active_ids) == EXPECTED_ACTIVE_MEMBERS) or (len(active_ids) > 0)
     gate1_msg = f"Active members: {len(active_ids)} (expected {EXPECTED_ACTIVE_MEMBERS})"
 
-    # Gate 2: contribution summary this rotation
     df_contrib = contributions_for_current_session(c, sid)
     summ = contribution_summary_this_rotation(df_contrib)
     problems = contribution_problems_this_rotation(active_ids, df_contrib)
     gate2_ok = (len(problems) == 0)
 
-    # Signatures
     signs = get_signatures(c, context="payout", ref_id=sid)
     missing = missing_roles(signs, PAYOUT_SIG_REQUIRED)
-    sig_ok = (len(missing) == 0) if signs is not None else True  # if no table, UI can treat optional
+    sig_ok = (len(missing) == 0) if signs is not None else True
     sig_msg = "OK" if sig_ok else f"Missing roles: {missing}"
 
     return {
@@ -393,18 +375,10 @@ def compliance_for_payout(c, active_ids: list[int], sid: int) -> dict:
 # PAYOUT EXECUTION (Option B)
 # ============================================================
 def payout_precheck_option_b(c, active_ids: list[int]) -> dict:
-    """
-    ✅ Hard-stop precheck:
-    - session_id defined
-    - contributions are session-scoped and clean
-    - signatures present (if signatures table exists)
-    - beneficiary not already paid
-    """
     sid = int(current_session_id(c) or 0)
     if sid <= 0:
         return {"ok": False, "reason": "No current session_id. app_state.next_payout_index is missing."}
 
-    # Gate checks
     comp = compliance_for_payout(c, active_ids, sid)
 
     if not comp["gate1_ok"]:
@@ -413,18 +387,18 @@ def payout_precheck_option_b(c, active_ids: list[int]) -> dict:
     if not comp["gate2_ok"]:
         return {"ok": False, "reason": "Contribution problems for this rotation/session.", "details": comp}
 
-    # enforce signatures if signatures table exists
-    if _table_exists(c, "signatures"):
-        if not comp["signatures_ok"]:
-            return {"ok": False, "reason": comp["signatures_msg"], "details": comp}
+    if _table_exists(c, "signatures") and not comp["signatures_ok"]:
+        return {"ok": False, "reason": comp["signatures_msg"], "details": comp}
 
-    # beneficiary resolution
     beneficiary_id = resolve_beneficiary_id(active_ids, sid)
 
-    # prevent double-pay
     already_paid = fetch_paid_out_member_ids(c, sid)
     if beneficiary_id in already_paid:
-        return {"ok": False, "reason": f"Beneficiary {beneficiary_id} already paid for session {sid}.", "details": comp}
+        return {
+            "ok": False,
+            "reason": f"Beneficiary {beneficiary_id} already paid for session {sid}.",
+            "details": comp,
+        }
 
     return {
         "ok": True,
@@ -434,36 +408,26 @@ def payout_precheck_option_b(c, active_ids: list[int]) -> dict:
         "details": comp,
     }
 
+
 def _update_app_state_next_index(c, next_idx: int) -> None:
-    """
-    Tries common patterns for app_state table.
-    If your app_state table differs, adjust here only.
-    """
     if not _table_exists(c, "app_state"):
         return
 
     payload = {"next_payout_index": int(next_idx), "updated_at": now_iso()}
     try:
-        # common: singleton row id=1
         c.table("app_state").update(payload).eq("id", 1).execute()
         return
     except Exception:
         pass
 
     try:
-        # fallback: upsert singleton
         c.table("app_state").upsert({"id": 1, **payload}).execute()
         return
     except Exception:
         pass
 
+
 def execute_payout_option_b(c, active_ids: list[int], actor_user_id: str | None = None) -> dict:
-    """
-    ✅ Executes payout:
-    - runs precheck
-    - writes payout record with session_id + beneficiary + amount
-    - advances rotation index in app_state.next_payout_index
-    """
     pre = payout_precheck_option_b(c, active_ids)
     if not pre.get("ok"):
         return pre
@@ -476,7 +440,6 @@ def execute_payout_option_b(c, active_ids: list[int], actor_user_id: str | None 
     if not t:
         return {"ok": False, "reason": "No payout table found (foundation_payments_legacy / payouts_legacy / payouts)."}
 
-    # Insert payout record
     payload = {
         "created_at": now_iso(),
         "session_id": sid,
@@ -492,11 +455,9 @@ def execute_payout_option_b(c, active_ids: list[int], actor_user_id: str | None 
         row = (res.data or [None])[0]
         if not row:
             return {"ok": False, "reason": "Payout insert failed (no row returned)."}
-
     except Exception as e:
         return {"ok": False, "reason": f"Payout insert failed: {repr(e)}"}
 
-    # Advance rotation pointer (store as 1-based index)
     nxt = next_rotation_pointer(active_ids, sid)
     _update_app_state_next_index(c, nxt)
 
@@ -508,3 +469,111 @@ def execute_payout_option_b(c, active_ids: list[int], actor_user_id: str | None 
         "next_payout_index": nxt,
         "payout_table": t,
     }
+
+
+# ============================================================
+# UI: PAYOUT PAGE (called by app.py)
+# ============================================================
+def _safe_select_schema(
+    sb,
+    schema: str,
+    table: str,
+    cols: str = "*",
+    limit: int = 2000,
+    order_col: str | None = None,
+    desc: bool = False,
+) -> list[dict]:
+    try:
+        q = sb.schema(schema).table(table).select(cols)
+        if order_col:
+            q = q.order(order_col, desc=desc)
+        if limit is not None:
+            q = q.limit(limit)
+        return q.execute().data or []
+    except Exception:
+        return []
+
+
+def render_payouts(sb_service, schema: str):
+    st.header("Payouts • Option B (Bi-weekly Rotation)")
+    st.caption("Session-scoped pot • Signatures enforced • Double-pay protection • Rotation advance")
+
+    # Load members
+    members = _safe_select_schema(sb_service, schema, "members_legacy", "id,name,position", limit=2000, order_col="id", desc=False)
+    dfm = pd.DataFrame(members or [])
+    if dfm.empty:
+        st.error("members_legacy is empty or not readable.")
+        return
+
+    dfm["id"] = pd.to_numeric(dfm["id"], errors="coerce").fillna(-1).astype(int)
+    active_ids = [int(x) for x in dfm["id"].tolist() if int(x) > 0]
+
+    # session id pointer
+    try:
+        sid = int(current_session_id(sb_service) or 0)
+    except Exception:
+        sid = 0
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Active Members", str(len(active_ids)))
+    c2.metric("Current Session ID", str(sid) if sid else "—")
+    c3.metric("Base Contribution", f"{BASE_CONTRIBUTION:,}")
+
+    st.divider()
+
+    # Gates
+    comp = compliance_for_payout(sb_service, active_ids, sid if sid else 0)
+
+    st.subheader("Gate Status")
+
+    with st.expander("Gate 1: Active members", expanded=False):
+        if comp.get("gate1_ok"):
+            st.success(comp.get("gate1_msg", "OK"))
+        else:
+            st.error(comp.get("gate1_msg", "Failed"))
+
+    with st.expander("Gate 2: Contribution summary (this rotation)", expanded=True):
+        st.write(comp.get("gate2_summary", {}))
+        st.caption("This reflects ONLY the current session/rotation (not all-time).")
+
+    with st.expander("Gate 2: Contribution problems", expanded=True):
+        probs = comp.get("gate2_problems", []) or []
+        if probs:
+            for p in probs:
+                st.error(p)
+        else:
+            st.success("No contribution problems detected for this rotation/session.")
+
+    st.subheader("Signatures")
+    if _table_exists(sb_service, "signatures"):
+        st.caption(f"Required roles: {PAYOUT_SIG_REQUIRED}")
+        if comp.get("signatures_ok"):
+            st.success("All required payout signatures are present.")
+        else:
+            st.warning(comp.get("signatures_msg", "Missing signatures"))
+    else:
+        st.info("signatures table not found — signature enforcement skipped.")
+
+    st.divider()
+
+    # Precheck + Execute
+    pre = payout_precheck_option_b(sb_service, active_ids)
+
+    left, right = st.columns([1, 1])
+    with left:
+        st.write("Precheck:")
+        st.json(pre)
+
+    with right:
+        disabled = not bool(pre.get("ok"))
+        if st.button("✅ Execute Payout (Option B)", disabled=disabled, use_container_width=True):
+            res = execute_payout_option_b(sb_service, active_ids, actor_user_id="admin")
+            if res.get("ok"):
+                st.success(
+                    f"Payout complete ✅  Beneficiary={res['beneficiary_id']}  "
+                    f"Amount={float(res['amount_paid']):,.0f}  NextIndex={res.get('next_payout_index')}"
+                )
+                st.rerun()
+            else:
+                st.error(res.get("reason", "Payout failed"))
+                st.json(res)
