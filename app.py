@@ -1,13 +1,15 @@
-# app.py ✅ CLEAN + UPDATED
+# app.py ✅ CLEAN + UPDATED (adds Minutes & Attendance legacy page)
 # - Railway-safe secrets
 # - Safe imports (Audit / Health / Loans)
 # - Dashboard fixed (uses dashboard_next_view.current_pot)
 # - Loans entry works with your current loans.py wrapper (show_loans or render_loans)
+# - Adds ✅ Minutes & Attendance (Legacy): meeting_minutes_legacy + meeting_attendance_legacy
 # - Avoids crashes if a module is missing
 
 from __future__ import annotations
 
 import os
+from datetime import date, datetime
 import streamlit as st
 import pandas as pd
 from supabase import create_client
@@ -164,11 +166,20 @@ def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFram
 
 
 # ============================================================
-# NAVIGATION
+# NAVIGATION ✅ UPDATED (adds Minutes & Attendance)
 # ============================================================
 page = st.sidebar.radio(
     "Menu",
-    ["Dashboard", "Contributions", "Payouts", "Loans", "Admin", "Audit", "Health"],
+    [
+        "Dashboard",
+        "Contributions",
+        "Payouts",
+        "Loans",
+        "Minutes & Attendance",
+        "Admin",
+        "Audit",
+        "Health",
+    ],
     key="main_menu",
 )
 
@@ -248,13 +259,144 @@ elif page == "Loans":
             st.error("Loans UI not available. loans.py failed to import.")
             st.caption("Check Railway/Streamlit logs for the import error.")
         else:
-            # Support either show_loans(...) or render_loans(...)
             loans_fn = getattr(loans_entry, "show_loans", None) or getattr(loans_entry, "render_loans", None)
             if loans_fn is None:
                 st.error("Loans UI not available. loans.py must define show_loans() or render_loans().")
             else:
-                # actor_user_id can be a real auth UUID later; for now keep admin placeholder
                 loans_fn(sb_service, SUPABASE_SCHEMA, actor_user_id="admin")
+
+# ============================================================
+# ✅ Minutes & Attendance (Legacy)
+# Tables:
+#   - meeting_minutes_legacy
+#   - meeting_attendance_legacy (legacy_member_id)
+# ============================================================
+elif page == "Minutes & Attendance":
+    st.header("📝 Meeting Minutes & ✅ Attendance (Legacy)")
+
+    if not sb_service:
+        st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY to enable writing minutes & attendance.")
+        st.stop()
+
+    labels, label_to_id, label_to_name, df_members = load_members_legacy(
+        SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA
+    )
+
+    tab1, tab2 = st.tabs(["Minutes / Documentation", "Attendance"])
+
+    # --------------------------
+    # MINUTES (LEGACY)
+    # --------------------------
+    with tab1:
+        st.subheader("Meeting Minutes / Documentation (Legacy)")
+
+        with st.form("minutes_legacy_form", clear_on_submit=True):
+            mdate = st.date_input("Meeting date", value=date.today(), key="minutes_legacy_date")
+            title = st.text_input("Title", key="minutes_legacy_title")
+            tags = st.text_input("Tags (optional)", key="minutes_legacy_tags")
+            content = st.text_area("Minutes / Documentation", height=260, key="minutes_legacy_content")
+            ok = st.form_submit_button("💾 Save minutes", use_container_width=True)
+
+        if ok:
+            if not title.strip() or not content.strip():
+                st.error("Title and content are required.")
+            else:
+                payload = {
+                    "meeting_date": str(mdate),
+                    "title": title.strip(),
+                    "content": content.strip(),
+                    "tags": tags.strip() or None,
+                    "created_by": "admin",
+                }
+                try:
+                    sb_service.schema(SUPABASE_SCHEMA).table("meeting_minutes_legacy").insert(payload).execute()
+                    st.success("Minutes saved.")
+                except Exception as e:
+                    st.error("Failed to save minutes.")
+                    st.exception(e)
+
+        st.divider()
+        st.markdown("### Recent minutes")
+        try:
+            rows = (
+                sb_service.schema(SUPABASE_SCHEMA).table("meeting_minutes_legacy")
+                .select("*")
+                .order("meeting_date", desc=True)
+                .limit(50)
+                .execute().data
+                or []
+            )
+            df = pd.DataFrame(rows)
+            if df.empty:
+                st.info("No minutes recorded yet.")
+            else:
+                st.dataframe(df, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning("Could not load minutes.")
+            st.exception(e)
+
+    # --------------------------
+    # ATTENDANCE (LEGACY)
+    # --------------------------
+    with tab2:
+        st.subheader("Attendance (Legacy)")
+
+        adate = st.date_input("Attendance date", value=date.today(), key="att_legacy_date")
+        st.caption("Record attendance per member for this meeting date.")
+
+        with st.form("attendance_legacy_form", clear_on_submit=True):
+            if labels:
+                pick = st.selectbox("Member", labels, key="att_legacy_member_pick")
+                legacy_member_id = int(label_to_id.get(pick))
+                member_name = str(label_to_name.get(pick))
+            else:
+                st.warning("No members loaded from members_legacy.")
+                legacy_member_id = 0
+                member_name = ""
+
+            status = st.selectbox("Status", ["present", "absent", "late", "excused"], index=0, key="att_legacy_status")
+            note = st.text_input("Note (optional)", "", key="att_legacy_note")
+            ok2 = st.form_submit_button("✅ Save attendance", use_container_width=True)
+
+        if ok2:
+            if legacy_member_id <= 0:
+                st.error("Invalid member selection.")
+            else:
+                payload = {
+                    "meeting_date": str(adate),
+                    "legacy_member_id": int(legacy_member_id),
+                    "member_name": member_name,
+                    "status": status,
+                    "note": note.strip() or None,
+                    "created_by": "admin",
+                }
+                try:
+                    sb_service.schema(SUPABASE_SCHEMA).table("meeting_attendance_legacy").insert(payload).execute()
+                    st.success("Attendance saved.")
+                except Exception as e:
+                    st.error("Failed to save attendance.")
+                    st.exception(e)
+
+        st.divider()
+        st.markdown("### Attendance for selected date")
+        try:
+            rows = (
+                sb_service.schema(SUPABASE_SCHEMA).table("meeting_attendance_legacy")
+                .select("*")
+                .eq("meeting_date", str(adate))
+                .order("legacy_member_id", desc=False)
+                .limit(500)
+                .execute().data
+                or []
+            )
+            df = pd.DataFrame(rows)
+            if df.empty:
+                st.info("No attendance recorded for this date yet.")
+            else:
+                st.dataframe(df, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning("Could not load attendance.")
+            st.exception(e)
 
 # ============================================================
 # ADMIN
