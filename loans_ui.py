@@ -1,4 +1,4 @@
-# loans_ui.py ✅ UPDATED (repayments: auto-detect link column to loans + SAFE ordering)
+# loans_ui.py ✅ UPDATED (repayments schema locked: loan_id + paid_at, no status)
 from __future__ import annotations
 
 from datetime import date
@@ -24,13 +24,9 @@ except Exception:
     def audit(*args, **kwargs):
         return None
 
-# Optional PostgREST error class
-try:
-    from postgrest.exceptions import APIError
-except Exception:
-    APIError = Exception
-
 PAYMENTS_TABLE = "repayments"
+REPAY_LINK_COL = "loan_id"   # ✅ confirmed
+REPAY_DATE_COL = "paid_at"   # ✅ confirmed
 
 
 def _is_uuid(s: str) -> bool:
@@ -50,7 +46,6 @@ def _get_or_make_session_uuid(key: str = "actor_user_uuid") -> str:
 
 
 def _actor_from_session(default_user_id: str) -> Actor:
-    # Simple RBAC UI for now (works without auth). Later replace with real login.
     with st.sidebar.expander("🔐 Role (temporary)", expanded=False):
         role = st.selectbox("Role", [ROLE_ADMIN, ROLE_TREASURY, ROLE_MEMBER], index=0, key="actor_role")
         member_id = st.number_input(
@@ -64,7 +59,6 @@ def _actor_from_session(default_user_id: str) -> Actor:
             key="actor_name",
         )
 
-    # ✅ Force UUID user_id so DB uuid columns won't break
     user_uuid = default_user_id if (default_user_id and _is_uuid(default_user_id)) else _get_or_make_session_uuid()
 
     return Actor(
@@ -76,126 +70,45 @@ def _actor_from_session(default_user_id: str) -> Actor:
 
 
 # ============================================================
-# ✅ SAFE READ HELPERS FOR repayments
-# - Some DBs use paid_at instead of paid_on
-# - Avoid crashing on order() if column missing
-# - Auto-detect loan-link column (NOT loan_legacy_id in your DB)
+# ✅ REPAYMENTS READ HELPERS (LOCKED to your schema)
+# repayments columns include: id, loan_id, member_id, amount, paid_at, amount_paid, notes, created_at, etc.
+# There is NO repayments.status and NO paid_on.
 # ============================================================
-def _safe_ordered_query(q):
-    for col in ["paid_on", "paid_at", "created_at", "id"]:
-        try:
-            return q.order(col, desc=True).execute().data or []
-        except Exception:
-            continue
-    return q.execute().data or []
-
-
-def _detect_repayment_loan_link_col(sb_service, schema: str) -> str:
-    """
-    Detect which column in public.repayments links to loans_legacy(id).
-    Caches result in session_state.
-    """
-    key = f"_repay_link_col::{schema}"
-    cached = st.session_state.get(key)
-    if cached:
-        return cached
-
-    candidates = [
-        "loan_id",
-        "loan",
-        "loan_fk",
-        "loan_ref",
-        "loan_legacy",
-        "loan_legacy_fk",
-        "loan_legacy_id",
-        "loan_pk",
-    ]
-
-    for col in candidates:
-        try:
-            sb_service.schema(schema).table(PAYMENTS_TABLE).select(f"id,{col}").limit(1).execute()
-            st.session_state[key] = col
-            return col
-        except Exception:
-            continue
-
-    st.error("Could not detect repayments → loans link column.")
-    try:
-        sample = sb_service.schema(schema).table(PAYMENTS_TABLE).select("*").limit(1).execute().data or []
-        st.write("Sample repayment row keys:", list((sample[0] or {}).keys()) if sample else [])
-    except Exception as e:
-        st.code(str(e), language="text")
-    st.stop()
-
-
-def get_pending_repayments(sb_service, schema: str, limit: int = 500) -> list[dict]:
-    q = (
-        sb_service.schema(schema).table(PAYMENTS_TABLE)
-        .select("*")
-        .eq("status", "pending")
-        .limit(int(limit))
-    )
-    return _safe_ordered_query(q)
-
-
 def get_repayments_for_loan_ids(sb_service, schema: str, loan_ids: list[int], limit: int = 5000) -> list[dict]:
     if not loan_ids:
         return []
-
-    link_col = _detect_repayment_loan_link_col(sb_service, schema)
-    q = (
+    return (
         sb_service.schema(schema).table(PAYMENTS_TABLE)
         .select("*")
-        .in_(link_col, loan_ids)
+        .in_(REPAY_LINK_COL, [int(x) for x in loan_ids])
+        .order(REPAY_DATE_COL, desc=True)
         .limit(int(limit))
+        .execute().data
+        or []
     )
-    return _safe_ordered_query(q)
 
 
-def get_repayments_for_dpd(sb_service, schema: str, limit: int = 20000) -> pd.DataFrame:
-    """
-    Fetch minimal columns for DPD. We ask for both paid_on and paid_at.
-    If minimal select fails, fallback to '*'.
-    Normalizes the loan link column into df["loan_link_id"].
-    """
-    link_col = _detect_repayment_loan_link_col(sb_service, schema)
-
-    try:
-        rows = (
-            sb_service.schema(schema).table(PAYMENTS_TABLE)
-            .select(f"{link_col},status,paid_on,paid_at,created_at")
-            .limit(int(limit))
-            .execute().data or []
-        )
-        df = pd.DataFrame(rows)
-    except Exception:
-        rows = (
-            sb_service.schema(schema).table(PAYMENTS_TABLE)
-            .select("*").limit(int(limit))
-            .execute().data or []
-        )
-        df = pd.DataFrame(rows)
-
-    if df.empty:
-        return df
-
-    if link_col in df.columns:
-        df["loan_link_id"] = pd.to_numeric(df[link_col], errors="coerce")
-    else:
-        df["loan_link_id"] = pd.NA
-
-    return df
+def get_repayments_for_member(sb_service, schema: str, member_id: int, limit: int = 5000) -> list[dict]:
+    return (
+        sb_service.schema(schema).table(PAYMENTS_TABLE)
+        .select("*")
+        .eq("member_id", int(member_id))
+        .order(REPAY_DATE_COL, desc=True)
+        .limit(int(limit))
+        .execute().data
+        or []
+    )
 
 
 def render_loans(sb_service, schema: str, actor_user_id: str = ""):
-    # ✅ Always use UUID if caller passes "admin" or empty
     actor_user_uuid = actor_user_id if (actor_user_id and _is_uuid(actor_user_id)) else _get_or_make_session_uuid()
     actor = _actor_from_session(actor_user_uuid)
 
     st.header("Loans (Organizational Standard)")
 
     # ============================================================
-    # KPIs (visible to all)
+    # KPIs (visible to all) - treat OPEN + ACTIVE as "active"
+    # loans_legacy.status default is 'open'
     # ============================================================
     loans_all = (
         sb_service.schema(schema).table("loans_legacy")
@@ -206,9 +119,9 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
     if df_all.empty:
         active_count, active_due = 0, 0.0
     else:
-        df_all["status"] = df_all["status"].astype(str)
+        df_all["status"] = df_all["status"].astype(str).str.lower().str.strip()
         df_all["total_due"] = pd.to_numeric(df_all.get("total_due"), errors="coerce").fillna(0)
-        active = df_all[df_all["status"].str.lower().str.strip() == "active"]
+        active = df_all[df_all["status"].isin(["open", "active"])]
         active_count = len(active)
         active_due = float(active["total_due"].sum())
 
@@ -220,7 +133,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
     st.divider()
 
     # ============================================================
-    # ✅ Mobile-safe menu with RBAC
+    # Menu
     # ============================================================
     sections = allowed_sections(actor.role)
     if not sections:
@@ -238,15 +151,12 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
     )
 
     # ============================================================
-    # ---- Requests ----
+    # ---- Requests ---- (unchanged; uses loans_core for requests/signatures)
     # ============================================================
     if section == "Requests":
         st.subheader("Loan Requests (Submit + Signatures)")
         st.caption("Submit a request, then Borrower/Surety/Treasury sign here. Admin approves later.")
 
-        # ------------------------------------------------------------
-        # ✅ ADMIN: Approve / Deny Pending Loan Requests (ONLY Admin)
-        # ------------------------------------------------------------
         if actor.role == ROLE_ADMIN:
             st.divider()
             st.subheader("Admin Approval (Approve / Deny)")
@@ -262,12 +172,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                     axis=1
                 )
 
-                pick_req = st.selectbox(
-                    "Select pending request",
-                    df_pending["label"].tolist(),
-                    key="admin_pick_loan_req"
-                )
-
+                pick_req = st.selectbox("Select pending request", df_pending["label"].tolist(), key="admin_pick_loan_req")
                 req_id_admin = int(df_pending[df_pending["label"] == pick_req].iloc[0]["id"])
                 req = core.get_request(sb_service, schema, req_id_admin)
 
@@ -292,19 +197,9 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                 with colA:
                     if st.button("✅ Approve Loan Request", use_container_width=True, key=f"admin_approve_{req_id_admin}"):
                         try:
-                            loan_id = core.approve_loan_request(
-                                sb_service,
-                                schema,
-                                req_id_admin,
-                                actor_user_id=actor.user_id
-                            )
-                            audit(
-                                sb_service,
-                                "loan_request_approved",
-                                "ok",
-                                {"request_id": req_id_admin, "loan_id": loan_id},
-                                actor_user_id=actor.user_id,
-                            )
+                            loan_id = core.approve_loan_request(sb_service, schema, req_id_admin, actor_user_id=actor.user_id)
+                            audit(sb_service, "loan_request_approved", "ok",
+                                  {"request_id": req_id_admin, "loan_id": loan_id}, actor_user_id=actor.user_id)
                             st.success(f"Loan approved. loan_legacy_id = {loan_id}")
                             st.rerun()
                         except Exception as e:
@@ -315,21 +210,14 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                     if st.button("❌ Deny Loan Request", use_container_width=True, key=f"admin_deny_{req_id_admin}"):
                         try:
                             core.deny_loan_request(sb_service, schema, req_id_admin, reason=deny_reason)
-                            audit(
-                                sb_service,
-                                "loan_request_denied",
-                                "ok",
-                                {"request_id": req_id_admin, "reason": deny_reason},
-                                actor_user_id=actor.user_id,
-                            )
+                            audit(sb_service, "loan_request_denied", "ok",
+                                  {"request_id": req_id_admin, "reason": deny_reason}, actor_user_id=actor.user_id)
                             st.success("Loan request denied.")
                             st.rerun()
                         except Exception as e:
                             st.error(str(e))
 
-        # ------------------------------------------------------------
-        # Submit Request
-        # ------------------------------------------------------------
+        # Submit Request UI
         st.divider()
         require(actor.role, "submit_request")
 
@@ -373,7 +261,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                     borrower_id, borrower_name,
                     surety_id, surety_name,
                     float(amount),
-                    requester_user_id=actor.user_id,  # ✅ UUID-safe
+                    requester_user_id=actor.user_id,
                 )
                 st.session_state["loan_active_request_id"] = req_id
                 audit(sb_service, "loan_request_created", "ok", {"request_id": req_id}, actor_user_id=actor.user_id)
@@ -382,9 +270,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
             except Exception as e:
                 st.error(str(e))
 
-        # ------------------------------------------------------------
-        # Sign Request
-        # ------------------------------------------------------------
+        # Sign Request UI (unchanged)
         st.divider()
         st.subheader("Sign Loan Request")
         require(actor.role, "sign_request")
@@ -405,13 +291,9 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
             pick = st.selectbox("Select request to sign", dfp["label"].tolist(), key="loan_req_sign_pick")
             req_id = int(dfp[dfp["label"] == pick].iloc[0]["id"])
 
-        try:
-            req = core.get_request(sb_service, schema, int(req_id))
-        except Exception as e:
-            st.error(str(e))
-            return
-
+        req = core.get_request(sb_service, schema, int(req_id))
         st.caption(f"Request ID: {req_id} • Amount: {float(req.get('amount') or 0):,.0f}")
+
         df_sig = core.sig_df(sb_service, schema, "loan", int(req_id))
         st.dataframe(df_sig, use_container_width=True, hide_index=True)
 
@@ -425,15 +307,8 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                     st.success(f"Signed by: {row.get('signer_name','')} • {str(row.get('signed_at',''))[:19]}")
                     return
 
-                name = st.text_input(
-                    "Signer name",
-                    value=default_name or "",
-                    key=f"{key_prefix}_{req_id}_{role}_name",
-                )
-                confirm = st.checkbox(
-                    "I confirm this signature",
-                    key=f"{key_prefix}_{req_id}_{role}_confirm",
-                )
+                name = st.text_input("Signer name", value=default_name or "", key=f"{key_prefix}_{req_id}_{role}_name")
+                confirm = st.checkbox("I confirm this signature", key=f"{key_prefix}_{req_id}_{role}_confirm")
                 if st.button("Sign", use_container_width=True, key=f"{key_prefix}_{req_id}_{role}_btn"):
                     if not confirm:
                         st.error("Please confirm the signature checkbox.")
@@ -442,41 +317,21 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                         st.error("Signer name is required.")
                         st.stop()
 
-                    try:
-                        core.insert_signature(
-                            sb_service, schema, "loan", int(req_id),
-                            role=role,
-                            signer_name=str(name).strip(),
-                            signer_member_id=signer_member_id,
-                        )
-                        st.success("Signed.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error("Failed to save signature.")
-                        st.code(str(e), language="text")
+                    core.insert_signature(
+                        sb_service, schema, "loan", int(req_id),
+                        role=role,
+                        signer_name=str(name).strip(),
+                        signer_member_id=signer_member_id,
+                    )
+                    st.success("Signed.")
+                    st.rerun()
 
-        signature_box(
-            "borrower",
-            default_name=str(req.get("requester_name") or ""),
-            signer_member_id=int(req.get("requester_member_id") or 0) or None,
-            key_prefix="loan_sig",
-        )
-        signature_box(
-            "surety",
-            default_name=str(req.get("surety_name") or ""),
-            signer_member_id=int(req.get("surety_member_id") or 0) or None,
-            key_prefix="loan_sig",
-        )
+        signature_box("borrower", str(req.get("requester_name") or ""), int(req.get("requester_member_id") or 0) or None, "loan_sig")
+        signature_box("surety", str(req.get("surety_name") or ""), int(req.get("surety_member_id") or 0) or None, "loan_sig")
 
         treasury_signer_mid = actor.member_id if actor.role == ROLE_TREASURY else None
         treasury_default_name = (actor.name or "Treasury") if actor.role == ROLE_TREASURY else "Treasury"
-
-        signature_box(
-            "treasury",
-            default_name=treasury_default_name,
-            signer_member_id=int(treasury_signer_mid) if treasury_signer_mid else None,
-            key_prefix="loan_sig",
-        )
+        signature_box("treasury", treasury_default_name, int(treasury_signer_mid) if treasury_signer_mid else None, "loan_sig")
 
         miss = core.missing_roles(core.sig_df(sb_service, schema, "loan", int(req_id)), core.LOAN_SIG_REQUIRED)
         if miss:
@@ -506,22 +361,21 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
     # ============================================================
     elif section == "Record Payment":
         require(actor.role, "record_payment")
-        st.subheader("Record Payment (Maker → Pending)")
-        loan_id = st.number_input("loan_legacy_id", min_value=1, step=1, value=1, key="loan_pay_loan_id")
-        amount = st.number_input("amount", min_value=0.0, step=50.0, value=100.0, key="loan_pay_amount")
-        paid_on = st.date_input("paid_on", value=date.today(), key="loan_pay_date")
+        st.subheader("Record Payment (Record into repayments)")
 
-        if st.button("Record Pending Payment", use_container_width=True, key="loan_pay_record"):
+        loan_id = st.number_input("loan_id", min_value=1, step=1, value=1, key="loan_pay_loan_id")
+        amount = st.number_input("amount", min_value=0.0, step=50.0, value=100.0, key="loan_pay_amount")
+        paid_at = st.date_input("paid_at (date)", value=date.today(), key="loan_pay_date")
+
+        if st.button("Record Repayment", use_container_width=True, key="loan_pay_record"):
             try:
+                # ✅ this must match loans_core.py (updated to insert into repayments.loan_id and repayments.paid_at)
                 core.record_payment_pending(
-                    sb_service, schema, int(loan_id), float(amount), str(paid_on),
+                    sb_service, schema, int(loan_id), float(amount), str(paid_at),
                     recorded_by=actor.user_id
                 )
-                audit(
-                    sb_service, "loan_payment_recorded_pending", "ok",
-                    {"loan_id": int(loan_id)}, actor_user_id=actor.user_id
-                )
-                st.success("Recorded pending. Checker must confirm.")
+                audit(sb_service, "repayment_recorded", "ok", {"loan_id": int(loan_id)}, actor_user_id=actor.user_id)
+                st.success("Repayment recorded.")
                 st.rerun()
             except Exception as e:
                 st.error(str(e))
@@ -531,57 +385,20 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
     # ============================================================
     elif section == "Confirm Payments":
         require(actor.role, "confirm_payment")
-        st.subheader("Confirm Payments (Checker)")
+        st.subheader("Confirm Payments")
 
-        pending = get_pending_repayments(sb_service, schema, limit=500)
-        dfp = pd.DataFrame(pending)
-        if dfp.empty:
-            st.success("No pending payments.")
-        else:
-            st.dataframe(dfp, use_container_width=True, hide_index=True)
-            pid_default = int(dfp.iloc[0].get("id") or 1)
-            pid = st.number_input("repayment id to confirm", min_value=1, step=1, value=pid_default, key="pay_confirm_id")
-
-            if st.button("✅ Confirm Selected Payment", use_container_width=True, key="pay_confirm_btn"):
-                try:
-                    core.confirm_payment(sb_service, schema, int(pid), confirmer=actor.user_id)
-                    audit(
-                        sb_service, "loan_payment_confirmed", "ok",
-                        {"repayment_id": int(pid)}, actor_user_id=actor.user_id
-                    )
-                    st.success("Confirmed and applied.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(str(e))
+        st.info("Your repayments table has no 'status' column. Use Record Payment to create repayments directly.")
+        st.write("If you need maker-checker, add a status column OR create a separate pending table.")
 
     # ============================================================
     # ---- Reject Payments ----
     # ============================================================
     elif section == "Reject Payments":
         require(actor.role, "reject_payment")
-        st.subheader("Reject Payments (Checker)")
+        st.subheader("Reject Payments")
 
-        pending = get_pending_repayments(sb_service, schema, limit=500)
-        dfp = pd.DataFrame(pending)
-        if dfp.empty:
-            st.success("No pending payments to reject.")
-        else:
-            st.dataframe(dfp, use_container_width=True, hide_index=True)
-            pid_default = int(dfp.iloc[0].get("id") or 1)
-            pid = st.number_input("repayment id to reject", min_value=1, step=1, value=pid_default, key="pay_reject_id")
-            reason = st.text_input("Reject reason", value="Invalid reference", key="pay_reject_reason")
-
-            if st.button("❌ Reject Selected Payment", use_container_width=True, key="pay_reject_btn"):
-                try:
-                    core.reject_payment(sb_service, schema, int(pid), rejecter=actor.user_id, reason=reason)
-                    audit(
-                        sb_service, "loan_payment_rejected", "ok",
-                        {"repayment_id": int(pid), "reason": reason}, actor_user_id=actor.user_id
-                    )
-                    st.success("Rejected.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(str(e))
+        st.info("Your repayments table has no 'status' column, so reject/confirm workflow cannot work as-is.")
+        st.write("If you want maker-checker, we can add: status, confirmed_by, confirmed_at, rejected_by, rejected_at.")
 
     # ============================================================
     # ---- Interest ----
@@ -610,71 +427,39 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
         st.dataframe(pd.DataFrame(snaps), use_container_width=True, hide_index=True)
 
     # ============================================================
-    # ---- Delinquency ----
+    # ---- Delinquency ---- (use SQL view if you created it)
     # ============================================================
     elif section == "Delinquency":
         require(actor.role, "view_delinquency")
         st.subheader("Delinquency (DPD)")
 
-        loans = (
-            sb_service.schema(schema).table("loans_legacy")
-            .select("id,member_id,status,balance,total_due,issued_at,due_date")
-            .limit(20000).execute().data or []
-        )
-        df_loans = pd.DataFrame(loans)
-        if df_loans.empty:
-            st.info("No loans found.")
-            return
-
-        df_pay = get_repayments_for_dpd(sb_service, schema, limit=20000)
-
-        last_paid: dict[int, date] = {}
-        if not df_pay.empty:
-            paid_col = "paid_on" if "paid_on" in df_pay.columns else ("paid_at" if "paid_at" in df_pay.columns else None)
-            if paid_col:
-                df_pay["paid_on_dt"] = pd.to_datetime(df_pay[paid_col], errors="coerce")
-            else:
-                df_pay["paid_on_dt"] = pd.NaT
-
-            df_pay = df_pay[df_pay["status"].astype(str).str.lower() == "confirmed"]
-
-            if "loan_link_id" in df_pay.columns:
-                for loan_id, grp in df_pay.dropna(subset=["loan_link_id"]).groupby("loan_link_id"):
-                    mx = grp["paid_on_dt"].max()
-                    if pd.notna(mx):
-                        last_paid[int(loan_id)] = mx.date()
-
-        rows = []
-        for r in df_loans.to_dict("records"):
-            if str(r.get("status") or "").lower().strip() != "active":
-                continue
-            lid = int(r["id"])
-            dpd = core.compute_dpd(r, last_paid.get(lid))
-            bucket = (
-                "0" if dpd == 0 else
-                ("1-14" if dpd <= 14 else
-                 ("15-30" if dpd <= 30 else
-                  ("31-60" if dpd <= 60 else "60+")))
+        # Prefer the SQL view (recommended). If it doesn't exist, fallback to a simple calc.
+        try:
+            rows = (
+                sb_service.schema(schema).table("v_loan_dpd")
+                .select("*")
+                .limit(20000).execute().data or []
             )
-            rows.append({
-                "loan_id": lid,
-                "member_id": r.get("member_id"),
-                "total_due": r.get("total_due"),
-                "due_date": r.get("due_date"),
-                "last_paid_on": str(last_paid.get(lid) or ""),
-                "dpd": dpd,
-                "bucket": bucket,
-            })
+            df = pd.DataFrame(rows)
+            if df.empty:
+                st.info("No rows in v_loan_dpd.")
+                return
 
-        df_dpd = pd.DataFrame(rows)
-        if df_dpd.empty:
-            st.success("No active delinquent loans detected.")
-        else:
+            df["dpd"] = pd.to_numeric(df.get("dpd"), errors="coerce").fillna(0).astype(int)
+            df = df[df["status"].astype(str).str.lower().str.strip().isin(["open", "active"])]
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Active/Open loans", f"{len(df):,}")
+            c2.metric("Delinquent (DPD>0)", f"{len(df[df['dpd']>0]):,}")
+            c3.metric("Max DPD", f"{int(df['dpd'].max()) if len(df)>0 else 0:,}")
+
             st.dataframe(
-                df_dpd.sort_values(["bucket", "dpd"], ascending=[True, False]),
+                df.sort_values("dpd", ascending=False),
                 use_container_width=True,
-                hide_index=True,
+                hide_index=True
             )
+        except Exception:
+            st.warning("DPD view not found. Create public.v_loan_dpd for best results.")
 
     # ============================================================
     # ---- Loan Statement ----
@@ -699,6 +484,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
 
         loaded_mid = st.session_state.get("stmt_loaded_member_id")
         if loaded_mid:
+            # member info
             mrow = (
                 sb_service.schema(schema).table("members_legacy")
                 .select("id,name,position").eq("id", int(loaded_mid)).limit(1)
@@ -711,19 +497,42 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                 "position": mrow.get("position"),
             }
 
+            # loans
             mloans = (
                 sb_service.schema(schema).table("loans_legacy")
                 .select("*").eq("member_id", int(loaded_mid))
                 .order("issued_at", desc=True).limit(5000)
                 .execute().data or []
             )
+
+            # ✅ Friendly behavior when there are no loans
+            if not mloans:
+                st.info("This member has no loans yet.")
+                return
+
             loan_ids = [int(l["id"]) for l in mloans if l.get("id") is not None]
+
+            # repayments (by loan_id)
             mpay = get_repayments_for_loan_ids(sb_service, schema, loan_ids, limit=5000)
 
             st.markdown("### Loans")
             st.dataframe(pd.DataFrame(mloans), use_container_width=True, hide_index=True)
-            st.markdown("### Payments")
+
+            st.markdown("### Repayments")
             st.dataframe(pd.DataFrame(mpay), use_container_width=True, hide_index=True)
+
+            # totals header (safe zeros)
+            df_loans = pd.DataFrame(mloans)
+            principal_total = float(pd.to_numeric(df_loans.get("principal"), errors="coerce").fillna(0).sum())
+            principal_out = float(pd.to_numeric(df_loans.get("principal_current"), errors="coerce").fillna(0).sum())
+            unpaid_int = float(pd.to_numeric(df_loans.get("unpaid_interest"), errors="coerce").fillna(0).sum())
+            total_due = float(pd.to_numeric(df_loans.get("total_due"), errors="coerce").fillna(0).sum())
+
+            a1, a2, a3, a4 = st.columns(4)
+            a1.metric("Loans", f"{len(df_loans):,}")
+            a2.metric("Principal Outstanding", f"{principal_out:,.0f}")
+            a3.metric("Unpaid Interest", f"{unpaid_int:,.0f}")
+            a4.metric("Total Due", f"{total_due:,.0f}")
 
             st.divider()
             st.markdown("### Download PDF")
@@ -770,9 +579,10 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                             .select("*").eq("member_id", member_id).order("issued_at", desc=True)
                             .limit(5000).execute().data or []
                         )
+                        if not mloans:
+                            continue
                         loan_ids = [int(l["id"]) for l in mloans if l.get("id") is not None]
                         mpay = get_repayments_for_loan_ids(sb_service, schema, loan_ids, limit=5000)
-
                         member_statements.append({
                             "member": {"member_id": member_id, "member_name": m.get("name"), "position": m.get("position")},
                             "loans": mloans,
