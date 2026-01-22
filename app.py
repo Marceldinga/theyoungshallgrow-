@@ -1,4 +1,10 @@
-# app.py ✅ CLEAN (Railway-safe secrets + Audit + Health + Loans import safe) — UPDATED (Dashboard fixed)
+# app.py ✅ CLEAN + UPDATED
+# - Railway-safe secrets
+# - Safe imports (Audit / Health / Loans)
+# - Dashboard fixed (uses dashboard_next_view.current_pot)
+# - Loans entry works with your current loans.py wrapper (show_loans or render_loans)
+# - Avoids crashes if a module is missing
+
 from __future__ import annotations
 
 import os
@@ -13,10 +19,13 @@ from audit_panel import render_audit
 from health_panel import render_health
 
 # ✅ Loans UI (safe import)
+# Support both patterns:
+#  - loans.py defines show_loans(...)
+#  - loans.py defines render_loans(...)
 try:
-    from loans import render_loans
+    import loans as loans_entry
 except Exception:
-    render_loans = None
+    loans_entry = None
 
 APP_BRAND = "theyoungshallgrow"
 
@@ -108,7 +117,7 @@ def safe_select(
         return []
 
 
-# ✅ NEW: canonical dashboard source
+# ✅ Canonical dashboard source
 def get_dashboard_next(sb, schema: str) -> dict:
     rows = safe_select(sb, "dashboard_next_view", "*", schema=schema, limit=1)
     return rows[0] if rows else {}
@@ -160,6 +169,7 @@ def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFram
 page = st.sidebar.radio(
     "Menu",
     ["Dashboard", "Contributions", "Payouts", "Loans", "Admin", "Audit", "Health"],
+    key="main_menu",
 )
 
 # ============================================================
@@ -174,8 +184,8 @@ if page == "Dashboard":
 
     next_index = dash.get("next_payout_index")
     next_date = dash.get("next_payout_date")
-    next_beneficiary = dash.get("next_beneficiary")  # already formatted "3 • Name"
-    current_pot = dash.get("current_pot")            # ✅ this is 500 now
+    next_beneficiary = dash.get("next_beneficiary")  # formatted "3 • Name"
+    current_pot = dash.get("current_pot")            # ✅ canonical pot (this session)
     session_number = dash.get("session_number")
 
     c1, c2, c3, c4 = st.columns(4)
@@ -184,7 +194,6 @@ if page == "Dashboard":
     c3.metric("Next Payout Date", str(next_date) if next_date else "—")
     c4.metric("Next Beneficiary", str(next_beneficiary) if next_beneficiary else "—")
 
-    # ✅ Correct pot display (same as payout page)
     try:
         st.caption(f"Pot Amount (this session): {float(current_pot or 0):,.0f}")
     except Exception:
@@ -195,7 +204,7 @@ if page == "Dashboard":
     st.divider()
 
     if labels:
-        pick = st.selectbox("Select member", labels)
+        pick = st.selectbox("Select member", labels, key="dash_member_pick")
         st.write("Selected member id:", label_to_id.get(pick))
         st.write("Selected member:", label_to_name.get(pick))
     else:
@@ -203,7 +212,7 @@ if page == "Dashboard":
 
     with st.expander("Member Registry (preview)", expanded=False):
         if not df_members.empty:
-            st.dataframe(df_members[["id", "name", "position"]], use_container_width=True)
+            st.dataframe(df_members[["id", "name", "position"]], use_container_width=True, hide_index=True)
         else:
             st.info("members_legacy empty or not readable.")
 
@@ -217,7 +226,7 @@ elif page == "Contributions":
         st.info("No contributions found (or view not readable).")
         st.caption("Confirm contributions_with_member exists and GRANT SELECT to anon.")
     else:
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
 # ============================================================
 # PAYOUTS
@@ -235,11 +244,17 @@ elif page == "Loans":
     if not sb_service:
         st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY in Railway Variables / Secrets.")
     else:
-        if render_loans is None:
-            st.error("Loans UI not available. loans.py failed to import or does not define render_loans().")
-            st.caption("Open logs to see the import error inside loans.py.")
+        if loans_entry is None:
+            st.error("Loans UI not available. loans.py failed to import.")
+            st.caption("Check Railway/Streamlit logs for the import error.")
         else:
-            render_loans(sb_service, SUPABASE_SCHEMA, actor_user_id="admin")
+            # Support either show_loans(...) or render_loans(...)
+            loans_fn = getattr(loans_entry, "show_loans", None) or getattr(loans_entry, "render_loans", None)
+            if loans_fn is None:
+                st.error("Loans UI not available. loans.py must define show_loans() or render_loans().")
+            else:
+                # actor_user_id can be a real auth UUID later; for now keep admin placeholder
+                loans_fn(sb_service, SUPABASE_SCHEMA, actor_user_id="admin")
 
 # ============================================================
 # ADMIN
