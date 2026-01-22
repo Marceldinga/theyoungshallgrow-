@@ -1,5 +1,6 @@
-# loans_core.py ✅ UPDATED (fixes signatures.entity_type NOT NULL for statement signing)
-# - Adds STATEMENT_ENTITY_TYPE and writes it on insert + filters on read
+# loans_core.py ✅ UPDATED
+# Fixes signatures.entity_type NOT NULL for statement signing
+# + Adds admin insert into loan_repayments_legacy (legacy repayments entry)
 # - Keeps repayments schema locked (loan_id + paid_at, no status)
 
 from __future__ import annotations
@@ -11,12 +12,18 @@ import pandas as pd
 MONTHLY_INTEREST_RATE = 0.05
 LOAN_SIG_REQUIRED = ["borrower", "surety", "treasury"]
 
+# ------------------------------------------------------------
+# CURRENT (non-legacy) repayments table (schema locked)
+# ------------------------------------------------------------
 PAYMENTS_TABLE = "repayments"
 REPAY_LINK_COL = "loan_id"   # ✅ confirmed
 REPAY_DATE_COL = "paid_at"   # ✅ confirmed
 
-STATEMENT_SIG_ROLE = "member_statement"   # ✅ fixed role for statement signing
-STATEMENT_ENTITY_TYPE = "loan_statement"  # ✅ REQUIRED: signatures.entity_type is NOT NULL
+# ------------------------------------------------------------
+# STATEMENT SIGNING (signatures.entity_type is NOT NULL)
+# ------------------------------------------------------------
+STATEMENT_SIG_ROLE = "member_statement"
+STATEMENT_ENTITY_TYPE = "loan_statement"  # ✅ REQUIRED
 
 
 def now_iso() -> str:
@@ -51,11 +58,49 @@ def fetch_one(query) -> dict | None:
 
 
 # ============================================================
+# SAFE LEGACY COLUMN FILTERING
+# ============================================================
+def _get_table_columns(sb, schema: str, table: str) -> set[str]:
+    """
+    Fetch column names using a 'select * limit 1' and reading keys.
+    This avoids needing information_schema permissions.
+    """
+    try:
+        rows = (
+            sb.schema(schema)
+            .table(table)
+            .select("*")
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not rows:
+            # table exists but empty: we can't infer columns from keys
+            # fallback: return empty set -> no filtering possible
+            return set()
+        return set(rows[0].keys())
+    except Exception:
+        return set()
+
+
+def filter_payload_to_existing_columns(sb, schema: str, table: str, payload: dict) -> dict:
+    """
+    Filters payload keys to only columns present in the table.
+    If we cannot infer columns (empty result), return payload as-is.
+    """
+    cols = _get_table_columns(sb, schema, table)
+    if not cols:
+        return payload
+    return {k: v for k, v in payload.items() if k in cols}
+
+
+# ============================================================
 # SIGNATURES  (table: public.signatures)
 # ============================================================
 def sig_df(sb, schema: str, entity_type: str, entity_id: int) -> pd.DataFrame:
     """
-    NOTE: Your signatures table REQUIRES entity_type (NOT NULL),
+    NOTE: signatures table REQUIRES entity_type (NOT NULL),
     so we filter by entity_type here.
     """
     try:
@@ -76,7 +121,9 @@ def sig_df(sb, schema: str, entity_type: str, entity_id: int) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["entity_type", "role", "signer_name", "signer_member_id", "signed_at", "entity_id"])
+        return pd.DataFrame(
+            columns=["entity_type", "role", "signer_name", "signer_member_id", "signed_at", "entity_id"]
+        )
     return df
 
 
@@ -119,10 +166,6 @@ def insert_signature(
 
 # ============================================================
 # ✅ DIGITAL STATEMENT SIGNING (Loan Statement)
-# Store signature in public.signatures with:
-#   entity_type = 'loan_statement'
-#   entity_id   = loan_id
-#   role        = 'member_statement'
 # ============================================================
 def insert_statement_signature(
     sb,
@@ -344,7 +387,7 @@ def deny_loan_request(sb, schema: str, request_id: int, reason: str):
 
 
 # ============================================================
-# REPAYMENTS (SIMPLE INSERT) ✅ matches your repayments schema
+# REPAYMENTS (CURRENT table) ✅ schema locked
 # ============================================================
 def record_payment_pending(
     sb,
@@ -396,6 +439,64 @@ def reject_payment(sb, schema: str, payment_id: int, rejecter: str, reason: str)
 
 
 # ============================================================
+# ✅ LEGACY REPAYMENTS INSERT (Admin dashboard)
+# Table: loan_repayments_legacy
+# - We do NOT assume exact columns
+# - We filter payload keys to existing columns when possible
+# ============================================================
+def insert_legacy_loan_repayment(
+    sb,
+    schema: str,
+    member_id: int,
+    amount: float,
+    paid_at: str,
+    loan_id: int | None = None,
+    method: str | None = None,
+    note: str | None = None,
+    actor_user_id: str | None = None,
+) -> dict | None:
+    """
+    Inserts a repayment row into loan_repayments_legacy.
+
+    Because this is a legacy table with unknown columns, we:
+    - build a rich payload
+    - remove None values
+    - filter keys to existing columns if we can infer them
+    """
+    if int(member_id) <= 0:
+        raise ValueError("Invalid member_id.")
+    if float(amount) <= 0:
+        raise ValueError("Amount must be > 0.")
+    if not str(paid_at).strip():
+        raise ValueError("paid_at is required.")
+
+    table = "loan_repayments_legacy"
+
+    payload = {
+        "created_at": now_iso(),
+        "member_id": int(member_id),
+        "legacy_member_id": int(member_id),     # legacy variant
+        "amount": float(amount),
+        "paid_at": str(paid_at),
+        "payment_date": str(paid_at)[:10],      # legacy variant
+        "loan_id": int(loan_id) if loan_id else None,
+        "method": str(method).strip() if method else None,
+        "note": str(note).strip() if note else None,
+        "notes": str(note).strip() if note else None,   # legacy variant
+        "recorded_by": actor_user_id,
+        "actor_user_id": actor_user_id,
+        "updated_at": now_iso(),
+    }
+
+    payload = {k: v for k, v in payload.items() if v is not None}
+    payload = filter_payload_to_existing_columns(sb, schema, table, payload)
+
+    res = sb.schema(schema).table(table).insert(payload).execute()
+    row = (res.data or [None])[0]
+    return row
+
+
+# ============================================================
 # INTEREST (idempotent snapshot)
 # ============================================================
 def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, float]:
@@ -434,12 +535,13 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, f
         total_interest_generated = float(r.get("total_interest_generated") or 0) + interest
         unpaid_interest = float(r.get("unpaid_interest") or 0) + interest
 
+        ts = now_iso()
         sb.schema(schema).table("loans_legacy").update({
             "accrued_interest": accrued_interest,
             "total_interest_generated": total_interest_generated,
             "unpaid_interest": unpaid_interest,
-            "last_interest_at": now_iso(),
-            "updated_at": now_iso(),
+            "last_interest_at": ts,
+            "updated_at": ts,
         }).eq("id", loan_id).execute()
 
         updated += 1
