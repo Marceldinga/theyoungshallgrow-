@@ -4,6 +4,7 @@
 # - Secrets handling
 # - Canonical Supabase clients (public + service)
 # - Safe loaders (NO streamlit UI calls here)
+# - Canonical session UUID + session-scoped pot helpers
 # ============================================================
 
 from __future__ import annotations
@@ -13,15 +14,14 @@ from typing import Any, Dict, List, Tuple, Optional
 
 import pandas as pd
 from supabase import create_client
-
-from datetime import datetime, timezone  # ✅ added
+from datetime import datetime, timezone
 
 # If Railway injects these, it can break DNS/resolution flows if your app accidentally uses Postgres.
 POSTGRES_ENV_VARS = ["DATABASE_URL", "PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"]
 
 
 # ============================================================
-# TIME HELPERS ✅ (added for modules that import now_iso)
+# TIME HELPERS
 # ============================================================
 def now_iso() -> str:
     """UTC ISO timestamp with Z suffix."""
@@ -159,7 +159,7 @@ def _safe_execute(resp: Any) -> List[Dict[str, Any]]:
 
 
 # ============================================================
-# SIMPLE DB HELPERS ✅ (added for modules that import fetch_one)
+# SIMPLE DB HELPERS
 # ============================================================
 def fetch_one(resp: Any) -> Dict[str, Any]:
     """Return first row from a Supabase response or {}."""
@@ -167,31 +167,118 @@ def fetch_one(resp: Any) -> Dict[str, Any]:
     return rows[0] if rows else {}
 
 
+def _looks_like_uuid(s: Any) -> bool:
+    try:
+        t = str(s)
+    except Exception:
+        return False
+    if len(t) != 36:
+        return False
+    parts = t.split("-")
+    return len(parts) == 5 and all(parts)
+
+
 # ============================================================
 # CANONICAL STATE HELPERS
 # ============================================================
-def current_session_id(c) -> str | None:
+def get_app_state(c) -> Dict[str, Any]:
+    """Returns the singleton app_state row (first row). Safe fallback to {}."""
+    try:
+        rows = _safe_execute(
+            c.schema(get_schema()).table("app_state").select("*").limit(1).execute()
+        )
+        return rows[0] if rows else {}
+    except Exception:
+        return {}
+
+
+def current_payout_index(c) -> int | None:
     """
-    Returns the current Njangi session/season identifier.
-    ✅ Prefers app_state.next_payout_index (rotation pointer)
-    Fallbacks: app_state.current_session_id, then sessions_legacy latest.
+    Returns current rotation pointer as an integer (business index).
+    This is NOT the UUID session_id. Use current_session_uuid() for that.
+    """
+    schema = get_schema()
+    try:
+        rows = _safe_execute(
+            c.schema(schema).table("app_state").select("next_payout_index").limit(1).execute()
+        )
+        if rows and rows[0].get("next_payout_index") is not None:
+            return int(rows[0]["next_payout_index"])
+    except Exception:
+        pass
+    return None
+
+
+def current_session_uuid(c) -> str | None:
+    """
+    ✅ Single source of truth for the current cycle/session UUID.
+
+    Priority:
+    1) app_state.current_session_id (if it is a UUID)
+    2) app_state.next_payout_index -> lookup sessions_legacy by payout_index (if present)
+    3) sessions_legacy latest row -> try UUID-like keys
     """
     schema = get_schema()
 
-    # 1) app_state singleton
+    # 1) app_state.current_session_id if it's already a UUID
     try:
         rows = _safe_execute(
-            c.schema(schema).table("app_state").select("next_payout_index,current_session_id").limit(1).execute()
+            c.schema(schema).table("app_state").select("current_session_id,next_payout_index").limit(1).execute()
         )
         if rows:
-            if rows[0].get("next_payout_index") is not None:
-                return str(rows[0]["next_payout_index"])
-            if rows[0].get("current_session_id") is not None:
-                return str(rows[0]["current_session_id"])
+            csid = rows[0].get("current_session_id")
+            if csid and _looks_like_uuid(csid):
+                return str(csid)
+
+            # 2) use next_payout_index to resolve UUID from sessions_legacy
+            npi = rows[0].get("next_payout_index")
+            if npi is not None:
+                try:
+                    npi_int = int(npi)
+                except Exception:
+                    npi_int = None
+
+                if npi_int is not None:
+                    # Try a few select variants to handle schema differences
+                    select_variants = [
+                        "id,payout_index,created_at",
+                        "session_id,payout_index,created_at",
+                        "id,next_payout_index,created_at",
+                        "session_id,next_payout_index,created_at",
+                        "*",
+                    ]
+                    for sel in select_variants:
+                        try:
+                            r = _safe_execute(
+                                c.schema(schema)
+                                .table("sessions_legacy")
+                                .select(sel)
+                                .eq("payout_index", npi_int)
+                                .limit(1)
+                                .execute()
+                            )
+                            if not r:
+                                # sometimes the column is named next_payout_index
+                                r = _safe_execute(
+                                    c.schema(schema)
+                                    .table("sessions_legacy")
+                                    .select(sel)
+                                    .eq("next_payout_index", npi_int)
+                                    .limit(1)
+                                    .execute()
+                                )
+                            if r:
+                                row = r[0]
+                                for k in ("id", "session_id", "current_session_id", "season_id", "legacy_session_id"):
+                                    v = row.get(k)
+                                    if v and _looks_like_uuid(v):
+                                        return str(v)
+                        except Exception:
+                            continue
     except Exception:
         pass
 
-    # 2) sessions_legacy latest
+    # 3) sessions_legacy latest fallback
     for order_col in ("created_at", "id", "session_id"):
         try:
             rows = _safe_execute(
@@ -203,24 +290,42 @@ def current_session_id(c) -> str | None:
                 .execute()
             )
             if rows:
-                for k in ("session_id", "id", "season_id", "legacy_session_id"):
-                    if rows[0].get(k) is not None:
-                        return str(rows[0][k])
+                for k in ("id", "session_id", "season_id", "legacy_session_id"):
+                    v = rows[0].get(k)
+                    if v and _looks_like_uuid(v):
+                        return str(v)
         except Exception:
             continue
 
     return None
 
 
-def get_app_state(c) -> Dict[str, Any]:
-    """Returns the singleton app_state row (first row). Safe fallback to {}."""
-    try:
-        rows = _safe_execute(
-            c.schema(get_schema()).table("app_state").select("*").limit(1).execute()
-        )
-        return rows[0] if rows else {}
-    except Exception:
-        return {}
+# Backward-compatible name (so existing imports don't break)
+def current_session_id(c) -> str | None:
+    """
+    Backward-compatible alias.
+    ✅ Returns the CURRENT SESSION UUID (not the integer payout index).
+    """
+    return current_session_uuid(c)
+
+
+# ============================================================
+# CONTRIBUTION HELPERS ✅ (single source of truth for pot)
+# ============================================================
+def pot_for_session(c, session_uuid: str) -> float:
+    """
+    Returns total contribution pot for a given session UUID.
+    Use this everywhere (Dashboard + Payouts) to avoid mismatches.
+    """
+    resp = (
+        c.schema(get_schema())
+        .table("contributions_legacy")
+        .select("amount")
+        .eq("session_id", session_uuid)
+        .execute()
+    )
+    rows = resp.data or []
+    return float(sum(float(r.get("amount") or 0) for r in rows))
 
 
 # ============================================================
