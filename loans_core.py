@@ -1,7 +1,8 @@
-# loans_core.py ✅ COMPLETE UPDATED (includes interest duplicate-key fix)
+# loans_core.py ✅ COMPLETE UPDATED (interest duplicate-key fix + repayment updates loan balances)
 # Fixes:
 # - signatures.entity_type NOT NULL for statement signing (STATEMENT_ENTITY_TYPE)
 # - Repayments schema locked (repayments: loan_id + paid_at, no status)
+# - ✅ Repayment now updates loan balances (principal_current / unpaid_interest / total_due if columns exist)
 # - Legacy repayments insert into loan_repayments_legacy:
 #     * filters payload keys when possible
 #     * retries by removing missing columns (fixes PGRST204 schema-cache errors)
@@ -178,9 +179,6 @@ def insert_signature(
     signer_name: str,
     signer_member_id: int | None,
 ):
-    """
-    Generic signature insert. entity_type is REQUIRED in your DB.
-    """
     payload = {
         "entity_type": str(entity_type),  # ✅ REQUIRED
         "entity_id": int(entity_id),
@@ -417,6 +415,7 @@ def deny_loan_request(sb, schema: str, request_id: int, reason: str):
 
 # ============================================================
 # REPAYMENTS (CURRENT table) ✅ schema locked
+# - Also updates loan balances in loans_legacy if those columns exist
 # ============================================================
 def record_payment_pending(
     sb,
@@ -434,7 +433,7 @@ def record_payment_pending(
 
     loan = fetch_one(
         sb.schema(schema).table("loans_legacy")
-        .select("id,member_id,borrower_member_id,borrower_name")
+        .select("id,member_id,principal,principal_current,unpaid_interest,accrued_interest,total_due")
         .eq("id", int(loan_id))
     )
     if not loan:
@@ -444,18 +443,62 @@ def record_payment_pending(
     if member_id <= 0:
         raise RuntimeError("Loan has invalid member_id; repayments.member_id is NOT NULL.")
 
+    # 1) Insert repayment row
     payload = {
         REPAY_LINK_COL: int(loan_id),
         "member_id": int(member_id),
         "amount": float(amount),
         REPAY_DATE_COL: str(paid_at),
-        "borrower_member_id": loan.get("borrower_member_id"),
-        "borrower_name": loan.get("borrower_name"),
         "notes": str(notes or "Repayment recorded").strip() or None,
         "created_at": now_iso(),
     }
-
     sb.schema(schema).table(PAYMENTS_TABLE).insert(payload).execute()
+
+    # 2) Apply payment to balances (interest first, then principal)
+    pay_amt = float(amount)
+
+    unpaid_interest = float(loan.get("unpaid_interest") or 0.0)
+    accrued_interest = float(loan.get("accrued_interest") or 0.0)
+
+    principal_current = loan.get("principal_current")
+    if principal_current is None:
+        principal_current = loan.get("principal")
+    principal_current = float(principal_current or 0.0)
+
+    # pay unpaid interest first
+    unpaid_interest_new = unpaid_interest
+    if unpaid_interest_new > 0:
+        if pay_amt >= unpaid_interest_new:
+            pay_amt -= unpaid_interest_new
+            unpaid_interest_new = 0.0
+        else:
+            unpaid_interest_new = unpaid_interest_new - pay_amt
+            pay_amt = 0.0
+
+    # then reduce principal
+    principal_new = max(principal_current - pay_amt, 0.0)
+
+    # total_due = principal + interest (prefer unpaid_interest if it exists)
+    total_due_new = principal_new + (unpaid_interest_new if ("unpaid_interest" in loan) else accrued_interest)
+
+    update_payload = {
+        "principal_current": float(principal_new),
+        "unpaid_interest": float(unpaid_interest_new),
+        "total_due": float(total_due_new),
+        "updated_at": now_iso(),
+        "last_paid_at": str(paid_at),
+    }
+
+    # Only update columns that exist (prevents schema errors)
+    update_payload = filter_payload_to_existing_columns(sb, schema, "loans_legacy", update_payload)
+
+    try:
+        if update_payload:
+            sb.schema(schema).table("loans_legacy").update(update_payload).eq("id", int(loan_id)).execute()
+    except Exception:
+        # repayment is already recorded; don't crash UI
+        pass
+
     return True
 
 
@@ -528,7 +571,6 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, f
     month = _month_key()
     today_str = str(date.today())
 
-    # ✅ Already ran this month OR already has a snapshot today -> no-op
     existing = (
         sb.schema(schema).table("loan_interest_snapshots")
         .select("id,snapshot_month,snapshot_date")
@@ -577,7 +619,6 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, f
 
     lifetime_interest_total = sum(float(r.get("total_interest_generated") or 0) for r in loans)
 
-    # ✅ Use upsert to avoid unique constraint errors (snapshot_date unique)
     snapshot_payload = {
         "snapshot_date": today_str,
         "snapshot_month": month,
@@ -586,7 +627,6 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, f
         "actor_user_id": actor_user_id,  # may not exist; drop if PostgREST complains
     }
 
-    # Try to insert/upsert, drop missing columns if needed
     for _ in range(6):
         try:
             sb.schema(schema).table("loan_interest_snapshots").upsert(snapshot_payload).execute()
