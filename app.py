@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import os
-from datetime import date, datetime
+from datetime import date
 import streamlit as st
 import pandas as pd
 from supabase import create_client
@@ -274,11 +274,6 @@ elif page == "Loans":
 
 # ============================================================
 # ✅ Minutes & Attendance (Legacy) — UPGRADED
-# - session_number linked from dashboard_next_view.session_number
-# - minutes PDF export (make_minutes_pdf)
-# - attendance PDF export (make_attendance_pdf)
-# - Mark all present (bulk upsert)
-# - Summaries tab (daily/member/monthly)
 # ============================================================
 elif page == "Minutes & Attendance":
     st.header("📝 Meeting Minutes & ✅ Attendance (Legacy)")
@@ -354,7 +349,6 @@ elif page == "Minutes & Attendance":
         else:
             st.dataframe(dfm, use_container_width=True, hide_index=True)
 
-            # Minutes PDF export
             if make_minutes_pdf is not None and "id" in dfm.columns:
                 pick_id = st.selectbox("Export minutes PDF (pick id)", dfm["id"].tolist(), key="minutes_pdf_pick")
                 row = dfm[dfm["id"] == pick_id].iloc[0].to_dict()
@@ -398,7 +392,6 @@ elif page == "Minutes & Attendance":
                         })
                     payloads = [{k: v for k, v in p.items() if v is not None} for p in payloads]
                     try:
-                        # Upsert avoids duplicates if you created UNIQUE index on (meeting_date, legacy_member_id)
                         sb_service.schema(SUPABASE_SCHEMA).table("meeting_attendance_legacy").upsert(payloads).execute()
                         st.success("All members marked present (upserted).")
                     except Exception as e:
@@ -462,7 +455,6 @@ elif page == "Minutes & Attendance":
         else:
             st.dataframe(dfa, use_container_width=True, hide_index=True)
 
-            # Attendance PDF export
             if make_attendance_pdf is not None:
                 pdf_bytes = make_attendance_pdf(
                     APP_BRAND,
