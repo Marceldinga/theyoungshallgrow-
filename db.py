@@ -1,4 +1,3 @@
-
 # db.py
 # ============================================================
 # Database helpers for Njangi system (Railway + Streamlit Cloud safe)
@@ -15,8 +14,23 @@ from typing import Any, Dict, List, Tuple, Optional
 import pandas as pd
 from supabase import create_client
 
+from datetime import datetime, timezone  # ✅ added
+
 # If Railway injects these, it can break DNS/resolution flows if your app accidentally uses Postgres.
 POSTGRES_ENV_VARS = ["DATABASE_URL", "PGHOST", "PGPORT", "PGUSER", "PGPASSWORD", "PGDATABASE"]
+
+
+# ============================================================
+# TIME HELPERS ✅ (added for modules that import now_iso)
+# ============================================================
+def now_iso() -> str:
+    """UTC ISO timestamp with Z suffix."""
+    return (
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
 
 # ============================================================
@@ -58,7 +72,6 @@ def _validate_supabase_env(url: str | None, key: str | None) -> tuple[str, str]:
         raise RuntimeError(f"SUPABASE_URL must start with https:// (got {url!r}).")
 
     # HARD BLOCK: if Postgres vars exist, fail with a clear instruction.
-    # (Railway sometimes injects DB vars automatically; we do not want any Postgres usage.)
     bad = [k for k in POSTGRES_ENV_VARS if os.getenv(k)]
     if bad:
         raise RuntimeError(
@@ -71,7 +84,6 @@ def _validate_supabase_env(url: str | None, key: str | None) -> tuple[str, str]:
 
 
 def get_schema() -> str:
-    # You can set SUPABASE_SCHEMA if needed; default is public.
     return str(get_secret("SUPABASE_SCHEMA", "public") or "public")
 
 
@@ -96,7 +108,7 @@ def get_service_client():
     url = get_secret("SUPABASE_URL")
     sk = get_secret("SUPABASE_SERVICE_KEY")
     if not sk or not str(sk).strip():
-        return None  # app can run without service key (read-only)
+        return None
     url, sk = _validate_supabase_env(url, sk)
     return create_client(url, sk)
 
@@ -147,26 +159,43 @@ def _safe_execute(resp: Any) -> List[Dict[str, Any]]:
 
 
 # ============================================================
+# SIMPLE DB HELPERS ✅ (added for modules that import fetch_one)
+# ============================================================
+def fetch_one(resp: Any) -> Dict[str, Any]:
+    """Return first row from a Supabase response or {}."""
+    rows = _safe_execute(resp)
+    return rows[0] if rows else {}
+
+
+# ============================================================
 # CANONICAL STATE HELPERS
 # ============================================================
 def current_session_id(c) -> str | None:
     """
     Returns the current Njangi session/season identifier.
-    Tries multiple safe fallbacks.
+    ✅ Prefers app_state.next_payout_index (rotation pointer)
+    Fallbacks: app_state.current_session_id, then sessions_legacy latest.
     """
+    schema = get_schema()
+
+    # 1) app_state singleton
     try:
         rows = _safe_execute(
-            c.schema(get_schema()).table("app_state").select("current_session_id").limit(1).execute()
+            c.schema(schema).table("app_state").select("next_payout_index,current_session_id").limit(1).execute()
         )
-        if rows and rows[0].get("current_session_id") is not None:
-            return str(rows[0]["current_session_id"])
+        if rows:
+            if rows[0].get("next_payout_index") is not None:
+                return str(rows[0]["next_payout_index"])
+            if rows[0].get("current_session_id") is not None:
+                return str(rows[0]["current_session_id"])
     except Exception:
         pass
 
+    # 2) sessions_legacy latest
     for order_col in ("created_at", "id", "session_id"):
         try:
             rows = _safe_execute(
-                c.schema(get_schema())
+                c.schema(schema)
                 .table("sessions_legacy")
                 .select("*")
                 .order(order_col, desc=True)
@@ -184,10 +213,7 @@ def current_session_id(c) -> str | None:
 
 
 def get_app_state(c) -> Dict[str, Any]:
-    """
-    Returns the singleton app_state row (first row).
-    Safe fallback to {}.
-    """
+    """Returns the singleton app_state row (first row). Safe fallback to {}."""
     try:
         rows = _safe_execute(
             c.schema(get_schema()).table("app_state").select("*").limit(1).execute()
@@ -210,11 +236,8 @@ def load_members_legacy(c) -> Tuple[List[str], Dict[str, int], Dict[str, str], p
     """
     schema = get_schema()
 
-    # Try both possible key column names
     select_variants = [
-        # legacy_member_id version
         "legacy_member_id,name,position,phone,has_benefits,contributed,foundation_contrib,loan_due,payout_total,total_fines_accumulated",
-        # id version
         "id,name,position,phone,has_benefits,contributed,foundation_contrib,loan_due,payout_total,total_fines_accumulated",
     ]
 
@@ -231,8 +254,6 @@ def load_members_legacy(c) -> Tuple[List[str], Dict[str, int], Dict[str, str], p
                 key_col = "legacy_member_id" if "legacy_member_id" in tmp[0] else "id"
                 break
             else:
-                # Could still be valid but empty; detect column by trying again with limit 1 + select key only
-                # We’ll decide later; continue.
                 rows = tmp
                 key_col = "legacy_member_id" if "legacy_member_id" in sel else "id"
                 break
@@ -241,25 +262,20 @@ def load_members_legacy(c) -> Tuple[List[str], Dict[str, int], Dict[str, str], p
 
     df = pd.DataFrame(rows) if rows else pd.DataFrame()
 
-    # Ensure df has a key column and name column
     if df.empty:
-        # Create predictable empty frame
         df = pd.DataFrame(columns=[key_col or "id", "name"])
         return [], {}, {}, df
 
     if "name" not in df.columns:
         df["name"] = ""
 
-    # Determine key column robustly
     if "legacy_member_id" in df.columns:
         key_col = "legacy_member_id"
     elif "id" in df.columns:
         key_col = "id"
     else:
-        # fallback: first column
         key_col = df.columns[0]
 
-    # Sort safely
     try:
         df[key_col] = pd.to_numeric(df[key_col], errors="coerce")
         df = df.dropna(subset=[key_col]).copy()
@@ -268,15 +284,12 @@ def load_members_legacy(c) -> Tuple[List[str], Dict[str, int], Dict[str, str], p
         pass
 
     df["name"] = df["name"].astype(str)
-
-    # Create labels
     df["label"] = df.apply(lambda r: f'{int(r[key_col]):02d} • {r["name"]}', axis=1)
 
     labels = df["label"].tolist()
     label_to_id = dict(zip(df["label"], df[key_col].astype(int)))
     label_to_name = dict(zip(df["label"], df["name"]))
 
-    # Order by key
     try:
         df = df.sort_values(by=key_col, ascending=True).reset_index(drop=True)
     except Exception:
