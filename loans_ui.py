@@ -1,4 +1,4 @@
-# loans_ui.py ✅ UPDATED (uses public.repayments + SAFE ordering if paid_on doesn't exist)
+# loans_ui.py ✅ UPDATED (repayments: auto-detect link column to loans + SAFE ordering)
 from __future__ import annotations
 
 from datetime import date
@@ -79,6 +79,7 @@ def _actor_from_session(default_user_id: str) -> Actor:
 # ✅ SAFE READ HELPERS FOR repayments
 # - Some DBs use paid_at instead of paid_on
 # - Avoid crashing on order() if column missing
+# - Auto-detect loan-link column (NOT loan_legacy_id in your DB)
 # ============================================================
 def _safe_ordered_query(q):
     for col in ["paid_on", "paid_at", "created_at", "id"]:
@@ -87,6 +88,44 @@ def _safe_ordered_query(q):
         except Exception:
             continue
     return q.execute().data or []
+
+
+def _detect_repayment_loan_link_col(sb_service, schema: str) -> str:
+    """
+    Detect which column in public.repayments links to loans_legacy(id).
+    Caches result in session_state.
+    """
+    key = f"_repay_link_col::{schema}"
+    cached = st.session_state.get(key)
+    if cached:
+        return cached
+
+    candidates = [
+        "loan_id",
+        "loan",
+        "loan_fk",
+        "loan_ref",
+        "loan_legacy",
+        "loan_legacy_fk",
+        "loan_legacy_id",
+        "loan_pk",
+    ]
+
+    for col in candidates:
+        try:
+            sb_service.schema(schema).table(PAYMENTS_TABLE).select(f"id,{col}").limit(1).execute()
+            st.session_state[key] = col
+            return col
+        except Exception:
+            continue
+
+    st.error("Could not detect repayments → loans link column.")
+    try:
+        sample = sb_service.schema(schema).table(PAYMENTS_TABLE).select("*").limit(1).execute().data or []
+        st.write("Sample repayment row keys:", list((sample[0] or {}).keys()) if sample else [])
+    except Exception as e:
+        st.code(str(e), language="text")
+    st.stop()
 
 
 def get_pending_repayments(sb_service, schema: str, limit: int = 500) -> list[dict]:
@@ -102,41 +141,50 @@ def get_pending_repayments(sb_service, schema: str, limit: int = 500) -> list[di
 def get_repayments_for_loan_ids(sb_service, schema: str, loan_ids: list[int], limit: int = 5000) -> list[dict]:
     if not loan_ids:
         return []
-    # NOTE: if your column is not loan_legacy_id, this will error and show message.
+
+    link_col = _detect_repayment_loan_link_col(sb_service, schema)
     q = (
         sb_service.schema(schema).table(PAYMENTS_TABLE)
         .select("*")
-        .in_("loan_legacy_id", loan_ids)
+        .in_(link_col, loan_ids)
         .limit(int(limit))
     )
-    try:
-        return _safe_ordered_query(q)
-    except Exception as e:
-        st.error("repayments table exists, but the column name for linking to loans is different from 'loan_legacy_id'.")
-        st.code(str(e), language="text")
-        st.stop()
+    return _safe_ordered_query(q)
 
 
 def get_repayments_for_dpd(sb_service, schema: str, limit: int = 20000) -> pd.DataFrame:
     """
     Fetch minimal columns for DPD. We ask for both paid_on and paid_at.
-    If one doesn't exist, PostgREST may error; so we fallback to '*'.
+    If minimal select fails, fallback to '*'.
+    Normalizes the loan link column into df["loan_link_id"].
     """
+    link_col = _detect_repayment_loan_link_col(sb_service, schema)
+
     try:
-        q = (
+        rows = (
             sb_service.schema(schema).table(PAYMENTS_TABLE)
-            .select("loan_legacy_id,status,paid_on,paid_at")
+            .select(f"{link_col},status,paid_on,paid_at,created_at")
             .limit(int(limit))
+            .execute().data or []
         )
-        rows = q.execute().data or []
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
     except Exception:
         rows = (
             sb_service.schema(schema).table(PAYMENTS_TABLE)
             .select("*").limit(int(limit))
             .execute().data or []
         )
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+
+    if df.empty:
+        return df
+
+    if link_col in df.columns:
+        df["loan_link_id"] = pd.to_numeric(df[link_col], errors="coerce")
+    else:
+        df["loan_link_id"] = pd.NA
+
+    return df
 
 
 def render_loans(sb_service, schema: str, actor_user_id: str = ""):
@@ -589,8 +637,9 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                 df_pay["paid_on_dt"] = pd.NaT
 
             df_pay = df_pay[df_pay["status"].astype(str).str.lower() == "confirmed"]
-            if "loan_legacy_id" in df_pay.columns:
-                for loan_id, grp in df_pay.groupby("loan_legacy_id"):
+
+            if "loan_link_id" in df_pay.columns:
+                for loan_id, grp in df_pay.dropna(subset=["loan_link_id"]).groupby("loan_link_id"):
                     mx = grp["paid_on_dt"].max()
                     if pd.notna(mx):
                         last_paid[int(loan_id)] = mx.date()
