@@ -1,8 +1,8 @@
-# loans_ui.py ✅ UPDATED (Streamlit width="stretch", RBAC + UUID-safe requester_user_id)
+# loans_ui.py ✅ UPDATED (Streamlit: use_container_width=True, RBAC + UUID-safe requester_user_id)
 from __future__ import annotations
 
 from datetime import date
-from uuid import uuid4
+from uuid import uuid4, UUID
 
 import streamlit as st
 import pandas as pd
@@ -25,22 +25,39 @@ except Exception:
         return None
 
 
+def _is_uuid(s: str) -> bool:
+    try:
+        UUID(str(s))
+        return True
+    except Exception:
+        return False
+
+
 def _get_or_make_session_uuid(key: str = "actor_user_uuid") -> str:
     """Guarantee a valid UUID string even without Supabase Auth."""
-    if key not in st.session_state or not str(st.session_state.get(key) or "").strip():
+    v = str(st.session_state.get(key) or "").strip()
+    if not v or not _is_uuid(v):
         st.session_state[key] = str(uuid4())
     return str(st.session_state[key])
 
 
 def _actor_from_session(default_user_id: str) -> Actor:
-    # Simple RBAC UI for now (works without auth). Later you can replace with real login.
+    # Simple RBAC UI for now (works without auth). Later replace with real login.
     with st.sidebar.expander("🔐 Role (temporary)", expanded=False):
         role = st.selectbox("Role", [ROLE_ADMIN, ROLE_TREASURY, ROLE_MEMBER], index=0, key="actor_role")
-        member_id = st.number_input("Member ID (if member/treasury)", min_value=0, step=1, value=0, key="actor_member_id")
-        name = st.text_input("Name", value="admin" if role != ROLE_MEMBER else "member", key="actor_name")
+        member_id = st.number_input(
+            "Member ID (if member/treasury)",
+            min_value=0, step=1, value=int(st.session_state.get("actor_member_id") or 0),
+            key="actor_member_id",
+        )
+        name = st.text_input(
+            "Name",
+            value=str(st.session_state.get("actor_name") or ("admin" if role != ROLE_MEMBER else "member")),
+            key="actor_name",
+        )
 
     # ✅ Force UUID user_id so DB uuid columns won't break
-    user_uuid = default_user_id if default_user_id else _get_or_make_session_uuid()
+    user_uuid = default_user_id if (default_user_id and _is_uuid(default_user_id)) else _get_or_make_session_uuid()
 
     return Actor(
         user_id=user_uuid,
@@ -52,7 +69,7 @@ def _actor_from_session(default_user_id: str) -> Actor:
 
 def render_loans(sb_service, schema: str, actor_user_id: str = ""):
     # ✅ Always use UUID if caller passes "admin" or empty
-    actor_user_uuid = actor_user_id if actor_user_id and len(actor_user_id) >= 32 else _get_or_make_session_uuid()
+    actor_user_uuid = actor_user_id if (actor_user_id and _is_uuid(actor_user_id)) else _get_or_make_session_uuid()
     actor = _actor_from_session(actor_user_uuid)
 
     st.header("Loans (Organizational Standard)")
@@ -142,7 +159,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                 )
 
                 df_sig_admin = core.sig_df(sb_service, schema, "loan", req_id_admin)
-                st.dataframe(df_sig_admin, width="stretch", hide_index=True)
+                st.dataframe(df_sig_admin, use_container_width=True, hide_index=True)
 
                 miss = core.missing_roles(df_sig_admin, core.LOAN_SIG_REQUIRED)
                 if miss:
@@ -153,7 +170,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                 colA, colB = st.columns(2)
 
                 with colA:
-                    if st.button("✅ Approve Loan Request", width="stretch", key=f"admin_approve_{req_id_admin}"):
+                    if st.button("✅ Approve Loan Request", use_container_width=True, key=f"admin_approve_{req_id_admin}"):
                         try:
                             loan_id = core.approve_loan_request(
                                 sb_service,
@@ -175,7 +192,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
 
                 with colB:
                     deny_reason = st.text_input("Deny reason", value="Not approved", key=f"deny_reason_{req_id_admin}")
-                    if st.button("❌ Deny Loan Request", width="stretch", key=f"admin_deny_{req_id_admin}"):
+                    if st.button("❌ Deny Loan Request", use_container_width=True, key=f"admin_deny_{req_id_admin}"):
                         try:
                             core.deny_loan_request(sb_service, schema, req_id_admin, reason=deny_reason)
                             audit(
@@ -229,14 +246,14 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
         limit_amt = core.member_loan_limit(sb_service, schema, borrower_id)
         st.caption(f"Borrower loan limit (2× foundation): {limit_amt:,.0f}")
 
-        if st.button("📩 Submit Loan Request", width="stretch", key="loan_req_submit"):
+        if st.button("📩 Submit Loan Request", use_container_width=True, key="loan_req_submit"):
             try:
                 req_id = core.create_loan_request(
                     sb_service, schema,
                     borrower_id, borrower_name,
                     surety_id, surety_name,
                     float(amount),
-                    requester_user_id=actor.user_id,  # ✅ UUID-safe now
+                    requester_user_id=actor.user_id,  # ✅ UUID-safe
                 )
                 st.session_state["loan_active_request_id"] = req_id
                 audit(sb_service, "loan_request_created", "ok", {"request_id": req_id}, actor_user_id=actor.user_id)
@@ -276,7 +293,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
 
         st.caption(f"Request ID: {req_id} • Amount: {float(req.get('amount') or 0):,.0f}")
         df_sig = core.sig_df(sb_service, schema, "loan", int(req_id))
-        st.dataframe(df_sig, width="stretch", hide_index=True)
+        st.dataframe(df_sig, use_container_width=True, hide_index=True)
 
         def signature_box(role: str, default_name: str, signer_member_id: int | None, key_prefix: str):
             existing = df_sig[df_sig["role"] == role] if not df_sig.empty else pd.DataFrame()
@@ -297,7 +314,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                     "I confirm this signature",
                     key=f"{key_prefix}_{req_id}_{role}_confirm",
                 )
-                if st.button("Sign", width="stretch", key=f"{key_prefix}_{req_id}_{role}_btn"):
+                if st.button("Sign", use_container_width=True, key=f"{key_prefix}_{req_id}_{role}_btn"):
                     if not confirm:
                         st.error("Please confirm the signature checkbox.")
                         st.stop()
@@ -350,7 +367,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
 
         st.divider()
         st.subheader("Recent Requests Register")
-        st.dataframe(pd.DataFrame(pending_rows), width="stretch", hide_index=True)
+        st.dataframe(pd.DataFrame(pending_rows), use_container_width=True, hide_index=True)
 
     # ============================================================
     # ---- Ledger ----
@@ -363,7 +380,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
             .select("*").order("issued_at", desc=True).limit(20000)
             .execute().data or []
         )
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     # ============================================================
     # ---- Record Payment ----
@@ -375,10 +392,16 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
         amount = st.number_input("amount", min_value=0.0, step=50.0, value=100.0, key="loan_pay_amount")
         paid_on = st.date_input("paid_on", value=date.today(), key="loan_pay_date")
 
-        if st.button("Record Pending Payment", width="stretch", key="loan_pay_record"):
+        if st.button("Record Pending Payment", use_container_width=True, key="loan_pay_record"):
             try:
-                core.record_payment_pending(sb_service, schema, int(loan_id), float(amount), str(paid_on), recorded_by=actor.user_id)
-                audit(sb_service, "loan_payment_recorded_pending", "ok", {"loan_id": int(loan_id)}, actor_user_id=actor.user_id)
+                core.record_payment_pending(
+                    sb_service, schema, int(loan_id), float(amount), str(paid_on),
+                    recorded_by=actor.user_id
+                )
+                audit(
+                    sb_service, "loan_payment_recorded_pending", "ok",
+                    {"loan_id": int(loan_id)}, actor_user_id=actor.user_id
+                )
                 st.success("Recorded pending. Checker must confirm.")
                 st.rerun()
             except Exception as e:
@@ -399,14 +422,17 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
         if dfp.empty:
             st.success("No pending payments.")
         else:
-            st.dataframe(dfp, width="stretch", hide_index=True)
+            st.dataframe(dfp, use_container_width=True, hide_index=True)
             pid_default = int(dfp.iloc[0].get("payment_id") or dfp.iloc[0].get("id") or 1)
             pid = st.number_input("payment_id to confirm", min_value=1, step=1, value=pid_default, key="pay_confirm_id")
 
-            if st.button("✅ Confirm Selected Payment", width="stretch", key="pay_confirm_btn"):
+            if st.button("✅ Confirm Selected Payment", use_container_width=True, key="pay_confirm_btn"):
                 try:
                     core.confirm_payment(sb_service, schema, int(pid), confirmer=actor.user_id)
-                    audit(sb_service, "loan_payment_confirmed", "ok", {"payment_id": int(pid)}, actor_user_id=actor.user_id)
+                    audit(
+                        sb_service, "loan_payment_confirmed", "ok",
+                        {"payment_id": int(pid)}, actor_user_id=actor.user_id
+                    )
                     st.success("Confirmed and applied.")
                     st.rerun()
                 except Exception as e:
@@ -427,15 +453,18 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
         if dfp.empty:
             st.success("No pending payments to reject.")
         else:
-            st.dataframe(dfp, width="stretch", hide_index=True)
+            st.dataframe(dfp, use_container_width=True, hide_index=True)
             pid_default = int(dfp.iloc[0].get("payment_id") or dfp.iloc[0].get("id") or 1)
             pid = st.number_input("payment_id to reject", min_value=1, step=1, value=pid_default, key="pay_reject_id")
             reason = st.text_input("Reject reason", value="Invalid reference", key="pay_reject_reason")
 
-            if st.button("❌ Reject Selected Payment", width="stretch", key="pay_reject_btn"):
+            if st.button("❌ Reject Selected Payment", use_container_width=True, key="pay_reject_btn"):
                 try:
                     core.reject_payment(sb_service, schema, int(pid), rejecter=actor.user_id, reason=reason)
-                    audit(sb_service, "loan_payment_rejected", "ok", {"payment_id": int(pid), "reason": reason}, actor_user_id=actor.user_id)
+                    audit(
+                        sb_service, "loan_payment_rejected", "ok",
+                        {"payment_id": int(pid), "reason": reason}, actor_user_id=actor.user_id
+                    )
                     st.success("Rejected.")
                     st.rerun()
                 except Exception as e:
@@ -449,7 +478,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
         st.subheader("Monthly Interest Accrual (Idempotent)")
         st.caption("Runs ONCE per month. If already run, it will do nothing.")
 
-        if st.button("Accrue Monthly Interest", width="stretch", key="loan_accrue"):
+        if st.button("Accrue Monthly Interest", use_container_width=True, key="loan_accrue"):
             try:
                 updated, total = core.accrue_monthly_interest(sb_service, schema, actor_user_id=actor.user_id)
                 if updated == 0 and total == 0.0:
@@ -465,7 +494,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
             .select("*").order("snapshot_date", desc=True).limit(50)
             .execute().data or []
         )
-        st.dataframe(pd.DataFrame(snaps), width="stretch", hide_index=True)
+        st.dataframe(pd.DataFrame(snaps), use_container_width=True, hide_index=True)
 
     # ============================================================
     # ---- Delinquency ----
@@ -528,7 +557,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
         else:
             st.dataframe(
                 df_dpd.sort_values(["bucket", "dpd"], ascending=[True, False]),
-                width="stretch",
+                use_container_width=True,
                 hide_index=True,
             )
 
@@ -550,7 +579,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
             st.warning("Members can only view their own statement.")
             return
 
-        if st.button("Load Statement", width="stretch", key="stmt_load"):
+        if st.button("Load Statement", use_container_width=True, key="stmt_load"):
             st.session_state["stmt_loaded_member_id"] = int(mid)
 
         loaded_mid = st.session_state.get("stmt_loaded_member_id")
@@ -584,9 +613,9 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                 )
 
             st.markdown("### Loans")
-            st.dataframe(pd.DataFrame(mloans), width="stretch", hide_index=True)
+            st.dataframe(pd.DataFrame(mloans), use_container_width=True, hide_index=True)
             st.markdown("### Payments")
-            st.dataframe(pd.DataFrame(mpay), width="stretch", hide_index=True)
+            st.dataframe(pd.DataFrame(mpay), use_container_width=True, hide_index=True)
 
             st.divider()
             st.markdown("### Download PDF")
@@ -608,7 +637,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                     pdf_bytes,
                     file_name=f"loan_statement_{member['member_id']:02d}_{str(member['member_name']).replace(' ', '_')}.pdf",
                     mime="application/pdf",
-                    width="stretch",
+                    use_container_width=True,
                     key="dl_member_loan_statement_pdf",
                 )
 
@@ -619,7 +648,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                 st.info("ZIP builder not available. Ensure pdfs.py defines make_loan_statements_zip.")
             else:
                 st.markdown("### Admin/Treasury: Download ALL Loan Statements (ZIP)")
-                if st.button("📦 Build ZIP for all members", width="stretch", key="dl_all_loan_zip_btn"):
+                if st.button("📦 Build ZIP for all members", use_container_width=True, key="dl_all_loan_zip_btn"):
                     all_members = (
                         sb_service.schema(schema).table("members_legacy")
                         .select("id,name,position").order("id", desc=False).limit(5000)
@@ -660,6 +689,6 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
                         zip_bytes,
                         file_name="loan_statements_all.zip",
                         mime="application/zip",
-                        width="stretch",
+                        use_container_width=True,
                         key="dl_all_loan_statements_zip",
                     )
