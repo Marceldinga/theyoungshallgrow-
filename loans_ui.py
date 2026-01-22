@@ -1,7 +1,9 @@
-# loans_ui.py ✅ UPDATED (Streamlit width=)
+# loans_ui.py ✅ UPDATED (Streamlit width="stretch", RBAC + UUID-safe requester_user_id)
 from __future__ import annotations
 
 from datetime import date
+from uuid import uuid4
+
 import streamlit as st
 import pandas as pd
 
@@ -23,26 +25,41 @@ except Exception:
         return None
 
 
+def _get_or_make_session_uuid(key: str = "actor_user_uuid") -> str:
+    """Guarantee a valid UUID string even without Supabase Auth."""
+    if key not in st.session_state or not str(st.session_state.get(key) or "").strip():
+        st.session_state[key] = str(uuid4())
+    return str(st.session_state[key])
+
+
 def _actor_from_session(default_user_id: str) -> Actor:
     # Simple RBAC UI for now (works without auth). Later you can replace with real login.
     with st.sidebar.expander("🔐 Role (temporary)", expanded=False):
         role = st.selectbox("Role", [ROLE_ADMIN, ROLE_TREASURY, ROLE_MEMBER], index=0, key="actor_role")
-        member_id = st.number_input("Member ID (if member)", min_value=0, step=1, value=0, key="actor_member_id")
+        member_id = st.number_input("Member ID (if member/treasury)", min_value=0, step=1, value=0, key="actor_member_id")
         name = st.text_input("Name", value="admin" if role != ROLE_MEMBER else "member", key="actor_name")
+
+    # ✅ Force UUID user_id so DB uuid columns won't break
+    user_uuid = default_user_id if default_user_id else _get_or_make_session_uuid()
+
     return Actor(
-        user_id=default_user_id,
+        user_id=user_uuid,
         role=role,
         member_id=(int(member_id) if int(member_id) > 0 else None),
         name=(name.strip() or None),
     )
 
 
-def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
-    actor = _actor_from_session(actor_user_id)
+def render_loans(sb_service, schema: str, actor_user_id: str = ""):
+    # ✅ Always use UUID if caller passes "admin" or empty
+    actor_user_uuid = actor_user_id if actor_user_id and len(actor_user_id) >= 32 else _get_or_make_session_uuid()
+    actor = _actor_from_session(actor_user_uuid)
 
     st.header("Loans (Organizational Standard)")
 
+    # ============================================================
     # KPIs (visible to all)
+    # ============================================================
     loans_all = (
         sb_service.schema(schema).table("loans_legacy")
         .select("id,status,total_due")
@@ -54,7 +71,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
     else:
         df_all["status"] = df_all["status"].astype(str)
         df_all["total_due"] = pd.to_numeric(df_all.get("total_due"), errors="coerce").fillna(0)
-        active = df_all[df_all["status"].str.lower() == "active"]
+        active = df_all[df_all["status"].str.lower().str.strip() == "active"]
         active_count = len(active)
         active_due = float(active["total_due"].sum())
 
@@ -66,14 +83,13 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
     st.divider()
 
     # ============================================================
-    # ✅ Mobile-safe menu with RBAC (FIXED: no manual session_state set)
+    # ✅ Mobile-safe menu with RBAC
     # ============================================================
     sections = allowed_sections(actor.role)
     if not sections:
         st.warning("No sections available for your role.")
         return
 
-    # Initialize only once
     if "loans_menu" not in st.session_state:
         st.session_state["loans_menu"] = sections[0]
 
@@ -83,119 +99,101 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
         index=sections.index(st.session_state["loans_menu"]) if st.session_state["loans_menu"] in sections else 0,
         key="loans_menu",
     )
-    # ✅ DO NOT assign st.session_state["loans_menu"] = section
-    # The widget owns it.
 
+    # ============================================================
     # ---- Requests ----
+    # ============================================================
     if section == "Requests":
         st.subheader("Loan Requests (Submit + Signatures)")
         st.caption("Submit a request, then Borrower/Surety/Treasury sign here. Admin approves later.")
-            # ============================================================
-    # ✅ ADMIN: Approve / Deny Pending Loan Requests
-    # (Visible ONLY to Admin role)
-    # ============================================================
-    if actor.role == ROLE_ADMIN:
-        st.divider()
-        st.subheader("Admin Approval (Approve / Deny)")
 
-        pending_rows = core.list_pending_requests(sb_service, schema, limit=300)
-        df_pending = pd.DataFrame(pending_rows)
+        # ------------------------------------------------------------
+        # ✅ ADMIN: Approve / Deny Pending Loan Requests (ONLY Admin)
+        # ------------------------------------------------------------
+        if actor.role == ROLE_ADMIN:
+            st.divider()
+            st.subheader("Admin Approval (Approve / Deny)")
 
-        if df_pending.empty:
-            st.success("No pending loan requests.")
-        else:
-            df_pending["label"] = df_pending.apply(
-                lambda r: f"Req {int(r['id'])} • {r.get('requester_name','')} • {float(r['amount']):,.0f}",
-                axis=1
-            )
+            pending_rows = core.list_pending_requests(sb_service, schema, limit=300)
+            df_pending = pd.DataFrame(pending_rows)
 
-            pick_req = st.selectbox(
-                "Select pending request",
-                df_pending["label"].tolist(),
-                key="admin_pick_loan_req"
-            )
-
-            req_id_admin = int(
-                df_pending[df_pending["label"] == pick_req].iloc[0]["id"]
-            )
-
-            req = core.get_request(sb_service, schema, req_id_admin)
-
-            st.caption(
-                f"Request #{req_id_admin} | "
-                f"Borrower: {req.get('requester_name')} | "
-                f"Surety: {req.get('surety_name')} | "
-                f"Amount: {float(req.get('amount') or 0):,.0f}"
-            )
-
-            # Show signatures status
-            df_sig_admin = core.sig_df(sb_service, schema, "loan", req_id_admin)
-            st.dataframe(df_sig_admin, width="stretch", hide_index=True)
-
-            miss = core.missing_roles(df_sig_admin, core.LOAN_SIG_REQUIRED)
-            if miss:
-                st.warning("Missing signatures: " + ", ".join(miss))
+            if df_pending.empty:
+                st.success("No pending loan requests.")
             else:
-                st.success("All required signatures present.")
-
-            colA, colB = st.columns(2)
-
-            with colA:
-                if st.button(
-                    "✅ Approve Loan Request",
-                    width="stretch",
-                    key=f"admin_approve_{req_id_admin}"
-                ):
-                    try:
-                        loan_id = core.approve_loan_request(
-                            sb_service,
-                            schema,
-                            req_id_admin,
-                            actor_user_id=actor.user_id
-                        )
-                        audit(
-                            sb_service,
-                            "loan_request_approved",
-                            "ok",
-                            {"request_id": req_id_admin, "loan_id": loan_id},
-                            actor_user_id=actor.user_id,
-                        )
-                        st.success(f"Loan approved. loan_legacy_id = {loan_id}")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(str(e))
-
-            with colB:
-                deny_reason = st.text_input(
-                    "Deny reason",
-                    value="Not approved",
-                    key=f"deny_reason_{req_id_admin}"
+                df_pending["label"] = df_pending.apply(
+                    lambda r: f"Req {int(r['id'])} • {r.get('requester_name','')} • {float(r['amount']):,.0f}",
+                    axis=1
                 )
-                if st.button(
-                    "❌ Deny Loan Request",
-                    width="stretch",
-                    key=f"admin_deny_{req_id_admin}"
-                ):
-                    try:
-                        core.deny_loan_request(
-                            sb_service,
-                            schema,
-                            req_id_admin,
-                            reason=deny_reason
-                        )
-                        audit(
-                            sb_service,
-                            "loan_request_denied",
-                            "ok",
-                            {"request_id": req_id_admin, "reason": deny_reason},
-                            actor_user_id=actor.user_id,
-                        )
-                        st.success("Loan request denied.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(str(e))
 
+                pick_req = st.selectbox(
+                    "Select pending request",
+                    df_pending["label"].tolist(),
+                    key="admin_pick_loan_req"
+                )
 
+                req_id_admin = int(df_pending[df_pending["label"] == pick_req].iloc[0]["id"])
+                req = core.get_request(sb_service, schema, req_id_admin)
+
+                st.caption(
+                    f"Request #{req_id_admin} | "
+                    f"Borrower: {req.get('requester_name')} | "
+                    f"Surety: {req.get('surety_name')} | "
+                    f"Amount: {float(req.get('amount') or 0):,.0f}"
+                )
+
+                df_sig_admin = core.sig_df(sb_service, schema, "loan", req_id_admin)
+                st.dataframe(df_sig_admin, width="stretch", hide_index=True)
+
+                miss = core.missing_roles(df_sig_admin, core.LOAN_SIG_REQUIRED)
+                if miss:
+                    st.warning("Missing signatures: " + ", ".join(miss))
+                else:
+                    st.success("All required signatures present.")
+
+                colA, colB = st.columns(2)
+
+                with colA:
+                    if st.button("✅ Approve Loan Request", width="stretch", key=f"admin_approve_{req_id_admin}"):
+                        try:
+                            loan_id = core.approve_loan_request(
+                                sb_service,
+                                schema,
+                                req_id_admin,
+                                actor_user_id=actor.user_id
+                            )
+                            audit(
+                                sb_service,
+                                "loan_request_approved",
+                                "ok",
+                                {"request_id": req_id_admin, "loan_id": loan_id},
+                                actor_user_id=actor.user_id,
+                            )
+                            st.success(f"Loan approved. loan_legacy_id = {loan_id}")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(str(e))
+
+                with colB:
+                    deny_reason = st.text_input("Deny reason", value="Not approved", key=f"deny_reason_{req_id_admin}")
+                    if st.button("❌ Deny Loan Request", width="stretch", key=f"admin_deny_{req_id_admin}"):
+                        try:
+                            core.deny_loan_request(sb_service, schema, req_id_admin, reason=deny_reason)
+                            audit(
+                                sb_service,
+                                "loan_request_denied",
+                                "ok",
+                                {"request_id": req_id_admin, "reason": deny_reason},
+                                actor_user_id=actor.user_id,
+                            )
+                            st.success("Loan request denied.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(str(e))
+
+        # ------------------------------------------------------------
+        # Submit Request
+        # ------------------------------------------------------------
+        st.divider()
         require(actor.role, "submit_request")
 
         members = (
@@ -238,7 +236,7 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
                     borrower_id, borrower_name,
                     surety_id, surety_name,
                     float(amount),
-                    requester_user_id=actor.user_id,  # ✅ important (uuid in DB)
+                    requester_user_id=actor.user_id,  # ✅ UUID-safe now
                 )
                 st.session_state["loan_active_request_id"] = req_id
                 audit(sb_service, "loan_request_created", "ok", {"request_id": req_id}, actor_user_id=actor.user_id)
@@ -247,9 +245,11 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
             except Exception as e:
                 st.error(str(e))
 
+        # ------------------------------------------------------------
+        # Sign Request
+        # ------------------------------------------------------------
         st.divider()
         st.subheader("Sign Loan Request")
-
         require(actor.role, "sign_request")
 
         req_id = st.session_state.get("loan_active_request_id")
@@ -258,94 +258,103 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
 
         if dfp.empty and not req_id:
             st.info("No pending requests to sign.")
-        else:
-            if not req_id:
-                dfp["label"] = dfp.apply(
-                    lambda r: f"Req {int(r['id'])} • {r.get('requester_name','')} • {float(r['amount']):,.0f}",
-                    axis=1
+            return
+
+        if not req_id:
+            dfp["label"] = dfp.apply(
+                lambda r: f"Req {int(r['id'])} • {r.get('requester_name','')} • {float(r['amount']):,.0f}",
+                axis=1
+            )
+            pick = st.selectbox("Select request to sign", dfp["label"].tolist(), key="loan_req_sign_pick")
+            req_id = int(dfp[dfp["label"] == pick].iloc[0]["id"])
+
+        try:
+            req = core.get_request(sb_service, schema, int(req_id))
+        except Exception as e:
+            st.error(str(e))
+            return
+
+        st.caption(f"Request ID: {req_id} • Amount: {float(req.get('amount') or 0):,.0f}")
+        df_sig = core.sig_df(sb_service, schema, "loan", int(req_id))
+        st.dataframe(df_sig, width="stretch", hide_index=True)
+
+        def signature_box(role: str, default_name: str, signer_member_id: int | None, key_prefix: str):
+            existing = df_sig[df_sig["role"] == role] if not df_sig.empty else pd.DataFrame()
+            with st.container(border=True):
+                st.markdown(f"**{role.upper()} SIGNATURE**")
+
+                if not existing.empty:
+                    row = existing.iloc[-1]
+                    st.success(f"Signed by: {row.get('signer_name','')} • {str(row.get('signed_at',''))[:19]}")
+                    return
+
+                name = st.text_input(
+                    "Signer name",
+                    value=default_name or "",
+                    key=f"{key_prefix}_{req_id}_{role}_name",
                 )
-                pick = st.selectbox("Select request to sign", dfp["label"].tolist(), key="loan_req_sign_pick")
-                req_id = int(dfp[dfp["label"] == pick].iloc[0]["id"])
+                confirm = st.checkbox(
+                    "I confirm this signature",
+                    key=f"{key_prefix}_{req_id}_{role}_confirm",
+                )
+                if st.button("Sign", width="stretch", key=f"{key_prefix}_{req_id}_{role}_btn"):
+                    if not confirm:
+                        st.error("Please confirm the signature checkbox.")
+                        st.stop()
+                    if not str(name).strip():
+                        st.error("Signer name is required.")
+                        st.stop()
 
-            try:
-                req = core.get_request(sb_service, schema, int(req_id))
-            except Exception as e:
-                st.error(str(e))
-                return
+                    try:
+                        core.insert_signature(
+                            sb_service, schema, "loan", int(req_id),
+                            role=role,
+                            signer_name=str(name).strip(),
+                            signer_member_id=signer_member_id,
+                        )
+                        st.success("Signed.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error("Failed to save signature.")
+                        st.code(str(e), language="text")
 
-            st.caption(f"Request ID: {req_id} • Amount: {float(req.get('amount') or 0):,.0f}")
-            df_sig = core.sig_df(sb_service, schema, "loan", int(req_id))
-            st.dataframe(df_sig, width="stretch", hide_index=True)
+        signature_box(
+            "borrower",
+            default_name=str(req.get("requester_name") or ""),
+            signer_member_id=int(req.get("requester_member_id") or 0) or None,
+            key_prefix="loan_sig",
+        )
+        signature_box(
+            "surety",
+            default_name=str(req.get("surety_name") or ""),
+            signer_member_id=int(req.get("surety_member_id") or 0) or None,
+            key_prefix="loan_sig",
+        )
 
-            def signature_box(role: str, default_name: str, signer_member_id: int | None, key_prefix: str):
-                existing = df_sig[df_sig["role"] == role] if not df_sig.empty else pd.DataFrame()
-                with st.container(border=True):
-                    st.markdown(f"**{role.upper()} SIGNATURE**")
-                    if not existing.empty:
-                        row = existing.iloc[-1]
-                        st.success(f"Signed by: {row.get('signer_name','')} • {str(row.get('signed_at',''))[:19]}")
-                        return
+        # ✅ Treasury signer_member_id should be the treasury actor's member_id (if provided)
+        treasury_signer_mid = actor.member_id if actor.role == ROLE_TREASURY else None
+        treasury_default_name = (actor.name or "Treasury") if actor.role == ROLE_TREASURY else "Treasury"
 
-                    name = st.text_input(
-                        "Signer name",
-                        value=default_name or "",
-                        key=f"{key_prefix}_{req_id}_{role}_name",
-                    )
-                    confirm = st.checkbox(
-                        "I confirm this signature",
-                        key=f"{key_prefix}_{req_id}_{role}_confirm",
-                    )
-                    if st.button("Sign", width="stretch", key=f"{key_prefix}_{req_id}_{role}_btn"):
-                        if not confirm:
-                            st.error("Please confirm the signature checkbox.")
-                            st.stop()
-                        if not str(name).strip():
-                            st.error("Signer name is required.")
-                            st.stop()
+        signature_box(
+            "treasury",
+            default_name=treasury_default_name,
+            signer_member_id=int(treasury_signer_mid) if treasury_signer_mid else None,
+            key_prefix="loan_sig",
+        )
 
-                        try:
-                            core.insert_signature(
-                                sb_service, schema, "loan", int(req_id),
-                                role=role,
-                                signer_name=str(name).strip(),
-                                signer_member_id=signer_member_id,
-                            )
-                            st.success("Signed.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error("Failed to save signature.")
-                            st.code(str(e), language="text")
-
-            signature_box(
-                "borrower",
-                default_name=str(req.get("requester_name") or ""),
-                signer_member_id=int(req.get("requester_member_id") or 0) or None,
-                key_prefix="loan_sig",
-            )
-            signature_box(
-                "surety",
-                default_name=str(req.get("surety_name") or ""),
-                signer_member_id=int(req.get("surety_member_id") or 0) or None,
-                key_prefix="loan_sig",
-            )
-            signature_box(
-                "treasury",
-                default_name="Treasury",
-                signer_member_id=None,
-                key_prefix="loan_sig",
-            )
-
-            miss = core.missing_roles(core.sig_df(sb_service, schema, "loan", int(req_id)), core.LOAN_SIG_REQUIRED)
-            if miss:
-                st.warning("Missing signatures: " + ", ".join(miss))
-            else:
-                st.success("✅ All required signatures present. Admin can approve now.")
+        miss = core.missing_roles(core.sig_df(sb_service, schema, "loan", int(req_id)), core.LOAN_SIG_REQUIRED)
+        if miss:
+            st.warning("Missing signatures: " + ", ".join(miss))
+        else:
+            st.success("✅ All required signatures present. Admin can approve now.")
 
         st.divider()
         st.subheader("Recent Requests Register")
         st.dataframe(pd.DataFrame(pending_rows), width="stretch", hide_index=True)
 
+    # ============================================================
     # ---- Ledger ----
+    # ============================================================
     elif section == "Ledger":
         require(actor.role, "view_ledger")
         st.subheader("Loans Ledger")
@@ -356,7 +365,9 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
         )
         st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
+    # ============================================================
     # ---- Record Payment ----
+    # ============================================================
     elif section == "Record Payment":
         require(actor.role, "record_payment")
         st.subheader("Record Payment (Maker → Pending)")
@@ -373,7 +384,9 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
             except Exception as e:
                 st.error(str(e))
 
+    # ============================================================
     # ---- Confirm Payments ----
+    # ============================================================
     elif section == "Confirm Payments":
         require(actor.role, "confirm_payment")
         st.subheader("Confirm Payments (Checker)")
@@ -399,7 +412,9 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
                 except Exception as e:
                     st.error(str(e))
 
+    # ============================================================
     # ---- Reject Payments ----
+    # ============================================================
     elif section == "Reject Payments":
         require(actor.role, "reject_payment")
         st.subheader("Reject Payments (Checker)")
@@ -426,7 +441,9 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
                 except Exception as e:
                     st.error(str(e))
 
+    # ============================================================
     # ---- Interest ----
+    # ============================================================
     elif section == "Interest":
         require(actor.role, "accrue_interest")
         st.subheader("Monthly Interest Accrual (Idempotent)")
@@ -450,7 +467,9 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
         )
         st.dataframe(pd.DataFrame(snaps), width="stretch", hide_index=True)
 
+    # ============================================================
     # ---- Delinquency ----
+    # ============================================================
     elif section == "Delinquency":
         require(actor.role, "view_delinquency")
         st.subheader("Delinquency (DPD)")
@@ -513,7 +532,9 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
                 hide_index=True,
             )
 
+    # ============================================================
     # ---- Loan Statement ----
+    # ============================================================
     elif section == "Loan Statement":
         require(actor.role, "loan_statement")
         st.subheader("Loan Statement (Preview + PDF Download)")
