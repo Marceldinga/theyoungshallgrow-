@@ -31,17 +31,12 @@ def make_member_loan_statement_pdf(
     payments: List[dict],
     currency: str = "$",
     logo_path: str = "assets/logo.png",
-    statement_signature: Optional[Dict[str, Any]] = None,  # ✅ NEW
+    statement_signature: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """
-    statement_signature (optional):
-      {
-        "role": "member_statement",
-        "signer_name": str,
-        "signer_member_id": int,
-        "signed_at": str,
-        "entity_id": int
-      }
+    Updated:
+    - Loans Summary now shows: Principal, Interest (Unpaid/Accrued), Total Due
+    - Keeps digital signature block
     """
     buf = BytesIO()
     pdf = canvas.Canvas(buf, pagesize=LETTER)
@@ -66,7 +61,6 @@ def make_member_loan_statement_pdf(
     # Header
     pdf.setFont("Helvetica-Bold", 15)
     pdf.drawString(2.0 * inch, height - 0.9 * inch, f"{brand} — Loan Statement")
-
     pdf.setFont("Helvetica", 9)
     pdf.drawRightString(width - 1 * inch, height - 0.9 * inch, _utc_now_str())
 
@@ -104,37 +98,67 @@ def make_member_loan_statement_pdf(
         pdf.drawString(left, y, "No loans on record for this member.")
         y -= 0.18 * inch
     else:
-        # Table header
+        # Table header (WITH interest)
         pdf.setFont("Helvetica-Bold", 9)
         pdf.drawString(left, y, "Loan ID")
-        pdf.drawString(left + 1.1 * inch, y, "Status")
-        pdf.drawRightString(left + 3.7 * inch, y, "Principal")
-        pdf.drawRightString(left + 5.8 * inch, y, "Balance")
+        pdf.drawString(left + 0.9 * inch, y, "Status")
+        pdf.drawRightString(left + 3.2 * inch, y, "Principal")
+        pdf.drawRightString(left + 4.5 * inch, y, "Interest")
+        pdf.drawRightString(left + 5.8 * inch, y, "Total Due")
         y -= 0.18 * inch
         pdf.setFont("Helvetica", 9)
 
+        total_principal = 0.0
+        total_interest = 0.0
+        total_due_all = 0.0
+
         for ln in loans:
-            if y < 1.3 * inch:
+            if y < 1.5 * inch:
                 pdf.showPage()
                 y = height - 1.0 * inch
                 pdf.setFont("Helvetica-Bold", 9)
                 pdf.drawString(left, y, "Loan ID")
-                pdf.drawString(left + 1.1 * inch, y, "Status")
-                pdf.drawRightString(left + 3.7 * inch, y, "Principal")
-                pdf.drawRightString(left + 5.8 * inch, y, "Balance")
+                pdf.drawString(left + 0.9 * inch, y, "Status")
+                pdf.drawRightString(left + 3.2 * inch, y, "Principal")
+                pdf.drawRightString(left + 4.5 * inch, y, "Interest")
+                pdf.drawRightString(left + 5.8 * inch, y, "Total Due")
                 y -= 0.18 * inch
                 pdf.setFont("Helvetica", 9)
 
             loan_id = ln.get("id") or ln.get("loan_id") or ln.get("loan_legacy_id")
-            status = str(ln.get("status") or "")
-            principal = ln.get("principal") or ln.get("amount") or ln.get("issued_amount") or 0
-            balance = ln.get("balance") or ln.get("principal_current") or ln.get("total_due") or 0
+            status = str(ln.get("status") or "")[:10]
+
+            principal = float(ln.get("principal") or 0)
+
+            unpaid_interest = float(ln.get("unpaid_interest") or 0)
+            accrued_interest = float(ln.get("accrued_interest") or 0)
+            interest_val = unpaid_interest if unpaid_interest > 0 else accrued_interest
+
+            total_due = ln.get("total_due")
+            if total_due is None:
+                total_due = principal + interest_val
+            total_due = float(total_due or 0)
+
+            total_principal += principal
+            total_interest += interest_val
+            total_due_all += total_due
 
             pdf.drawString(left, y, str(loan_id))
-            pdf.drawString(left + 1.1 * inch, y, status[:14])
-            pdf.drawRightString(left + 3.7 * inch, y, _money(principal, currency))
-            pdf.drawRightString(left + 5.8 * inch, y, _money(balance, currency))
+            pdf.drawString(left + 0.9 * inch, y, status)
+            pdf.drawRightString(left + 3.2 * inch, y, _money(principal, currency))
+            pdf.drawRightString(left + 4.5 * inch, y, _money(interest_val, currency))
+            pdf.drawRightString(left + 5.8 * inch, y, _money(total_due, currency))
             y -= 0.16 * inch
+
+        # Totals row
+        y -= 0.06 * inch
+        pdf.setFont("Helvetica-Bold", 9)
+        pdf.drawString(left, y, "Totals")
+        pdf.drawRightString(left + 3.2 * inch, y, _money(total_principal, currency))
+        pdf.drawRightString(left + 4.5 * inch, y, _money(total_interest, currency))
+        pdf.drawRightString(left + 5.8 * inch, y, _money(total_due_all, currency))
+        pdf.setFont("Helvetica", 9)
+        y -= 0.18 * inch
 
     # Payments section
     y -= 0.20 * inch
@@ -215,14 +239,7 @@ def make_loan_statements_zip(
     logo_path: str = "assets/logo.png",
 ) -> bytes:
     """
-    member_statements: list of dicts like:
-      {
-        "member": {"member_id":..., "member_name":..., "position":...},
-        "loans": [...],
-        "payments": [...],
-        "statement_signature": {...}   # optional
-      }
-    Returns ZIP bytes containing one PDF per member with loans/payments.
+    member_statements may include "statement_signature" optionally.
     """
     zbuf = BytesIO()
     with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -239,7 +256,7 @@ def make_loan_statements_zip(
                 payments=ms.get("payments") or [],
                 currency=currency,
                 logo_path=logo_path,
-                statement_signature=ms.get("statement_signature"),  # ✅ optional
+                statement_signature=ms.get("statement_signature"),
             )
 
             filename = (
