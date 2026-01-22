@@ -1,9 +1,10 @@
-# app.py ✅ CLEAN + UPDATED (adds Minutes & Attendance legacy page)
+# app.py ✅ CLEAN + UPDATED (Minutes & Attendance upgraded: PDFs + Bulk attendance + Summaries + session_number link)
 # - Railway-safe secrets
-# - Safe imports (Audit / Health / Loans)
+# - Safe imports (Audit / Health / Loans + PDFs)
 # - Dashboard fixed (uses dashboard_next_view.current_pot)
 # - Loans entry works with your current loans.py wrapper (show_loans or render_loans)
 # - Adds ✅ Minutes & Attendance (Legacy): meeting_minutes_legacy + meeting_attendance_legacy
+# - Upgrades: link to session_number, minutes PDF, attendance PDF, mark-all-present, summaries tab
 # - Avoids crashes if a module is missing
 
 from __future__ import annotations
@@ -19,6 +20,13 @@ from admin_panels import render_admin
 from payout import render_payouts
 from audit_panel import render_audit
 from health_panel import render_health
+
+# ✅ Optional PDFs (safe)
+try:
+    from pdfs import make_minutes_pdf, make_attendance_pdf
+except Exception:
+    make_minutes_pdf = None
+    make_attendance_pdf = None
 
 # ✅ Loans UI (safe import)
 # Support both patterns:
@@ -184,7 +192,7 @@ page = st.sidebar.radio(
 )
 
 # ============================================================
-# DASHBOARD ✅ FIXED (reads canonical dashboard_next_view.current_pot)
+# DASHBOARD ✅ FIXED
 # ============================================================
 if page == "Dashboard":
     labels, label_to_id, label_to_name, df_members = load_members_legacy(
@@ -195,8 +203,8 @@ if page == "Dashboard":
 
     next_index = dash.get("next_payout_index")
     next_date = dash.get("next_payout_date")
-    next_beneficiary = dash.get("next_beneficiary")  # formatted "3 • Name"
-    current_pot = dash.get("current_pot")            # ✅ canonical pot (this session)
+    next_beneficiary = dash.get("next_beneficiary")
+    current_pot = dash.get("current_pot")
     session_number = dash.get("session_number")
 
     c1, c2, c3, c4 = st.columns(4)
@@ -211,7 +219,6 @@ if page == "Dashboard":
         st.caption(f"Pot Amount (this session): {current_pot}")
 
     st.caption(f"Current session #: {session_number if session_number is not None else '—'}")
-
     st.divider()
 
     if labels:
@@ -266,10 +273,12 @@ elif page == "Loans":
                 loans_fn(sb_service, SUPABASE_SCHEMA, actor_user_id="admin")
 
 # ============================================================
-# ✅ Minutes & Attendance (Legacy)
-# Tables:
-#   - meeting_minutes_legacy
-#   - meeting_attendance_legacy (legacy_member_id)
+# ✅ Minutes & Attendance (Legacy) — UPGRADED
+# - session_number linked from dashboard_next_view.session_number
+# - minutes PDF export (make_minutes_pdf)
+# - attendance PDF export (make_attendance_pdf)
+# - Mark all present (bulk upsert)
+# - Summaries tab (daily/member/monthly)
 # ============================================================
 elif page == "Minutes & Attendance":
     st.header("📝 Meeting Minutes & ✅ Attendance (Legacy)")
@@ -278,124 +287,282 @@ elif page == "Minutes & Attendance":
         st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY to enable writing minutes & attendance.")
         st.stop()
 
+    # RBAC-lite (temporary switch)
+    with st.sidebar.expander("🔐 Role (Minutes/Attendance)", expanded=False):
+        role = st.selectbox("Role", ["admin", "treasury", "member"], index=0, key="ma_role")
+    can_write = role in ("admin", "treasury")
+
     labels, label_to_id, label_to_name, df_members = load_members_legacy(
         SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA
     )
 
-    tab1, tab2 = st.tabs(["Minutes / Documentation", "Attendance"])
+    dash = get_dashboard_next(sb_anon, SUPABASE_SCHEMA)
+    current_session_number = dash.get("session_number")
+
+    tab1, tab2, tab3 = st.tabs(["Minutes / Documentation", "Attendance", "Summaries"])
 
     # --------------------------
     # MINUTES (LEGACY)
     # --------------------------
     with tab1:
         st.subheader("Meeting Minutes / Documentation (Legacy)")
+        st.caption(f"Linked session #: {current_session_number if current_session_number is not None else '—'}")
 
-        with st.form("minutes_legacy_form", clear_on_submit=True):
-            mdate = st.date_input("Meeting date", value=date.today(), key="minutes_legacy_date")
-            title = st.text_input("Title", key="minutes_legacy_title")
-            tags = st.text_input("Tags (optional)", key="minutes_legacy_tags")
-            content = st.text_area("Minutes / Documentation", height=260, key="minutes_legacy_content")
-            ok = st.form_submit_button("💾 Save minutes", use_container_width=True)
+        if can_write:
+            with st.form("minutes_legacy_form", clear_on_submit=True):
+                mdate = st.date_input("Meeting date", value=date.today(), key="minutes_legacy_date")
+                title = st.text_input("Title", key="minutes_legacy_title")
+                tags = st.text_input("Tags (optional)", key="minutes_legacy_tags")
+                content = st.text_area("Minutes / Documentation", height=260, key="minutes_legacy_content")
+                ok = st.form_submit_button("💾 Save minutes", use_container_width=True)
 
-        if ok:
-            if not title.strip() or not content.strip():
-                st.error("Title and content are required.")
-            else:
-                payload = {
-                    "meeting_date": str(mdate),
-                    "title": title.strip(),
-                    "content": content.strip(),
-                    "tags": tags.strip() or None,
-                    "created_by": "admin",
-                }
-                try:
-                    sb_service.schema(SUPABASE_SCHEMA).table("meeting_minutes_legacy").insert(payload).execute()
-                    st.success("Minutes saved.")
-                except Exception as e:
-                    st.error("Failed to save minutes.")
-                    st.exception(e)
+            if ok:
+                if not title.strip() or not content.strip():
+                    st.error("Title and content are required.")
+                else:
+                    payload = {
+                        "meeting_date": str(mdate),
+                        "session_number": int(current_session_number) if current_session_number is not None else None,
+                        "title": title.strip(),
+                        "content": content.strip(),
+                        "tags": tags.strip() or None,
+                        "created_by": role,
+                    }
+                    payload = {k: v for k, v in payload.items() if v is not None}
+                    try:
+                        sb_service.schema(SUPABASE_SCHEMA).table("meeting_minutes_legacy").insert(payload).execute()
+                        st.success("Minutes saved.")
+                    except Exception as e:
+                        st.error("Failed to save minutes.")
+                        st.exception(e)
+        else:
+            st.info("Read-only: switch role to Admin/Treasury to write minutes.")
 
         st.divider()
         st.markdown("### Recent minutes")
-        try:
-            rows = (
-                sb_service.schema(SUPABASE_SCHEMA).table("meeting_minutes_legacy")
-                .select("*")
-                .order("meeting_date", desc=True)
-                .limit(50)
-                .execute().data
-                or []
-            )
-            df = pd.DataFrame(rows)
-            if df.empty:
-                st.info("No minutes recorded yet.")
-            else:
-                st.dataframe(df, use_container_width=True, hide_index=True)
-        except Exception as e:
-            st.warning("Could not load minutes.")
-            st.exception(e)
+        rows = (
+            sb_service.schema(SUPABASE_SCHEMA).table("meeting_minutes_legacy")
+            .select("*")
+            .order("meeting_date", desc=True)
+            .limit(50)
+            .execute().data
+            or []
+        )
+        dfm = pd.DataFrame(rows)
+        if dfm.empty:
+            st.info("No minutes recorded yet.")
+        else:
+            st.dataframe(dfm, use_container_width=True, hide_index=True)
+
+            # Minutes PDF export
+            if make_minutes_pdf is not None and "id" in dfm.columns:
+                pick_id = st.selectbox("Export minutes PDF (pick id)", dfm["id"].tolist(), key="minutes_pdf_pick")
+                row = dfm[dfm["id"] == pick_id].iloc[0].to_dict()
+                pdf_bytes = make_minutes_pdf(APP_BRAND, row)
+                st.download_button(
+                    "⬇️ Download Minutes (PDF)",
+                    pdf_bytes,
+                    file_name=f"minutes_{row.get('meeting_date')}_session_{row.get('session_number','')}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key="dl_minutes_pdf",
+                )
+            elif make_minutes_pdf is None:
+                st.caption("Minutes PDF export not available (add make_minutes_pdf to pdfs.py).")
 
     # --------------------------
-    # ATTENDANCE (LEGACY)
+    # ATTENDANCE (LEGACY) + BULK
     # --------------------------
     with tab2:
         st.subheader("Attendance (Legacy)")
+        st.caption(f"Linked session #: {current_session_number if current_session_number is not None else '—'}")
 
         adate = st.date_input("Attendance date", value=date.today(), key="att_legacy_date")
-        st.caption("Record attendance per member for this meeting date.")
 
-        with st.form("attendance_legacy_form", clear_on_submit=True):
-            if labels:
-                pick = st.selectbox("Member", labels, key="att_legacy_member_pick")
-                legacy_member_id = int(label_to_id.get(pick))
-                member_name = str(label_to_name.get(pick))
-            else:
-                st.warning("No members loaded from members_legacy.")
-                legacy_member_id = 0
-                member_name = ""
+        st.markdown("### ⚡ Bulk tools")
+        if can_write:
+            if st.button("✅ Mark ALL members PRESENT for this date", use_container_width=True, key="mark_all_present"):
+                if df_members.empty:
+                    st.error("members_legacy is empty; cannot bulk mark.")
+                else:
+                    payloads = []
+                    for _, r in df_members.iterrows():
+                        payloads.append({
+                            "meeting_date": str(adate),
+                            "session_number": int(current_session_number) if current_session_number is not None else None,
+                            "legacy_member_id": int(r["id"]),
+                            "member_name": str(r["name"]),
+                            "status": "present",
+                            "note": None,
+                            "created_by": role,
+                        })
+                    payloads = [{k: v for k, v in p.items() if v is not None} for p in payloads]
+                    try:
+                        # Upsert avoids duplicates if you created UNIQUE index on (meeting_date, legacy_member_id)
+                        sb_service.schema(SUPABASE_SCHEMA).table("meeting_attendance_legacy").upsert(payloads).execute()
+                        st.success("All members marked present (upserted).")
+                    except Exception as e:
+                        st.error("Bulk upsert failed.")
+                        st.exception(e)
+        else:
+            st.info("Read-only: switch role to Admin/Treasury to write attendance.")
 
-            status = st.selectbox("Status", ["present", "absent", "late", "excused"], index=0, key="att_legacy_status")
-            note = st.text_input("Note (optional)", "", key="att_legacy_note")
-            ok2 = st.form_submit_button("✅ Save attendance", use_container_width=True)
+        st.divider()
+        st.markdown("### Single entry")
+        if can_write:
+            with st.form("attendance_legacy_form", clear_on_submit=True):
+                if labels:
+                    pick = st.selectbox("Member", labels, key="att_legacy_member_pick")
+                    legacy_member_id = int(label_to_id.get(pick))
+                    member_name = str(label_to_name.get(pick))
+                else:
+                    st.warning("No members loaded from members_legacy.")
+                    legacy_member_id = 0
+                    member_name = ""
 
-        if ok2:
-            if legacy_member_id <= 0:
-                st.error("Invalid member selection.")
-            else:
-                payload = {
-                    "meeting_date": str(adate),
-                    "legacy_member_id": int(legacy_member_id),
-                    "member_name": member_name,
-                    "status": status,
-                    "note": note.strip() or None,
-                    "created_by": "admin",
-                }
-                try:
-                    sb_service.schema(SUPABASE_SCHEMA).table("meeting_attendance_legacy").insert(payload).execute()
-                    st.success("Attendance saved.")
-                except Exception as e:
-                    st.error("Failed to save attendance.")
-                    st.exception(e)
+                status = st.selectbox("Status", ["present", "absent", "late", "excused"], index=0, key="att_legacy_status")
+                note = st.text_input("Note (optional)", "", key="att_legacy_note")
+                ok2 = st.form_submit_button("✅ Save attendance", use_container_width=True)
+
+            if ok2:
+                if legacy_member_id <= 0:
+                    st.error("Invalid member selection.")
+                else:
+                    payload = {
+                        "meeting_date": str(adate),
+                        "session_number": int(current_session_number) if current_session_number is not None else None,
+                        "legacy_member_id": int(legacy_member_id),
+                        "member_name": member_name,
+                        "status": status,
+                        "note": note.strip() or None,
+                        "created_by": role,
+                    }
+                    payload = {k: v for k, v in payload.items() if v is not None}
+                    try:
+                        sb_service.schema(SUPABASE_SCHEMA).table("meeting_attendance_legacy").insert(payload).execute()
+                        st.success("Attendance saved.")
+                    except Exception as e:
+                        st.error("Failed to save attendance.")
+                        st.exception(e)
 
         st.divider()
         st.markdown("### Attendance for selected date")
+        rows = (
+            sb_service.schema(SUPABASE_SCHEMA).table("meeting_attendance_legacy")
+            .select("*")
+            .eq("meeting_date", str(adate))
+            .order("legacy_member_id", desc=False)
+            .limit(2000)
+            .execute().data
+            or []
+        )
+        dfa = pd.DataFrame(rows)
+        if dfa.empty:
+            st.info("No attendance recorded for this date yet.")
+        else:
+            st.dataframe(dfa, use_container_width=True, hide_index=True)
+
+            # Attendance PDF export
+            if make_attendance_pdf is not None:
+                pdf_bytes = make_attendance_pdf(
+                    APP_BRAND,
+                    meeting_date=str(adate),
+                    session_number=(int(current_session_number) if current_session_number is not None else None),
+                    attendance_rows=dfa.to_dict(orient="records"),
+                )
+                st.download_button(
+                    "⬇️ Download Attendance Sheet (PDF)",
+                    pdf_bytes,
+                    file_name=f"attendance_{str(adate)}_session_{current_session_number or ''}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key="dl_attendance_pdf",
+                )
+            else:
+                st.caption("Attendance PDF export not available (add make_attendance_pdf to pdfs.py).")
+
+    # --------------------------
+    # SUMMARIES
+    # --------------------------
+    with tab3:
+        st.subheader("Attendance Summaries")
+
+        st.markdown("### Daily summary (latest 120)")
         try:
             rows = (
-                sb_service.schema(SUPABASE_SCHEMA).table("meeting_attendance_legacy")
+                sb_service.schema(SUPABASE_SCHEMA).table("v_attendance_daily_summary")
                 .select("*")
-                .eq("meeting_date", str(adate))
-                .order("legacy_member_id", desc=False)
-                .limit(500)
+                .order("meeting_date", desc=True)
+                .limit(120)
                 .execute().data
                 or []
             )
-            df = pd.DataFrame(rows)
-            if df.empty:
-                st.info("No attendance recorded for this date yet.")
+            dfd = pd.DataFrame(rows)
+            if dfd.empty:
+                st.info("No daily summary yet.")
             else:
-                st.dataframe(df, use_container_width=True, hide_index=True)
+                dfd["present_count"] = pd.to_numeric(dfd.get("present_count"), errors="coerce").fillna(0)
+                dfd["total_marked"] = pd.to_numeric(dfd.get("total_marked"), errors="coerce").fillna(0)
+                dfd["present_pct"] = dfd.apply(
+                    lambda r: (float(r["present_count"]) / float(r["total_marked"]) * 100.0) if float(r["total_marked"]) > 0 else 0.0,
+                    axis=1,
+                )
+                st.dataframe(dfd, use_container_width=True, hide_index=True)
         except Exception as e:
-            st.warning("Could not load attendance.")
+            st.warning("Could not load v_attendance_daily_summary (create the SQL view).")
+            st.exception(e)
+
+        st.divider()
+        st.markdown("### Member summary")
+        try:
+            rows = (
+                sb_service.schema(SUPABASE_SCHEMA).table("v_attendance_member_summary")
+                .select("*")
+                .order("legacy_member_id", desc=False)
+                .limit(2000)
+                .execute().data
+                or []
+            )
+            dfms = pd.DataFrame(rows)
+            if dfms.empty:
+                st.info("No member summary yet.")
+            else:
+                st.dataframe(dfms, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning("Could not load v_attendance_member_summary (create the SQL view).")
+            st.exception(e)
+
+        st.divider()
+        st.markdown("### Monthly summary (computed)")
+        try:
+            rows = (
+                sb_service.schema(SUPABASE_SCHEMA).table("meeting_attendance_legacy")
+                .select("meeting_date,status")
+                .order("meeting_date", desc=True)
+                .limit(20000)
+                .execute().data
+                or []
+            )
+            dfraw = pd.DataFrame(rows)
+            if dfraw.empty:
+                st.info("No attendance data yet.")
+            else:
+                dfraw["meeting_date"] = pd.to_datetime(dfraw["meeting_date"], errors="coerce")
+                dfraw = dfraw.dropna(subset=["meeting_date"]).copy()
+                dfraw["month"] = dfraw["meeting_date"].dt.to_period("M").astype(str)
+                dfraw["present"] = (dfraw["status"].astype(str).str.lower().str.strip() == "present").astype(int)
+                monthly = dfraw.groupby("month", as_index=False).agg(
+                    meetings=("meeting_date", lambda x: x.dt.date.nunique()),
+                    marks=("status", "count"),
+                    present=("present", "sum"),
+                )
+                monthly["present_pct"] = monthly.apply(
+                    lambda r: (float(r["present"]) / float(r["marks"]) * 100.0) if float(r["marks"]) > 0 else 0.0,
+                    axis=1,
+                )
+                st.dataframe(monthly.sort_values("month", ascending=False), use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning("Could not compute monthly summary.")
             st.exception(e)
 
 # ============================================================
