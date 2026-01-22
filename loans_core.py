@@ -413,3 +413,31 @@ def compute_dpd(loan_row: dict, last_paid_on: date | None) -> int:
     if last_paid_on and last_paid_on >= due:
         return 0
     return (today - due).days
+    # -------------------------------------------------
+# Loan Requests
+# -------------------------------------------------
+
+from db import now_iso
+
+def create_loan_request(
+    sb,
+    user_id,                 # Supabase Auth UUID
+    requester_mid: int,
+    requester_name: str,
+    surety_mid: int,
+    surety_name: str,
+    amount: float,
+):
+    payload = {
+        "requester_user_id": user_id,              # ✅ UUID
+        "requester_member_id": int(requester_mid),
+        "requester_name": requester_name,
+        "surety_member_id": int(surety_mid),
+        "surety_name": surety_name,
+        "amount": float(amount),
+        "status": "pending",
+        "created_at": now_iso(),
+    }
+
+    return sb.table("loan_requests").insert(payload).execute()
+
