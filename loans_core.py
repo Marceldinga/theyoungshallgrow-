@@ -1,7 +1,12 @@
-# loans_core.py ✅ UPDATED
-# Fixes signatures.entity_type NOT NULL for statement signing
-# + Adds admin insert into loan_repayments_legacy (legacy repayments entry)
-# - Keeps repayments schema locked (loan_id + paid_at, no status)
+# loans_core.py ✅ COMPLETE UPDATED
+# Fixes:
+# - signatures.entity_type NOT NULL for statement signing (STATEMENT_ENTITY_TYPE)
+# - Repayments schema locked (repayments: loan_id + paid_at, no status)
+# - Legacy repayments insert into loan_repayments_legacy:
+#     * filters payload keys when possible
+#     * retries by removing missing columns (fixes PGRST204 schema-cache errors)
+#
+# Works with loans_ui.py + rbac.py updated permissions.
 
 from __future__ import annotations
 
@@ -26,6 +31,9 @@ STATEMENT_SIG_ROLE = "member_statement"
 STATEMENT_ENTITY_TYPE = "loan_statement"  # ✅ REQUIRED
 
 
+# ============================================================
+# TIME + DB HELPERS
+# ============================================================
 def now_iso() -> str:
     """UTC ISO string with Z suffix."""
     return (
@@ -63,7 +71,7 @@ def fetch_one(query) -> dict | None:
 def _get_table_columns(sb, schema: str, table: str) -> set[str]:
     """
     Fetch column names using a 'select * limit 1' and reading keys.
-    This avoids needing information_schema permissions.
+    If table is empty, this returns empty set.
     """
     try:
         rows = (
@@ -76,8 +84,6 @@ def _get_table_columns(sb, schema: str, table: str) -> set[str]:
             or []
         )
         if not rows:
-            # table exists but empty: we can't infer columns from keys
-            # fallback: return empty set -> no filtering possible
             return set()
         return set(rows[0].keys())
     except Exception:
@@ -87,12 +93,32 @@ def _get_table_columns(sb, schema: str, table: str) -> set[str]:
 def filter_payload_to_existing_columns(sb, schema: str, table: str, payload: dict) -> dict:
     """
     Filters payload keys to only columns present in the table.
-    If we cannot infer columns (empty result), return payload as-is.
+    If we cannot infer columns (table empty), return payload as-is.
     """
     cols = _get_table_columns(sb, schema, table)
     if not cols:
         return payload
     return {k: v for k, v in payload.items() if k in cols}
+
+
+def _drop_missing_column_from_postgrest_error(payload: dict, e: Exception) -> tuple[dict, bool]:
+    """
+    If PostgREST says a column doesn't exist, remove it and return (new_payload, changed=True).
+    Otherwise return (payload, changed=False).
+    Typical message:
+      "Could not find the 'actor_user_id' column of 'loan_repayments_legacy' in the schema cache"
+    """
+    msg = str(e)
+    if "Could not find the '" in msg and "' column of '" in msg:
+        try:
+            missing = msg.split("Could not find the '", 1)[1].split("' column", 1)[0]
+            if missing in payload:
+                new_payload = dict(payload)
+                new_payload.pop(missing, None)
+                return new_payload, True
+        except Exception:
+            return payload, False
+    return payload, False
 
 
 # ============================================================
@@ -198,7 +224,7 @@ def get_statement_signature(sb, schema: str, loan_id: int) -> dict | None:
     rows = (
         sb.schema(schema).table("signatures")
         .select("entity_type,role,signer_name,signer_member_id,signed_at,entity_id")
-        .eq("entity_type", STATEMENT_ENTITY_TYPE)  # ✅
+        .eq("entity_type", STATEMENT_ENTITY_TYPE)
         .eq("entity_id", int(loan_id))
         .eq("role", STATEMENT_SIG_ROLE)
         .order("signed_at", desc=True)
@@ -441,8 +467,8 @@ def reject_payment(sb, schema: str, payment_id: int, rejecter: str, reason: str)
 # ============================================================
 # ✅ LEGACY REPAYMENTS INSERT (Admin dashboard)
 # Table: loan_repayments_legacy
-# - We do NOT assume exact columns
-# - We filter payload keys to existing columns when possible
+# - Filters payload keys when possible
+# - Retries by removing missing columns if PostgREST complains
 # ============================================================
 def insert_legacy_loan_repayment(
     sb,
@@ -455,14 +481,6 @@ def insert_legacy_loan_repayment(
     note: str | None = None,
     actor_user_id: str | None = None,
 ) -> dict | None:
-    """
-    Inserts a repayment row into loan_repayments_legacy.
-
-    Because this is a legacy table with unknown columns, we:
-    - build a rich payload
-    - remove None values
-    - filter keys to existing columns if we can infer them
-    """
     if int(member_id) <= 0:
         raise ValueError("Invalid member_id.")
     if float(amount) <= 0:
@@ -475,25 +493,35 @@ def insert_legacy_loan_repayment(
     payload = {
         "created_at": now_iso(),
         "member_id": int(member_id),
-        "legacy_member_id": int(member_id),     # legacy variant
+        "legacy_member_id": int(member_id),
         "amount": float(amount),
         "paid_at": str(paid_at),
-        "payment_date": str(paid_at)[:10],      # legacy variant
+        "payment_date": str(paid_at)[:10],
         "loan_id": int(loan_id) if loan_id else None,
         "method": str(method).strip() if method else None,
         "note": str(note).strip() if note else None,
-        "notes": str(note).strip() if note else None,   # legacy variant
+        "notes": str(note).strip() if note else None,
+        # may or may not exist in table
         "recorded_by": actor_user_id,
         "actor_user_id": actor_user_id,
         "updated_at": now_iso(),
     }
-
     payload = {k: v for k, v in payload.items() if v is not None}
+
+    # try filter by inferred columns (works when table already has rows)
     payload = filter_payload_to_existing_columns(sb, schema, table, payload)
 
-    res = sb.schema(schema).table(table).insert(payload).execute()
-    row = (res.data or [None])[0]
-    return row
+    # ✅ PostgREST schema-cache can still complain; retry dropping missing columns
+    for _ in range(6):
+        try:
+            res = sb.schema(schema).table(table).insert(payload).execute()
+            return (res.data or [None])[0]
+        except Exception as e:
+            new_payload, changed = _drop_missing_column_from_postgrest_error(payload, e)
+            if changed:
+                payload = new_payload
+                continue
+            raise
 
 
 # ============================================================
