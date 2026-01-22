@@ -1,14 +1,21 @@
-# dashboard_panel.py ✅ ORG-STANDARD DASHBOARD MOCK (clean, executive readable)
+# dashboard_panel.py ✅ UPDATED (canonical views only: dashboard_next_view)
 from __future__ import annotations
 
 import streamlit as st
 import pandas as pd
-from datetime import datetime
 
 # -------------------------
 # small helpers
 # -------------------------
-def safe_select(sb, schema: str, table: str, cols: str="*", order_by: str|None=None, desc: bool=False, limit: int|None=None):
+def safe_select(
+    sb,
+    schema: str,
+    table: str,
+    cols: str = "*",
+    order_by: str | None = None,
+    desc: bool = False,
+    limit: int | None = None,
+):
     try:
         q = sb.schema(schema).table(table).select(cols)
         if order_by:
@@ -19,7 +26,8 @@ def safe_select(sb, schema: str, table: str, cols: str="*", order_by: str|None=N
     except Exception:
         return []
 
-def safe_single(sb, schema: str, table: str, cols: str="*", **eq_filters):
+
+def safe_single(sb, schema: str, table: str, cols: str = "*", **eq_filters):
     try:
         q = sb.schema(schema).table(table).select(cols)
         for k, v in eq_filters.items():
@@ -28,16 +36,6 @@ def safe_single(sb, schema: str, table: str, cols: str="*", **eq_filters):
     except Exception:
         return {}
 
-def get_rotation_state(sb_anon, schema: str) -> dict:
-    """
-    Single source of truth:
-    Prefer current_season_view, fallback to app_state (id=1).
-    """
-    season = safe_single(sb_anon, schema, "current_season_view", "*")
-    if season and any(season.values()):
-        return season
-    state = safe_single(sb_anon, schema, "app_state", "*", id=1)
-    return state or {}
 
 def format_date(x) -> str:
     if not x:
@@ -47,31 +45,34 @@ def format_date(x) -> str:
     except Exception:
         return str(x)
 
+
 # -------------------------
 # Main dashboard render
 # -------------------------
 def render_dashboard(sb_anon, sb_service, schema: str):
     st.subheader("Meeting Dashboard")
 
-    # Load core data
+    # Load members
     members = safe_select(sb_anon, schema, "members_legacy", "id,name,position", order_by="id")
-    df_members = pd.DataFrame(members) if members else pd.DataFrame(columns=["id","name","position"])
+    df_members = pd.DataFrame(members) if members else pd.DataFrame(columns=["id", "name", "position"])
 
-    rot = get_rotation_state(sb_anon, schema)
-    next_idx = rot.get("next_payout_index") or rot.get("next_payout_index".lower())
-    next_date = rot.get("next_payout_date") or rot.get("next_payout_date".lower())
-    next_beneficiary = rot.get("next_beneficiary") or rot.get("next_beneficiary".lower()) or rot.get("beneficiary_name")
+    # ✅ Single source of truth for dashboard KPIs
+    # (This view already combines: next beneficiary, session_number, session_id, current_pot, already_paid, etc.)
+    dash = safe_single(sb_anon, schema, "dashboard_next_view", "*")
 
-    # Try contribution pot view if it exists
-    pot_row = safe_single(sb_anon, schema, "v_contribution_pot", "*")
-    pot_amount = pot_row.get("pot_amount") if pot_row else None
+    next_idx = dash.get("next_payout_index")
+    next_date = dash.get("next_payout_date")
+    next_beneficiary = dash.get("next_beneficiary")
+    session_number = dash.get("session_number")
+    current_pot = dash.get("current_pot")
+    already_paid = dash.get("already_paid")
 
     # KPI strip (exec-friendly)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Members", f"{len(df_members):,}")
     c2.metric("Next Payout Index", str(next_idx or "N/A"))
     c3.metric("Next Payout Date", format_date(next_date))
-    c4.metric("Pot Amount", f"{float(pot_amount):,.0f}" if pot_amount not in (None, "") else "N/A")
+    c4.metric("Pot Amount (this session)", f"{float(current_pot):,.0f}" if current_pot not in (None, "") else "N/A")
 
     st.divider()
 
@@ -85,15 +86,20 @@ def render_dashboard(sb_anon, sb_service, schema: str):
         else:
             st.info("N/A (will appear when rotation state is initialized)")
 
+        st.markdown("### Session Status")
+        st.caption("Bi-weekly session + payout readiness (from canonical views).")
+        st.write("Current session number:", session_number if session_number is not None else "N/A")
+        st.write("Already paid this session:", "✅ Yes" if bool(already_paid) else "❌ No")
+
         st.markdown("### Rotation Preview (Top 5)")
         if not df_members.empty:
-            # show first 5 by position if present, else by id
             if "position" in df_members.columns and df_members["position"].notna().any():
                 dfp = df_members.sort_values("position", ascending=True).head(5)
             else:
                 dfp = df_members.sort_values("id", ascending=True).head(5)
-            st.dataframe(dfp[["id","name","position"]] if "position" in dfp.columns else dfp[["id","name"]],
-                         use_container_width=True, hide_index=True)
+
+            cols = ["id", "name"] + (["position"] if "position" in dfp.columns else [])
+            st.dataframe(dfp[cols], use_container_width=True, hide_index=True)
         else:
             st.warning("No members loaded.")
 
@@ -110,6 +116,7 @@ def render_dashboard(sb_anon, sb_service, schema: str):
                     sb_service.schema(schema).table("app_state").upsert({"id": 1, "next_payout_index": 1}).execute()
                     st.success("Initialized. Refresh dashboard.")
                     st.cache_data.clear()
+                    st.cache_resource.clear()
                     st.rerun()
                 except Exception as e:
                     st.error(f"Init failed: {e}")
@@ -122,20 +129,38 @@ def render_dashboard(sb_anon, sb_service, schema: str):
                     sb_service.schema(schema).table("app_state").upsert({"id": 1, "next_payout_index": int(new_idx)}).execute()
                     st.success("Saved. Refresh.")
                     st.cache_data.clear()
+                    st.cache_resource.clear()
                     st.rerun()
                 except Exception as e:
                     st.error(f"Save failed: {e}")
+
+            # Refresh button that REALLY refreshes cached values
+            if st.button("🔄 Refresh data (clear cache)", use_container_width=True):
+                st.cache_data.clear()
+                st.cache_resource.clear()
+                st.rerun()
 
     st.divider()
 
     # Operational alerts (organizational standard)
     st.markdown("### Operational Alerts")
-    alerts = []
+    alerts: list[str] = []
 
     if not next_idx:
         alerts.append("Rotation state not initialized (next_payout_index is missing).")
-    if pot_amount in (None, "", 0, 0.0):
-        alerts.append("Pot amount is not available yet (no contributions recorded or pot view not ready).")
+
+    # Pot messaging: 0 is not an error — it's just "no contributions yet"
+    if current_pot in (None, ""):
+        alerts.append("Pot amount is not available (dashboard view missing or unreadable).")
+    else:
+        try:
+            if float(current_pot) == 0.0:
+                alerts.append("Pot is 0 (no contributions recorded yet for this session).")
+        except Exception:
+            alerts.append("Pot amount could not be parsed (unexpected value).")
+
+    if bool(already_paid):
+        alerts.append("Payout already executed for the current beneficiary in this session.")
 
     if alerts:
         for a in alerts:
