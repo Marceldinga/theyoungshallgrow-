@@ -90,6 +90,111 @@ def render_loans(sb_service, schema: str, actor_user_id: str = "admin"):
     if section == "Requests":
         st.subheader("Loan Requests (Submit + Signatures)")
         st.caption("Submit a request, then Borrower/Surety/Treasury sign here. Admin approves later.")
+            # ============================================================
+    # ✅ ADMIN: Approve / Deny Pending Loan Requests
+    # (Visible ONLY to Admin role)
+    # ============================================================
+    if actor.role == ROLE_ADMIN:
+        st.divider()
+        st.subheader("Admin Approval (Approve / Deny)")
+
+        pending_rows = core.list_pending_requests(sb_service, schema, limit=300)
+        df_pending = pd.DataFrame(pending_rows)
+
+        if df_pending.empty:
+            st.success("No pending loan requests.")
+        else:
+            df_pending["label"] = df_pending.apply(
+                lambda r: f"Req {int(r['id'])} • {r.get('requester_name','')} • {float(r['amount']):,.0f}",
+                axis=1
+            )
+
+            pick_req = st.selectbox(
+                "Select pending request",
+                df_pending["label"].tolist(),
+                key="admin_pick_loan_req"
+            )
+
+            req_id_admin = int(
+                df_pending[df_pending["label"] == pick_req].iloc[0]["id"]
+            )
+
+            req = core.get_request(sb_service, schema, req_id_admin)
+
+            st.caption(
+                f"Request #{req_id_admin} | "
+                f"Borrower: {req.get('requester_name')} | "
+                f"Surety: {req.get('surety_name')} | "
+                f"Amount: {float(req.get('amount') or 0):,.0f}"
+            )
+
+            # Show signatures status
+            df_sig_admin = core.sig_df(sb_service, schema, "loan", req_id_admin)
+            st.dataframe(df_sig_admin, width="stretch", hide_index=True)
+
+            miss = core.missing_roles(df_sig_admin, core.LOAN_SIG_REQUIRED)
+            if miss:
+                st.warning("Missing signatures: " + ", ".join(miss))
+            else:
+                st.success("All required signatures present.")
+
+            colA, colB = st.columns(2)
+
+            with colA:
+                if st.button(
+                    "✅ Approve Loan Request",
+                    width="stretch",
+                    key=f"admin_approve_{req_id_admin}"
+                ):
+                    try:
+                        loan_id = core.approve_loan_request(
+                            sb_service,
+                            schema,
+                            req_id_admin,
+                            actor_user_id=actor.user_id
+                        )
+                        audit(
+                            sb_service,
+                            "loan_request_approved",
+                            "ok",
+                            {"request_id": req_id_admin, "loan_id": loan_id},
+                            actor_user_id=actor.user_id,
+                        )
+                        st.success(f"Loan approved. loan_legacy_id = {loan_id}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+
+            with colB:
+                deny_reason = st.text_input(
+                    "Deny reason",
+                    value="Not approved",
+                    key=f"deny_reason_{req_id_admin}"
+                )
+                if st.button(
+                    "❌ Deny Loan Request",
+                    width="stretch",
+                    key=f"admin_deny_{req_id_admin}"
+                ):
+                    try:
+                        core.deny_loan_request(
+                            sb_service,
+                            schema,
+                            req_id_admin,
+                            reason=deny_reason
+                        )
+                        audit(
+                            sb_service,
+                            "loan_request_denied",
+                            "ok",
+                            {"request_id": req_id_admin, "reason": deny_reason},
+                            actor_user_id=actor.user_id,
+                        )
+                        st.success("Loan request denied.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+
 
         require(actor.role, "submit_request")
 
