@@ -1,4 +1,4 @@
-# app.py ✅ CLEAN (Railway-safe secrets + Audit + Health + Loans import safe) — UPDATED
+# app.py ✅ CLEAN (Railway-safe secrets + Audit + Health + Loans import safe) — UPDATED (Dashboard fixed)
 from __future__ import annotations
 
 import os
@@ -30,12 +30,9 @@ st.set_page_config(
 # SECRETS (Railway-safe)
 # ============================================================
 def get_secret(key: str, default: str | None = None) -> str | None:
-    # 1) Production: environment variables (Railway Variables)
     v = os.getenv(key)
     if v not in (None, ""):
         return v
-
-    # 2) Local/dev: Streamlit secrets (only if available)
     try:
         return st.secrets.get(key, default)
     except Exception:
@@ -54,7 +51,6 @@ if not SUPABASE_URL or not SUPABASE_ANON_KEY:
 if not SUPABASE_SERVICE_KEY:
     st.warning("SUPABASE_SERVICE_KEY not set. Admin/Loans/Payout write features will be disabled.")
 
-
 # ============================================================
 # CLIENTS
 # ============================================================
@@ -71,7 +67,6 @@ def get_service_client(url: str, service_key: str):
 sb_anon = get_anon_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 sb_service = get_service_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_SERVICE_KEY else None
 
-
 # ============================================================
 # TOP BAR
 # ============================================================
@@ -83,7 +78,6 @@ with right:
         st.rerun()
 
 st.title(f"🏦 {APP_BRAND} • Bank Dashboard")
-
 
 # ============================================================
 # SAFE QUERY HELPER
@@ -114,8 +108,9 @@ def safe_select(
         return []
 
 
-def get_dashboard_rotation(sb, schema: str) -> dict:
-    rows = safe_select(sb, "v_dashboard_rotation", "*", schema=schema, limit=1)
+# ✅ NEW: canonical dashboard source
+def get_dashboard_next(sb, schema: str) -> dict:
+    rows = safe_select(sb, "dashboard_next_view", "*", schema=schema, limit=1)
     return rows[0] if rows else {}
 
 
@@ -168,33 +163,34 @@ page = st.sidebar.radio(
 )
 
 # ============================================================
-# DASHBOARD
+# DASHBOARD ✅ FIXED (reads canonical dashboard_next_view.current_pot)
 # ============================================================
 if page == "Dashboard":
     labels, label_to_id, label_to_name, df_members = load_members_legacy(
         SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA
     )
 
-    rot = get_dashboard_rotation(sb_anon, SUPABASE_SCHEMA)
-    next_index = rot.get("next_payout_index")
-    next_date = rot.get("next_payout_date")
-    beneficiary_id = rot.get("legacy_member_id")
-    beneficiary_name = rot.get("next_beneficiary")
-    pot_amount = rot.get("pot_amount")
+    dash = get_dashboard_next(sb_anon, SUPABASE_SCHEMA)
 
-    beneficiary_label = f"{beneficiary_id} • {beneficiary_name}" if beneficiary_id and beneficiary_name else "—"
+    next_index = dash.get("next_payout_index")
+    next_date = dash.get("next_payout_date")
+    next_beneficiary = dash.get("next_beneficiary")  # already formatted "3 • Name"
+    current_pot = dash.get("current_pot")            # ✅ this is 500 now
+    session_number = dash.get("session_number")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Members", f"{len(df_members):,}")
     c2.metric("Next Payout Index", str(next_index) if next_index is not None else "—")
     c3.metric("Next Payout Date", str(next_date) if next_date else "—")
-    c4.metric("Next Beneficiary", beneficiary_label)
+    c4.metric("Next Beneficiary", str(next_beneficiary) if next_beneficiary else "—")
 
-    if pot_amount is not None:
-        try:
-            st.caption(f"Pot Amount (dashboard view): {float(pot_amount):,.0f}")
-        except Exception:
-            st.caption(f"Pot Amount: {pot_amount}")
+    # ✅ Correct pot display (same as payout page)
+    try:
+        st.caption(f"Pot Amount (this session): {float(current_pot or 0):,.0f}")
+    except Exception:
+        st.caption(f"Pot Amount (this session): {current_pot}")
+
+    st.caption(f"Current session #: {session_number if session_number is not None else '—'}")
 
     st.divider()
 
