@@ -1,21 +1,8 @@
 # dashboard_panel.py ✅ COMPLETE UPDATED + BEAUTIFUL THEME (dark dotted grid like your image)
-# Fixes (from your version):
-# - Uses sessions_legacy.session_number (NOT session_id) to resolve session window
-# - Pulls Session Window directly from sessions_legacy if dashboard_next_view doesn't expose start/end
-# - ✅ Cycle Contributions + Members Paid now come from v_current_cycle_kpis (authoritative aggregate)
-# - Current Pot: prefers dashboard_next_view.current_pot, fallback to cycle_total from kpis
-# - All-time finance from dashboard_finance_view
-# - Interest (All-Time) from v_interest_total.total_interest_generated
-#
-# UI Upgrade:
-# - ✅ Dark dotted grid background (like your screenshot)
-# - ✅ Glass cards + colored KPI accents (blue/green/purple/orange)
-# - ✅ Wraps sections inside modern "card" containers
-#
-# Requires:
-# - sb_anon: supabase client (anon)
-# - sb_service: supabase client (service) or None
-# - schema: your schema (default "public")
+# FIXED (your Interest 0.00 bug):
+# ✅ Interest (All-Time) now comes from dashboard_finance_view.total_interest_generated (authoritative)
+# ✅ Finance views are forced to PUBLIC schema (because your views are in public)
+# Everything else kept the same.
 
 from __future__ import annotations
 
@@ -216,17 +203,14 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     # =========================================================
     dash = (safe_view(sb_anon, schema, "dashboard_next_view", limit=1) or [{}])[0]
 
-    # Session index / payout index
     session_number = _pick(dash, "session_number", "payout_index", "next_payout_index", default=None)
     next_idx = _pick(dash, "payout_index", "next_payout_index", default=session_number)
 
     beneficiary_name = _pick(dash, "next_beneficiary", "beneficiary_name", "next_beneficiary_name", default="—")
 
-    # Try read window from dashboard_next_view first
     start_date = _s(_pick(dash, "start_date", "rotation_start_date"))
     end_date = _s(_pick(dash, "end_date", "rotation_end_date"))
 
-    # ✅ If missing, pull from sessions_legacy using session_number
     if (not start_date or not end_date) and session_number not in (None, "—", ""):
         try:
             sid_int = int(session_number)
@@ -251,7 +235,6 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
 
     window = f"{start_date} → {end_date}" if start_date and end_date else "—"
 
-    # Pot amount from dashboard_next_view (your view exposes current_pot)
     pot_amount = _pick(dash, "current_pot", "pot_amount")
     pot_amount_num = _num(pot_amount, default=0.0) if pot_amount not in (None, "") else 0.0
 
@@ -278,27 +261,16 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     members_paid = _pick(kpis, "members_paid")
     cycle_total_num = _num(cycle_total, default=0.0)
 
-    # Current Pot: prefer dashboard_next_view.current_pot if present/nonzero,
-    # otherwise fallback to KPI cycle_total.
     current_pot_num = pot_amount_num if pot_amount_num > 0 else cycle_total_num
 
     st.markdown(glass_open(), unsafe_allow_html=True)
     p1, p2, p3 = st.columns(3)
     with p1:
-        st.markdown(
-            kpi_card("Current Pot", _fmt_money(current_pot_num) if current_pot_num > 0 else "—", "green"),
-            unsafe_allow_html=True,
-        )
+        st.markdown(kpi_card("Current Pot", _fmt_money(current_pot_num) if current_pot_num > 0 else "—", "green"), unsafe_allow_html=True)
     with p2:
-        st.markdown(
-            kpi_card("Cycle Contributions", _fmt_money(cycle_total_num) if cycle_total_num > 0 else "—", "blue"),
-            unsafe_allow_html=True,
-        )
+        st.markdown(kpi_card("Cycle Contributions", _fmt_money(cycle_total_num) if cycle_total_num > 0 else "—", "blue"), unsafe_allow_html=True)
     with p3:
-        st.markdown(
-            kpi_card("Members Paid", str(members_paid) if members_paid not in (None, "") else "—", "purple"),
-            unsafe_allow_html=True,
-        )
+        st.markdown(kpi_card("Members Paid", str(members_paid) if members_paid not in (None, "") else "—", "purple"), unsafe_allow_html=True)
     st.markdown(glass_close(), unsafe_allow_html=True)
 
     st.divider()
@@ -318,10 +290,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     with s1:
         st.markdown(kpi_card("Is Payout Day", "YES" if is_payout_day else "NO", "orange"), unsafe_allow_html=True)
     with s2:
-        st.markdown(
-            kpi_card("Payout Ready", "YES" if ready is True else ("NO" if ready is False else "—"), "green" if ready else "red"),
-            unsafe_allow_html=True,
-        )
+        st.markdown(kpi_card("Payout Ready", "YES" if ready is True else ("NO" if ready is False else "—"), "green" if ready else "red"), unsafe_allow_html=True)
     with s3:
         st.markdown(kpi_card("Missing Signatures", missing if missing else "—", "purple"), unsafe_allow_html=True)
     st.markdown(glass_close(), unsafe_allow_html=True)
@@ -329,16 +298,20 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     st.divider()
 
     # =========================================================
-    # 4) ALL-TIME FINANCE + Interest (v_interest_total)
+    # 4) ALL-TIME FINANCE (FORCE PUBLIC) ✅ Interest fixed here
     # =========================================================
-    fin = (safe_view(sb_anon, schema, "dashboard_finance_view", limit=1) or [{}])[0]
+    fin = (safe_view(sb_anon, "public", "dashboard_finance_view", limit=1) or [{}])[0]
 
     total_foundation_paid = _pick(fin, "total_foundation_paid", "foundation_paid", "total_foundation")
+    total_foundation_unpaid = _pick(fin, "total_foundation_unpaid", "foundation_unpaid")
     total_fines_paid = _pick(fin, "total_fines_paid", "fines_paid")
     total_fines_unpaid = _pick(fin, "total_fines_unpaid", "fines_unpaid")
 
-    interest_row = (safe_view(sb_anon, schema, "v_interest_total", limit=1) or [{}])[0]
-    total_interest_generated = _pick(interest_row, "total_interest_generated", "total_interest", "interest_total")
+    # ✅ FIX: Interest comes from the same finance view (authoritative)
+    total_interest_generated = _pick(fin, "total_interest_generated", "total_interest", "interest_total")
+
+    # Foundation all-time = paid + unpaid (matches your DB screenshot)
+    foundation_all = _num(total_foundation_paid) + _num(total_foundation_unpaid)
 
     st.markdown("### 🧾 All-Time Finance Summary")
 
@@ -346,30 +319,15 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     f1, f2, f3, f4, f5 = st.columns(5)
 
     with f1:
-        st.markdown(
-            kpi_card("Foundation (All-Time)", _fmt_money(_num(total_foundation_paid), 0) if total_foundation_paid is not None else "—", "blue"),
-            unsafe_allow_html=True,
-        )
+        st.markdown(kpi_card("Foundation (All-Time)", _fmt_money(foundation_all, 0) if foundation_all > 0 else "—", "blue"), unsafe_allow_html=True)
     with f2:
-        st.markdown(
-            kpi_card("Foundation Paid", _fmt_money(_num(total_foundation_paid), 0) if total_foundation_paid is not None else "—", "green"),
-            unsafe_allow_html=True,
-        )
+        st.markdown(kpi_card("Foundation Paid", _fmt_money(_num(total_foundation_paid), 0) if total_foundation_paid is not None else "—", "green"), unsafe_allow_html=True)
     with f3:
-        st.markdown(
-            kpi_card("Fines Paid", _fmt_money(_num(total_fines_paid), 0) if total_fines_paid is not None else "—", "purple"),
-            unsafe_allow_html=True,
-        )
+        st.markdown(kpi_card("Fines Paid", _fmt_money(_num(total_fines_paid), 0) if total_fines_paid is not None else "—", "purple"), unsafe_allow_html=True)
     with f4:
-        st.markdown(
-            kpi_card("Fines Unpaid", _fmt_money(_num(total_fines_unpaid), 0) if total_fines_unpaid is not None else "—", "orange"),
-            unsafe_allow_html=True,
-        )
+        st.markdown(kpi_card("Fines Unpaid", _fmt_money(_num(total_fines_unpaid), 0) if total_fines_unpaid is not None else "—", "orange"), unsafe_allow_html=True)
     with f5:
-        st.markdown(
-            kpi_card("Interest (All-Time)", _fmt_money(_num(total_interest_generated), 2) if total_interest_generated is not None else "—", "green"),
-            unsafe_allow_html=True,
-        )
+        st.markdown(kpi_card("Interest (All-Time)", _fmt_money(_num(total_interest_generated), 2) if total_interest_generated is not None else "—", "green"), unsafe_allow_html=True)
 
     st.markdown(glass_close(), unsafe_allow_html=True)
 
@@ -397,15 +355,12 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     # =========================================================
     with st.expander("🔎 Debug (raw rows)", expanded=False):
         st.write("dashboard_next_view", dash)
-        st.write(
-            "sessions_legacy (resolved window)",
-            {"start_date": start_date, "end_date": end_date, "session_number": session_number},
-        )
+        st.write("sessions_legacy (resolved window)", {"start_date": start_date, "end_date": end_date, "session_number": session_number})
         st.write("v_current_cycle_kpis", kpis)
-        st.write("dashboard_finance_view", fin)
+        st.write("dashboard_finance_view (PUBLIC)", fin)
         st.write("v_is_payout_day", is_day)
         st.write("v_payout_status_current_session", payout_status)
-        st.write("v_interest_total", interest_row)
+        st.write("interest (from finance view)", {"total_interest_generated": total_interest_generated})
 
     # Service key status
     if sb_service is None:
