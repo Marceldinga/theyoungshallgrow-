@@ -1,4 +1,4 @@
-# loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED
+# loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED (FIXED IMPORT + COMPLETES compute_dpd)
 # What’s updated (per your latest decisions):
 # 1) ✅ DROP OLD RULE completely.
 #    New qualification rule ONLY:
@@ -8,17 +8,17 @@
 #
 # 2) ✅ Fix duplicate signature key error:
 #    signatures upsert now uses on_conflict="entity_type,entity_id,role"
-#    and we also provide "insert once" option if you want immutable.
 #
 # 3) ✅ Maker–Checker for repayments:
 #    - Maker inserts into loan_repayments_pending (status=pending)
 #    - Checker confirms -> inserts into loan_repayments + updates loans_legacy balances
 #    - Checker rejects -> marks pending rejected
 #
-# 4) ✅ Repayment confirmation updates balances (interest first, then principal) if columns exist:
-#    principal_current, unpaid_interest, total_due, total_paid, last_paid_at, status/closed_at
+# 4) ✅ Repayment confirmation updates balances (interest first, then principal) if columns exist
 #
 # 5) ✅ Interest accrual duplicate-key safe snapshot (month/date guard + upsert conflict)
+#
+# 6) ✅ FIXED: compute_dpd() signature + full implementation (was causing loans.py to fail import)
 #
 # Notes:
 # - Assumes these tables exist:
@@ -27,11 +27,12 @@
 #   - loan_repayments_pending (maker-checker queue)
 #   - loan_repayments (confirmed payments)
 #   - loan_interest_snapshots
-# If a table/column is missing, this code tries to degrade gracefully and show clear errors.
+# - If a table/column is missing, this code tries to degrade gracefully.
 
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from typing import Optional, Tuple, List, Dict, Any
 import uuid
 import pandas as pd
 
@@ -43,8 +44,8 @@ LOAN_SIG_REQUIRED = ["borrower", "surety", "treasury"]
 # ------------------------------------------------------------
 # Tables
 # ------------------------------------------------------------
-PAYMENTS_TABLE = "loan_repayments"              # confirmed
-PENDING_PAYMENTS_TABLE = "loan_repayments_pending"  # maker-checker pending
+PAYMENTS_TABLE = "loan_repayments"                   # confirmed
+PENDING_PAYMENTS_TABLE = "loan_repayments_pending"   # maker-checker pending
 LEGACY_PAYMENTS_TABLE = "loan_repayments_legacy"
 
 REPAY_LINK_COL = "loan_id"
@@ -433,7 +434,7 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_user_id: str) -
     if has_active_loan(sb, schema, borrower_id):
         raise ValueError("Approval blocked: borrower already has an active/open loan.")
 
-    # ✅ NEW RULE ONLY (drop old rule)
+    # ✅ NEW RULE ONLY
     cap = check_loan_qualification(sb, schema, borrower_id, surety_id, amount)
     if not cap["ok"]:
         raise ValueError(
@@ -593,7 +594,6 @@ def record_payment_pending(
 def confirm_payment(sb, schema: str, pending_id: int, confirmer_user_id: str):
     """
     CHECKER step:
-      - Locks pending row (best effort)
       - Inserts into loan_repayments (confirmed)
       - Updates loans_legacy balances
       - Marks pending row confirmed
@@ -747,12 +747,16 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, f
     ts = now_iso()
 
     # Already ran this month OR already has a snapshot today -> no-op
-    existing = (
-        sb.schema(schema).table("loan_interest_snapshots")
-        .select("id,snapshot_month,snapshot_date")
-        .or_(f"snapshot_month.eq.{month},snapshot_date.eq.{today_str}")
-        .limit(1).execute().data or []
-    )
+    try:
+        existing = (
+            sb.schema(schema).table("loan_interest_snapshots")
+            .select("id,snapshot_month,snapshot_date")
+            .or_(f"snapshot_month.eq.{month},snapshot_date.eq.{today_str}")
+            .limit(1).execute().data or []
+        )
+    except Exception:
+        existing = []
+
     if existing:
         return 0, 0.0
 
@@ -837,4 +841,214 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, f
 # ============================================================
 # DELINQUENCY (fallback; SQL view is preferred)
 # ============================================================
-def compute_dpd(loan_row: dict, last_paid_on: date |
+def _parse_due_date(loan_row: dict) -> Optional[date]:
+    """Try common due-date fields; returns None if unavailable."""
+    for k in ("due_date", "next_due_date", "expected_due_date", "payment_due_date"):
+        v = loan_row.get(k)
+        d = _to_date(v)
+        if d:
+            return d
+    return None
+
+
+def _get_last_paid_on(sb, schema: str, loan_id: int) -> Optional[date]:
+    """Find last paid date from confirmed repayments table; fallback to legacy if needed."""
+    # confirmed
+    try:
+        rows = (
+            sb.schema(schema)
+            .table(PAYMENTS_TABLE)
+            .select(REPAY_DATE_COL)
+            .eq(REPAY_LINK_COL, int(loan_id))
+            .order(REPAY_DATE_COL, desc=True)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if rows:
+            return _to_date(rows[0].get(REPAY_DATE_COL))
+    except Exception:
+        pass
+
+    # legacy fallback
+    try:
+        rows = (
+            sb.schema(schema)
+            .table(LEGACY_PAYMENTS_TABLE)
+            .select(REPAY_DATE_COL)
+            .eq(REPAY_LINK_COL, int(loan_id))
+            .order(REPAY_DATE_COL, desc=True)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if rows:
+            return _to_date(rows[0].get(REPAY_DATE_COL))
+    except Exception:
+        pass
+
+    return None
+
+
+def compute_dpd(loan_row: dict, last_paid_on: Optional[date]) -> int:
+    """
+    ✅ FIXED signature + full implementation.
+    Days Past Due (DPD) – simple fallback:
+      - If loan status is closed/paid/completed -> 0
+      - If no due date -> 0
+      - Reference date = last_paid_on if provided else today
+      - dpd = max((ref_date - due_date).days, 0)
+    """
+    try:
+        status = str(loan_row.get("status", "")).lower().strip()
+        if status in ("closed", "paid", "completed", "settled"):
+            return 0
+
+        due_date = _parse_due_date(loan_row)
+        if not due_date:
+            return 0
+
+        ref_date = last_paid_on if last_paid_on is not None else date.today()
+        dpd = (ref_date - due_date).days
+        return int(dpd) if dpd > 0 else 0
+    except Exception:
+        return 0
+
+
+def delinquency_table(sb, schema: str, limit: int = 500) -> pd.DataFrame:
+    """
+    Returns a DF with dpd for open/active loans.
+    If your SQL views already handle DPD, use those instead.
+    """
+    try:
+        loans = (
+            sb.schema(schema).table("loans_legacy")
+            .select("id,member_id,status,principal,principal_current,unpaid_interest,total_due,due_date,next_due_date,expected_due_date,payment_due_date,borrow_date,updated_at")
+            .order("updated_at", desc=True)
+            .limit(int(limit))
+            .execute().data or []
+        )
+    except Exception:
+        loans = []
+
+    if not loans:
+        return pd.DataFrame()
+
+    out = []
+    for r in loans:
+        if str(r.get("status") or "").lower().strip() not in ("open", "active"):
+            continue
+        loan_id = int(r.get("id") or 0)
+        if loan_id <= 0:
+            continue
+        last_paid = _get_last_paid_on(sb, schema, loan_id)
+        dpd = compute_dpd(r, last_paid)
+        rr = dict(r)
+        rr["last_paid_on"] = str(last_paid) if last_paid else None
+        rr["dpd"] = int(dpd)
+        out.append(rr)
+
+    df = pd.DataFrame(out)
+    if not df.empty and "dpd" in df.columns:
+        df = df.sort_values("dpd", ascending=False)
+    return df
+
+
+# ============================================================
+# SIMPLE READ HELPERS (used by loans_ui / loans.py)
+# ============================================================
+def list_loans(sb, schema: str, limit: int = 500) -> List[Dict[str, Any]]:
+    try:
+        return (
+            sb.schema(schema).table("loans_legacy")
+            .select("*")
+            .order("updated_at", desc=True)
+            .limit(int(limit))
+            .execute().data or []
+        )
+    except Exception:
+        return []
+
+
+def get_loan(sb, schema: str, loan_id: int) -> Optional[Dict[str, Any]]:
+    return fetch_one(
+        sb.schema(schema).table("loans_legacy")
+        .select("*")
+        .eq("id", int(loan_id))
+    )
+
+
+def list_member_loans(sb, schema: str, member_id: int, limit: int = 200) -> List[Dict[str, Any]]:
+    try:
+        return (
+            sb.schema(schema).table("loans_legacy")
+            .select("*")
+            .eq("member_id", int(member_id))
+            .order("updated_at", desc=True)
+            .limit(int(limit))
+            .execute().data or []
+        )
+    except Exception:
+        return []
+
+
+def list_pending_payments(sb, schema: str, limit: int = 500) -> List[Dict[str, Any]]:
+    try:
+        return (
+            sb.schema(schema).table(PENDING_PAYMENTS_TABLE)
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(int(limit))
+            .execute().data or []
+        )
+    except Exception:
+        return []
+
+
+def list_confirmed_payments(sb, schema: str, loan_id: int, limit: int = 500) -> List[Dict[str, Any]]:
+    try:
+        return (
+            sb.schema(schema).table(PAYMENTS_TABLE)
+            .select("*")
+            .eq("loan_id", int(loan_id))
+            .order("paid_at", desc=True)
+            .limit(int(limit))
+            .execute().data or []
+        )
+    except Exception:
+        return []
+
+
+def loan_statement_df(sb, schema: str, member_id: int) -> pd.DataFrame:
+    """
+    Statement: loans + repayments for a member (simple, UI-friendly).
+    If you already have statement SQL views, use them; this is a fallback.
+    """
+    loans = list_member_loans(sb, schema, member_id, limit=2000)
+    if not loans:
+        return pd.DataFrame()
+
+    rows = []
+    for ln in loans:
+        loan_id = int(ln.get("id") or 0)
+        pays = list_confirmed_payments(sb, schema, loan_id, limit=5000)
+        total_paid = sum(float(p.get("amount") or 0) for p in pays)
+        rows.append({
+            "loan_id": loan_id,
+            "member_id": int(ln.get("member_id") or 0),
+            "status": ln.get("status"),
+            "borrow_date": ln.get("borrow_date"),
+            "principal": ln.get("principal"),
+            "principal_current": ln.get("principal_current"),
+            "unpaid_interest": ln.get("unpaid_interest"),
+            "total_due": ln.get("total_due"),
+            "total_paid_confirmed": total_paid,
+            "last_paid_at": ln.get("last_paid_at") or (pays[0].get("paid_at") if pays else None),
+        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values(["loan_id"], ascending=False)
+    return df
