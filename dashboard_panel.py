@@ -1,8 +1,16 @@
 # dashboard_panel.py ✅ COMPLETE UPDATED + BEAUTIFUL THEME (dark dotted grid like your image)
-# FIXED (your Interest 0.00 bug):
-# ✅ Interest (All-Time) now comes from dashboard_finance_view.total_interest_generated (authoritative)
-# ✅ Finance views are forced to PUBLIC schema (because your views are in public)
-# Everything else kept the same.
+# FIXED:
+# ✅ Option A enforced: "Current Pot" = CURRENT ACTIVE SESSION contributions ONLY
+#    -> No more reading old pot from dashboard_next_view.current_pot
+# ✅ Cycle Contributions always shows 0 (not "—") when empty
+# ✅ Members Paid defaults to 0 when empty
+# ✅ Interest (All-Time) comes from dashboard_finance_view.total_interest_generated (authoritative)
+# ✅ Finance view forced to PUBLIC schema (because your views are in public)
+#
+# Requires:
+# - sb_anon: supabase client (anon)
+# - sb_service: supabase client (service) or None
+# - schema: your schema (default "public")
 
 from __future__ import annotations
 
@@ -235,9 +243,6 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
 
     window = f"{start_date} → {end_date}" if start_date and end_date else "—"
 
-    pot_amount = _pick(dash, "current_pot", "pot_amount")
-    pot_amount_num = _num(pot_amount, default=0.0) if pot_amount not in (None, "") else 0.0
-
     st.markdown(glass_open(), unsafe_allow_html=True)
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -254,23 +259,24 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
 
     # =========================================================
     # 2) SESSION POT / CYCLE TOTALS (AUTHORITATIVE: v_current_cycle_kpis)
+    #    ✅ Option A: Current Pot MUST equal current session contributions
     # =========================================================
     kpis = (safe_view(sb_anon, schema, "v_current_cycle_kpis", limit=1) or [{}])[0]
 
-    cycle_total = _pick(kpis, "cycle_total")
-    members_paid = _pick(kpis, "members_paid")
-    cycle_total_num = _num(cycle_total, default=0.0)
+    cycle_total_num = _num(_pick(kpis, "cycle_total", default=0), default=0.0)
+    members_paid_num = int(_num(_pick(kpis, "members_paid", default=0), default=0))
 
-    current_pot_num = pot_amount_num if pot_amount_num > 0 else cycle_total_num
+    # ✅ FIX: do NOT read pot from dashboard_next_view. It can be stale.
+    current_pot_num = cycle_total_num
 
     st.markdown(glass_open(), unsafe_allow_html=True)
     p1, p2, p3 = st.columns(3)
     with p1:
-        st.markdown(kpi_card("Current Pot", _fmt_money(current_pot_num) if current_pot_num > 0 else "—", "green"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Current Pot", _fmt_money(current_pot_num, 0), "green"), unsafe_allow_html=True)
     with p2:
-        st.markdown(kpi_card("Cycle Contributions", _fmt_money(cycle_total_num) if cycle_total_num > 0 else "—", "blue"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Cycle Contributions", _fmt_money(cycle_total_num, 0), "blue"), unsafe_allow_html=True)
     with p3:
-        st.markdown(kpi_card("Members Paid", str(members_paid) if members_paid not in (None, "") else "—", "purple"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Members Paid", str(members_paid_num), "purple"), unsafe_allow_html=True)
     st.markdown(glass_close(), unsafe_allow_html=True)
 
     st.divider()
@@ -290,7 +296,14 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     with s1:
         st.markdown(kpi_card("Is Payout Day", "YES" if is_payout_day else "NO", "orange"), unsafe_allow_html=True)
     with s2:
-        st.markdown(kpi_card("Payout Ready", "YES" if ready is True else ("NO" if ready is False else "—"), "green" if ready else "red"), unsafe_allow_html=True)
+        st.markdown(
+            kpi_card(
+                "Payout Ready",
+                "YES" if ready is True else ("NO" if ready is False else "—"),
+                "green" if ready else "red",
+            ),
+            unsafe_allow_html=True,
+        )
     with s3:
         st.markdown(kpi_card("Missing Signatures", missing if missing else "—", "purple"), unsafe_allow_html=True)
     st.markdown(glass_close(), unsafe_allow_html=True)
@@ -307,10 +320,9 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     total_fines_paid = _pick(fin, "total_fines_paid", "fines_paid")
     total_fines_unpaid = _pick(fin, "total_fines_unpaid", "fines_unpaid")
 
-    # ✅ FIX: Interest comes from the same finance view (authoritative)
+    # ✅ Interest from finance view (authoritative)
     total_interest_generated = _pick(fin, "total_interest_generated", "total_interest", "interest_total")
 
-    # Foundation all-time = paid + unpaid (matches your DB screenshot)
     foundation_all = _num(total_foundation_paid) + _num(total_foundation_unpaid)
 
     st.markdown("### 🧾 All-Time Finance Summary")
@@ -361,6 +373,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         st.write("v_is_payout_day", is_day)
         st.write("v_payout_status_current_session", payout_status)
         st.write("interest (from finance view)", {"total_interest_generated": total_interest_generated})
+        st.write("Option A current_pot_num (from cycle_total)", current_pot_num)
 
     # Service key status
     if sb_service is None:
