@@ -1,19 +1,11 @@
-# ai_risk_panel.py ✅ UPDATED (uses real tables: contributions_legacy, loans; optional fines)
+# ai_risk_panel.py ✅ UPDATED (permissions-aware + correct columns + loans order fix)
 from __future__ import annotations
 
 import streamlit as st
 import pandas as pd
 
 
-def _safe_select(
-    client,
-    schema: str,
-    table: str,
-    cols: str = "*",
-    limit: int = 2000,
-    order_by: str | None = "created_at",
-    desc: bool = True,
-):
+def _safe_select(client, schema: str, table: str, cols: str = "*", limit: int = 2000, order_by: str | None = None, desc: bool = True):
     try:
         q = client.schema(schema).table(table).select(cols)
         if order_by:
@@ -24,7 +16,7 @@ def _safe_select(
         return resp.data or []
     except Exception as e:
         st.error(f"Failed reading {schema}.{table}")
-        st.code(repr(e), language="text")
+        st.code(str(e), language="text")
         return []
 
 
@@ -36,59 +28,68 @@ def _to_num(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce").fillna(0)
 
 
+def _load_contrib(sb_anon, sb_service, schema: str, source: str) -> pd.DataFrame:
+    # Column sets that work for BOTH contributions_legacy and contributions_with_member
+    # (your view is missing id and payout_index, so we try without those too)
+    try_cols = [
+        "id, member_id, session_id, amount, kind, created_at, payout_index, payout_date, user_id, updated_at",  # table-friendly
+        "member_id, session_id, amount, kind, created_at, payout_date, user_id, updated_at",                   # view-friendly
+        "member_id, amount, kind, created_at, session_id",                                                     # minimum
+        "*",
+    ]
+
+    # 1) Try anon
+    for cols in try_cols:
+        rows = _safe_select(sb_anon, schema, source, cols=cols, limit=3000, order_by="created_at", desc=True)
+        if rows:
+            return pd.DataFrame(rows)
+
+    # 2) If anon returns nothing (likely RLS/GRANT), try service client
+    if sb_service is not None:
+        st.info("Anon could not read contributions. Trying service client…")
+        for cols in try_cols:
+            rows = _safe_select(sb_service, schema, source, cols=cols, limit=3000, order_by="created_at", desc=True)
+            if rows:
+                return pd.DataFrame(rows)
+
+    return pd.DataFrame()
+
+
 def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     st.header("🤖 AI Risk Panel")
     st.caption("Fail-safe heuristic risk view (NO-SKLEARN).")
 
-    # ✅ REAL sources (based on your DB screenshots)
-    # contributions_with_member is optional; it breaks if it doesn't have id.
-    contrib_source = st.selectbox(
+    # ✅ Only show real sources you actually have
+    source = st.selectbox(
         "Contributions source (recommended: contributions_legacy)",
-        ["contributions_legacy", "contributions_with_member", "contributions"],
+        ["contributions_legacy", "contributions_with_member"],
         index=0,
     )
 
-    # ---------- LOAD CONTRIBUTIONS ----------
-    # ✅ DO NOT assume the view has "id" — use fallback lists
-    try_cols = [
-        # for tables like contributions_legacy (has id)
-        "id, member_id, session_id, amount, kind, created_at, payout_index, payout_date, user_id, updated_at",
-        # for views that might not have id
-        "member_id, session_id, amount, kind, created_at, payout_index, payout_date, user_id, updated_at",
-        # minimum
-        "member_id, amount, kind, created_at, session_id",
-        "*",
-    ]
-
-    rows = []
-    for cols in try_cols:
-        rows = _safe_select(sb_anon, schema, contrib_source, cols=cols, limit=3000, order_by="created_at", desc=True)
-        if rows:
-            break
-
-    contrib = pd.DataFrame(rows)
+    contrib = _load_contrib(sb_anon, sb_service, schema, source)
 
     if contrib.empty:
-        st.info("No contributions returned (or source not readable).")
-        st.caption("Use contributions_legacy or grant SELECT on the view/table to anon.")
+        st.error("No contributions returned.")
+        st.caption("Fix: GRANT SELECT / RLS policy for anon on contributions_legacy (or use sb_service).")
         return
 
     if "member_id" not in contrib.columns:
-        st.error("Contributions dataframe missing 'member_id'.")
-        st.write("Available columns:", list(contrib.columns))
-        st.stop()
+        st.error("Contributions dataframe missing member_id.")
+        st.write("Columns:", list(contrib.columns))
+        return
 
     contrib["member_id"] = _to_int(contrib["member_id"])
     if "amount" in contrib.columns:
         contrib["amount"] = _to_num(contrib["amount"])
 
-    # ---------- LOAD MEMBERS ----------
+    # members (try anon first, fallback to service)
     mrows = _safe_select(sb_anon, schema, "members_legacy", cols="id,name,position", limit=500, order_by="id", desc=False)
-    members = pd.DataFrame(mrows)
+    if not mrows and sb_service is not None:
+        mrows = _safe_select(sb_service, schema, "members_legacy", cols="id,name,position", limit=500, order_by="id", desc=False)
 
+    members = pd.DataFrame(mrows)
     if members.empty or "id" not in members.columns:
-        st.warning("members_legacy not readable. Showing raw contributions instead.")
-        st.dataframe(contrib.head(200), use_container_width=True, hide_index=True)
+        st.error("members_legacy not readable.")
         return
 
     members["id"] = _to_int(members["id"])
@@ -99,7 +100,6 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     pick = st.selectbox("Select member", members["label"].tolist())
     mid = int(members.loc[members["label"] == pick, "id"].iloc[0])
 
-    # ---------- MEMBER CONTRIBUTIONS ----------
     m_contrib = contrib[contrib["member_id"] == mid].copy()
 
     c1, c2, c3 = st.columns(3)
@@ -107,9 +107,9 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     c2.metric("Contrib Total", f"{float(m_contrib['amount'].sum() if 'amount' in m_contrib.columns else 0):,.0f}")
     c3.metric("Last Contribution", str(m_contrib["created_at"].max()) if "created_at" in m_contrib.columns and len(m_contrib) else "—")
 
-    # ---------- CONTRIBUTION-BASED RISK ----------
+    # Risk from contributions
     risk = 0
-    notes: list[str] = []
+    notes = []
 
     if len(m_contrib) == 0:
         risk += 3
@@ -128,20 +128,23 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
         except Exception:
             pass
 
-    # ---------- LOANS (REAL TABLE: loans) ----------
+    # ---------------- LOANS ----------------
     st.divider()
     st.subheader("Loans")
 
     if sb_service is None:
-        st.info("Loans need SUPABASE_SERVICE_KEY (sb_service). Add it to enable loan analytics.")
+        st.info("Loans need SUPABASE_SERVICE_KEY (service client).")
     else:
-        loans_rows = _safe_select(sb_service, schema, "loans", cols="*", limit=2000, order_by="created_at", desc=True)
+        # your loans table has issued_at/updated_at, not created_at
+        loans_rows = _safe_select(sb_service, schema, "loans", cols="*", limit=2000, order_by="issued_at", desc=True)
+        if not loans_rows:
+            loans_rows = _safe_select(sb_service, schema, "loans", cols="*", limit=2000, order_by="updated_at", desc=True)
+
         loans = pd.DataFrame(loans_rows)
 
         if loans.empty:
-            st.warning("No rows returned from loans (or table not readable).")
+            st.info("No rows returned from loans (or table not readable).")
         else:
-            # your table has member_id
             if "member_id" in loans.columns:
                 loans["member_id"] = _to_int(loans["member_id"])
                 m_loans = loans[loans["member_id"] == mid].copy()
@@ -149,82 +152,61 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
                 m_loans = pd.DataFrame()
 
             if m_loans.empty:
-                st.info("No loans found for this member.")
+                st.info("No loans for this member.")
             else:
-                # numeric fields from your screenshot
                 for col in ["principal", "interest", "total_due", "balance"]:
                     if col in m_loans.columns:
                         m_loans[col] = _to_num(m_loans[col])
 
-                k1, k2, k3, k4 = st.columns(4)
+                k1, k2, k3 = st.columns(3)
                 k1.metric("Loans Count", f"{len(m_loans):,}")
-                k2.metric("Principal (sum)", f"{float(m_loans['principal'].sum() if 'principal' in m_loans.columns else 0):,.0f}")
-                k3.metric("Balance (sum)", f"{float(m_loans['balance'].sum() if 'balance' in m_loans.columns else 0):,.0f}")
-                k4.metric("Total Due (sum)", f"{float(m_loans['total_due'].sum() if 'total_due' in m_loans.columns else 0):,.0f}")
+                k2.metric("Balance (sum)", f"{float(m_loans['balance'].sum() if 'balance' in m_loans.columns else 0):,.0f}")
+                k3.metric("Total Due (sum)", f"{float(m_loans['total_due'].sum() if 'total_due' in m_loans.columns else 0):,.0f}")
 
-                # loan-based risk heuristics
                 if "balance" in m_loans.columns and float(m_loans["balance"].sum()) > 0:
                     risk += 1
                     notes.append("Outstanding loan balance detected.")
 
-                if "status" in m_loans.columns:
-                    bad = m_loans["status"].astype(str).str.lower().isin(["delinquent", "default", "overdue"])
-                    if bad.any():
-                        risk += 2
-                        notes.append("Loan status indicates delinquency/default/overdue.")
-
                 st.dataframe(m_loans.head(50), use_container_width=True, hide_index=True)
 
-    # ---------- FINES (optional; try a few likely names safely) ----------
+    # ---------------- FINES ----------------
     st.divider()
-    st.subheader("Fines (optional)")
+    st.subheader("Fines")
 
-    fines_found = False
     if sb_service is None:
-        st.caption("Fines read skipped (service key not set).")
+        st.caption("Fines skipped (service key not set).")
     else:
-        for fines_table in ["fines_with_member", "fines_legacy", "fines"]:
-            fines_rows = _safe_select(sb_service, schema, fines_table, cols="*", limit=500, order_by="created_at", desc=True)
-            df_f = pd.DataFrame(fines_rows)
-            if df_f.empty:
-                continue
+        fines_rows = _safe_select(sb_service, schema, "fines_legacy", cols="*", limit=500, order_by="created_at", desc=True)
+        fines = pd.DataFrame(fines_rows)
 
-            # must have member_id to filter
-            if "member_id" not in df_f.columns:
-                continue
-
-            df_f["member_id"] = _to_int(df_f["member_id"])
-            m_f = df_f[df_f["member_id"] == mid].copy()
-            fines_found = True
-
-            if m_f.empty:
-                st.caption(f"{fines_table}: no fines for this member.")
+        if fines.empty:
+            st.caption("No fines rows returned (or fines_legacy not readable).")
+        else:
+            if "member_id" in fines.columns:
+                fines["member_id"] = _to_int(fines["member_id"])
+                mf = fines[fines["member_id"] == mid].copy()
+                if mf.empty:
+                    st.caption("No fines for this member.")
+                else:
+                    if "amount" in mf.columns:
+                        mf["amount"] = _to_num(mf["amount"])
+                        if float(mf["amount"].sum()) > 0:
+                            risk += 1
+                            notes.append("Member has recorded fines.")
+                    st.dataframe(mf.head(50), use_container_width=True, hide_index=True)
             else:
-                if "amount" in m_f.columns:
-                    m_f["amount"] = _to_num(m_f["amount"])
-                    if float(m_f["amount"].sum()) > 0:
-                        risk += 1
-                        notes.append("Member has recorded fines.")
+                st.caption("fines_legacy has no member_id column.")
 
-                st.markdown(f"**Source:** `{fines_table}`")
-                st.dataframe(m_f.head(50), use_container_width=True, hide_index=True)
-
-            break
-
-    if not fines_found:
-        st.caption("No fines table/view found (or not readable).")
-
-    # ---------- FINAL SUMMARY ----------
+    # ---------------- SUMMARY ----------------
     st.divider()
     st.subheader("Risk summary")
     st.progress(min(risk / 5, 1.0))
     st.write(f"**Risk score (0–5):** {min(risk, 5)}")
-
     if notes:
         for n in notes:
             st.warning(n)
     else:
-        st.success("No obvious risk flags based on contributions/loans.")
+        st.success("No obvious risk flags based on contributions/loans/fines.")
 
     st.caption("Debug: contributions columns")
     st.write(list(contrib.columns))
