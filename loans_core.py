@@ -1,40 +1,22 @@
-# loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED (FIXED IMPORT + COMPLETES compute_dpd)
-# What’s updated (per your latest decisions):
-# 1) ✅ DROP OLD RULE completely.
-#    New qualification rule ONLY:
-#      cap(member) = contrib_total + 0.70*(foundation_paid_total + foundation_pending_total)
-#      qualify if (cap(borrower) + cap(surety)) >= requested_amount
-#      - self-surety allowed and counted ONCE (cap_total = cap_borrower)
+# loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED (Ledger-based Interest + compute_dpd complete)
+# Key update you asked for:
+# ✅ Interest accrual now writes to interest_ledger (bank-grade, auditable, consistent)
+# ✅ Keeps your existing loan_interest_snapshots behavior (optional) BUT ledger is source-of-truth
+# ✅ Updates loans_legacy interest fields as before (unpaid_interest/accrued/total_interest_generated)
 #
-# 2) ✅ Fix duplicate signature key error:
-#    signatures upsert now uses on_conflict="entity_type,entity_id,role"
-#
-# 3) ✅ Maker–Checker for repayments:
-#    - Maker inserts into loan_repayments_pending (status=pending)
-#    - Checker confirms -> inserts into loan_repayments + updates loans_legacy balances
-#    - Checker rejects -> marks pending rejected
-#
-# 4) ✅ Repayment confirmation updates balances (interest first, then principal) if columns exist
-#
-# 5) ✅ Interest accrual duplicate-key safe snapshot (month/date guard + upsert conflict)
-#
-# 6) ✅ FIXED: compute_dpd() signature + full implementation (was causing loans.py to fail import)
-#
-# Notes:
-# - Assumes these tables exist:
-#   - member_contribution_totals(member_id, contrib_total, foundation_paid_total, foundation_pending_total)
-#   - loan_requests, loans_legacy, signatures
-#   - loan_repayments_pending (maker-checker queue)
-#   - loan_repayments (confirmed payments)
-#   - loan_interest_snapshots
-# - If a table/column is missing, this code tries to degrade gracefully.
+# Assumptions:
+# - public.interest_ledger exists with unique(loan_id, interest_month)
+# - loans_legacy has: id, member_id, status, principal_current/principal, interest_rate_monthly (optional),
+#   unpaid_interest/accrued_interest/total_interest_generated/last_interest_at/updated_at (some may be absent)
+# - If columns/tables are missing, code degrades gracefully using filter_payload_to_existing_columns.
 
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, List, Dict, Any
 import uuid
 import pandas as pd
+from postgrest.exceptions import APIError
 
 MONTHLY_INTEREST_RATE = 0.05
 CAP_MULT = 0.70
@@ -50,6 +32,12 @@ LEGACY_PAYMENTS_TABLE = "loan_repayments_legacy"
 
 REPAY_LINK_COL = "loan_id"
 REPAY_DATE_COL = "paid_at"
+
+# ✅ Bank-grade interest ledger
+INTEREST_LEDGER_TABLE = "interest_ledger"            # public.interest_ledger
+
+# legacy snapshots (keep if you want; safe if missing)
+INTEREST_SNAPSHOTS_TABLE = "loan_interest_snapshots"
 
 # ------------------------------------------------------------
 # STATEMENT SIGNING (signatures.entity_type is NOT NULL)
@@ -125,8 +113,6 @@ def filter_payload_to_existing_columns(sb, schema: str, table: str, payload: dic
 def _drop_missing_column_from_postgrest_error(payload: dict, e: Exception) -> tuple[dict, bool]:
     """
     If PostgREST says a column doesn't exist, remove it and return (new_payload, changed=True).
-    Example message:
-      "Could not find the 'actor_user_id' column of 'loan_repayments_legacy' in the schema cache"
     """
     msg = str(e)
     if "Could not find the '" in msg and "' column of '" in msg:
@@ -139,6 +125,14 @@ def _drop_missing_column_from_postgrest_error(payload: dict, e: Exception) -> tu
         except Exception:
             return payload, False
     return payload, False
+
+
+def _table_readable(sb, schema: str, table: str) -> bool:
+    try:
+        sb.schema(schema).table(table).select("*").limit(1).execute()
+        return True
+    except Exception:
+        return False
 
 
 # ============================================================
@@ -190,10 +184,7 @@ def insert_signature(
     signer_name: str,
     signer_member_id: int | None,
 ):
-    """
-    ✅ Fixes uq_signatures_once duplicates by setting on_conflict correctly.
-    Upsert = idempotent: same role signs same entity again -> updates signed_at/name.
-    """
+    """Upsert is idempotent via on_conflict="entity_type,entity_id,role"."""
     payload = {
         "entity_type": str(entity_type),
         "entity_id": int(entity_id),
@@ -277,12 +268,6 @@ def _capacity_from_row(r: dict) -> float:
 
 
 def check_loan_qualification(sb, schema: str, borrower_id: int, surety_id: int, amount: float) -> dict:
-    """
-    Qualify if:
-      - self surety: cap_total = cap_borrower
-      - else: cap_total = cap_borrower + cap_surety
-      - cap(member) = contrib_total + 0.70*(foundation_paid_total + foundation_pending_total)
-    """
     borrower = _get_totals_row(sb, schema, borrower_id)
     cap_b = _capacity_from_row(borrower)
 
@@ -341,9 +326,6 @@ def create_loan_request(
     amount: float,
     requester_user_id: str | None = None,
 ) -> int:
-    """
-    ✅ self-surety allowed (borrower_id == surety_id allowed)
-    """
     if borrower_id <= 0 or surety_id <= 0:
         raise ValueError("Invalid borrower/surety.")
     if amount <= 0:
@@ -409,15 +391,10 @@ def get_request(sb, schema: str, request_id: int) -> dict:
 # ADMIN APPROVAL / DENY
 # ============================================================
 def approve_loan_request(sb, schema: str, request_id: int, actor_user_id: str) -> int:
-    """
-    ✅ Uses ONLY the new borrower+surety capacity rule via member_contribution_totals.
-    ✅ Treasury signs per borrowing event because request_id changes each time.
-    """
     req = get_request(sb, schema, request_id)
     if str(req.get("status") or "").lower().strip() != "pending":
         raise ValueError("Only pending requests can be approved.")
 
-    # Signatures are stored with entity_type='loan' and entity_id=request_id
     df_sig = sig_df(sb, schema, "loan", int(request_id))
     miss = missing_roles(df_sig, LOAN_SIG_REQUIRED)
     if miss:
@@ -434,7 +411,6 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_user_id: str) -
     if has_active_loan(sb, schema, borrower_id):
         raise ValueError("Approval blocked: borrower already has an active/open loan.")
 
-    # ✅ NEW RULE ONLY
     cap = check_loan_qualification(sb, schema, borrower_id, surety_id, amount)
     if not cap["ok"]:
         raise ValueError(
@@ -488,10 +464,6 @@ def deny_loan_request(sb, schema: str, request_id: int, reason: str):
 # REPAYMENTS — Maker–Checker
 # ============================================================
 def _apply_payment_to_loan_balances(sb, schema: str, loan: dict, loan_id: int, amount: float, paid_at: str):
-    """
-    Apply payment interest-first then principal. Updates known columns if present.
-    Safe: if some columns do not exist, we filter payload.
-    """
     pay_amt = float(amount)
 
     unpaid_interest = float(loan.get("unpaid_interest") or 0.0)
@@ -504,7 +476,6 @@ def _apply_payment_to_loan_balances(sb, schema: str, loan: dict, loan_id: int, a
 
     total_paid_old = float(loan.get("total_paid") or 0.0)
 
-    # pay interest first
     unpaid_interest_new = unpaid_interest
     if unpaid_interest_new > 0:
         if pay_amt >= unpaid_interest_new:
@@ -514,14 +485,11 @@ def _apply_payment_to_loan_balances(sb, schema: str, loan: dict, loan_id: int, a
             unpaid_interest_new = unpaid_interest_new - pay_amt
             pay_amt = 0.0
 
-    # then principal
     principal_new = max(principal_current - pay_amt, 0.0)
 
-    # total_due: use unpaid_interest if present, else accrued_interest
     interest_component = unpaid_interest_new if "unpaid_interest" in loan else accrued_interest
     total_due_new = principal_new + float(interest_component or 0.0)
 
-    # status close if fully paid
     close_now = (principal_new <= 0.0) and (unpaid_interest_new <= 0.0)
 
     update_payload = {
@@ -550,11 +518,6 @@ def record_payment_pending(
     recorded_by: str | None = None,
     notes: str | None = None,
 ):
-    """
-    MAKER step:
-      - Inserts into loan_repayments_pending (status=pending)
-      - Does NOT change loans_legacy yet
-    """
     if amount <= 0:
         raise ValueError("Amount must be > 0.")
     if int(loan_id) <= 0:
@@ -592,16 +555,9 @@ def record_payment_pending(
 
 
 def confirm_payment(sb, schema: str, pending_id: int, confirmer_user_id: str):
-    """
-    CHECKER step:
-      - Inserts into loan_repayments (confirmed)
-      - Updates loans_legacy balances
-      - Marks pending row confirmed
-    """
     if int(pending_id) <= 0:
         raise ValueError("Invalid pending_id.")
 
-    # Read pending row
     pend = fetch_one(
         sb.schema(schema).table(PENDING_PAYMENTS_TABLE)
         .select("*")
@@ -618,7 +574,6 @@ def confirm_payment(sb, schema: str, pending_id: int, confirmer_user_id: str):
     if loan_id <= 0 or amount <= 0 or not paid_at:
         raise RuntimeError("Pending payment has invalid data.")
 
-    # Insert confirmed payment
     repay_payload = {
         "loan_id": int(loan_id),
         "member_id": int(pend.get("member_id") or 0),
@@ -632,7 +587,6 @@ def confirm_payment(sb, schema: str, pending_id: int, confirmer_user_id: str):
 
     sb.schema(schema).table(PAYMENTS_TABLE).insert(repay_payload).execute()
 
-    # Update loan balances
     loan = fetch_one(
         sb.schema(schema).table("loans_legacy")
         .select("id,member_id,principal,principal_current,unpaid_interest,accrued_interest,total_due,total_paid,status")
@@ -641,7 +595,6 @@ def confirm_payment(sb, schema: str, pending_id: int, confirmer_user_id: str):
     if loan:
         _apply_payment_to_loan_balances(sb, schema, loan, loan_id, amount, paid_at)
 
-    # Mark pending confirmed
     upd = {
         "status": "confirmed",
         "checker_user_id": str(confirmer_user_id),
@@ -654,11 +607,6 @@ def confirm_payment(sb, schema: str, pending_id: int, confirmer_user_id: str):
 
 
 def reject_payment(sb, schema: str, pending_id: int, rejecter_user_id: str, reason: str):
-    """
-    CHECKER reject:
-      - Marks pending row rejected
-      - Does not write to loan_repayments or loans_legacy
-    """
     if int(pending_id) <= 0:
         raise ValueError("Invalid pending_id.")
 
@@ -699,10 +647,6 @@ def insert_legacy_loan_repayment(
     note: str | None = None,
     actor_user_id: str | None = None,
 ) -> dict | None:
-    """
-    Inserts into loan_repayments_legacy (legacy table).
-    We don't assume columns; we filter when possible and retry dropping missing columns.
-    """
     if int(member_id) <= 0:
         raise ValueError("Invalid member_id.")
     if float(amount) <= 0:
@@ -716,7 +660,6 @@ def insert_legacy_loan_repayment(
         "amount": float(amount),
         "paid_at": str(paid_at),
         "note": (str(note or "").strip() or None),
-        # optional audit fields (may not exist)
         "recorded_by": actor_user_id,
         "actor_user_id": actor_user_id,
         "created_at": now_iso(),
@@ -739,30 +682,22 @@ def insert_legacy_loan_repayment(
 
 
 # ============================================================
-# INTEREST (idempotent snapshot) ✅ duplicate-key safe
+# INTEREST (✅ Ledger-based + optional snapshot)
 # ============================================================
 def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, float]:
+    """
+    ✅ Source-of-truth: interest_ledger
+    Idempotent: relies on unique(loan_id, interest_month) in interest_ledger.
+    Also updates loans_legacy interest fields for convenience.
+    Optionally writes loan_interest_snapshots if table exists.
+    """
     month = _month_key()
     today_str = str(date.today())
     ts = now_iso()
 
-    # Already ran this month OR already has a snapshot today -> no-op
-    try:
-        existing = (
-            sb.schema(schema).table("loan_interest_snapshots")
-            .select("id,snapshot_month,snapshot_date")
-            .or_(f"snapshot_month.eq.{month},snapshot_date.eq.{today_str}")
-            .limit(1).execute().data or []
-        )
-    except Exception:
-        existing = []
-
-    if existing:
-        return 0, 0.0
-
     loans = (
         sb.schema(schema).table("loans_legacy")
-        .select("id,status,principal_current,accrued_interest,total_interest_generated,unpaid_interest,interest_rate_monthly")
+        .select("id,member_id,status,principal,principal_current,accrued_interest,total_interest_generated,unpaid_interest,interest_rate_monthly")
         .limit(20000).execute().data or []
     )
 
@@ -774,16 +709,42 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, f
             continue
 
         loan_id = int(r["id"])
-        principal_current = float(r.get("principal_current") or 0)
+        member_id = int(r.get("member_id") or 0)
+
+        principal_current = float(r.get("principal_current") or r.get("principal") or 0.0)
         if principal_current <= 0:
             continue
 
         rate = float(r.get("interest_rate_monthly") or MONTHLY_INTEREST_RATE)
-        interest = principal_current * rate
+        interest = round(principal_current * rate, 2)
+        if interest <= 0:
+            continue
 
-        accrued_interest = float(r.get("accrued_interest") or 0) + interest
-        total_interest_generated = float(r.get("total_interest_generated") or 0) + interest
-        unpaid_interest = float(r.get("unpaid_interest") or 0) + interest
+        # ✅ 1) Insert into interest_ledger (unique loan_id+interest_month blocks duplicates)
+        ledger_payload = {
+            "loan_id": loan_id,
+            "member_id": (member_id if member_id > 0 else None),
+            "amount": float(interest),
+            "interest_month": month,
+            "note": f"monthly interest {month}",
+            "created_at": ts,
+        }
+        ledger_payload = {k: v for k, v in ledger_payload.items() if v is not None}
+        ledger_payload = filter_payload_to_existing_columns(sb, schema, INTEREST_LEDGER_TABLE, ledger_payload)
+
+        try:
+            sb.schema(schema).table(INTEREST_LEDGER_TABLE).insert(ledger_payload).execute()
+        except APIError as e:
+            msg = str(e)
+            # duplicate = already accrued for this loan/month
+            if "duplicate key value" in msg or "uq_interest_ledger_loan_month" in msg:
+                continue
+            raise
+
+        # ✅ 2) Update loans_legacy fields (keeps your current behavior)
+        accrued_interest = float(r.get("accrued_interest") or 0) + float(interest)
+        total_interest_generated = float(r.get("total_interest_generated") or 0) + float(interest)
+        unpaid_interest = float(r.get("unpaid_interest") or 0) + float(interest)
 
         upd = {
             "accrued_interest": accrued_interest,
@@ -796,53 +757,65 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, f
         sb.schema(schema).table("loans_legacy").update(upd).eq("id", loan_id).execute()
 
         updated += 1
-        interest_added_total += interest
+        interest_added_total += float(interest)
 
-    lifetime_interest_total = sum(float(r.get("total_interest_generated") or 0) for r in loans)
-
-    snapshot_payload = {
-        "snapshot_date": today_str,
-        "snapshot_month": month,
-        "lifetime_interest_generated": float(lifetime_interest_total),
-        "created_at": ts,
-        "actor_user_id": actor_user_id,  # may not exist; drop if PostgREST complains
-    }
-
-    # Safe upsert (some schemas enforce uniqueness on snapshot_month or snapshot_date)
-    for _ in range(6):
+    # ✅ Optional snapshot table (if it exists)
+    if _table_readable(sb, schema, INTEREST_SNAPSHOTS_TABLE):
         try:
-            sb.schema(schema).table("loan_interest_snapshots").upsert(
-                snapshot_payload,
-                on_conflict="snapshot_month",
-            ).execute()
-            break
-        except Exception as e:
-            # try alternative on_conflict if snapshot_month isn't unique
-            msg = str(e)
-            if "on_conflict" in msg or "constraint" in msg:
+            # ledger lifetime total is authoritative
+            try:
+                led = (
+                    sb.schema(schema).table(INTEREST_LEDGER_TABLE)
+                    .select("amount")
+                    .limit(200000).execute().data or []
+                )
+                lifetime_total = sum(float(x.get("amount") or 0) for x in led)
+            except Exception:
+                lifetime_total = float(interest_added_total)
+
+            snapshot_payload = {
+                "snapshot_date": today_str,
+                "snapshot_month": month,
+                "lifetime_interest_generated": float(lifetime_total),
+                "created_at": ts,
+                "actor_user_id": actor_user_id,
+            }
+
+            snapshot_payload = {k: v for k, v in snapshot_payload.items() if v is not None}
+            snapshot_payload = filter_payload_to_existing_columns(sb, schema, INTEREST_SNAPSHOTS_TABLE, snapshot_payload)
+
+            for _ in range(6):
                 try:
-                    sb.schema(schema).table("loan_interest_snapshots").upsert(
+                    sb.schema(schema).table(INTEREST_SNAPSHOTS_TABLE).upsert(
                         snapshot_payload,
-                        on_conflict="snapshot_date",
+                        on_conflict="snapshot_month",
                     ).execute()
                     break
-                except Exception:
-                    pass
+                except Exception as e:
+                    new_payload, changed = _drop_missing_column_from_postgrest_error(snapshot_payload, e)
+                    if changed:
+                        snapshot_payload = new_payload
+                        continue
+                    # try snapshot_date as alternate conflict target
+                    try:
+                        sb.schema(schema).table(INTEREST_SNAPSHOTS_TABLE).upsert(
+                            snapshot_payload,
+                            on_conflict="snapshot_date",
+                        ).execute()
+                        break
+                    except Exception:
+                        raise
+        except Exception:
+            # snapshot failure should never block accrual
+            pass
 
-            new_payload, changed = _drop_missing_column_from_postgrest_error(snapshot_payload, e)
-            if changed:
-                snapshot_payload = new_payload
-                continue
-            raise
-
-    return updated, interest_added_total
+    return updated, float(round(interest_added_total, 2))
 
 
 # ============================================================
 # DELINQUENCY (fallback; SQL view is preferred)
 # ============================================================
 def _parse_due_date(loan_row: dict) -> Optional[date]:
-    """Try common due-date fields; returns None if unavailable."""
     for k in ("due_date", "next_due_date", "expected_due_date", "payment_due_date"):
         v = loan_row.get(k)
         d = _to_date(v)
@@ -852,8 +825,6 @@ def _parse_due_date(loan_row: dict) -> Optional[date]:
 
 
 def _get_last_paid_on(sb, schema: str, loan_id: int) -> Optional[date]:
-    """Find last paid date from confirmed repayments table; fallback to legacy if needed."""
-    # confirmed
     try:
         rows = (
             sb.schema(schema)
@@ -871,7 +842,6 @@ def _get_last_paid_on(sb, schema: str, loan_id: int) -> Optional[date]:
     except Exception:
         pass
 
-    # legacy fallback
     try:
         rows = (
             sb.schema(schema)
@@ -893,14 +863,6 @@ def _get_last_paid_on(sb, schema: str, loan_id: int) -> Optional[date]:
 
 
 def compute_dpd(loan_row: dict, last_paid_on: Optional[date]) -> int:
-    """
-    ✅ FIXED signature + full implementation.
-    Days Past Due (DPD) – simple fallback:
-      - If loan status is closed/paid/completed -> 0
-      - If no due date -> 0
-      - Reference date = last_paid_on if provided else today
-      - dpd = max((ref_date - due_date).days, 0)
-    """
     try:
         status = str(loan_row.get("status", "")).lower().strip()
         if status in ("closed", "paid", "completed", "settled"):
@@ -918,10 +880,6 @@ def compute_dpd(loan_row: dict, last_paid_on: Optional[date]) -> int:
 
 
 def delinquency_table(sb, schema: str, limit: int = 500) -> pd.DataFrame:
-    """
-    Returns a DF with dpd for open/active loans.
-    If your SQL views already handle DPD, use those instead.
-    """
     try:
         loans = (
             sb.schema(schema).table("loans_legacy")
@@ -1022,10 +980,6 @@ def list_confirmed_payments(sb, schema: str, loan_id: int, limit: int = 500) -> 
 
 
 def loan_statement_df(sb, schema: str, member_id: int) -> pd.DataFrame:
-    """
-    Statement: loans + repayments for a member (simple, UI-friendly).
-    If you already have statement SQL views, use them; this is a fallback.
-    """
     loans = list_member_loans(sb, schema, member_id, limit=2000)
     if not loans:
         return pd.DataFrame()
