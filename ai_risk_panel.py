@@ -1,4 +1,4 @@
-# ai_risk_panel.py
+# ai_risk_panel.py  ✅ LEGACY ONLY
 from __future__ import annotations
 
 import streamlit as st
@@ -10,144 +10,151 @@ def _safe_select(sb, schema: str, table: str, cols: str = "*", limit: int = 5000
         q = sb.schema(schema).table(table).select(cols)
         if order_by:
             q = q.order(order_by, desc=True)
-        q = q.limit(limit)
+        if limit is not None:
+            q = q.limit(limit)
         return q.execute().data or []
     except Exception:
         return []
 
 
-def render_ai_risk_panel(sb_anon, sb_service, schema: str):
-    st.header("🤖 AI Risk Panel")
-    st.caption("Phase 1: rules-based scoring (works now). Phase 2: replace with ML model.")
+def _first_existing_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
 
-    if sb_anon is None:
-        st.error("Anon client not available.")
+
+def render_ai_risk_panel(sb_anon, sb_service, schema: str):
+    st.header("🤖 AI Risk Panel (Legacy)")
+    st.caption("Rules-based risk scoring using legacy tables. (ML upgrade later.)")
+
+    reader = sb_anon or sb_service
+    if reader is None:
+        st.error("No Supabase client available.")
         return
 
     # -----------------------------
-    # Load members (your app uses members_legacy)
+    # LOAD LEGACY TABLES
     # -----------------------------
-    members = _safe_select(sb_anon, schema, "members_legacy", "id,name,position", limit=2000, order_by="id")
+    members = _safe_select(reader, schema, "members_legacy", "*", limit=2000, order_by="id")
+    contrib = _safe_select(reader, schema, "contributions_legacy", "*", limit=8000, order_by="created_at")
+    loans = _safe_select(reader, schema, "loans_legacy", "*", limit=5000, order_by="created_at")
+    repays = _safe_select(reader, schema, "loan_repayments_legacy", "*", limit=12000, order_by="paid_at")
+    fines = _safe_select(reader, schema, "fines_legacy", "*", limit=8000, order_by="created_at")
+
     df_members = pd.DataFrame(members)
+    df_contrib = pd.DataFrame(contrib)
+    df_loans = pd.DataFrame(loans)
+    df_repays = pd.DataFrame(repays)
+    df_fines = pd.DataFrame(fines)
+
     if df_members.empty:
         st.info("No members found in members_legacy.")
         return
 
     # -----------------------------
-    # Try to load loan & payment tables (optional)
-    # If they don't exist, scoring still works using contributions only.
+    # DETECT MEMBER-ID COLUMNS (legacy might vary)
     # -----------------------------
-    loans = _safe_select(sb_anon, schema, "loans", "*", limit=5000, order_by="created_at")
-    pays = _safe_select(sb_anon, schema, "loan_payments", "*", limit=8000, order_by="paid_at")
-
-    df_loans = pd.DataFrame(loans) if loans else pd.DataFrame()
-    df_pays = pd.DataFrame(pays) if pays else pd.DataFrame()
+    contrib_mid = _first_existing_col(df_contrib, ["member_id", "legacy_member_id", "id"]) if not df_contrib.empty else None
+    loans_mid = _first_existing_col(df_loans, ["member_id", "requester_member_id", "borrower_member_id", "legacy_member_id"]) if not df_loans.empty else None
+    repays_mid = _first_existing_col(df_repays, ["member_id", "payer_member_id", "legacy_member_id"]) if not df_repays.empty else None
+    fines_mid = _first_existing_col(df_fines, ["member_id", "legacy_member_id", "id"]) if not df_fines.empty else None
 
     # -----------------------------
-    # Load contributions view (you already have contributions_with_member view)
-    # -----------------------------
-    contrib = _safe_select(sb_anon, schema, "contributions_with_member", "*", limit=5000, order_by="created_at")
-    df_contrib = pd.DataFrame(contrib) if contrib else pd.DataFrame()
-
-    # -----------------------------
-    # Build scores
+    # SCORE MEMBERS (rules-based)
     # score starts 100; subtract penalties
     # -----------------------------
-    scores = []
+    out = []
+
     for _, m in df_members.iterrows():
-        mid = int(m.get("id"))
-        name = str(m.get("name") or f"Member {mid}")
+        mid = m.get("id") or m.get("legacy_member_id") or m.get("member_id")
+        try:
+            mid = int(mid)
+        except Exception:
+            continue
+
+        name = str(m.get("name") or m.get("full_name") or f"Member {mid}")
 
         score = 100
 
-        # Contributions behavior (if view exists)
-        if not df_contrib.empty:
-            # try common member id column names
-            member_col = None
-            for c in ["member_id", "legacy_member_id", "id"]:
-                if c in df_contrib.columns:
-                    member_col = c
-                    break
+        # Contributions penalty
+        if contrib_mid and not df_contrib.empty:
+            m_con = df_contrib[df_contrib[contrib_mid] == mid]
+            # fewer total contributions => risk
+            score -= min(30, max(0, 6 - len(m_con)) * 5)
 
-            if member_col is not None:
-                m_con = df_contrib[df_contrib[member_col] == mid]
-                # fewer recent contributions => higher risk
-                score -= min(30, max(0, 5 - len(m_con)) * 5)
+        # Loans penalty
+        if loans_mid and not df_loans.empty:
+            m_loans = df_loans[df_loans[loans_mid] == mid]
+            score -= min(35, len(m_loans) * 5)
 
-        # Loans behavior (if table exists)
-        if not df_loans.empty:
-            # try common member id columns
-            loan_member_col = None
-            for c in ["requester_member_id", "member_id", "legacy_member_id", "borrower_member_id"]:
-                if c in df_loans.columns:
-                    loan_member_col = c
-                    break
+            # If status exists, penalize bad statuses
+            if "status" in df_loans.columns:
+                bad = m_loans[m_loans["status"].isin(["defaulted", "delinquent", "late", "arrears"])]
+                score -= min(60, len(bad) * 15)
 
-            if loan_member_col is not None:
-                m_loans = df_loans[df_loans[loan_member_col] == mid]
-                score -= min(35, len(m_loans) * 5)
+        # Repayments penalty
+        if repays_mid and not df_repays.empty:
+            m_rep = df_repays[df_repays[repays_mid] == mid]
+            # too few repayments relative to loans -> risk
+            if loans_mid and not df_loans.empty:
+                n_loans = len(df_loans[df_loans[loans_mid] == mid])
+            else:
+                n_loans = 0
+            if n_loans > 0:
+                score -= min(25, max(0, n_loans - len(m_rep)) * 5)
 
-                if "status" in df_loans.columns:
-                    bad = m_loans[m_loans["status"].isin(["defaulted", "delinquent", "late"])]
-                    score -= min(60, len(bad) * 15)
-
-        # Payment behavior (if table exists)
-        if not df_pays.empty:
-            pay_member_col = None
-            for c in ["payer_member_id", "member_id", "legacy_member_id"]:
-                if c in df_pays.columns:
-                    pay_member_col = c
-                    break
-
-            if pay_member_col is not None:
-                m_p = df_pays[df_pays[pay_member_col] == mid]
-                # fewer payments => higher risk
-                score -= min(25, max(0, 3 - len(m_p)) * 5)
+        # Fines penalty
+        if fines_mid and not df_fines.empty:
+            m_fines = df_fines[df_fines[fines_mid] == mid]
+            score -= min(20, len(m_fines) * 3)
 
         score = max(0, min(100, score))
 
         if score >= 75:
-            risk_label = "🟢 Low"
+            risk = "🟢 Low"
         elif score >= 50:
-            risk_label = "🟡 Medium"
+            risk = "🟡 Medium"
         else:
-            risk_label = "🔴 High"
+            risk = "🔴 High"
 
-        scores.append(
+        out.append(
             {
                 "member_id": mid,
                 "member": name,
                 "risk_score": int(score),
-                "risk": risk_label,
+                "risk": risk,
+                "contributions": int(len(df_contrib[df_contrib[contrib_mid] == mid])) if contrib_mid and not df_contrib.empty else 0,
+                "loans": int(len(df_loans[df_loans[loans_mid] == mid])) if loans_mid and not df_loans.empty else 0,
+                "repayments": int(len(df_repays[df_repays[repays_mid] == mid])) if repays_mid and not df_repays.empty else 0,
+                "fines": int(len(df_fines[df_fines[fines_mid] == mid])) if fines_mid and not df_fines.empty else 0,
             }
         )
 
-    df_scores = pd.DataFrame(scores).sort_values(["risk_score", "member"], ascending=[True, True])
+    df = pd.DataFrame(out).sort_values(["risk_score", "member"], ascending=[True, True])
 
     # -----------------------------
     # UI
     # -----------------------------
     c1, c2, c3 = st.columns(3)
-    c1.metric("Members Scored", f"{len(df_scores):,}")
-    c2.metric("High Risk (<50)", f"{(df_scores['risk_score'] < 50).sum():,}")
-    c3.metric("Low Risk (>=75)", f"{(df_scores['risk_score'] >= 75).sum():,}")
+    c1.metric("Members scored", f"{len(df):,}")
+    c2.metric("High risk (<50)", f"{(df['risk_score'] < 50).sum():,}")
+    c3.metric("Low risk (>=75)", f"{(df['risk_score'] >= 75).sum():,}")
 
     st.divider()
-    st.subheader("Risk Table")
-    st.dataframe(df_scores, use_container_width=True, hide_index=True)
+    st.subheader("Risk table")
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
-    st.subheader("Quick Recommendation")
-    pick = st.selectbox("Select member", df_scores["member"].tolist(), key="ai_pick_member")
-    row = df_scores[df_scores["member"] == pick].iloc[0]
+    st.subheader("Recommendation")
+    pick = st.selectbox("Select member", df["member"].tolist(), key="ai_pick_member_legacy")
+    row = df[df["member"] == pick].iloc[0]
 
     st.write("**Risk:**", row["risk"])
     st.write("**Score:**", row["risk_score"])
 
     if row["risk_score"] >= 75:
-        st.success("Recommendation: Approve normal terms ✅")
+        st.success("Approve normal terms ✅")
     elif row["risk_score"] >= 50:
-        st.warning("Recommendation: Approve with guarantor / lower limit ⚠️")
+        st.warning("Approve with guarantor / lower limit ⚠️")
     else:
-        st.error("Recommendation: Reject or require strict conditions ❌")
-
-    st.info("Next step: replace rules with a trained ML model (predict_proba) once we finalize features.")
+        st.error("Reject or require strict conditions ❌")
