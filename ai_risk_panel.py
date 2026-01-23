@@ -1,23 +1,63 @@
-# ai_risk_panel.py ✅ UPDATED (permissions-aware + correct columns + loans order fix)
+# ai_risk_panel.py ✅ UPDATED (loans_legacy + safer selects)
 from __future__ import annotations
 
 import streamlit as st
 import pandas as pd
 
 
-def _safe_select(client, schema: str, table: str, cols: str = "*", limit: int = 2000, order_by: str | None = None, desc: bool = True):
+def _safe_select(
+    client,
+    schema: str,
+    table: str,
+    cols: str = "*",
+    limit: int = 2000,
+    order_by: str | None = None,
+    desc: bool = True,
+    silent: bool = False,
+):
+    """
+    Safe Supabase read that won't crash if an order_by column doesn't exist.
+    If order_by fails, we retry without ordering.
+    """
     try:
         q = client.schema(schema).table(table).select(cols)
+
         if order_by:
-            q = q.order(order_by, desc=desc)
+            try:
+                q = q.order(order_by, desc=desc)
+            except Exception:
+                # retry without ordering
+                q = client.schema(schema).table(table).select(cols)
+
         if limit:
             q = q.limit(limit)
+
         resp = q.execute()
         return resp.data or []
+
     except Exception as e:
-        st.error(f"Failed reading {schema}.{table}")
-        st.code(str(e), language="text")
+        if not silent:
+            st.error(f"Failed reading {schema}.{table}")
+            st.code(str(e), language="text")
         return []
+
+
+def _safe_select_autosort(
+    client,
+    schema: str,
+    table: str,
+    cols: str = "*",
+    limit: int = 2000,
+    desc: bool = True,
+):
+    """
+    Try common timestamp/id columns for ordering, then fallback to no-order.
+    """
+    for c in ["created_at", "issued_at", "updated_at", "paid_at", "date_paid", "start_date", "id"]:
+        rows = _safe_select(client, schema, table, cols=cols, limit=limit, order_by=c, desc=desc, silent=True)
+        if rows:
+            return rows
+    return _safe_select(client, schema, table, cols=cols, limit=limit, order_by=None, desc=desc, silent=True)
 
 
 def _to_int(s: pd.Series) -> pd.Series:
@@ -29,26 +69,30 @@ def _to_num(s: pd.Series) -> pd.Series:
 
 
 def _load_contrib(sb_anon, sb_service, schema: str, source: str) -> pd.DataFrame:
-    # Column sets that work for BOTH contributions_legacy and contributions_with_member
-    # (your view is missing id and payout_index, so we try without those too)
+    """
+    Loads contributions safely for:
+    - contributions_legacy (table: has id, payout_index, payout_date)
+    - contributions_with_member (view: may NOT have id/payout_index/payout_date)
+    """
     try_cols = [
-        "id, member_id, session_id, amount, kind, created_at, payout_index, payout_date, user_id, updated_at",  # table-friendly
-        "member_id, session_id, amount, kind, created_at, payout_date, user_id, updated_at",                   # view-friendly
-        "member_id, amount, kind, created_at, session_id",                                                     # minimum
+        # ✅ table-friendly
+        "id, member_id, session_id, amount, kind, created_at, payout_index, payout_date, user_id, updated_at",
+        # ✅ view-friendly (minimum set that your view actually had in debug)
+        "member_id, amount, kind, created_at, session_id",
         "*",
     ]
 
     # 1) Try anon
     for cols in try_cols:
-        rows = _safe_select(sb_anon, schema, source, cols=cols, limit=3000, order_by="created_at", desc=True)
+        rows = _safe_select_autosort(sb_anon, schema, source, cols=cols, limit=3000, desc=True)
         if rows:
             return pd.DataFrame(rows)
 
-    # 2) If anon returns nothing (likely RLS/GRANT), try service client
+    # 2) Try service if anon blocked
     if sb_service is not None:
         st.info("Anon could not read contributions. Trying service client…")
         for cols in try_cols:
-            rows = _safe_select(sb_service, schema, source, cols=cols, limit=3000, order_by="created_at", desc=True)
+            rows = _safe_select_autosort(sb_service, schema, source, cols=cols, limit=3000, desc=True)
             if rows:
                 return pd.DataFrame(rows)
 
@@ -59,7 +103,6 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     st.header("🤖 AI Risk Panel")
     st.caption("Fail-safe heuristic risk view (NO-SKLEARN).")
 
-    # ✅ Only show real sources you actually have
     source = st.selectbox(
         "Contributions source (recommended: contributions_legacy)",
         ["contributions_legacy", "contributions_with_member"],
@@ -82,10 +125,10 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     if "amount" in contrib.columns:
         contrib["amount"] = _to_num(contrib["amount"])
 
-    # members (try anon first, fallback to service)
-    mrows = _safe_select(sb_anon, schema, "members_legacy", cols="id,name,position", limit=500, order_by="id", desc=False)
+    # Members (try anon first, fallback to service)
+    mrows = _safe_select(sb_anon, schema, "members_legacy", cols="id,name,position", limit=500, order_by="id", desc=False, silent=True)
     if not mrows and sb_service is not None:
-        mrows = _safe_select(sb_service, schema, "members_legacy", cols="id,name,position", limit=500, order_by="id", desc=False)
+        mrows = _safe_select(sb_service, schema, "members_legacy", cols="id,name,position", limit=500, order_by="id", desc=False, silent=True)
 
     members = pd.DataFrame(mrows)
     if members.empty or "id" not in members.columns:
@@ -100,14 +143,18 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     pick = st.selectbox("Select member", members["label"].tolist())
     mid = int(members.loc[members["label"] == pick, "id"].iloc[0])
 
+    # ---- Contributions for member
     m_contrib = contrib[contrib["member_id"] == mid].copy()
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Contrib Records", f"{len(m_contrib):,}")
     c2.metric("Contrib Total", f"{float(m_contrib['amount'].sum() if 'amount' in m_contrib.columns else 0):,.0f}")
-    c3.metric("Last Contribution", str(m_contrib["created_at"].max()) if "created_at" in m_contrib.columns and len(m_contrib) else "—")
+    c3.metric(
+        "Last Contribution",
+        str(m_contrib["created_at"].max()) if "created_at" in m_contrib.columns and len(m_contrib) else "—",
+    )
 
-    # Risk from contributions
+    # ---- Risk from contributions
     risk = 0
     notes = []
 
@@ -128,23 +175,21 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
         except Exception:
             pass
 
-    # ---------------- LOANS ----------------
+    # ---------------- LOANS (✅ USE loans_legacy) ----------------
     st.divider()
-    st.subheader("Loans")
+    st.subheader("Loans (Legacy)")
 
     if sb_service is None:
         st.info("Loans need SUPABASE_SERVICE_KEY (service client).")
     else:
-        # your loans table has issued_at/updated_at, not created_at
-        loans_rows = _safe_select(sb_service, schema, "loans", cols="*", limit=2000, order_by="issued_at", desc=True)
-        if not loans_rows:
-            loans_rows = _safe_select(sb_service, schema, "loans", cols="*", limit=2000, order_by="updated_at", desc=True)
-
+        # ✅ loans_legacy has issued_at / created_at / updated_at
+        loans_rows = _safe_select_autosort(sb_service, schema, "loans_legacy", cols="*", limit=2000, desc=True)
         loans = pd.DataFrame(loans_rows)
 
         if loans.empty:
-            st.info("No rows returned from loans (or table not readable).")
+            st.info("No rows returned from loans_legacy (or table not readable).")
         else:
+            # filter by member_id
             if "member_id" in loans.columns:
                 loans["member_id"] = _to_int(loans["member_id"])
                 m_loans = loans[loans["member_id"] == mid].copy()
@@ -167,6 +212,13 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
                     risk += 1
                     notes.append("Outstanding loan balance detected.")
 
+                # status risk
+                if "status" in m_loans.columns:
+                    bad = m_loans["status"].astype(str).str.lower().isin(["delinquent", "default", "overdue"])
+                    if bad.any():
+                        risk += 2
+                        notes.append("Loan status indicates delinquency/default/overdue.")
+
                 st.dataframe(m_loans.head(50), use_container_width=True, hide_index=True)
 
     # ---------------- FINES ----------------
@@ -176,7 +228,7 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     if sb_service is None:
         st.caption("Fines skipped (service key not set).")
     else:
-        fines_rows = _safe_select(sb_service, schema, "fines_legacy", cols="*", limit=500, order_by="created_at", desc=True)
+        fines_rows = _safe_select_autosort(sb_service, schema, "fines_legacy", cols="*", limit=500, desc=True)
         fines = pd.DataFrame(fines_rows)
 
         if fines.empty:
@@ -202,6 +254,7 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     st.subheader("Risk summary")
     st.progress(min(risk / 5, 1.0))
     st.write(f"**Risk score (0–5):** {min(risk, 5)}")
+
     if notes:
         for n in notes:
             st.warning(n)
