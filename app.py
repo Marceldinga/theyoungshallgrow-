@@ -1,6 +1,10 @@
 # app.py ✅ UPDATED — Attendance + Summaries implemented (no placeholders)
-# Fixes your WHITE inputs issue by keeping the strong BaseWeb overrides inside inject_global_theme().
-# Also fixes: meeting minutes save errors shown as clean message (no scary trace) and attendance selection persistence.
+# ✅ Fixes WHITE inputs (BaseWeb override)
+# ✅ Minutes save shows clean API message (no scary trace)
+# ✅ Attendance now uses the correct WRITE table + READ view:
+#    - WRITE  -> public.meeting_attendance_legacy  (real table)
+#    - READ   -> public.attendance_legacy          (compatibility view you created)
+# ✅ Summaries reads from the READ view so column names match the UI.
 
 from __future__ import annotations
 
@@ -181,6 +185,13 @@ def glass_close() -> str:
     return "</div>"
 
 inject_global_theme()
+
+# ============================================================
+# ✅ TABLE NAMES (attendance) — THIS IS THE FIX
+# ============================================================
+ATTENDANCE_READ_TABLE = "attendance_legacy"           # 👓 view: attendance_date, member_id, ...
+ATTENDANCE_WRITE_TABLE = "meeting_attendance_legacy"  # 🧱 table: meeting_date, legacy_member_id, ...
+
 
 # ============================================================
 # SECRETS (Railway-safe)
@@ -483,7 +494,8 @@ elif page == "Minutes & Attendance":
 
     # -------------------------
     # Attendance ✅ IMPLEMENTED
-    # Table expected: attendance_legacy
+    # WRITE -> meeting_attendance_legacy (table)
+    # READ  -> attendance_legacy (view)
     # -------------------------
     with tab2:
         st.markdown(glass_open(), unsafe_allow_html=True)
@@ -499,7 +511,7 @@ elif page == "Minutes & Attendance":
 
         st.caption("Mark who is present for this meeting.")
 
-        present_ids = []
+        present_ids: list[int] = []
         for _, r in df_members.sort_values("id").iterrows():
             mid = int(r["id"])
             name = str(r["name"])
@@ -521,25 +533,26 @@ elif page == "Minutes & Attendance":
             elif not present_ids:
                 st.error("Select at least 1 member as present.")
             else:
+                # ✅ INSERT payload for the REAL TABLE columns
                 payload_rows = []
                 for mid in present_ids:
                     nm = df_members[df_members["id"] == mid]["name"].iloc[0]
                     payload_rows.append(
                         {
-                            "attendance_date": str(adate),
+                            "meeting_date": str(adate),
                             "session_number": int(current_session_number),
-                            "member_id": int(mid),
+                            "legacy_member_id": int(mid),
                             "member_name": str(nm),
                             "status": "present",
                             "created_by": role,
                         }
                     )
                 try:
-                    sb_service.schema(SUPABASE_SCHEMA).table("attendance_legacy").insert(payload_rows).execute()
+                    sb_service.schema(SUPABASE_SCHEMA).table(ATTENDANCE_WRITE_TABLE).insert(payload_rows).execute()
                     st.success(f"Attendance saved: {len(payload_rows)} present.")
                     st.rerun()
                 except Exception as e:
-                    st.error("Failed to save attendance. Make sure table attendance_legacy exists.")
+                    st.error(f"Failed to save attendance into {ATTENDANCE_WRITE_TABLE}.")
                     st.code(_api_msg(e), language="text")
 
         st.divider()
@@ -547,7 +560,7 @@ elif page == "Minutes & Attendance":
 
         try:
             arows = (
-                sb_service.schema(SUPABASE_SCHEMA).table("attendance_legacy")
+                sb_service.schema(SUPABASE_SCHEMA).table(ATTENDANCE_READ_TABLE)
                 .select("*")
                 .order("attendance_date", desc=True)
                 .limit(200)
@@ -555,7 +568,7 @@ elif page == "Minutes & Attendance":
                 or []
             )
         except Exception as e:
-            st.error("Failed to load attendance_legacy (table may not exist).")
+            st.error(f"Failed to load {ATTENDANCE_READ_TABLE}.")
             st.code(_api_msg(e), language="text")
             arows = []
 
@@ -634,11 +647,11 @@ elif page == "Minutes & Attendance":
 
         st.divider()
 
-        # Attendance summary
+        # Attendance summary (READ from view)
         st.markdown("### ✅ Attendance summary")
         try:
             a_rows = (
-                sb_service.schema(SUPABASE_SCHEMA).table("attendance_legacy")
+                sb_service.schema(SUPABASE_SCHEMA).table(ATTENDANCE_READ_TABLE)
                 .select("*")
                 .order("attendance_date", desc=True)
                 .limit(300)
@@ -650,7 +663,7 @@ elif page == "Minutes & Attendance":
         dfa = pd.DataFrame(a_rows)
 
         if dfa.empty:
-            st.info("No attendance recorded yet (or attendance_legacy not created).")
+            st.info(f"No attendance recorded yet (or {ATTENDANCE_READ_TABLE} not readable).")
         else:
             dfa["attendance_date"] = dfa["attendance_date"].astype(str)
             unique_dates = sorted(dfa["attendance_date"].unique().tolist(), reverse=True)
