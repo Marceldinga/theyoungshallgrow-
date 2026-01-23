@@ -1,11 +1,16 @@
 # app.py ✅ CLEAN + UPDATED (uses dashboard_panel.py upgraded dashboard)
 # - Railway-safe secrets
 # - Safe imports (Audit / Health / Loans + PDFs)
-# - ✅ Dashboard now rendered by dashboard_panel.render_dashboard (beautiful standard dashboard)
+# - ✅ Dashboard now rendered by dashboard_panel.render_dashboard
 # - Loans entry works with loans.py wrapper (show_loans or render_loans)
 # - Minutes & Attendance upgraded: PDFs + Bulk attendance + Summaries + session_number link
 # - ✅ FIXED: safe_select now supports filters like meeting_date=...
 # - Avoids crashes if a module is missing
+#
+# IMPORTANT:
+# - This file assumes these modules exist: admin_panels.py, payout.py, audit_panel.py, health_panel.py, dashboard_panel.py
+# - For Loans: loans.py must define show_loans(sb_service, schema, actor_user_id=...) OR render_loans(...)
+# - For PDFs: pdfs.py can optionally define make_minutes_pdf(...) and make_attendance_pdf(...)
 
 from __future__ import annotations
 
@@ -31,11 +36,14 @@ except Exception:
     make_minutes_pdf = None
     make_attendance_pdf = None
 
-# ✅ Loans UI (safe import)
+# ✅ Loans UI (safe import + error capture)
+loans_entry = None
+loans_import_error = None
 try:
-    import loans as loans_entry
-except Exception:
+    import loans as loans_entry  # noqa: F401
+except Exception as e:
     loans_entry = None
+    loans_import_error = e
 
 APP_BRAND = "theyoungshallgrow"
 
@@ -135,6 +143,7 @@ def safe_select(
         return []
     except Exception as e:
         st.error(f"Unexpected error reading {schema}.{table_name}: {e}")
+        st.code(repr(e), language="text")
         return []
 
 
@@ -232,18 +241,28 @@ elif page == "Payouts":
 # LOANS
 # ============================================================
 elif page == "Loans":
+    st.header("Loans")
+
     if not sb_service:
         st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY in Railway Variables / Secrets.")
     else:
         if loans_entry is None:
             st.error("Loans UI not available. loans.py failed to import.")
-            st.caption("Check Railway/Streamlit logs for the import error.")
+            if loans_import_error is not None:
+                st.caption("Import error detail:")
+                st.code(repr(loans_import_error), language="text")
+            st.caption("Fix the error in loans.py (or its dependencies) and redeploy.")
         else:
             loans_fn = getattr(loans_entry, "show_loans", None) or getattr(loans_entry, "render_loans", None)
             if loans_fn is None:
                 st.error("Loans UI not available. loans.py must define show_loans() or render_loans().")
+                st.caption("Expected signature: show_loans(sb_service, schema, actor_user_id='admin')")
             else:
-                loans_fn(sb_service, SUPABASE_SCHEMA, actor_user_id="admin")
+                try:
+                    loans_fn(sb_service, SUPABASE_SCHEMA, actor_user_id="admin")
+                except TypeError:
+                    # If older signature: loans_fn(sb_service, schema)
+                    loans_fn(sb_service, SUPABASE_SCHEMA)
 
 # ============================================================
 # Minutes & Attendance (Legacy) — upgraded
@@ -353,15 +372,19 @@ elif page == "Minutes & Attendance":
                 else:
                     payloads = []
                     for _, r in df_members.iterrows():
-                        payloads.append({
-                            "meeting_date": str(adate),
-                            "session_number": int(current_session_number) if current_session_number is not None else None,
-                            "legacy_member_id": int(r["id"]),
-                            "member_name": str(r["name"]),
-                            "status": "present",
-                            "note": None,
-                            "created_by": role,
-                        })
+                        payloads.append(
+                            {
+                                "meeting_date": str(adate),
+                                "session_number": int(current_session_number)
+                                if current_session_number is not None
+                                else None,
+                                "legacy_member_id": int(r["id"]),
+                                "member_name": str(r["name"]),
+                                "status": "present",
+                                "note": None,
+                                "created_by": role,
+                            }
+                        )
                     payloads = [{k: v for k, v in p.items() if v is not None} for p in payloads]
                     try:
                         sb_service.schema(SUPABASE_SCHEMA).table("meeting_attendance_legacy").upsert(payloads).execute()
@@ -385,7 +408,9 @@ elif page == "Minutes & Attendance":
                     legacy_member_id = 0
                     member_name = ""
 
-                status = st.selectbox("Status", ["present", "absent", "late", "excused"], index=0, key="att_legacy_status")
+                status = st.selectbox(
+                    "Status", ["present", "absent", "late", "excused"], index=0, key="att_legacy_status"
+                )
                 note = st.text_input("Note (optional)", "", key="att_legacy_note")
                 ok2 = st.form_submit_button("✅ Save attendance", use_container_width=True)
 
@@ -468,7 +493,9 @@ elif page == "Minutes & Attendance":
                 dfd["present_count"] = pd.to_numeric(dfd.get("present_count"), errors="coerce").fillna(0)
                 dfd["total_marked"] = pd.to_numeric(dfd.get("total_marked"), errors="coerce").fillna(0)
                 dfd["present_pct"] = dfd.apply(
-                    lambda r: (float(r["present_count"]) / float(r["total_marked"]) * 100.0) if float(r["total_marked"]) > 0 else 0.0,
+                    lambda r: (float(r["present_count"]) / float(r["total_marked"]) * 100.0)
+                    if float(r["total_marked"]) > 0
+                    else 0.0,
                     axis=1,
                 )
                 st.dataframe(dfd, use_container_width=True, hide_index=True)
