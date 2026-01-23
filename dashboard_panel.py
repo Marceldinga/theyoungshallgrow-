@@ -1,13 +1,9 @@
-# dashboard_panel.py ✅ FINAL COMPLETE (UPDATED + Interest fix)
+# dashboard_panel.py ✅ FINAL COMPLETE (UPDATED AGAIN — fixes remaining blanks)
 # Fixes:
-# - Session Window uses dashboard_next_view.start_date/end_date
-# - Current Pot uses dashboard_next_view.pot_amount (session-scoped)
-# - Cycle totals use v_current_cycle_contributions, fallback to dashboard_next_view.pot_amount
-# - Members Paid uses v_current_cycle_contributions.members_paid, fallback to dashboard_finance_view.contributors
-# - All-time finance uses dashboard_finance_view:
-#     total_foundation_paid, total_fines_paid, total_fines_unpaid
-# - Interest (All-Time) comes from v_interest_total:
-#     total_interest_generated  ✅ (existing column name; no renaming)
+# - Session Window: robust conversion to string
+# - Current Pot / Cycle Contributions / Members Paid: explicit numeric fallbacks
+# - All-time finance from dashboard_finance_view
+# - Interest (All-Time) from v_interest_total.total_interest_generated
 
 from __future__ import annotations
 
@@ -53,6 +49,14 @@ def _pick(row: dict, *keys, default=None):
     return default
 
 
+def _s(x) -> str | None:
+    """Safe stringify for dates/values."""
+    if x is None:
+        return None
+    s = str(x).strip()
+    return s if s else None
+
+
 def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     st.markdown("## 📊 Dashboard")
 
@@ -61,18 +65,17 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     # =========================================================
     dash = (safe_view(sb_anon, schema, "dashboard_next_view", limit=1) or [{}])[0]
 
-    # dashboard_next_view (confirmed by your DB):
-    # session_id (uuid), payout_index, start_date, end_date, beneficiary_id, beneficiary_name, pot_amount
     session_number = _pick(dash, "payout_index", "session_number", default="—")
     next_idx = _pick(dash, "payout_index", "next_payout_index", default="—")
     beneficiary_name = _pick(dash, "beneficiary_name", "next_beneficiary", default="—")
 
-    start_date = _pick(dash, "start_date")
-    end_date = _pick(dash, "end_date")
+    start_date = _s(_pick(dash, "start_date"))
+    end_date = _s(_pick(dash, "end_date"))
     window = f"{start_date} → {end_date}" if start_date and end_date else "—"
 
-    # ✅ session-scoped pot amount
+    # ✅ session-scoped pot amount (confirmed exists in your view)
     pot_amount = _pick(dash, "pot_amount")
+    pot_amount_num = _num(pot_amount, default=0.0) if pot_amount is not None else None
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Session #", session_number if session_number is not None else "—")
@@ -89,22 +92,32 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     cycle_total = _pick(cyc, "cycle_total")
     members_paid = _pick(cyc, "members_paid")
 
-    # finance view (contains pot_total + contributors)
     fin_session = (safe_view(sb_anon, schema, "dashboard_finance_view", limit=1) or [{}])[0]
     pot_total = _pick(fin_session, "pot_total")
     contributors = _pick(fin_session, "contributors")
 
-    # Strong fallbacks
-    cycle_total = cycle_total or pot_amount or pot_total
-    members_paid = members_paid or contributors
+    # ✅ Explicit numeric fallbacks (prevents showing "—" when values exist)
+    cycle_total_num = _num(cycle_total, default=0.0) if cycle_total not in (None, "") else 0.0
+    pot_total_num = _num(pot_total, default=0.0) if pot_total not in (None, "") else 0.0
+
+    # If cycle_total is missing/0, use pot_amount (session) else pot_total
+    if cycle_total in (None, "", 0) or cycle_total_num == 0.0:
+        if pot_amount_num is not None and pot_amount_num > 0:
+            cycle_total_num = pot_amount_num
+        elif pot_total_num > 0:
+            cycle_total_num = pot_total_num
+        else:
+            cycle_total_num = 0.0
+
+    # Members paid: if missing, use contributors
+    members_paid_val = members_paid
+    if members_paid_val in (None, "", 0):
+        members_paid_val = contributors
 
     p1, p2, p3 = st.columns(3)
-    p1.metric(
-        "Current Pot",
-        _fmt_money(pot_amount) if pot_amount is not None else (_fmt_money(pot_total) if pot_total is not None else "—"),
-    )
-    p2.metric("Cycle Contributions", _fmt_money(cycle_total) if cycle_total is not None else "—")
-    p3.metric("Members Paid", str(members_paid) if members_paid is not None else "—")
+    p1.metric("Current Pot", _fmt_money(pot_amount_num) if (pot_amount_num is not None and pot_amount_num > 0) else (_fmt_money(pot_total_num) if pot_total_num > 0 else "—"))
+    p2.metric("Cycle Contributions", _fmt_money(cycle_total_num) if cycle_total_num > 0 else "—")
+    p3.metric("Members Paid", str(members_paid_val) if members_paid_val not in (None, "") else "—")
 
     st.divider()
 
@@ -126,23 +139,20 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     st.divider()
 
     # =========================================================
-    # 4) ALL-TIME FINANCE (dashboard_finance_view) + Interest (v_interest_total)
+    # 4) ALL-TIME FINANCE + Interest (v_interest_total)
     # =========================================================
-    fin = fin_session  # reuse
+    fin = fin_session
 
     total_foundation_paid = _pick(fin, "total_foundation_paid")
     total_fines_paid = _pick(fin, "total_fines_paid")
     total_fines_unpaid = _pick(fin, "total_fines_unpaid")
 
-    # Interest is not reliably in dashboard_finance_view; use v_interest_total
     interest_row = (safe_view(sb_anon, schema, "v_interest_total", limit=1) or [{}])[0]
     total_interest_generated = _pick(interest_row, "total_interest_generated")
 
     st.markdown("### 🧾 All-Time Finance Summary")
 
     f1, f2, f3, f4, f5 = st.columns(5)
-
-    # You don't have total_foundation -> use total_foundation_paid as all-time foundation
     f1.metric("Foundation (All-Time)", _fmt_money(_num(total_foundation_paid), 0) if total_foundation_paid is not None else "—")
     f2.metric("Foundation Paid", _fmt_money(_num(total_foundation_paid), 0) if total_foundation_paid is not None else "—")
     f3.metric("Fines Paid", _fmt_money(_num(total_fines_paid), 0) if total_fines_paid is not None else "—")
@@ -165,7 +175,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         st.dataframe(kpi_member, use_container_width=True, hide_index=True)
 
     # =========================================================
-    # DEBUG (keep for now; remove later)
+    # DEBUG
     # =========================================================
     with st.expander("🔎 Debug (raw rows)", expanded=False):
         st.write("dashboard_next_view", dash)
