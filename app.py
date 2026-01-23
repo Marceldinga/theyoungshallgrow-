@@ -1,9 +1,4 @@
-# app.py ✅ COMPLETE UPDATED — GLOBAL DARK THEME + 🤖 AI RISK PANEL (FAIL-SAFE IMPORT)
-# Fix requested: inputs are still WHITE -> ✅ dark inputs (BaseWeb)
-# ✅ NEW: Adds "🤖 AI Risk Panel" to Menu
-# ✅ FIX: AI panel import is now SAFE (app won't crash if sklearn missing)
-# ✅ Keeps your app logic exactly the same.
-
+# app.py ✅ UPDATED — Attendance + Summaries implemented (no placeholders)
 from __future__ import annotations
 
 import os
@@ -54,13 +49,11 @@ st.set_page_config(
 
 # ============================================================
 # ✅ GLOBAL THEME (applies to the whole app, all pages)
-# FIXED: white inputs -> dark inputs (BaseWeb components)
 # ============================================================
 def inject_global_theme():
     st.markdown(
         """
         <style>
-        /* ====== BACKGROUND ====== */
         .stApp {
             background-color: #0b0f1a !important;
             background-image:
@@ -70,20 +63,17 @@ def inject_global_theme():
         }
         header, footer { background: transparent !important; }
 
-        /* ====== SIDEBAR ====== */
         section[data-testid="stSidebar"]{
             background: #0b0f1a !important;
             border-right: 1px solid rgba(255,255,255,0.06) !important;
         }
 
-        /* ====== TEXT ====== */
         html, body, p, div, span, label, small,
         h1, h2, h3, h4, h5, h6 {
             color: #e5e7eb !important;
         }
         a { color: #60a5fa !important; }
 
-        /* ====== GLASS ====== */
         .glass {
             background: rgba(255,255,255,0.04) !important;
             border: 1px solid rgba(255,255,255,0.06) !important;
@@ -94,7 +84,6 @@ def inject_global_theme():
             -webkit-backdrop-filter: blur(10px);
         }
 
-        /* ====== BUTTONS ====== */
         .stButton button, .stDownloadButton button {
             border-radius: 14px !important;
             border: 1px solid rgba(255,255,255,0.12) !important;
@@ -106,9 +95,6 @@ def inject_global_theme():
             background: rgba(255,255,255,0.06) !important;
         }
 
-        /* ===========================
-           ✅ INPUTS FIX (BaseWeb)
-           =========================== */
         [data-baseweb="input"] input,
         [data-testid="stTextInput"] input,
         [data-testid="stNumberInput"] input,
@@ -128,11 +114,6 @@ def inject_global_theme():
         [data-testid="stTextArea"] textarea {
             background: rgba(255,255,255,0.03) !important;
             color: #e5e7eb !important;
-            border: 1px solid rgba(255,255,255,0.12) !important;
-            border-radius: 12px !important;
-        }
-        [data-baseweb="textarea"] > div {
-            background: rgba(255,255,255,0.03) !important;
             border: 1px solid rgba(255,255,255,0.12) !important;
             border-radius: 12px !important;
         }
@@ -189,14 +170,11 @@ def inject_global_theme():
         unsafe_allow_html=True,
     )
 
-
 def glass_open() -> str:
     return "<div class='glass'>"
 
-
 def glass_close() -> str:
     return "</div>"
-
 
 inject_global_theme()
 
@@ -211,7 +189,6 @@ def get_secret(key: str, default: str | None = None) -> str | None:
         return st.secrets.get(key, default)
     except Exception:
         return default
-
 
 SUPABASE_URL = (get_secret("SUPABASE_URL") or "").strip()
 SUPABASE_ANON_KEY = (get_secret("SUPABASE_ANON_KEY") or "").strip()
@@ -232,11 +209,9 @@ if not SUPABASE_SERVICE_KEY:
 def get_anon_client(url: str, anon_key: str):
     return create_client(url.strip(), anon_key.strip())
 
-
 @st.cache_resource
 def get_service_client(url: str, service_key: str):
     return create_client(url.strip(), service_key.strip())
-
 
 sb_anon = get_anon_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 sb_service = get_service_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_SERVICE_KEY else None
@@ -254,7 +229,7 @@ with right:
         st.rerun()
 
 # ============================================================
-# SAFE QUERY HELPER (Minutes & Attendance)
+# SAFE QUERY HELPER
 # ============================================================
 def safe_select(
     client,
@@ -291,11 +266,9 @@ def safe_select(
         st.code(repr(e), language="text")
         return []
 
-
 def get_dashboard_next(sb, schema: str) -> dict:
     rows = safe_select(sb, "dashboard_next_view", "*", schema=schema, limit=1)
     return rows[0] if rows else {}
-
 
 # ============================================================
 # LOADERS
@@ -321,21 +294,19 @@ def load_members_legacy(url: str, anon_key: str, schema: str):
 
     return labels, label_to_id, label_to_name, df
 
-
 @st.cache_data(ttl=60)
-def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFrame:
+def load_contributions_legacy(url: str, anon_key: str, schema: str) -> pd.DataFrame:
     client = create_client(url, anon_key)
     rows = safe_select(
         client,
-        "contributions_with_member",
-        "*",
+        "contributions_legacy",
+        "id,member_id,session_id,amount,kind,created_at,payout_index,payout_date,user_id,updated_at",
         schema=schema,
         order_by="created_at",
         order_desc=True,
-        limit=200,
+        limit=500,
     )
     return pd.DataFrame(rows) if rows else pd.DataFrame()
-
 
 # ============================================================
 # NAVIGATION
@@ -357,37 +328,28 @@ page = st.sidebar.radio(
 )
 
 # ============================================================
-# DASHBOARD
+# PAGES
 # ============================================================
 if page == "Dashboard":
     render_dashboard(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
 
-# ============================================================
-# CONTRIBUTIONS
-# ============================================================
 elif page == "Contributions":
     st.markdown(glass_open(), unsafe_allow_html=True)
-    st.subheader("Contributions (View)")
-    df = load_contributions_view(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
+    st.subheader("Contributions (Legacy)")
+    df = load_contributions_legacy(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
     if df.empty:
-        st.info("No contributions found (or view not readable).")
-        st.caption("Confirm contributions_with_member exists and GRANT SELECT to anon.")
+        st.info("No contributions found (or table not readable).")
+        st.caption("Confirm contributions_legacy exists and GRANT SELECT to anon.")
     else:
         st.dataframe(df, use_container_width=True, hide_index=True)
     st.markdown(glass_close(), unsafe_allow_html=True)
 
-# ============================================================
-# PAYOUTS
-# ============================================================
 elif page == "Payouts":
     if not sb_service:
         st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY in Railway Variables / Secrets.")
     else:
         render_payouts(sb_service, SUPABASE_SCHEMA)
 
-# ============================================================
-# LOANS
-# ============================================================
 elif page == "Loans":
     if not sb_service:
         st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY in Railway Variables / Secrets.")
@@ -405,21 +367,14 @@ elif page == "Loans":
             else:
                 loans_fn(sb_service, SUPABASE_SCHEMA, actor_user_id="admin")
 
-# ============================================================
-# 🤖 AI RISK PANEL (FAIL-SAFE)
-# ============================================================
 elif page == "🤖 AI Risk Panel":
     if ai_render_fn is None:
         st.error("AI Risk Panel failed to load.")
-        st.caption("Fix ai_risk_panel.py (likely missing dependency such as scikit-learn).")
+        st.caption("Fix ai_risk_panel.py.")
         st.code(repr(ai_import_error), language="text")
-        st.info("Quick fix: use the NO-SKLEARN version of ai_risk_panel.py.")
     else:
         ai_render_fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
 
-# ============================================================
-# Minutes & Attendance
-# ============================================================
 elif page == "Minutes & Attendance":
     st.subheader("📝 Meeting Minutes & ✅ Attendance (Legacy)")
 
@@ -440,6 +395,9 @@ elif page == "Minutes & Attendance":
 
     tab1, tab2, tab3 = st.tabs(["Minutes / Documentation", "Attendance", "Summaries"])
 
+    # -------------------------
+    # Minutes
+    # -------------------------
     with tab1:
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.subheader("Meeting Minutes / Documentation (Legacy)")
@@ -504,22 +462,229 @@ elif page == "Minutes & Attendance":
 
         st.markdown(glass_close(), unsafe_allow_html=True)
 
+    # -------------------------
+    # Attendance ✅ IMPLEMENTED
+    # Table expected: attendance_legacy
+    # -------------------------
     with tab2:
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.subheader("Attendance (Legacy)")
         st.caption(f"Linked session #: {current_session_number if current_session_number is not None else '—'}")
-        st.info("Attendance UI unchanged here (your existing code continues).")
+
+        if df_members.empty:
+            st.warning("No members found in members_legacy.")
+            st.markdown(glass_close(), unsafe_allow_html=True)
+            st.stop()
+
+        adate = st.date_input("Attendance date", value=date.today(), key="att_date")
+
+        if "att_checked" not in st.session_state:
+            st.session_state.att_checked = set()
+
+        st.caption("Mark who is present for this meeting.")
+
+        present_ids = []
+        for _, r in df_members.sort_values("id").iterrows():
+            mid = int(r["id"])
+            name = str(r["name"])
+            label = f"{mid:02d} • {name}"
+            checked = st.checkbox(label, value=(mid in st.session_state.att_checked), key=f"att_{mid}")
+            if checked:
+                present_ids.append(mid)
+
+        c1, c2 = st.columns(2)
+        save = c1.button("💾 Save attendance", use_container_width=True)
+        clear = c2.button("🧹 Clear selection", use_container_width=True)
+
+        if clear:
+            st.session_state.att_checked = set()
+            st.rerun()
+
+        if save:
+            if current_session_number is None:
+                st.error("Current session number missing (dashboard_next_view.session_number).")
+            elif not present_ids:
+                st.error("Select at least 1 member as present.")
+            else:
+                payload_rows = []
+                for mid in present_ids:
+                    payload_rows.append(
+                        {
+                            "attendance_date": str(adate),
+                            "session_number": int(current_session_number),
+                            "member_id": int(mid),
+                            "member_name": df_members[df_members["id"] == mid]["name"].iloc[0],
+                            "status": "present",
+                            "created_by": role,
+                        }
+                    )
+                try:
+                    sb_service.schema(SUPABASE_SCHEMA).table("attendance_legacy").insert(payload_rows).execute()
+                    st.success(f"Attendance saved: {len(payload_rows)} present.")
+                    st.session_state.att_checked = set()
+                except Exception as e:
+                    st.error("Failed to save attendance. Make sure table attendance_legacy exists.")
+                    st.exception(e)
+
+        st.divider()
+        st.markdown("### Recent attendance")
+
+        try:
+            arows = (
+                sb_service.schema(SUPABASE_SCHEMA).table("attendance_legacy")
+                .select("*")
+                .order("attendance_date", desc=True)
+                .limit(200)
+                .execute().data
+                or []
+            )
+        except Exception as e:
+            st.error("Failed to load attendance_legacy (table may not exist).")
+            st.exception(e)
+            arows = []
+
+        dfa = pd.DataFrame(arows)
+        if dfa.empty:
+            st.info("No attendance recorded yet.")
+        else:
+            st.dataframe(dfa, use_container_width=True, hide_index=True)
+
+            if make_attendance_pdf is not None:
+                st.caption("Export Attendance PDF (latest date/session)")
+                try:
+                    dfa["attendance_date"] = dfa["attendance_date"].astype(str)
+                    latest_date = dfa["attendance_date"].max()
+                    latest_session = int(dfa["session_number"].max()) if "session_number" in dfa.columns else None
+                    sub = dfa[(dfa["attendance_date"] == latest_date)]
+                    if latest_session is not None and "session_number" in sub.columns:
+                        sub = sub[sub["session_number"] == latest_session]
+                    pdf_bytes = make_attendance_pdf(APP_BRAND, latest_date, latest_session, sub.to_dict("records"))
+                    st.download_button(
+                        "⬇️ Download Attendance (PDF)",
+                        pdf_bytes,
+                        file_name=f"attendance_{latest_date}_session_{latest_session}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                        key="dl_att_pdf",
+                    )
+                except Exception:
+                    pass
+
         st.markdown(glass_close(), unsafe_allow_html=True)
 
+    # -------------------------
+    # Summaries ✅ IMPLEMENTED
+    # -------------------------
     with tab3:
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.subheader("Summaries")
-        st.info("Summaries UI unchanged here (your existing code continues).")
+        st.caption("Quick summaries of Minutes, Attendance, and Contributions (Legacy).")
+
+        # Minutes summary
+        st.markdown("### 📝 Minutes summary")
+        m_rows = (
+            sb_service.schema(SUPABASE_SCHEMA).table("meeting_minutes_legacy")
+            .select("*")
+            .order("meeting_date", desc=True)
+            .limit(30)
+            .execute().data
+            or []
+        )
+        dfm = pd.DataFrame(m_rows)
+        if dfm.empty:
+            st.info("No minutes recorded yet.")
+        else:
+            pick_id = st.selectbox("Pick minutes ID", dfm["id"].tolist(), index=0, key="sum_minutes_pick")
+            row = dfm[dfm["id"] == pick_id].iloc[0].to_dict()
+            title = str(row.get("title", ""))
+            meeting_date = str(row.get("meeting_date", ""))
+            content = str(row.get("content", ""))
+
+            st.write(f"**{title}**  •  {meeting_date}")
+
+            lines = [ln.strip("-• ").strip() for ln in content.splitlines() if ln.strip()]
+            bullets = [ln for ln in lines if len(ln) > 6][:8]
+            if bullets:
+                st.markdown("**Highlights**")
+                for b in bullets:
+                    st.write(f"• {b}")
+            else:
+                st.markdown("**Excerpt**")
+                st.write((content[:700] + "…") if len(content) > 700 else content)
+
+        st.divider()
+
+        # Attendance summary
+        st.markdown("### ✅ Attendance summary")
+        try:
+            a_rows = (
+                sb_service.schema(SUPABASE_SCHEMA).table("attendance_legacy")
+                .select("*")
+                .order("attendance_date", desc=True)
+                .limit(300)
+                .execute().data
+                or []
+            )
+        except Exception:
+            a_rows = []
+        dfa = pd.DataFrame(a_rows)
+
+        if dfa.empty:
+            st.info("No attendance recorded yet (or attendance_legacy not created).")
+        else:
+            dfa["attendance_date"] = dfa["attendance_date"].astype(str)
+            unique_dates = sorted(dfa["attendance_date"].unique().tolist(), reverse=True)
+            pick_date = st.selectbox("Pick attendance date", unique_dates, index=0, key="sum_att_date")
+            sub = dfa[dfa["attendance_date"] == pick_date].copy()
+
+            if "session_number" in sub.columns and sub["session_number"].nunique() > 1:
+                sess = st.selectbox("Pick session #", sorted(sub["session_number"].unique().tolist()), key="sum_att_sess")
+                sub = sub[sub["session_number"] == sess]
+
+            st.metric("Present count", f"{len(sub):,}")
+            if "member_name" in sub.columns and sub["member_name"].notna().any():
+                names = sub["member_name"].fillna("").astype(str).tolist()
+                names = [n for n in names if n.strip()]
+                if names:
+                    st.markdown("**Present members**")
+                    st.write(", ".join(names[:40]) + ("…" if len(names) > 40 else ""))
+
+        st.divider()
+
+        # Contributions summary (Legacy)
+        st.markdown("### 💰 Contributions summary (recent)")
+        try:
+            c_rows = (
+                sb_service.schema(SUPABASE_SCHEMA).table("contributions_legacy")
+                .select("member_id, amount, kind, created_at, session_id")
+                .order("created_at", desc=True)
+                .limit(2000)
+                .execute().data
+                or []
+            )
+        except Exception:
+            c_rows = []
+        dfc = pd.DataFrame(c_rows)
+
+        if dfc.empty:
+            st.info("No contributions found.")
+        else:
+            dfc["amount"] = pd.to_numeric(dfc["amount"], errors="coerce").fillna(0)
+            c1, c2 = st.columns(2)
+            c1.metric("Rows", f"{len(dfc):,}")
+            c2.metric("Sum", f"{float(dfc['amount'].sum()):,.0f}")
+
+            st.caption("Top contributors (recent)")
+            top = (
+                dfc.groupby("member_id", dropna=False)["amount"].sum()
+                .sort_values(ascending=False)
+                .head(10)
+                .reset_index()
+            )
+            st.dataframe(top, use_container_width=True, hide_index=True)
+
         st.markdown(glass_close(), unsafe_allow_html=True)
 
-# ============================================================
-# ADMIN / AUDIT / HEALTH
-# ============================================================
 elif page == "Admin":
     if not sb_service:
         st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY in Railway Variables / Secrets.")
