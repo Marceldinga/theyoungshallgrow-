@@ -1,6 +1,7 @@
-# app.py ✅ COMPLETE UPDATED — GLOBAL DARK THEME + 🤖 AI RISK PANEL ADDED
+# app.py ✅ COMPLETE UPDATED — GLOBAL DARK THEME + 🤖 AI RISK PANEL (FAIL-SAFE IMPORT)
 # Fix requested: inputs are still WHITE -> ✅ dark inputs (BaseWeb)
-# ✅ NEW: Adds "🤖 AI Risk Panel" to Menu (calls render_ai_risk_panel)
+# ✅ NEW: Adds "🤖 AI Risk Panel" to Menu
+# ✅ FIX: AI panel import is now SAFE (app won't crash if sklearn missing)
 # ✅ Keeps your app logic exactly the same.
 
 from __future__ import annotations
@@ -18,9 +19,6 @@ from audit_panel import render_audit
 from health_panel import render_health
 from dashboard_panel import render_dashboard
 
-# ✅ NEW: AI panel import
-from ai_risk_panel import render_ai_risk_panel
-
 # ✅ Optional PDFs (safe)
 try:
     from pdfs import make_minutes_pdf, make_attendance_pdf
@@ -36,6 +34,15 @@ try:
 except Exception as e:
     loans_entry = None
     loans_import_error = e
+
+# ✅ AI Risk Panel (SAFE import + error capture)
+ai_render_fn = None
+ai_import_error = None
+try:
+    from ai_risk_panel import render_ai_risk_panel as ai_render_fn  # noqa: F401
+except Exception as e:
+    ai_render_fn = None
+    ai_import_error = e
 
 APP_BRAND = "theyoungshallgrow"
 
@@ -99,12 +106,9 @@ def inject_global_theme():
             background: rgba(255,255,255,0.06) !important;
         }
 
-        /* ======================================================
-           ✅ INPUTS (THIS FIXES YOUR WHITE BOXES)
-           Streamlit uses BaseWeb. We must style those internals.
-           ====================================================== */
-
-        /* Text inputs / date inputs / number inputs (BaseWeb Input) */
+        /* ===========================
+           ✅ INPUTS FIX (BaseWeb)
+           =========================== */
         [data-baseweb="input"] input,
         [data-testid="stTextInput"] input,
         [data-testid="stNumberInput"] input,
@@ -114,15 +118,12 @@ def inject_global_theme():
             border: 1px solid rgba(255,255,255,0.12) !important;
             border-radius: 12px !important;
         }
-
-        /* The input wrapper */
         [data-baseweb="input"] > div {
             background: rgba(255,255,255,0.03) !important;
             border: 1px solid rgba(255,255,255,0.12) !important;
             border-radius: 12px !important;
         }
 
-        /* Text area (BaseWeb Textarea) */
         [data-baseweb="textarea"] textarea,
         [data-testid="stTextArea"] textarea {
             background: rgba(255,255,255,0.03) !important;
@@ -136,21 +137,18 @@ def inject_global_theme():
             border-radius: 12px !important;
         }
 
-        /* Selectbox / multiselect (BaseWeb Select) */
         [data-baseweb="select"] > div {
             background: rgba(255,255,255,0.03) !important;
             border: 1px solid rgba(255,255,255,0.12) !important;
             color: #e5e7eb !important;
             border-radius: 12px !important;
         }
-        /* dropdown menu */
         [data-baseweb="menu"] {
             background: #0f172a !important;
             border: 1px solid rgba(255,255,255,0.12) !important;
         }
         [data-baseweb="menu"] * { color: #e5e7eb !important; }
 
-        /* Calendar popup */
         [data-baseweb="calendar"] {
             background: #0f172a !important;
             border: 1px solid rgba(255,255,255,0.12) !important;
@@ -158,12 +156,10 @@ def inject_global_theme():
         }
         [data-baseweb="calendar"] * { color: #e5e7eb !important; }
 
-        /* Placeholder */
         input::placeholder, textarea::placeholder {
             color: rgba(229,231,235,0.45) !important;
         }
 
-        /* ====== METRICS ====== */
         div[data-testid="stMetric"]{
             background: rgba(255,255,255,0.04) !important;
             border: 1px solid rgba(255,255,255,0.06) !important;
@@ -171,7 +167,6 @@ def inject_global_theme():
             padding: 12px 14px !important;
         }
 
-        /* ====== ALERTS ====== */
         [data-testid="stAlert"]{
             border-radius: 14px !important;
             border: 1px solid rgba(255,255,255,0.10) !important;
@@ -179,7 +174,6 @@ def inject_global_theme():
             color: #e5e7eb !important;
         }
 
-        /* ====== DATAFRAMES ====== */
         div[data-testid="stDataFrame"]{
             border-radius: 14px !important;
             overflow: hidden !important;
@@ -187,7 +181,6 @@ def inject_global_theme():
             background: rgba(255,255,255,0.02) !important;
         }
 
-        /* ====== CAPTIONS ====== */
         .stCaption, [data-testid="stCaptionContainer"] {
             color: rgba(229,231,235,0.70) !important;
         }
@@ -205,7 +198,6 @@ def glass_close() -> str:
     return "</div>"
 
 
-# ✅ Apply theme ONCE (global)
 inject_global_theme()
 
 # ============================================================
@@ -346,7 +338,7 @@ def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFram
 
 
 # ============================================================
-# NAVIGATION ✅ UPDATED (AI Risk Panel added)
+# NAVIGATION
 # ============================================================
 page = st.sidebar.radio(
     "Menu",
@@ -414,11 +406,16 @@ elif page == "Loans":
                 loans_fn(sb_service, SUPABASE_SCHEMA, actor_user_id="admin")
 
 # ============================================================
-# 🤖 AI RISK PANEL ✅ NEW
+# 🤖 AI RISK PANEL (FAIL-SAFE)
 # ============================================================
 elif page == "🤖 AI Risk Panel":
-    # Uses anon for reads; service optional
-    render_ai_risk_panel(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
+    if ai_render_fn is None:
+        st.error("AI Risk Panel failed to load.")
+        st.caption("Fix ai_risk_panel.py (likely missing dependency such as scikit-learn).")
+        st.code(repr(ai_import_error), language="text")
+        st.info("Quick fix: use the NO-SKLEARN version of ai_risk_panel.py.")
+    else:
+        ai_render_fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
 
 # ============================================================
 # Minutes & Attendance
