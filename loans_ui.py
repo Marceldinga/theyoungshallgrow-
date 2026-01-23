@@ -4,6 +4,7 @@
 # - Delinquency NaT crash (safe loan_id parsing)
 # - Record Payment "Loan not found" (select existing loan)
 # - ✅ Writes/reads loan repayments from loan_repayments (NOT historical repayments table)
+# - ✅ Approve request shows clean DB trigger message (APIError P0001) instead of scary stack trace
 # Includes:
 # - Requests (create + list + signatures + admin approve/deny)
 # - Ledger (loans_legacy table)
@@ -22,6 +23,8 @@ import inspect
 
 import streamlit as st
 import pandas as pd
+
+from postgrest.exceptions import APIError
 
 from rbac import Actor, require, allowed_sections, ROLE_ADMIN, ROLE_TREASURY, ROLE_MEMBER
 import loans_core as core
@@ -94,6 +97,18 @@ def _to_iso(d: date) -> str:
 
 def _safe_df(rows: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows or [])
+
+
+def _apierror_message(e: Exception) -> str:
+    """
+    Extracts PostgREST / Supabase error payload message cleanly.
+    """
+    if isinstance(e, APIError):
+        payload = e.args[0] if getattr(e, "args", None) else {}
+        if isinstance(payload, dict):
+            return str(payload.get("message") or payload.get("details") or payload.get("hint") or "APIError")
+        return str(e)
+    return str(e)
 
 
 def _build_statement_pdf(member: dict, mloans: list[dict], mpay: list[dict], statement_sig: dict | None) -> bytes:
@@ -194,7 +209,7 @@ def _render_requests(sb_service, schema: str, actor: Actor):
                 st.success(f"Request submitted. ID = {req_id}")
             except Exception as e:
                 st.error("Failed to create request.")
-                st.exception(e)
+                st.code(_apierror_message(e), language="text")
 
     st.divider()
     st.markdown("### Pending requests")
@@ -243,7 +258,7 @@ def _render_requests(sb_service, schema: str, actor: Actor):
             st.rerun()
         except Exception as e:
             st.error("Failed to save signature.")
-            st.exception(e)
+            st.code(_apierror_message(e), language="text")
 
     st.divider()
 
@@ -256,13 +271,22 @@ def _render_requests(sb_service, schema: str, actor: Actor):
         with c1:
             if st.button("✅ Approve request", use_container_width=True, key="req_approve"):
                 try:
-                    loan_id = core.approve_loan_request(sb_service, schema, int(pick_req), actor_user_id=str(actor.user_id))
-                    audit(sb_service, "loan_request_approved", "ok", {"request_id": int(pick_req), "loan_id": loan_id}, actor_user_id=actor.user_id)
+                    loan_id = core.approve_loan_request(
+                        sb_service, schema, int(pick_req), actor_user_id=str(actor.user_id)
+                    )
+                    audit(
+                        sb_service, "loan_request_approved", "ok",
+                        {"request_id": int(pick_req), "loan_id": loan_id},
+                        actor_user_id=actor.user_id
+                    )
                     st.success(f"Approved. Loan created: {loan_id}")
                     st.rerun()
+                except APIError as e:
+                    # ✅ Show the DB trigger message cleanly
+                    st.error(_apierror_message(e))
                 except Exception as e:
                     st.error("Approval blocked/failed.")
-                    st.exception(e)
+                    st.code(_apierror_message(e), language="text")
 
         with c2:
             reason = st.text_input("Deny reason", value="Not approved", key="req_deny_reason")
@@ -274,7 +298,7 @@ def _render_requests(sb_service, schema: str, actor: Actor):
                     st.rerun()
                 except Exception as e:
                     st.error("Deny failed.")
-                    st.exception(e)
+                    st.code(_apierror_message(e), language="text")
 
 
 # ============================================================
@@ -320,12 +344,14 @@ def _render_record_payment(sb_service, schema: str, actor: Actor):
         st.warning("No loans found in loans_legacy. Cannot record repayment.")
         return
 
-    # show balance info in label
     def _lbl(r):
         due = float(r.get("total_due") or 0)
         pc = float(r.get("principal_current") or r.get("principal") or 0)
         ui = float(r.get("unpaid_interest") or 0)
-        return f"Loan {int(r['id'])} • Member {r.get('member_id')} • {str(r.get('status') or '')} • Principal {pc:,.0f} • Interest {ui:,.0f} • Due {due:,.0f}"
+        return (
+            f"Loan {int(r['id'])} • Member {r.get('member_id')} • {str(r.get('status') or '')} • "
+            f"Principal {pc:,.0f} • Interest {ui:,.0f} • Due {due:,.0f}"
+        )
 
     df["label"] = df.apply(_lbl, axis=1)
 
@@ -345,14 +371,14 @@ def _render_record_payment(sb_service, schema: str, actor: Actor):
                 amount=float(amount),
                 paid_at=_to_iso(paid_on),
                 recorded_by=str(actor.user_id),
-                notes=note,  # core will map to 'note' column in loan_repayments
+                notes=note,  # core maps to 'note' column
             )
             audit(sb_service, "loan_payment_recorded", "ok", {"loan_id": int(loan_id), "amount": float(amount)}, actor_user_id=actor.user_id)
             st.success("Payment inserted into loan_repayments and loan balance updated.")
             st.rerun()
         except Exception as e:
             st.error("Failed to record payment.")
-            st.exception(e)
+            st.code(_apierror_message(e), language="text")
 
     st.divider()
     st.markdown("### Recent loan_repayments for this loan")
@@ -369,7 +395,7 @@ def _render_record_payment(sb_service, schema: str, actor: Actor):
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     except Exception as e:
         st.warning("Could not load loan_repayments.")
-        st.exception(e)
+        st.code(_apierror_message(e), language="text")
 
     st.divider()
     st.markdown("### Loan balance (after payments)")
@@ -414,7 +440,7 @@ def _render_interest(sb_service, schema: str, actor: Actor):
             st.success(f"Updated loans: {updated}, Interest added total: {added:,.2f}")
         except Exception as e:
             st.error("Interest accrual failed.")
-            st.exception(e)
+            st.code(_apierror_message(e), language="text")
 
 
 # ============================================================
@@ -627,7 +653,7 @@ def _render_legacy_repayment(sb_service, schema: str, actor: Actor):
             st.json(row)
     except Exception as e:
         st.error("Insert into loan_repayments_legacy failed.")
-        st.exception(e)
+        st.code(_apierror_message(e), language="text")
 
 
 # ============================================================
