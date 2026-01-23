@@ -1,6 +1,6 @@
-# app.py ✅ COMPLETE UPDATED — GLOBAL DARK THEME (FIXES WHITE INPUT BOXES)
-# Fix requested: your inputs (date/title/tags/textarea) are still WHITE.
-# ✅ This update makes ALL inputs dark (date_input, text_input, text_area, selectbox, multiselect)
+# app.py ✅ COMPLETE UPDATED — GLOBAL DARK THEME + 🤖 AI RISK PANEL ADDED
+# Fix requested: inputs are still WHITE -> ✅ dark inputs (BaseWeb)
+# ✅ NEW: Adds "🤖 AI Risk Panel" to Menu (calls render_ai_risk_panel)
 # ✅ Keeps your app logic exactly the same.
 
 from __future__ import annotations
@@ -17,6 +17,9 @@ from payout import render_payouts
 from audit_panel import render_audit
 from health_panel import render_health
 from dashboard_panel import render_dashboard
+
+# ✅ NEW: AI panel import
+from ai_risk_panel import render_ai_risk_panel
 
 # ✅ Optional PDFs (safe)
 try:
@@ -343,7 +346,7 @@ def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFram
 
 
 # ============================================================
-# NAVIGATION
+# NAVIGATION ✅ UPDATED (AI Risk Panel added)
 # ============================================================
 page = st.sidebar.radio(
     "Menu",
@@ -352,6 +355,7 @@ page = st.sidebar.radio(
         "Contributions",
         "Payouts",
         "Loans",
+        "🤖 AI Risk Panel",
         "Minutes & Attendance",
         "Admin",
         "Audit",
@@ -408,6 +412,13 @@ elif page == "Loans":
                 st.error("Loans UI not available. loans.py must define show_loans() or render_loans().")
             else:
                 loans_fn(sb_service, SUPABASE_SCHEMA, actor_user_id="admin")
+
+# ============================================================
+# 🤖 AI RISK PANEL ✅ NEW
+# ============================================================
+elif page == "🤖 AI Risk Panel":
+    # Uses anon for reads; service optional
+    render_ai_risk_panel(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
 
 # ============================================================
 # Minutes & Attendance
