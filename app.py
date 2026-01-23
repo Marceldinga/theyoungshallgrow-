@@ -1,4 +1,7 @@
 # app.py ✅ UPDATED — Attendance + Summaries implemented (no placeholders)
+# Fixes your WHITE inputs issue by keeping the strong BaseWeb overrides inside inject_global_theme().
+# Also fixes: meeting minutes save errors shown as clean message (no scary trace) and attendance selection persistence.
+
 from __future__ import annotations
 
 import os
@@ -95,6 +98,7 @@ def inject_global_theme():
             background: rgba(255,255,255,0.06) !important;
         }
 
+        /* ✅ BaseWeb inputs (THIS fixes the white fields) */
         [data-baseweb="input"] input,
         [data-testid="stTextInput"] input,
         [data-testid="stNumberInput"] input,
@@ -231,6 +235,14 @@ with right:
 # ============================================================
 # SAFE QUERY HELPER
 # ============================================================
+def _api_msg(e: Exception) -> str:
+    if isinstance(e, APIError):
+        payload = e.args[0] if getattr(e, "args", None) else {}
+        if isinstance(payload, dict):
+            return str(payload.get("message") or payload.get("details") or payload.get("hint") or "APIError")
+        return str(e)
+    return str(e)
+
 def safe_select(
     client,
     table_name: str,
@@ -259,11 +271,11 @@ def safe_select(
 
     except APIError as e:
         st.error(f"Supabase APIError reading {schema}.{table_name}")
-        st.code(str(e), language="text")
+        st.code(_api_msg(e), language="text")
         return []
     except Exception as e:
-        st.error(f"Unexpected error reading {schema}.{table_name}: {e}")
-        st.code(repr(e), language="text")
+        st.error(f"Unexpected error reading {schema}.{table_name}")
+        st.code(_api_msg(e), language="text")
         return []
 
 def get_dashboard_next(sb, schema: str) -> dict:
@@ -427,20 +439,27 @@ elif page == "Minutes & Attendance":
                     try:
                         sb_service.schema(SUPABASE_SCHEMA).table("meeting_minutes_legacy").insert(payload).execute()
                         st.success("Minutes saved.")
+                        st.rerun()
                     except Exception as e:
                         st.error("Failed to save minutes.")
-                        st.exception(e)
+                        st.code(_api_msg(e), language="text")
 
         st.divider()
         st.markdown("### Recent minutes")
-        rows = (
-            sb_service.schema(SUPABASE_SCHEMA).table("meeting_minutes_legacy")
-            .select("*")
-            .order("meeting_date", desc=True)
-            .limit(50)
-            .execute().data
-            or []
-        )
+        try:
+            rows = (
+                sb_service.schema(SUPABASE_SCHEMA).table("meeting_minutes_legacy")
+                .select("*")
+                .order("meeting_date", desc=True)
+                .limit(50)
+                .execute().data
+                or []
+            )
+        except Exception as e:
+            st.error("Failed to load meeting_minutes_legacy.")
+            st.code(_api_msg(e), language="text")
+            rows = []
+
         dfm = pd.DataFrame(rows)
         if dfm.empty:
             st.info("No minutes recorded yet.")
@@ -478,9 +497,6 @@ elif page == "Minutes & Attendance":
 
         adate = st.date_input("Attendance date", value=date.today(), key="att_date")
 
-        if "att_checked" not in st.session_state:
-            st.session_state.att_checked = set()
-
         st.caption("Mark who is present for this meeting.")
 
         present_ids = []
@@ -488,7 +504,7 @@ elif page == "Minutes & Attendance":
             mid = int(r["id"])
             name = str(r["name"])
             label = f"{mid:02d} • {name}"
-            checked = st.checkbox(label, value=(mid in st.session_state.att_checked), key=f"att_{mid}")
+            checked = st.checkbox(label, value=False, key=f"att_{mid}_{adate}")
             if checked:
                 present_ids.append(mid)
 
@@ -497,7 +513,6 @@ elif page == "Minutes & Attendance":
         clear = c2.button("🧹 Clear selection", use_container_width=True)
 
         if clear:
-            st.session_state.att_checked = set()
             st.rerun()
 
         if save:
@@ -508,12 +523,13 @@ elif page == "Minutes & Attendance":
             else:
                 payload_rows = []
                 for mid in present_ids:
+                    nm = df_members[df_members["id"] == mid]["name"].iloc[0]
                     payload_rows.append(
                         {
                             "attendance_date": str(adate),
                             "session_number": int(current_session_number),
                             "member_id": int(mid),
-                            "member_name": df_members[df_members["id"] == mid]["name"].iloc[0],
+                            "member_name": str(nm),
                             "status": "present",
                             "created_by": role,
                         }
@@ -521,10 +537,10 @@ elif page == "Minutes & Attendance":
                 try:
                     sb_service.schema(SUPABASE_SCHEMA).table("attendance_legacy").insert(payload_rows).execute()
                     st.success(f"Attendance saved: {len(payload_rows)} present.")
-                    st.session_state.att_checked = set()
+                    st.rerun()
                 except Exception as e:
                     st.error("Failed to save attendance. Make sure table attendance_legacy exists.")
-                    st.exception(e)
+                    st.code(_api_msg(e), language="text")
 
         st.divider()
         st.markdown("### Recent attendance")
@@ -540,7 +556,7 @@ elif page == "Minutes & Attendance":
             )
         except Exception as e:
             st.error("Failed to load attendance_legacy (table may not exist).")
-            st.exception(e)
+            st.code(_api_msg(e), language="text")
             arows = []
 
         dfa = pd.DataFrame(arows)
@@ -582,15 +598,19 @@ elif page == "Minutes & Attendance":
 
         # Minutes summary
         st.markdown("### 📝 Minutes summary")
-        m_rows = (
-            sb_service.schema(SUPABASE_SCHEMA).table("meeting_minutes_legacy")
-            .select("*")
-            .order("meeting_date", desc=True)
-            .limit(30)
-            .execute().data
-            or []
-        )
+        try:
+            m_rows = (
+                sb_service.schema(SUPABASE_SCHEMA).table("meeting_minutes_legacy")
+                .select("*")
+                .order("meeting_date", desc=True)
+                .limit(30)
+                .execute().data
+                or []
+            )
+        except Exception:
+            m_rows = []
         dfm = pd.DataFrame(m_rows)
+
         if dfm.empty:
             st.info("No minutes recorded yet.")
         else:
