@@ -134,6 +134,13 @@ def _build_statement_pdf(member: dict, mloans: list[dict], mpay: list[dict], sta
     return make_member_loan_statement_pdf(**kwargs)
 
 
+def _num(x) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+
 # ============================================================
 # Repayments read helpers (loan_repayments)
 # ============================================================
@@ -282,7 +289,7 @@ def _render_requests(sb_service, schema: str, actor: Actor):
                     st.success(f"Approved. Loan created: {loan_id}")
                     st.rerun()
                 except APIError as e:
-                    # ✅ Show the DB trigger message cleanly
+                    # ✅ Show the DB trigger message cleanly (P0001 etc.)
                     st.error(_apierror_message(e))
                 except Exception as e:
                     st.error("Approval blocked/failed.")
@@ -345,9 +352,9 @@ def _render_record_payment(sb_service, schema: str, actor: Actor):
         return
 
     def _lbl(r):
-        due = float(r.get("total_due") or 0)
-        pc = float(r.get("principal_current") or r.get("principal") or 0)
-        ui = float(r.get("unpaid_interest") or 0)
+        due = _num(r.get("total_due"))
+        pc = _num(r.get("principal_current") or r.get("principal"))
+        ui = _num(r.get("unpaid_interest"))
         return (
             f"Loan {int(r['id'])} • Member {r.get('member_id')} • {str(r.get('status') or '')} • "
             f"Principal {pc:,.0f} • Interest {ui:,.0f} • Due {due:,.0f}"
@@ -363,6 +370,9 @@ def _render_record_payment(sb_service, schema: str, actor: Actor):
     note = st.text_input("Note (optional)", value="Loan repayment", key="pay_note")
 
     if st.button("💾 Save payment", use_container_width=True, key="pay_save"):
+        if float(amount) <= 0:
+            st.error("Amount must be > 0.")
+            st.stop()
         try:
             core.record_payment_pending(
                 sb_service,
@@ -476,7 +486,7 @@ def _render_delinquency(sb_service, schema: str, actor: Actor):
 
     last_paid_map: dict[int, date] = {}
     if not dfr.empty:
-        dfr["paid_at"] = pd.to_datetime(dfr["paid_at"], errors="coerce")
+        dfr["paid_at"] = pd.to_datetime(dfr.get("paid_at"), errors="coerce")
         dfr = dfr.dropna(subset=["paid_at"]).sort_values("paid_at", ascending=False)
 
         for _, r in dfr.iterrows():
@@ -555,7 +565,7 @@ def _render_statement(sb_service, schema: str, actor: Actor):
 
     df_loans = pd.DataFrame(mloans)
     df_loans["label"] = df_loans.apply(
-        lambda r: f"Loan {int(r['id'])} • Status: {r.get('status','')} • Principal: {float(r.get('principal') or 0):,.0f}",
+        lambda r: f"Loan {int(r['id'])} • Status: {r.get('status','')} • Principal: {_num(r.get('principal')):,.0f}",
         axis=1
     )
     pick_loan_label = st.selectbox("Select loan to sign", df_loans["label"].tolist(), key="stmt_sign_pick_loan")
