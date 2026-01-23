@@ -1,19 +1,16 @@
-# loans_ui.py ✅ COMPLETE UPDATED (uses loan_repayments for loan-linked payments)
-# Fixes:
-# - Permission errors (RBAC perms match rbac.py)
-# - Delinquency NaT crash (safe loan_id parsing)
-# - Record Payment "Loan not found" (select existing loan)
-# - ✅ Writes/reads loan repayments from loan_repayments (NOT historical repayments table)
-# - ✅ Approve request shows clean DB trigger message (APIError P0001) instead of scary stack trace
-# Includes:
-# - Requests (create + list + signatures + admin approve/deny)
-# - Ledger (loans_legacy table)
-# - Record Payment (loan_repayments insert via core.record_payment_pending)
-# - Confirm/Reject (schema locked; UI explains)
-# - Interest (core.accrue_monthly_interest)
-# - Delinquency (simple DPD)
-# - Loan Statement (digital signature + SAFE PDF call)
-# - Loan Repayment (Legacy) insert into loan_repayments_legacy
+# loans_ui.py ✅ COMPLETE UPDATED (Bank-grade Interest Ledger + loan_repayments for payments)
+# What’s updated vs your version:
+# ✅ Interest is now ledger-based (reads/writes from public.interest_ledger)
+# ✅ Interest UI shows: This month / All-time totals from interest_ledger (no more app_state drift)
+# ✅ After clicking "Accrue monthly interest" it refreshes totals and shows a clearer message
+# ✅ Still uses loan_repayments for loan-linked payments (record + statements + delinquency)
+#
+# IMPORTANT:
+# - This file expects that you created the table + unique index:
+#     public.interest_ledger(loan_id, member_id, amount, interest_month, note, created_at)
+#     unique(loan_id, interest_month)
+# - Your loans_core.py should also be updated so core.accrue_monthly_interest writes to interest_ledger.
+#   (This UI will still work even if core is old, but the ledger totals will remain unchanged.)
 
 from __future__ import annotations
 
@@ -43,10 +40,15 @@ except Exception:
     def audit(*args, **kwargs):
         return None
 
+
 # ✅ Loan-linked repayments table (strict)
 PAYMENTS_TABLE = "loan_repayments"
 REPAY_LINK_COL = "loan_id"
 REPAY_DATE_COL = "paid_at"
+
+# ✅ Bank-grade Interest Ledger
+INTEREST_LEDGER_TABLE = "interest_ledger"   # public.interest_ledger
+INTEREST_MONTH_FMT = "%Y-%m"
 
 
 # ============================================================
@@ -100,9 +102,7 @@ def _safe_df(rows: list[dict]) -> pd.DataFrame:
 
 
 def _apierror_message(e: Exception) -> str:
-    """
-    Extracts PostgREST / Supabase error payload message cleanly.
-    """
+    """Extracts PostgREST / Supabase error payload message cleanly."""
     if isinstance(e, APIError):
         payload = e.args[0] if getattr(e, "args", None) else {}
         if isinstance(payload, dict):
@@ -141,6 +141,61 @@ def _num(x) -> float:
         return 0.0
 
 
+def _month_key(d: date | None = None) -> str:
+    d = d or date.today()
+    return f"{d.year:04d}-{d.month:02d}"
+
+
+def _table_exists(sb_service, schema: str, table_name: str) -> bool:
+    """Best-effort existence check (works even without SQL access)."""
+    try:
+        sb_service.schema(schema).table(table_name).select("*").limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
+def _interest_ledger_totals(sb_service, schema: str) -> dict:
+    """
+    Returns totals from interest_ledger:
+      - all_time
+      - this_month
+      - last_row (latest accrual record)
+    """
+    out = {"all_time": 0.0, "this_month": 0.0, "last_row": None, "ok": False, "error": None}
+    if not _table_exists(sb_service, schema, INTEREST_LEDGER_TABLE):
+        out["error"] = f"Table {schema}.{INTEREST_LEDGER_TABLE} not found/readable."
+        return out
+
+    try:
+        rows = (
+            sb_service.schema(schema).table(INTEREST_LEDGER_TABLE)
+            .select("amount,interest_month,created_at,loan_id,member_id,note")
+            .order("created_at", desc=True)
+            .limit(20000)
+            .execute().data
+            or []
+        )
+        df = pd.DataFrame(rows)
+        if df.empty:
+            out["ok"] = True
+            out["last_row"] = None
+            return out
+
+        df["amount"] = pd.to_numeric(df.get("amount"), errors="coerce").fillna(0.0)
+        df["interest_month"] = df.get("interest_month").astype(str)
+
+        mk = _month_key()
+        out["all_time"] = float(df["amount"].sum())
+        out["this_month"] = float(df[df["interest_month"] == mk]["amount"].sum())
+        out["last_row"] = rows[0] if rows else None
+        out["ok"] = True
+        return out
+    except Exception as e:
+        out["error"] = _apierror_message(e)
+        return out
+
+
 # ============================================================
 # Repayments read helpers (loan_repayments)
 # ============================================================
@@ -163,7 +218,6 @@ def get_repayments_for_loan_ids(sb_service, schema: str, loan_ids: list[int], li
 # ============================================================
 def _render_requests(sb_service, schema: str, actor: Actor):
     require(actor.role, "submit_request")
-
     st.subheader("Requests")
 
     members = (
@@ -260,7 +314,8 @@ def _render_requests(sb_service, schema: str, actor: Actor):
                 signer_name=str(sig_name or "").strip(),
                 signer_member_id=int(sig_member_id),
             )
-            audit(sb_service, "loan_request_signed", "ok", {"request_id": int(pick_req), "role": sig_role}, actor_user_id=actor.user_id)
+            audit(sb_service, "loan_request_signed", "ok",
+                  {"request_id": int(pick_req), "role": sig_role}, actor_user_id=actor.user_id)
             st.success("Signature saved.")
             st.rerun()
         except Exception as e:
@@ -271,7 +326,6 @@ def _render_requests(sb_service, schema: str, actor: Actor):
 
     if actor.role in (ROLE_ADMIN, ROLE_TREASURY):
         require(actor.role, "approve_deny")
-
         st.markdown("### Admin actions")
         c1, c2 = st.columns(2)
 
@@ -281,15 +335,11 @@ def _render_requests(sb_service, schema: str, actor: Actor):
                     loan_id = core.approve_loan_request(
                         sb_service, schema, int(pick_req), actor_user_id=str(actor.user_id)
                     )
-                    audit(
-                        sb_service, "loan_request_approved", "ok",
-                        {"request_id": int(pick_req), "loan_id": loan_id},
-                        actor_user_id=actor.user_id
-                    )
+                    audit(sb_service, "loan_request_approved", "ok",
+                          {"request_id": int(pick_req), "loan_id": loan_id}, actor_user_id=actor.user_id)
                     st.success(f"Approved. Loan created: {loan_id}")
                     st.rerun()
                 except APIError as e:
-                    # ✅ Show the DB trigger message cleanly (P0001 etc.)
                     st.error(_apierror_message(e))
                 except Exception as e:
                     st.error("Approval blocked/failed.")
@@ -300,7 +350,8 @@ def _render_requests(sb_service, schema: str, actor: Actor):
             if st.button("❌ Deny request", use_container_width=True, key="req_deny"):
                 try:
                     core.deny_loan_request(sb_service, schema, int(pick_req), reason=reason)
-                    audit(sb_service, "loan_request_denied", "ok", {"request_id": int(pick_req)}, actor_user_id=actor.user_id)
+                    audit(sb_service, "loan_request_denied", "ok",
+                          {"request_id": int(pick_req)}, actor_user_id=actor.user_id)
                     st.success("Denied.")
                     st.rerun()
                 except Exception as e:
@@ -313,8 +364,8 @@ def _render_requests(sb_service, schema: str, actor: Actor):
 # ============================================================
 def _render_ledger(sb_service, schema: str, actor: Actor):
     require(actor.role, "view_ledger")
-
     st.subheader("Ledger (loans_legacy)")
+
     rows = (
         sb_service.schema(schema).table("loans_legacy")
         .select("*")
@@ -335,7 +386,6 @@ def _render_ledger(sb_service, schema: str, actor: Actor):
 # ============================================================
 def _render_record_payment(sb_service, schema: str, actor: Actor):
     require(actor.role, "record_payment")
-
     st.subheader("Record Payment (loan_repayments)")
 
     loans = (
@@ -361,7 +411,6 @@ def _render_record_payment(sb_service, schema: str, actor: Actor):
         )
 
     df["label"] = df.apply(_lbl, axis=1)
-
     pick = st.selectbox("Select loan", df["label"].tolist(), key="pay_pick_loan")
     loan_id = int(df[df["label"] == pick].iloc[0]["id"])
 
@@ -383,7 +432,8 @@ def _render_record_payment(sb_service, schema: str, actor: Actor):
                 recorded_by=str(actor.user_id),
                 notes=note,  # core maps to 'note' column
             )
-            audit(sb_service, "loan_payment_recorded", "ok", {"loan_id": int(loan_id), "amount": float(amount)}, actor_user_id=actor.user_id)
+            audit(sb_service, "loan_payment_recorded", "ok",
+                  {"loan_id": int(loan_id), "amount": float(amount)}, actor_user_id=actor.user_id)
             st.success("Payment inserted into loan_repayments and loan balance updated.")
             st.rerun()
         except Exception as e:
@@ -435,19 +485,49 @@ def _render_reject_payments(sb_service, schema: str, actor: Actor):
 
 
 # ============================================================
-# Interest UI
+# Interest UI (Ledger-based)
 # ============================================================
 def _render_interest(sb_service, schema: str, actor: Actor):
     require(actor.role, "accrue_interest")
+    st.subheader("Interest (Ledger-based)")
+    st.caption("Source of truth: interest_ledger. Accrual is idempotent per loan per month.")
 
-    st.subheader("Interest")
-    st.caption("Applies monthly interest (idempotent; duplicate-safe).")
+    totals = _interest_ledger_totals(sb_service, schema)
+    mk = _month_key()
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Interest this month", f"{totals['this_month']:,.2f}")
+    c2.metric("Interest all-time", f"{totals['all_time']:,.2f}")
+    last = totals.get("last_row") or {}
+    c3.metric("Last accrual month", str(last.get("interest_month") or "—"))
+
+    if totals.get("error"):
+        st.warning(totals["error"])
+
+    st.divider()
 
     if st.button("➕ Accrue monthly interest", use_container_width=True, key="accrue_interest_btn"):
         try:
             updated, added = core.accrue_monthly_interest(sb_service, schema, actor_user_id=str(actor.user_id))
-            audit(sb_service, "interest_accrued", "ok", {"updated": updated, "added": added}, actor_user_id=actor.user_id)
-            st.success(f"Updated loans: {updated}, Interest added total: {added:,.2f}")
+            audit(sb_service, "interest_accrued", "ok",
+                  {"updated": updated, "added": float(added), "month": mk}, actor_user_id=actor.user_id)
+
+            # Refresh ledger totals after accrual
+            totals2 = _interest_ledger_totals(sb_service, schema)
+
+            if float(added) <= 0 and int(updated) <= 0:
+                st.info(f"No changes made (interest already accrued for {mk} or no eligible loans).")
+            else:
+                st.success(f"Updated loans: {updated}, Interest added total: {float(added):,.2f}")
+
+            st.caption("Ledger totals (after run):")
+            st.write(
+                {
+                    "interest_this_month": round(float(totals2["this_month"]), 2),
+                    "interest_all_time": round(float(totals2["all_time"]), 2),
+                    "last_row": totals2.get("last_row"),
+                }
+            )
         except Exception as e:
             st.error("Interest accrual failed.")
             st.code(_apierror_message(e), language="text")
@@ -458,7 +538,6 @@ def _render_interest(sb_service, schema: str, actor: Actor):
 # ============================================================
 def _render_delinquency(sb_service, schema: str, actor: Actor):
     require(actor.role, "view_delinquency")
-
     st.subheader("Delinquency (DPD)")
 
     loans = (
@@ -508,7 +587,6 @@ def _render_delinquency(sb_service, schema: str, actor: Actor):
 # ============================================================
 def _render_statement(sb_service, schema: str, actor: Actor):
     require(actor.role, "loan_statement")
-
     st.subheader("Loan Statement (Preview + PDF Download)")
 
     mid = st.number_input(
@@ -627,7 +705,6 @@ def _render_statement(sb_service, schema: str, actor: Actor):
 # ============================================================
 def _render_legacy_repayment(sb_service, schema: str, actor: Actor):
     require(actor.role, "legacy_loan_repayment")
-
     st.subheader("Loan Repayment (Legacy) — Admin Insert")
 
     with st.form("legacy_repay_form", clear_on_submit=False):
