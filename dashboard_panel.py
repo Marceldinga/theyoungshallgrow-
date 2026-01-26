@@ -4,7 +4,7 @@
 #    -> No more reading old pot from dashboard_next_view.current_pot
 # ✅ Cycle Contributions always shows 0 (not "—") when empty
 # ✅ Members Paid defaults to 0 when empty
-# ✅ Interest (All-Time) comes from dashboard_finance_view.total_interest_generated (authoritative)
+# ✅ Interest KPI FIXED: shows PAID interest (generated - unpaid) from loans_legacy (ACTIVE loans)
 # ✅ Finance view forced to PUBLIC schema (because your views are in public)
 #
 # Requires:
@@ -199,6 +199,39 @@ def _s(x) -> str | None:
 
 
 # ------------------------------------------------------------
+# NEW: Paid interest helper (no interest_ledger.member_id ever)
+# ------------------------------------------------------------
+def compute_interest_paid_all_time(sb, schema: str = "public") -> float:
+    """
+    Paid interest is implied as:
+      SUM(total_interest_generated - unpaid_interest)
+    for ACTIVE loans only.
+
+    This matches your verified totals:
+      generated=950, unpaid=400 -> paid=550.
+    """
+    try:
+        rows = (
+            sb.schema(schema)
+            .table("loans_legacy")
+            .select("total_interest_generated,unpaid_interest,status")
+            .execute()
+            .data
+            or []
+        )
+        paid = 0.0
+        for r in rows:
+            if str(r.get("status", "")).lower() != "active":
+                continue
+            gen = _num(r.get("total_interest_generated"), 0.0)
+            unpaid = _num(r.get("unpaid_interest"), 0.0)
+            paid += (gen - unpaid)
+        return float(paid)
+    except Exception:
+        return 0.0
+
+
+# ------------------------------------------------------------
 # Dashboard renderer
 # ------------------------------------------------------------
 def render_dashboard(sb_anon, sb_service, schema: str = "public"):
@@ -311,7 +344,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     st.divider()
 
     # =========================================================
-    # 4) ALL-TIME FINANCE (FORCE PUBLIC) ✅ Interest fixed here
+    # 4) ALL-TIME FINANCE (FORCE PUBLIC) ✅ Interest PAID fixed here
     # =========================================================
     fin = (safe_view(sb_anon, "public", "dashboard_finance_view", limit=1) or [{}])[0]
 
@@ -320,10 +353,10 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     total_fines_paid = _pick(fin, "total_fines_paid", "fines_paid")
     total_fines_unpaid = _pick(fin, "total_fines_unpaid", "fines_unpaid")
 
-    # ✅ Interest from finance view (authoritative)
-    total_interest_generated = _pick(fin, "total_interest_generated", "total_interest", "interest_total")
-
     foundation_all = _num(total_foundation_paid) + _num(total_foundation_unpaid)
+
+    # ✅ NEW: Interest Paid All-Time (active loans) = generated - unpaid
+    interest_paid_all_time = compute_interest_paid_all_time(sb_anon, schema="public")
 
     st.markdown("### 🧾 All-Time Finance Summary")
 
@@ -339,7 +372,15 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     with f4:
         st.markdown(kpi_card("Fines Unpaid", _fmt_money(_num(total_fines_unpaid), 0) if total_fines_unpaid is not None else "—", "orange"), unsafe_allow_html=True)
     with f5:
-        st.markdown(kpi_card("Interest (All-Time)", _fmt_money(_num(total_interest_generated), 2) if total_interest_generated is not None else "—", "green"), unsafe_allow_html=True)
+        st.markdown(
+            kpi_card(
+                "Interest Paid (All-Time)",
+                _fmt_money(interest_paid_all_time, 2),
+                "green",
+                sub="Paid = Generated − Unpaid (Active Loans)",
+            ),
+            unsafe_allow_html=True,
+        )
 
     st.markdown(glass_close(), unsafe_allow_html=True)
 
@@ -372,7 +413,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         st.write("dashboard_finance_view (PUBLIC)", fin)
         st.write("v_is_payout_day", is_day)
         st.write("v_payout_status_current_session", payout_status)
-        st.write("interest (from finance view)", {"total_interest_generated": total_interest_generated})
+        st.write("interest_paid_all_time (computed)", {"interest_paid_all_time": interest_paid_all_time})
         st.write("Option A current_pot_num (from cycle_total)", current_pot_num)
 
     # Service key status
