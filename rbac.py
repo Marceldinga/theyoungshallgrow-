@@ -1,3 +1,4 @@
+
 # rbac.py ✅ COMPLETE UPDATED (matches your existing permission names)
 # Fixes your errors:
 # - Permission denied: requests/ledger/interest/delinquency for role 'admin'
@@ -33,7 +34,7 @@ PERMISSIONS: dict[str, set[str]] = {
         "view_delinquency",
         "loan_statement",
         "download_all_statements",
-        "legacy_loan_repayment",   # ✅ NEW: legacy repayments insert screen
+        "legacy_loan_repayment",   # ✅ legacy repayments insert screen
     },
     ROLE_TREASURY: {
         "view_ledger",
@@ -52,7 +53,7 @@ PERMISSIONS: dict[str, set[str]] = {
         "submit_request",
         "sign_request",
         "loan_statement",
-        # Optional: allow members to view ledger read-only (comment in if you want)
+        # Optional: allow members to view ledger read-only
         # "view_ledger",
     },
 }
@@ -127,9 +128,11 @@ def allowed_sections(actor_role: str) -> list[str]:
     if "record_payment" in perms:
         sections.append("Record Payment")
 
+    # Maker–checker confirmation
     if "confirm_payment" in perms:
         sections.append("Confirm Payments")
 
+    # Optional separate reject menu (only if your UI actually has this section)
     if "reject_payment" in perms:
         sections.append("Reject Payments")
 
@@ -142,7 +145,7 @@ def allowed_sections(actor_role: str) -> list[str]:
     if "loan_statement" in perms:
         sections.append("Loan Statement")
 
-    # Legacy repayment insert (admin/treasury)
+    # Admin/Treasury-only legacy direct insert
     if "legacy_loan_repayment" in perms:
         sections.append("Loan Repayment (Legacy)")
 
