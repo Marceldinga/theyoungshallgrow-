@@ -1,14 +1,18 @@
 
-# rbac.py ✅ COMPLETE UPDATED (matches your existing permission names)
-# Fixes your errors:
-# - Permission denied: requests/ledger/interest/delinquency for role 'admin'
-# - Aligns loans_ui.py require(...) calls with the PERMISSIONS you already use
-#
-# Key idea:
-# loans_ui.py should call require(role, "<one of these perms>"):
+# rbac.py ✅ COMPLETE UPDATED (adds aliases to match loans_ui.py + your existing permission names)
+# Fixes:
+# - Permission denied: legacy_repayment for role 'admin'
+# - Permission denied: confirm_payments for role 'admin'
+# - Keeps your canonical permission names:
 #   view_ledger, submit_request, sign_request, approve_deny,
 #   record_payment, confirm_payment, reject_payment, accrue_interest,
 #   view_delinquency, loan_statement, download_all_statements, legacy_loan_repayment
+#
+# ✅ KEY UPGRADE:
+# Adds PERMISSION_ALIASES so loans_ui.py can call:
+#   confirm_payments -> confirm_payment
+#   legacy_repayment -> legacy_loan_repayment
+#   (and a few other safe mappings)
 
 from __future__ import annotations
 
@@ -20,7 +24,9 @@ ROLE_MEMBER = "member"
 
 VALID_ROLES = {ROLE_ADMIN, ROLE_TREASURY, ROLE_MEMBER}
 
-# What each role can see/do in Loans
+# ============================================================
+# Canonical permissions by role
+# ============================================================
 PERMISSIONS: dict[str, set[str]] = {
     ROLE_ADMIN: {
         "view_ledger",
@@ -34,7 +40,7 @@ PERMISSIONS: dict[str, set[str]] = {
         "view_delinquency",
         "loan_statement",
         "download_all_statements",
-        "legacy_loan_repayment",   # ✅ legacy repayments insert screen
+        "legacy_loan_repayment",
     },
     ROLE_TREASURY: {
         "view_ledger",
@@ -47,16 +53,39 @@ PERMISSIONS: dict[str, set[str]] = {
         "view_delinquency",
         "loan_statement",
         "download_all_statements",
-        "legacy_loan_repayment",   # ✅ allow treasury too
+        "legacy_loan_repayment",
     },
     ROLE_MEMBER: {
         "submit_request",
         "sign_request",
         "loan_statement",
-        # Optional: allow members to view ledger read-only
+        # optional:
         # "view_ledger",
     },
 }
+
+# ============================================================
+# Aliases to support older/alternate perm names used in UI files
+# ============================================================
+PERMISSION_ALIASES: dict[str, str] = {
+    # loans_ui.py aliases (your current crash)
+    "confirm_payments": "confirm_payment",
+    "legacy_repayment": "legacy_loan_repayment",
+
+    # common pluralization / variations (safe)
+    "confirm_payment": "confirm_payment",
+    "reject_payments": "reject_payment",
+    "confirm_payment_pending": "confirm_payment",
+    "reject_payment_pending": "reject_payment",
+
+    # legacy alternative wording
+    "legacy_payment": "legacy_loan_repayment",
+    "legacy_repay": "legacy_loan_repayment",
+}
+
+def _canon_perm(perm: str) -> str:
+    p = (perm or "").strip()
+    return PERMISSION_ALIASES.get(p, p)
 
 
 @dataclass(frozen=True)
@@ -102,17 +131,21 @@ def resolve_role_by_member_id(sb, schema: str, member_id: int) -> str:
 
 
 def can(actor_role: str, perm: str) -> bool:
-    return perm in PERMISSIONS.get(normalize_role(actor_role), set())
+    role = normalize_role(actor_role)
+    canon = _canon_perm(perm)
+    return canon in PERMISSIONS.get(role, set())
 
 
 def require(actor_role: str, perm: str):
-    if not can(actor_role, perm):
+    canon = _canon_perm(perm)
+    if not can(actor_role, canon):
         raise PermissionError(f"Permission denied: {perm} for role '{actor_role}'.")
 
 
 def allowed_sections(actor_role: str) -> list[str]:
     """
     Returns the Loans UI menu sections allowed for the actor role.
+    MUST match the section strings used in loans_ui.py render_loans().
     Order matters (mobile-friendly).
     """
     perms = PERMISSIONS.get(normalize_role(actor_role), set())
@@ -128,13 +161,15 @@ def allowed_sections(actor_role: str) -> list[str]:
     if "record_payment" in perms:
         sections.append("Record Payment")
 
-    # Maker–checker confirmation
+    # ✅ loans_ui.py implements Confirm Payments (checker)
     if "confirm_payment" in perms:
         sections.append("Confirm Payments")
 
-    # Optional separate reject menu (only if your UI actually has this section)
-    if "reject_payment" in perms:
-        sections.append("Reject Payments")
+    # ❗ Only include Reject Payments if you actually implemented a section for it in loans_ui.py
+    # If your loans_ui.py currently shows "enabled but not implemented" for Reject Payments,
+    # comment this out to stop showing it in the menu.
+    # if "reject_payment" in perms:
+    #     sections.append("Reject Payments")
 
     if "accrue_interest" in perms:
         sections.append("Interest")
@@ -145,7 +180,6 @@ def allowed_sections(actor_role: str) -> list[str]:
     if "loan_statement" in perms:
         sections.append("Loan Statement")
 
-    # Admin/Treasury-only legacy direct insert
     if "legacy_loan_repayment" in perms:
         sections.append("Loan Repayment (Legacy)")
 
