@@ -1,5 +1,18 @@
 
-# payout.py ✅ COMPLETE FIXED CODE — payout on payout day + in-app signatures + PDF receipt
+# payout.py ✅ COMPLETED SINGLE CODE (FINAL — MATCHES YOUR REAL DB)
+# ✅ signatures columns (confirmed): id, entity_type, entity_id, role, signer_name, signer_member_id, signed_at
+# ✅ payouts_legacy columns (confirmed): id, member_id, member_name, payout_amount, payout_date, created_at, updated_at, payout_index
+# ✅ payout allowed ON/AFTER payout day: app_state.next_payout_date
+# ✅ in-app signatures (handles uq_signatures_once duplicates)
+# ✅ prevents double-pay in same cycle using payouts_legacy.payout_date within cycle window
+# ✅ after successful payout: download PDF receipt with:
+#    - list of members + amount contributed
+#    - total pot received
+#    - beneficiary + amount received
+#    - signatures
+#
+# Dependency: reportlab (add to requirements.txt if missing)
+
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
@@ -107,11 +120,6 @@ def _first_existing_table(c, candidates: list[str]) -> Optional[str]:
 # SESSION WINDOW
 # ============================================================
 def _session_window_from_sessions_table(c, session_id: int) -> Optional[Tuple[str, str]]:
-    """
-    sessions_legacy expected fields:
-      - start_date/end_date OR starts_at/ends_at
-    Returns ISO [start,end].
-    """
     if not _table_exists(c, "sessions_legacy"):
         return None
 
@@ -150,10 +158,6 @@ def _session_window_from_sessions_table(c, session_id: int) -> Optional[Tuple[st
 
 
 def _fallback_biweekly_window_from_app_state(c) -> Tuple[str, str, Optional[str]]:
-    """
-    end = app_state.next_payout_date 23:59:59
-    start = end - 13 days 00:00:00
-    """
     npd_str = None
     try:
         rows = _safe_select(c, "app_state", limit=1)
@@ -198,7 +202,7 @@ def get_cycle_window(c, session_id: int) -> Tuple[str, str]:
 
 
 # ============================================================
-# IDs
+# IDS
 # ============================================================
 def get_session_id(c) -> int:
     try:
@@ -237,7 +241,7 @@ def get_rotation_pointer(c) -> int:
 
 
 # ============================================================
-# SIGNATURES (real schema)
+# SIGNATURES (REAL SCHEMA)
 # ============================================================
 def get_signatures(c, entity_type: str, entity_id: int) -> list[dict]:
     if not _table_exists(c, "signatures"):
@@ -363,11 +367,9 @@ def contributions_for_session(c, session_id: int) -> tuple[pd.DataFrame, dict]:
 def contribution_summary(df_contrib: pd.DataFrame) -> dict:
     if df_contrib is None or df_contrib.empty:
         return {"rows": 0, "total": 0.0, "contributors": 0}
-
     amt = pd.to_numeric(df_contrib.get("amount", 0), errors="coerce").fillna(0.0)
     member_col = "legacy_member_id" if "legacy_member_id" in df_contrib.columns else ("member_id" if "member_id" in df_contrib.columns else None)
     contributors = int(df_contrib[member_col].nunique()) if member_col else 0
-
     return {"rows": int(len(df_contrib)), "total": float(amt.sum()), "contributors": contributors}
 
 
@@ -409,7 +411,7 @@ def contribution_problems(active_ids: list[int], df_contrib: pd.DataFrame) -> li
 
 
 # ============================================================
-# PAYOUTS (legacy rotation-only)
+# PAYOUTS (REAL payouts_legacy schema)
 # ============================================================
 def _payout_table(c) -> Optional[str]:
     return _first_existing_table(c, ["payouts_legacy", "payouts"])
@@ -417,25 +419,28 @@ def _payout_table(c) -> Optional[str]:
 
 def fetch_paid_out_member_ids_for_window(c, session_id: int) -> Set[int]:
     """
-    payouts_legacy has no session_id, so use created_at in cycle window to prevent double-pay in this cycle.
+    Use payouts_legacy.payout_date within cycle window to prevent double-pay.
     """
     t = _payout_table(c)
     if not t:
         return set()
 
     start_iso, end_iso = get_cycle_window(c, session_id)
+    start_day = start_iso.split("T")[0]
+    end_day = end_iso.split("T")[0]
+
     rows = _safe_select(
         c,
         t,
-        filters=[("created_at", "gte", start_iso), ("created_at", "lte", end_iso)],
-        order_col="created_at",
+        filters=[("payout_date", "gte", start_day), ("payout_date", "lte", end_day)],
+        order_col="payout_date",
         desc=True,
         limit=8000,
     )
 
     paid: Set[int] = set()
     for r in rows:
-        mid = r.get("legacy_member_id") or r.get("member_id")
+        mid = r.get("member_id")
         if mid is not None:
             try:
                 paid.add(int(mid))
@@ -444,29 +449,30 @@ def fetch_paid_out_member_ids_for_window(c, session_id: int) -> Set[int]:
     return paid
 
 
-def _insert_payout_row(c, table: str, beneficiary_id: int) -> dict:
+def _insert_payout_row(
+    c,
+    table: str,
+    member_id: int,
+    member_name: str,
+    payout_amount: float,
+    payout_date_iso: str,
+    payout_index: int,
+) -> dict:
     """
-    Insert into payouts_legacy with minimal columns only.
+    Insert into payouts_legacy using REAL columns:
+      member_id, member_name, payout_amount, payout_date, payout_index, created_at, updated_at
     """
-    payloads = [
-        {"legacy_member_id": int(beneficiary_id), "created_at": now_iso(), "status": "paid"},
-        {"legacy_member_id": int(beneficiary_id), "created_at": now_iso()},
-        {"member_id": int(beneficiary_id), "created_at": now_iso(), "status": "paid"},
-        {"member_id": int(beneficiary_id), "created_at": now_iso()},
-    ]
-
-    last_err = None
-    for p in payloads:
-        try:
-            res = c.table(table).insert(p).execute()
-            row = (res.data or [None])[0]
-            if row:
-                return row
-        except Exception as e:
-            last_err = e
-            continue
-
-    raise Exception(f"Insert failed for {table}: {repr(last_err)}")
+    payload = {
+        "member_id": int(member_id),
+        "member_name": (member_name or "").strip() or f"Member {int(member_id):02d}",
+        "payout_amount": float(payout_amount),
+        "payout_date": payout_date_iso,  # YYYY-MM-DD
+        "payout_index": int(payout_index),
+        "created_at": now_iso(),
+        "updated_at": now_iso(),
+    }
+    res = c.table(table).insert(payload).execute()
+    return (res.data or [None])[0] or payload
 
 
 # ============================================================
@@ -521,11 +527,7 @@ def payout_precheck_option_b(c, active_ids: list[int], allow_override: bool = Fa
     payout_day = _get_app_state_payout_day(c)
     today = date.today()
     if payout_day is not None and today < payout_day and not allow_override:
-        return {
-            "ok": False,
-            "reason": f"Payout allowed on {payout_day.isoformat()} (today is {today.isoformat()}).",
-            "details": comp,
-        }
+        return {"ok": False, "reason": f"Payout allowed on {payout_day.isoformat()} (today is {today.isoformat()}).", "details": comp}
 
     if _table_exists(c, "signatures") and not comp["signatures_ok"] and not allow_override:
         return {"ok": False, "reason": comp["signatures_msg"], "details": comp}
@@ -561,7 +563,12 @@ def _update_app_state_next_index(c, next_idx: int) -> None:
         pass
 
 
-def execute_payout_option_b(c, active_ids: list[int], allow_override: bool = False) -> dict:
+def execute_payout_option_b(
+    c,
+    active_ids: list[int],
+    beneficiary_name: str,
+    allow_override: bool = False,
+) -> dict:
     pre = payout_precheck_option_b(c, active_ids, allow_override=allow_override)
     if not pre.get("ok"):
         return pre
@@ -575,8 +582,19 @@ def execute_payout_option_b(c, active_ids: list[int], allow_override: bool = Fal
     if not t:
         return {"ok": False, "reason": "No payout table found (payouts_legacy / payouts)."}
 
+    payout_date_iso = date.today().isoformat()
+    payout_index = int(rotation_pointer)
+
     try:
-        payout_row = _insert_payout_row(c, t, beneficiary_id)
+        payout_row = _insert_payout_row(
+            c,
+            t,
+            member_id=beneficiary_id,
+            member_name=beneficiary_name,
+            payout_amount=pot_total,
+            payout_date_iso=payout_date_iso,
+            payout_index=payout_index,
+        )
     except Exception as e:
         return {"ok": False, "reason": str(e)}
 
@@ -596,18 +614,20 @@ def execute_payout_option_b(c, active_ids: list[int], allow_override: bool = Fal
 
 
 # ============================================================
-# PDF RECEIPT
+# PDF RECEIPT (members + contributions + total + signatures)
 # ============================================================
 def build_payout_receipt_pdf(
     *,
     group_name: str,
     session_id: int,
     payout_day: str | None,
+    payout_date: str,
     beneficiary_id: int,
     beneficiary_name: str,
     contributions_df: pd.DataFrame,
     members_df: pd.DataFrame,
     signatures: list[dict] | None,
+    total_paid: float,
 ) -> bytes:
     from reportlab.lib.pagesizes import LETTER
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
@@ -655,12 +675,14 @@ def build_payout_receipt_pdf(
 
     story.append(Paragraph(f"<b>{group_name} — Payout Receipt</b>", styles["Title"]))
     story.append(Spacer(1, 10))
+
     story.append(Paragraph(f"<b>Session ID:</b> {session_id}", styles["Normal"]))
     if payout_day:
-        story.append(Paragraph(f"<b>Payout day:</b> {payout_day}", styles["Normal"]))
+        story.append(Paragraph(f"<b>Scheduled payout day:</b> {payout_day}", styles["Normal"]))
+    story.append(Paragraph(f"<b>Actual payout date:</b> {payout_date}", styles["Normal"]))
     story.append(Paragraph(f"<b>Beneficiary:</b> {beneficiary_id:02d} • {beneficiary_name}", styles["Normal"]))
     story.append(Paragraph(f"<b>Total amount received (pot):</b> {total_pot:,.0f}", styles["Normal"]))
-    story.append(Paragraph(f"<b>Amount paid to beneficiary:</b> {total_pot:,.0f}", styles["Normal"]))
+    story.append(Paragraph(f"<b>Total amount paid to beneficiary:</b> {total_paid:,.0f}", styles["Normal"]))
     story.append(Spacer(1, 12))
 
     story.append(Paragraph("<b>Member Contributions</b>", styles["Heading2"]))
@@ -820,7 +842,8 @@ def render_payouts(sb_service, schema: str):
     try:
         arows = _safe_select(sb_service, "app_state", limit=1)
         if arows:
-            next_payout_date = str(arows[0].get(APP_STATE_PAYOUT_DATE_FIELD) or "") or None
+            v = arows[0].get(APP_STATE_PAYOUT_DATE_FIELD)
+            next_payout_date = str(v) if v else None
     except Exception:
         pass
 
@@ -871,7 +894,7 @@ def render_payouts(sb_service, schema: str):
         for p in (comp.get("gate2_problems", []) or []):
             st.warning(str(p))
 
-    # Signatures UI
+    # Signatures
     st.subheader("Signatures")
     if _table_exists(sb_service, "signatures"):
         sign_rows = get_signatures(sb_service, "payout", int(session_id)) if session_id else []
@@ -913,23 +936,23 @@ def render_payouts(sb_service, schema: str):
         st.info("signatures table not found — signature enforcement skipped.")
 
     if already_paid:
-        st.warning("Already paid detected in this cycle window (by payouts_legacy.created_at filter).")
+        st.warning("Already paid detected in this cycle window (by payouts_legacy.payout_date filter).")
 
     st.divider()
 
+    # Execute payout + PDF download
     force = st.checkbox("⚠️ Admin override (force payout)", value=False)
     pre = payout_precheck_option_b(sb_service, active_ids, allow_override=force)
 
     disabled = not bool(pre.get("ok"))
     if st.button("✅ Execute Payout (Option B)", disabled=disabled, use_container_width=True):
-        res = execute_payout_option_b(sb_service, active_ids, allow_override=force)
+        res = execute_payout_option_b(sb_service, active_ids, beneficiary_name=beneficiary_name, allow_override=force)
         if res.get("ok"):
             st.success(
                 f"Payout complete ✅  Session={res['session_id']}  Beneficiary={res['beneficiary_id']}  "
                 f"Amount={float(res['amount_paid']):,.0f}"
             )
 
-            # Build receipt inputs
             df_contrib, _meta = contributions_for_session(sb_service, int(res["session_id"]))
             sigs = get_signatures(sb_service, "payout", int(res["session_id"]))
 
@@ -938,11 +961,13 @@ def render_payouts(sb_service, schema: str):
                     group_name="theyoungshallgrow",
                     session_id=int(res["session_id"]),
                     payout_day=(payout_day.isoformat() if payout_day else None),
+                    payout_date=date.today().isoformat(),
                     beneficiary_id=int(res["beneficiary_id"]),
                     beneficiary_name=beneficiary_name,
                     contributions_df=df_contrib,
                     members_df=dfm,
                     signatures=sigs,
+                    total_paid=float(res["amount_paid"]),
                 )
 
                 filename = "payout_receipt_session_%s_beneficiary_%02d.pdf" % (
