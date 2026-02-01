@@ -5,9 +5,10 @@
 # ✅ payout allowed ON/AFTER app_state.next_payout_date
 # ✅ prevents double-pay by checking payouts_legacy.payout_date within the cycle window
 # ✅ after payout: PDF receipt with member contributions + totals + signatures
-# ✅ NEW: After payout -> advances app_state (next_payout_index, next_payout_date +14d, current_session_id +1 if exists)
-# ✅ NEW: After payout -> clears Streamlit caches + st.rerun() so Dashboard updates automatically
-# ✅ NEW: Keeps PDF available AFTER rerun via st.session_state
+# ✅ FIX: next_payout_date now advances correctly to +14 days from the *scheduled payout day* of the paid cycle
+# ✅ FIX: sessions_legacy lookup no longer assumes sessions_legacy.id is integer (your id is UUID)
+# ✅ After payout -> clears Streamlit caches + st.rerun() so Dashboard updates automatically
+# ✅ Keeps PDF available AFTER rerun via st.session_state
 
 from __future__ import annotations
 
@@ -117,10 +118,21 @@ def _first_existing_table(c, candidates: list[str]) -> Optional[str]:
 # SESSION WINDOW
 # ============================================================
 def _session_window_from_sessions_table(c, session_id: int) -> Optional[Tuple[str, str]]:
+    """
+    ✅ Your sessions_legacy.id is UUID, so we DO NOT query by id=int(session_id).
+    We try common numeric columns:
+      - session_number
+      - session_id
+    """
     if not _table_exists(c, "sessions_legacy"):
         return None
 
-    rows = _safe_select(c, "sessions_legacy", filters=[("id", "eq", int(session_id))], limit=1)
+    # Try session_number first (most common)
+    rows = _safe_select(c, "sessions_legacy", filters=[("session_number", "eq", int(session_id))], limit=1)
+    if not rows:
+        # Try session_id column (some schemas use this)
+        rows = _safe_select(c, "sessions_legacy", filters=[("session_id", "eq", int(session_id))], limit=1)
+
     if not rows:
         return None
 
@@ -456,7 +468,7 @@ def _insert_payout_row(
         "member_id": int(member_id),
         "member_name": (member_name or "").strip() or f"Member {int(member_id):02d}",
         "payout_amount": float(payout_amount),
-        "payout_date": payout_date_iso,
+        "payout_date": payout_date_iso,  # actual date paid
         "payout_index": int(payout_index),
         "created_at": now_iso(),
         "updated_at": now_iso(),
@@ -537,24 +549,24 @@ def payout_precheck_option_b(c, active_ids: list[int], allow_override: bool = Fa
     }
 
 
-def _update_app_state_next_index(c, next_idx: int, session_id: int) -> None:
+def _update_app_state_next_index(c, next_idx: int, session_id: int, base_payout_day: Optional[date]) -> None:
     """
-    ✅ Advances cycle state:
+    ✅ Advances cycle state correctly:
       - next_payout_index -> next_idx
-      - next_payout_date  -> +14 days (from current next_payout_date or today)
-      - current_session_id -> +1 IF the column exists
+      - next_payout_date  -> (base_payout_day + 14 days)  ✅ FIXED
+            base_payout_day = app_state.next_payout_date (the scheduled day for the cycle we just paid)
+            so paying late won't push the schedule by a day.
+      - current_session_id -> +1 IF column exists
     """
     if not _table_exists(c, "app_state"):
         return
 
+    # Use scheduled payout day if available; fallback to today
+    base = base_payout_day or date.today()
+    new_day = base + timedelta(days=CYCLE_DAYS)
+
     rows = _safe_select(c, "app_state", limit=1)
     cur = rows[0] if rows else {}
-
-    # Compute new payout date
-    cur_day = _parse_date_only(cur.get(APP_STATE_PAYOUT_DATE_FIELD))
-    if cur_day is None:
-        cur_day = date.today()
-    new_day = cur_day + timedelta(days=CYCLE_DAYS)
 
     payload = {
         "next_payout_index": int(next_idx),
@@ -566,9 +578,7 @@ def _update_app_state_next_index(c, next_idx: int, session_id: int) -> None:
     if cur.get("current_session_id") is not None and str(cur.get("current_session_id")).strip().isdigit():
         payload["current_session_id"] = int(cur["current_session_id"]) + 1
     else:
-        # fallback: advance from passed session_id if you track it but it's missing in row
-        # only include if column exists; we'll try and fallback if it errors
-        payload["current_session_id"] = int(session_id) + 1
+        payload["current_session_id"] = int(session_id) + 1  # may fail if column doesn't exist
 
     # Try update; if it fails because current_session_id doesn't exist, retry without it
     try:
@@ -577,7 +587,6 @@ def _update_app_state_next_index(c, next_idx: int, session_id: int) -> None:
     except Exception:
         pass
 
-    # retry without current_session_id
     payload2 = {
         "next_payout_index": int(next_idx),
         APP_STATE_PAYOUT_DATE_FIELD: new_day.isoformat(),
@@ -589,7 +598,6 @@ def _update_app_state_next_index(c, next_idx: int, session_id: int) -> None:
     except Exception:
         pass
 
-    # upsert fallback
     try:
         c.table("app_state").upsert({"id": 1, **payload2}).execute()
         return
@@ -616,7 +624,10 @@ def execute_payout_option_b(
     if not t:
         return {"ok": False, "reason": "No payout table found (payouts_legacy / payouts)."}
 
-    payout_date_iso = date.today().isoformat()
+    # ✅ capture scheduled payout day BEFORE we change app_state
+    scheduled_payout_day = _get_app_state_payout_day(c)
+
+    payout_date_iso = date.today().isoformat()  # actual date paid
     payout_index = int(rotation_pointer)
 
     try:
@@ -632,9 +643,9 @@ def execute_payout_option_b(
     except Exception as e:
         return {"ok": False, "reason": str(e)}
 
-    # ✅ advance pointer + next payout date (+14d) + session_id (if present)
+    # ✅ advance pointer + next payout schedule (based on scheduled payout day)
     nxt = next_rotation_pointer(active_ids, rotation_pointer)
-    _update_app_state_next_index(c, nxt, session_id=session_id)
+    _update_app_state_next_index(c, nxt, session_id=session_id, base_payout_day=scheduled_payout_day)
 
     return {
         "ok": True,
