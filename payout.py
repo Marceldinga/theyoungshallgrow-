@@ -1,5 +1,5 @@
 
-# payout.py ✅ COMPLETE UPDATED — payout allowed ON payout day + in-app signatures (matches your signatures schema)
+# payout.py ✅ COMPLETE SINGLE FILE — payout on payout day + in-app signatures + no actor_user_id inserts
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
@@ -182,7 +182,7 @@ def _fallback_biweekly_window_from_app_state(c) -> Tuple[str, str, Optional[str]
 
 
 def _get_app_state_payout_day(c) -> Optional[date]:
-    """Reads app_state.next_payout_date and returns date. If missing, returns None (legacy mode)."""
+    """Reads app_state.next_payout_date and returns date. If missing, returns None."""
     try:
         rows = _safe_select(c, "app_state", limit=1)
         if rows:
@@ -236,9 +236,7 @@ def get_rotation_pointer(c) -> int:
 
 
 # ============================================================
-# SIGNATURES (✅ matches your real schema)
-# signatures columns:
-# id, entity_type, entity_id, role, signer_name, signer_member_id, signed_at
+# SIGNATURES (matches your actual schema)
 # ============================================================
 def get_signatures(c, entity_type: str, entity_id: int) -> list[dict]:
     if not _table_exists(c, "signatures"):
@@ -267,13 +265,16 @@ def insert_signature(
     signer_name: str,
     signer_member_id: int | None = None,
 ) -> None:
-    """Insert into signatures using your real columns."""
+    """
+    Insert signature row using your real columns:
+    entity_type, entity_id, role, signer_name, signer_member_id, signed_at
+    """
     if not _table_exists(c, "signatures"):
         raise Exception("signatures table not found.")
 
     payload = {
-        "entity_type": entity_type,       # e.g., "payout"
-        "entity_id": int(entity_id),      # session_id
+        "entity_type": str(entity_type),
+        "entity_id": int(entity_id),
         "role": str(role),
         "signer_name": str(signer_name),
         "signed_at": now_iso(),
@@ -464,16 +465,24 @@ def fetch_paid_out_member_ids(c, session_id: int) -> Set[int]:
     return paid
 
 
-def _insert_payout_row(c, table: str, session_id: int, beneficiary_id: int, amount: float, actor_user_id: str | None):
-    base = {"created_at": now_iso(), "status": "paid"}
-    if actor_user_id:
-        base["actor_user_id"] = actor_user_id
+def _insert_payout_row(c, table: str, session_id: int, beneficiary_id: int, amount: float):
+    """
+    Insert into payouts_legacy/payouts using ONLY columns that exist.
+    (No actor_user_id — your payouts_legacy table does not have it.)
+    """
+    base = {
+        "created_at": now_iso(),
+        "status": "paid",
+        "amount": float(amount),
+    }
 
     payloads = [
-        {**base, "session_id": session_id, "beneficiary_member_id": beneficiary_id, "amount": amount},
-        {**base, "session_id": session_id, "legacy_member_id": beneficiary_id, "amount": amount},
-        {**base, "payout_session_id": session_id, "beneficiary_id": beneficiary_id, "amount": amount},
-        {**base, "session_id": session_id, "member_id": beneficiary_id, "amount": amount},
+        # legacy-like
+        {**base, "session_id": session_id, "legacy_member_id": beneficiary_id},
+        # alternates
+        {**base, "session_id": session_id, "beneficiary_member_id": beneficiary_id},
+        {**base, "payout_session_id": session_id, "beneficiary_id": beneficiary_id},
+        {**base, "session_id": session_id, "member_id": beneficiary_id},
     ]
 
     last_err = None
@@ -502,7 +511,6 @@ def compliance_for_payout(c, active_ids: list[int], session_id: int, rotation_po
     problems = contribution_problems(active_ids, df_contrib)
     gate2_ok = (len(problems) == 0)
 
-    # ✅ signatures for this session: entity_type="payout", entity_id=session_id
     sign_rows = get_signatures(c, entity_type="payout", entity_id=int(session_id)) if session_id else []
     missing = missing_roles(sign_rows, PAYOUT_SIG_REQUIRED) if sign_rows is not None else []
     sig_ok = (len(missing) == 0) if _table_exists(c, "signatures") else True
@@ -514,19 +522,15 @@ def compliance_for_payout(c, active_ids: list[int], session_id: int, rotation_po
         "session_id": int(session_id),
         "rotation_pointer": int(rotation_pointer),
         "beneficiary_id": int(beneficiary_id) if beneficiary_id else 0,
-
         "gate1_ok": bool(gate1_ok),
         "gate1_msg": gate1_msg,
-
         "gate2_ok": bool(gate2_ok),
         "gate2_summary": summ,
         "gate2_problems": problems,
         "contrib_meta": meta,
-
         "signatures_ok": bool(sig_ok),
         "signatures_missing": missing,
         "signatures_msg": sig_msg,
-
         "contrib_rows": int(summ.get("rows", 0)),
         "contrib_total": float(summ.get("total", 0.0)),
     }
@@ -552,10 +556,9 @@ def payout_precheck_option_b(c, active_ids: list[int], allow_override: bool = Fa
     if not comp["gate2_ok"]:
         return {"ok": False, "reason": "Contribution problems for this bi-weekly session.", "details": comp}
 
-    # ✅ Allow payout ON payout day (today >= payout_day), block before payout day unless override
-    payout_day = _get_app_state_payout_day(c)  # date | None
+    # ✅ payout day enforcement: allow ON payout day (today >= payout_day)
+    payout_day = _get_app_state_payout_day(c)
     today = date.today()
-
     if payout_day is not None and today < payout_day and not allow_override:
         return {
             "ok": False,
@@ -563,7 +566,7 @@ def payout_precheck_option_b(c, active_ids: list[int], allow_override: bool = Fa
             "details": comp,
         }
 
-    # ✅ Signatures required (unless admin override)
+    # ✅ signatures required unless override
     if _table_exists(c, "signatures") and not comp["signatures_ok"] and not allow_override:
         return {"ok": False, "reason": comp["signatures_msg"], "details": comp}
 
@@ -608,7 +611,7 @@ def _update_app_state_next_index(c, next_idx: int) -> None:
         pass
 
 
-def execute_payout_option_b(c, active_ids: list[int], actor_user_id: str | None = None, allow_override: bool = False) -> dict:
+def execute_payout_option_b(c, active_ids: list[int], allow_override: bool = False) -> dict:
     pre = payout_precheck_option_b(c, active_ids, allow_override=allow_override)
     if not pre.get("ok"):
         return pre
@@ -623,7 +626,7 @@ def execute_payout_option_b(c, active_ids: list[int], actor_user_id: str | None 
         return {"ok": False, "reason": "No payout table found (payouts_legacy / payouts)."}
 
     try:
-        row = _insert_payout_row(c, t, session_id, beneficiary_id, pot_total, actor_user_id)
+        row = _insert_payout_row(c, t, session_id, beneficiary_id, pot_total)
     except Exception as e:
         return {"ok": False, "reason": str(e)}
 
@@ -713,7 +716,7 @@ def compute_cycle_kpi_row(
 # ============================================================
 def render_payouts(sb_service, schema: str):
     st.title("Payouts • Option B (Bi-weekly Rotation)")
-    st.caption("✅ KPIs computed in Python • ✅ Payout allowed ON payout day • ✅ In-app signatures")
+    st.caption("✅ Payout allowed ON payout day • ✅ In-app signatures • ✅ No actor_user_id inserts")
 
     members = _safe_select_schema(
         sb_service, schema, "members_legacy", "id,name,position", limit=2000, order_col="id", desc=False
@@ -725,7 +728,6 @@ def render_payouts(sb_service, schema: str):
 
     dfm["id"] = pd.to_numeric(dfm["id"], errors="coerce").fillna(-1).astype(int)
     dfm["name"] = dfm.get("name", "").astype(str)
-
     active_ids = [int(x) for x in dfm["id"].tolist() if int(x) > 0]
 
     session_id = get_session_id(sb_service)
@@ -735,7 +737,7 @@ def render_payouts(sb_service, schema: str):
     beneficiary_name = _member_name_by_id(dfm, beneficiary_id)
     beneficiary_label = f"{beneficiary_id:02d} • {beneficiary_name}" if beneficiary_id else "—"
 
-    # next payout date display (from app_state)
+    # app_state payout date
     next_payout_date = None
     try:
         arows = _safe_select(sb_service, "app_state", limit=1)
@@ -750,7 +752,6 @@ def render_payouts(sb_service, schema: str):
 
     comp = compliance_for_payout(sb_service, active_ids, session_id=session_id, rotation_pointer=rotation_pointer)
 
-    # already paid?
     already_paid_ids = fetch_paid_out_member_ids(sb_service, session_id) if session_id else set()
     already_paid = bool(beneficiary_id and beneficiary_id in already_paid_ids)
 
@@ -764,7 +765,6 @@ def render_payouts(sb_service, schema: str):
 
     st.divider()
 
-    # KPI table
     st.subheader("KPIs — Current Cycle (Python)")
     kdf = compute_cycle_kpi_row(
         session_id=session_id,
@@ -784,7 +784,7 @@ def render_payouts(sb_service, schema: str):
 
     st.divider()
 
-    # Gate messages
+    # gates
     if comp.get("gate1_ok"):
         st.success(comp.get("gate1_msg", "Gate 1 OK"))
     else:
@@ -801,11 +801,8 @@ def render_payouts(sb_service, schema: str):
         for p in (comp.get("gate2_problems", []) or []):
             st.warning(str(p))
 
-    # ============================
-    # ✅ In-app signatures
-    # ============================
+    # signatures
     st.subheader("Signatures")
-
     if _table_exists(sb_service, "signatures"):
         sign_rows = get_signatures(sb_service, entity_type="payout", entity_id=int(session_id)) if session_id else []
         missing = missing_roles(sign_rows, PAYOUT_SIG_REQUIRED)
@@ -837,7 +834,12 @@ def render_payouts(sb_service, schema: str):
                         st.success(f"Signature recorded: {role} ✅")
                         st.rerun()
                 except Exception as e:
-                    st.error(str(e))
+                    # if duplicate unique constraint, show friendly message
+                    msg = str(e)
+                    if "duplicate key value violates unique constraint" in msg:
+                        st.warning(f"{role} already signed for this session.")
+                    else:
+                        st.error(msg)
     else:
         st.info("signatures table not found — signature enforcement skipped.")
 
@@ -846,13 +848,13 @@ def render_payouts(sb_service, schema: str):
 
     st.divider()
 
-    # ✅ Optional admin override
+    # admin override
     force = st.checkbox("⚠️ Admin override (force payout)", value=False)
     pre = payout_precheck_option_b(sb_service, active_ids, allow_override=force)
 
     disabled = not bool(pre.get("ok"))
     if st.button("✅ Execute Payout (Option B)", disabled=disabled, use_container_width=True):
-        res = execute_payout_option_b(sb_service, active_ids, actor_user_id="admin", allow_override=force)
+        res = execute_payout_option_b(sb_service, active_ids, allow_override=force)
         if res.get("ok"):
             st.success(
                 f"Payout complete ✅  Session={res['session_id']}  Beneficiary={res['beneficiary_id']}  "
@@ -868,17 +870,8 @@ def render_payouts(sb_service, schema: str):
         st.json(pre)
         st.write("Gate details JSON:")
         st.json(comp)
-        st.write("Signatures rows:")
+        st.write("Signatures for this session:")
         try:
             st.dataframe(pd.DataFrame(get_signatures(sb_service, "payout", int(session_id))), use_container_width=True)
         except Exception:
             pass
-        st.write("Contributions sample (top 30):")
-        try:
-            dfc, meta = contributions_for_session(sb_service, session_id) if session_id else (pd.DataFrame([]), {})
-            st.caption(f"Contribution source: {meta.get('source')}  table: {meta.get('table')}")
-            if meta.get("start") and meta.get("end"):
-                st.caption(f"Window: {meta.get('start')} → {meta.get('end')}")
-            st.dataframe(dfc.head(30), use_container_width=True)
-        except Exception as e:
-            st.code(repr(e), language="text")
