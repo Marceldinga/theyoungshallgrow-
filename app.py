@@ -1,10 +1,15 @@
-# app.py ✅ UPDATED — Attendance + Summaries implemented (no placeholders)
+
+# app.py ✅ COMPLETE SINGLE CODE — Minutes + Attendance (Present/Absent + Reason) + Summaries
 # ✅ Fixes WHITE inputs (BaseWeb override)
 # ✅ Minutes save shows clean API message (no scary trace)
-# ✅ Attendance now uses the correct WRITE table + READ view:
+# ✅ Attendance uses correct tables:
 #    - WRITE  -> public.meeting_attendance_legacy  (real table)
-#    - READ   -> public.attendance_legacy          (compatibility view you created)
-# ✅ Summaries reads from the READ view so column names match the UI.
+#    - READ   -> public.attendance_legacy          (compatibility view)
+# ✅ Attendance UPDATED:
+#    - Records ALL members each meeting
+#    - Each member marked Present/Absent + optional Reason/Note
+#    - Saves one row per member per meeting_date + session_number (delete-then-insert to prevent duplicates)
+# ✅ Summaries reads from READ view so column names match the UI.
 
 from __future__ import annotations
 
@@ -178,16 +183,19 @@ def inject_global_theme():
         unsafe_allow_html=True,
     )
 
+
 def glass_open() -> str:
     return "<div class='glass'>"
+
 
 def glass_close() -> str:
     return "</div>"
 
+
 inject_global_theme()
 
 # ============================================================
-# ✅ TABLE NAMES (attendance) — THIS IS THE FIX
+# ✅ TABLE NAMES (attendance)
 # ============================================================
 ATTENDANCE_READ_TABLE = "attendance_legacy"           # 👓 view: attendance_date, member_id, ...
 ATTENDANCE_WRITE_TABLE = "meeting_attendance_legacy"  # 🧱 table: meeting_date, legacy_member_id, ...
@@ -204,6 +212,7 @@ def get_secret(key: str, default: str | None = None) -> str | None:
         return st.secrets.get(key, default)
     except Exception:
         return default
+
 
 SUPABASE_URL = (get_secret("SUPABASE_URL") or "").strip()
 SUPABASE_ANON_KEY = (get_secret("SUPABASE_ANON_KEY") or "").strip()
@@ -224,9 +233,11 @@ if not SUPABASE_SERVICE_KEY:
 def get_anon_client(url: str, anon_key: str):
     return create_client(url.strip(), anon_key.strip())
 
+
 @st.cache_resource
 def get_service_client(url: str, service_key: str):
     return create_client(url.strip(), service_key.strip())
+
 
 sb_anon = get_anon_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 sb_service = get_service_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_SERVICE_KEY else None
@@ -253,6 +264,7 @@ def _api_msg(e: Exception) -> str:
             return str(payload.get("message") or payload.get("details") or payload.get("hint") or "APIError")
         return str(e)
     return str(e)
+
 
 def safe_select(
     client,
@@ -289,6 +301,7 @@ def safe_select(
         st.code(_api_msg(e), language="text")
         return []
 
+
 def get_dashboard_next(sb, schema: str) -> dict:
     rows = safe_select(sb, "dashboard_next_view", "*", schema=schema, limit=1)
     return rows[0] if rows else {}
@@ -317,6 +330,7 @@ def load_members_legacy(url: str, anon_key: str, schema: str):
 
     return labels, label_to_id, label_to_name, df
 
+
 @st.cache_data(ttl=60)
 def load_contributions_legacy(url: str, anon_key: str, schema: str) -> pd.DataFrame:
     client = create_client(url, anon_key)
@@ -330,6 +344,7 @@ def load_contributions_legacy(url: str, anon_key: str, schema: str) -> pd.DataFr
         limit=500,
     )
     return pd.DataFrame(rows) if rows else pd.DataFrame()
+
 
 # ============================================================
 # NAVIGATION
@@ -493,7 +508,7 @@ elif page == "Minutes & Attendance":
         st.markdown(glass_close(), unsafe_allow_html=True)
 
     # -------------------------
-    # Attendance ✅ IMPLEMENTED
+    # Attendance ✅ FULL (Present/Absent + Reason)
     # WRITE -> meeting_attendance_legacy (table)
     # READ  -> attendance_legacy (view)
     # -------------------------
@@ -509,19 +524,51 @@ elif page == "Minutes & Attendance":
 
         adate = st.date_input("Attendance date", value=date.today(), key="att_date")
 
-        st.caption("Mark who is present for this meeting.")
+        st.caption("Mark each member as Present or Absent. Add a reason/note if needed (especially for absent).")
 
-        present_ids: list[int] = []
+        # Build attendance rows for ALL members
+        attendance_rows: list[dict] = []
+
         for _, r in df_members.sort_values("id").iterrows():
             mid = int(r["id"])
             name = str(r["name"])
             label = f"{mid:02d} • {name}"
-            checked = st.checkbox(label, value=False, key=f"att_{mid}_{adate}")
-            if checked:
-                present_ids.append(mid)
+
+            c_status, c_note = st.columns([0.42, 0.58])
+
+            with c_status:
+                status_key = f"att_status_{mid}_{adate}"
+                status = st.radio(
+                    label,
+                    options=["present", "absent"],
+                    index=0,
+                    horizontal=True,
+                    key=status_key,
+                )
+
+            with c_note:
+                note_key = f"att_note_{mid}_{adate}"
+                note = st.text_input(
+                    "Reason / Note",
+                    value="",
+                    placeholder="e.g., Sick, Travel, Deploy, Late, Excused…",
+                    key=note_key,
+                    label_visibility="collapsed",
+                )
+
+            attendance_rows.append(
+                {
+                    "legacy_member_id": mid,
+                    "member_name": name,
+                    "status": status,
+                    "note": note.strip() or None,
+                }
+            )
+
+        st.divider()
 
         c1, c2 = st.columns(2)
-        save = c1.button("💾 Save attendance", use_container_width=True)
+        save = c1.button("💾 Save attendance (ALL members)", use_container_width=True)
         clear = c2.button("🧹 Clear selection", use_container_width=True)
 
         if clear:
@@ -530,26 +577,37 @@ elif page == "Minutes & Attendance":
         if save:
             if current_session_number is None:
                 st.error("Current session number missing (dashboard_next_view.session_number).")
-            elif not present_ids:
-                st.error("Select at least 1 member as present.")
             else:
-                # ✅ INSERT payload for the REAL TABLE columns
                 payload_rows = []
-                for mid in present_ids:
-                    nm = df_members[df_members["id"] == mid]["name"].iloc[0]
+                for row in attendance_rows:
                     payload_rows.append(
                         {
                             "meeting_date": str(adate),
                             "session_number": int(current_session_number),
-                            "legacy_member_id": int(mid),
-                            "member_name": str(nm),
-                            "status": "present",
+                            "legacy_member_id": int(row["legacy_member_id"]),
+                            "member_name": str(row["member_name"]),
+                            "status": str(row["status"]),      # present/absent
+                            "note": row["note"],               # reason/note
                             "created_by": role,
                         }
                     )
+
+                # Prevent duplicates for same meeting_date + session_number:
+                # delete existing rows then insert new full set
+                try:
+                    sb_service.schema(SUPABASE_SCHEMA).table(ATTENDANCE_WRITE_TABLE) \
+                        .delete() \
+                        .eq("meeting_date", str(adate)) \
+                        .eq("session_number", int(current_session_number)) \
+                        .execute()
+                except Exception:
+                    pass
+
                 try:
                     sb_service.schema(SUPABASE_SCHEMA).table(ATTENDANCE_WRITE_TABLE).insert(payload_rows).execute()
-                    st.success(f"Attendance saved: {len(payload_rows)} present.")
+                    present_count = sum(1 for r in payload_rows if r.get("status") == "present")
+                    absent_count = sum(1 for r in payload_rows if r.get("status") == "absent")
+                    st.success(f"Attendance saved ✅ Present: {present_count} • Absent: {absent_count}")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Failed to save attendance into {ATTENDANCE_WRITE_TABLE}.")
@@ -674,12 +732,12 @@ elif page == "Minutes & Attendance":
                 sess = st.selectbox("Pick session #", sorted(sub["session_number"].unique().tolist()), key="sum_att_sess")
                 sub = sub[sub["session_number"] == sess]
 
-            st.metric("Present count", f"{len(sub):,}")
+            st.metric("Present count", f"{len(sub[sub.get('status','')=='present']):,}" if "status" in sub.columns else f"{len(sub):,}")
             if "member_name" in sub.columns and sub["member_name"].notna().any():
                 names = sub["member_name"].fillna("").astype(str).tolist()
                 names = [n for n in names if n.strip()]
                 if names:
-                    st.markdown("**Present members**")
+                    st.markdown("**Members recorded**")
                     st.write(", ".join(names[:40]) + ("…" if len(names) > 40 else ""))
 
         st.divider()
