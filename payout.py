@@ -1,10 +1,12 @@
 
-# payout.py ✅ COMPLETED SINGLE CODE (WORKING)
+# payout.py ✅ COMPLETE SINGLE CODE (FINAL + WORKING)
 # ✅ signatures: id, entity_type, entity_id, role, signer_name, signer_member_id, signed_at
 # ✅ payouts_legacy: id, member_id, member_name, payout_amount, payout_date, created_at, updated_at, payout_index
 # ✅ payout allowed ON/AFTER app_state.next_payout_date
 # ✅ prevents double-pay by checking payouts_legacy.payout_date within the cycle window
 # ✅ after payout: PDF receipt with member contributions + totals + signatures
+#
+# Dependency: reportlab (add to requirements.txt) ✅ you already did
 
 from __future__ import annotations
 
@@ -88,8 +90,7 @@ def _safe_select(
         if order_col:
             q = q.order(order_col, desc=desc)
         q = q.limit(limit)
-        res = q.execute()
-        return res.data or []
+        return (q.execute().data or [])
     except Exception:
         return []
 
@@ -143,9 +144,7 @@ def _session_window_from_sessions_table(c, session_id: int) -> Optional[Tuple[st
     if not end_iso:
         try:
             d0 = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-            end_iso = (
-                d0 + timedelta(days=13, hours=23, minutes=59, seconds=59)
-            ).replace(microsecond=0).isoformat()
+            end_iso = (d0 + timedelta(days=13, hours=23, minutes=59, seconds=59)).replace(microsecond=0).isoformat()
         except Exception:
             end_iso = ""
 
@@ -167,12 +166,8 @@ def _fallback_biweekly_window_from_app_state(c) -> Tuple[str, str, Optional[str]
 
     if npd_str:
         try:
-            end_dt = datetime.fromisoformat(npd_str).replace(
-                hour=23, minute=59, second=59, microsecond=0
-            )
-            start_dt = (end_dt - timedelta(days=13)).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
+            end_dt = datetime.fromisoformat(npd_str).replace(hour=23, minute=59, second=59, microsecond=0)
+            start_dt = (end_dt - timedelta(days=13)).replace(hour=0, minute=0, second=0, microsecond=0)
             return start_dt.isoformat(), end_dt.isoformat(), npd_str
         except Exception:
             pass
@@ -417,9 +412,6 @@ def _payout_table(c) -> Optional[str]:
 
 
 def fetch_paid_out_member_ids_for_window(c, session_id: int) -> Set[int]:
-    """
-    Use payouts_legacy.payout_date within cycle window to prevent double-pay.
-    """
     t = _payout_table(c)
     if not t:
         return set()
@@ -461,7 +453,7 @@ def _insert_payout_row(
         "member_id": int(member_id),
         "member_name": (member_name or "").strip() or f"Member {int(member_id):02d}",
         "payout_amount": float(payout_amount),
-        "payout_date": payout_date_iso,  # YYYY-MM-DD
+        "payout_date": payout_date_iso,
         "payout_index": int(payout_index),
         "created_at": now_iso(),
         "updated_at": now_iso(),
@@ -609,7 +601,7 @@ def execute_payout_option_b(
 
 
 # ============================================================
-# PDF RECEIPT
+# PDF RECEIPT (FIXED: no duplicate member_id columns)
 # ============================================================
 def build_payout_receipt_pdf(
     *,
@@ -624,7 +616,6 @@ def build_payout_receipt_pdf(
     signatures: list[dict] | None,
     total_paid: float,
 ) -> bytes:
-    # Requires reportlab
     from reportlab.lib.pagesizes import LETTER
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
     from reportlab.lib.styles import getSampleStyleSheet
@@ -633,6 +624,7 @@ def build_payout_receipt_pdf(
     dfc = contributions_df.copy() if contributions_df is not None else pd.DataFrame([])
     dfm = members_df.copy() if members_df is not None else pd.DataFrame([])
 
+    # --- Build contrib_summary: member_id, amount
     member_col = None
     if not dfc.empty:
         if "legacy_member_id" in dfc.columns:
@@ -641,8 +633,9 @@ def build_payout_receipt_pdf(
             member_col = "member_id"
 
     if dfc.empty or member_col is None:
-        contrib_summary = pd.DataFrame(columns=["member_id", "amount"])
+        contrib_summary = pd.DataFrame({"member_id": [], "amount": []})
     else:
+        dfc = dfc.copy()
         dfc[member_col] = pd.to_numeric(dfc[member_col], errors="coerce").fillna(-1).astype(int)
         dfc["amount_num"] = pd.to_numeric(dfc.get("amount", 0), errors="coerce").fillna(0.0).astype(float)
         contrib_summary = (
@@ -651,13 +644,28 @@ def build_payout_receipt_pdf(
             .rename(columns={member_col: "member_id", "amount_num": "amount"})
         )
 
+    # --- Join names SAFELY: rebuild a clean dataframe with UNIQUE columns
     if not dfm.empty and "id" in dfm.columns:
+        dfm = dfm.copy()
         dfm["id"] = pd.to_numeric(dfm["id"], errors="coerce").fillna(-1).astype(int)
         dfm["name"] = dfm.get("name", "").astype(str)
-        contrib_summary = dfm[["id", "name"]].merge(contrib_summary, how="left", left_on="id", right_on="member_id")
-        contrib_summary["amount"] = contrib_summary["amount"].fillna(0.0)
-        contrib_summary = contrib_summary.rename(columns={"id": "member_id"}).drop(columns=["member_id_y"], errors="ignore")
-        contrib_summary = contrib_summary[["member_id", "name", "amount"]]
+
+        contrib_summary = contrib_summary.copy()
+        contrib_summary["member_id"] = pd.to_numeric(contrib_summary["member_id"], errors="coerce").fillna(-1).astype(int)
+
+        merged = dfm[["id", "name"]].merge(
+            contrib_summary,
+            how="left",
+            left_on="id",
+            right_on="member_id",
+        )
+        merged["amount"] = pd.to_numeric(merged.get("amount", 0), errors="coerce").fillna(0.0)
+
+        contrib_summary = pd.DataFrame({
+            "member_id": merged["id"].astype(int),
+            "name": merged["name"].astype(str),
+            "amount": merged["amount"].astype(float),
+        })
     else:
         contrib_summary["name"] = ""
         contrib_summary = contrib_summary[["member_id", "name", "amount"]]
@@ -684,11 +692,11 @@ def build_payout_receipt_pdf(
     story.append(Spacer(1, 6))
 
     table_data = [["#", "Member ID", "Member Name", "Amount Contributed"]]
-    cs = contrib_summary.sort_values(["member_id"])
+    cs = contrib_summary.sort_values("member_id")
     for i, row in enumerate(cs.itertuples(index=False), start=1):
-        mid = int(getattr(row, "member_id")) if pd.notna(getattr(row, "member_id")) else 0
-        nm = str(getattr(row, "name"))
-        am = float(getattr(row, "amount")) if pd.notna(getattr(row, "amount")) else 0.0
+        mid = int(getattr(row, "member_id", 0))
+        nm = str(getattr(row, "name", ""))
+        am = float(getattr(row, "amount", 0.0))
         table_data.append([str(i), str(mid), nm, f"{am:,.0f}"])
 
     t = Table(table_data, colWidths=[28, 60, 240, 120])
@@ -789,7 +797,7 @@ def compute_cycle_kpi_row(
     rows_count = int(summ.get("rows", 0))
     missing = max(len(active_ids) - contributors, 0)
 
-    df = pd.DataFrame([{
+    return pd.DataFrame([{
         "session_number": session_id,
         "pot_total": pot_total,
         "rows_count": rows_count,
@@ -803,7 +811,6 @@ def compute_cycle_kpi_row(
         "window_start": meta.get("start", "—"),
         "window_end": meta.get("end", "—"),
     }])
-    return df
 
 
 # ============================================================
@@ -944,42 +951,37 @@ def render_payouts(sb_service, schema: str):
         res = execute_payout_option_b(sb_service, active_ids, beneficiary_name=beneficiary_name, allow_override=force)
         if res.get("ok"):
             st.success(
-                f"Payout complete ✅  Session={res['session_id']}  Beneficiary={res['beneficiary_id']}  "
+                f"Payout complete ✅ Session={res['session_id']} Beneficiary={res['beneficiary_id']} "
                 f"Amount={float(res['amount_paid']):,.0f}"
             )
 
-            df_contrib, meta = contributions_for_session(sb_service, int(res["session_id"]))
+            df_contrib, _meta = contributions_for_session(sb_service, int(res["session_id"]))
             sigs = get_signatures(sb_service, "payout", int(res["session_id"]))
 
-            try:
-                pdf_bytes = build_payout_receipt_pdf(
-                    group_name="theyoungshallgrow",
-                    session_id=int(res["session_id"]),
-                    payout_day=(payout_day.isoformat() if payout_day else None),
-                    payout_date=date.today().isoformat(),
-                    beneficiary_id=int(res["beneficiary_id"]),
-                    beneficiary_name=beneficiary_name,
-                    contributions_df=df_contrib,
-                    members_df=dfm,
-                    signatures=sigs,
-                    total_paid=float(res["amount_paid"]),
-                )
+            pdf_bytes = build_payout_receipt_pdf(
+                group_name="theyoungshallgrow",
+                session_id=int(res["session_id"]),
+                payout_day=(payout_day.isoformat() if payout_day else None),
+                payout_date=date.today().isoformat(),
+                beneficiary_id=int(res["beneficiary_id"]),
+                beneficiary_name=beneficiary_name,
+                contributions_df=df_contrib,
+                members_df=dfm,
+                signatures=sigs,
+                total_paid=float(res["amount_paid"]),
+            )
 
-                filename = "payout_receipt_session_%s_beneficiary_%02d.pdf" % (
-                    int(res["session_id"]),
-                    int(res["beneficiary_id"]),
-                )
-
-                st.download_button(
-                    "⬇️ Download Payout Receipt (PDF)",
-                    data=pdf_bytes,
-                    file_name=filename,
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-            except Exception as e:
-                st.error("PDF generation failed. Add 'reportlab' to requirements.txt and redeploy.")
-                st.code(repr(e), language="text")
+            filename = "payout_receipt_session_%s_beneficiary_%02d.pdf" % (
+                int(res["session_id"]),
+                int(res["beneficiary_id"]),
+            )
+            st.download_button(
+                "⬇️ Download Payout Receipt (PDF)",
+                data=pdf_bytes,
+                file_name=filename,
+                mime="application/pdf",
+                use_container_width=True,
+            )
         else:
             st.error(res.get("reason", "Payout failed"))
 
@@ -988,9 +990,3 @@ def render_payouts(sb_service, schema: str):
         st.json(pre)
         st.write("Gate details JSON:")
         st.json(comp)
-        st.write("Contribution source:")
-        try:
-            _dfc, _meta = contributions_for_session(sb_service, session_id) if session_id else (pd.DataFrame([]), {})
-            st.json(_meta)
-        except Exception:
-            pass
