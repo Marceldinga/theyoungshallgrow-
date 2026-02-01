@@ -1,12 +1,13 @@
 
-# payout.py ✅ COMPLETE SINGLE CODE (FINAL + WORKING)
+# payout.py ✅ COMPLETE SINGLE CODE (FINAL + WORKING + AUTO-ADVANCE + AUTO-REFRESH)
 # ✅ signatures: id, entity_type, entity_id, role, signer_name, signer_member_id, signed_at
 # ✅ payouts_legacy: id, member_id, member_name, payout_amount, payout_date, created_at, updated_at, payout_index
 # ✅ payout allowed ON/AFTER app_state.next_payout_date
 # ✅ prevents double-pay by checking payouts_legacy.payout_date within the cycle window
 # ✅ after payout: PDF receipt with member contributions + totals + signatures
-#
-# Dependency: reportlab (add to requirements.txt) ✅ you already did
+# ✅ NEW: After payout -> advances app_state (next_payout_index, next_payout_date +14d, current_session_id +1 if exists)
+# ✅ NEW: After payout -> clears Streamlit caches + st.rerun() so Dashboard updates automatically
+# ✅ NEW: Keeps PDF available AFTER rerun via st.session_state
 
 from __future__ import annotations
 
@@ -62,6 +63,8 @@ ALLOWED_CONTRIB_KINDS = ["paid", "contributed"]
 
 PAYOUT_SIG_REQUIRED = ["president", "beneficiary", "treasury"]
 APP_STATE_PAYOUT_DATE_FIELD = "next_payout_date"
+
+CYCLE_DAYS = 14  # ✅ bi-weekly
 
 
 # ============================================================
@@ -534,17 +537,61 @@ def payout_precheck_option_b(c, active_ids: list[int], allow_override: bool = Fa
     }
 
 
-def _update_app_state_next_index(c, next_idx: int) -> None:
+def _update_app_state_next_index(c, next_idx: int, session_id: int) -> None:
+    """
+    ✅ Advances cycle state:
+      - next_payout_index -> next_idx
+      - next_payout_date  -> +14 days (from current next_payout_date or today)
+      - current_session_id -> +1 IF the column exists
+    """
     if not _table_exists(c, "app_state"):
         return
-    payload = {"next_payout_index": int(next_idx), "updated_at": now_iso()}
+
+    rows = _safe_select(c, "app_state", limit=1)
+    cur = rows[0] if rows else {}
+
+    # Compute new payout date
+    cur_day = _parse_date_only(cur.get(APP_STATE_PAYOUT_DATE_FIELD))
+    if cur_day is None:
+        cur_day = date.today()
+    new_day = cur_day + timedelta(days=CYCLE_DAYS)
+
+    payload = {
+        "next_payout_index": int(next_idx),
+        APP_STATE_PAYOUT_DATE_FIELD: new_day.isoformat(),
+        "updated_at": now_iso(),
+    }
+
+    # Try to advance current_session_id if present
+    if cur.get("current_session_id") is not None and str(cur.get("current_session_id")).strip().isdigit():
+        payload["current_session_id"] = int(cur["current_session_id"]) + 1
+    else:
+        # fallback: advance from passed session_id if you track it but it's missing in row
+        # only include if column exists; we'll try and fallback if it errors
+        payload["current_session_id"] = int(session_id) + 1
+
+    # Try update; if it fails because current_session_id doesn't exist, retry without it
     try:
         c.table("app_state").update(payload).eq("id", 1).execute()
         return
     except Exception:
         pass
+
+    # retry without current_session_id
+    payload2 = {
+        "next_payout_index": int(next_idx),
+        APP_STATE_PAYOUT_DATE_FIELD: new_day.isoformat(),
+        "updated_at": now_iso(),
+    }
     try:
-        c.table("app_state").upsert({"id": 1, **payload}).execute()
+        c.table("app_state").update(payload2).eq("id", 1).execute()
+        return
+    except Exception:
+        pass
+
+    # upsert fallback
+    try:
+        c.table("app_state").upsert({"id": 1, **payload2}).execute()
         return
     except Exception:
         pass
@@ -585,8 +632,9 @@ def execute_payout_option_b(
     except Exception as e:
         return {"ok": False, "reason": str(e)}
 
+    # ✅ advance pointer + next payout date (+14d) + session_id (if present)
     nxt = next_rotation_pointer(active_ids, rotation_pointer)
-    _update_app_state_next_index(c, nxt)
+    _update_app_state_next_index(c, nxt, session_id=session_id)
 
     return {
         "ok": True,
@@ -624,7 +672,6 @@ def build_payout_receipt_pdf(
     dfc = contributions_df.copy() if contributions_df is not None else pd.DataFrame([])
     dfm = members_df.copy() if members_df is not None else pd.DataFrame([])
 
-    # --- Build contrib_summary: member_id, amount
     member_col = None
     if not dfc.empty:
         if "legacy_member_id" in dfc.columns:
@@ -644,7 +691,6 @@ def build_payout_receipt_pdf(
             .rename(columns={member_col: "member_id", "amount_num": "amount"})
         )
 
-    # --- Join names SAFELY: rebuild a clean dataframe with UNIQUE columns
     if not dfm.empty and "id" in dfm.columns:
         dfm = dfm.copy()
         dfm["id"] = pd.to_numeric(dfm["id"], errors="coerce").fillna(-1).astype(int)
@@ -818,7 +864,20 @@ def compute_cycle_kpi_row(
 # ============================================================
 def render_payouts(sb_service, schema: str):
     st.title("Payouts • Option B (Bi-weekly Rotation)")
-    st.caption("✅ Payout ON payout day • ✅ Signatures • ✅ PDF receipt download after payout")
+    st.caption("✅ Payout ON payout day • ✅ Signatures • ✅ PDF receipt download after payout • ✅ Auto refresh to next cycle")
+
+    # ✅ Keep last PDF available after rerun
+    if st.session_state.get("last_payout_pdf") and st.session_state.get("last_payout_filename"):
+        st.success("✅ Last payout receipt is ready (saved after auto-refresh).")
+        st.download_button(
+            "⬇️ Download Last Payout Receipt (PDF)",
+            data=st.session_state["last_payout_pdf"],
+            file_name=st.session_state["last_payout_filename"],
+            mime="application/pdf",
+            use_container_width=True,
+            key="dl_last_payout_pdf",
+        )
+        st.divider()
 
     members = _safe_select_schema(
         sb_service, schema, "members_legacy", "id,name,position", limit=2000, order_col="id", desc=False
@@ -950,11 +1009,6 @@ def render_payouts(sb_service, schema: str):
     if st.button("✅ Execute Payout (Option B)", disabled=disabled, use_container_width=True):
         res = execute_payout_option_b(sb_service, active_ids, beneficiary_name=beneficiary_name, allow_override=force)
         if res.get("ok"):
-            st.success(
-                f"Payout complete ✅ Session={res['session_id']} Beneficiary={res['beneficiary_id']} "
-                f"Amount={float(res['amount_paid']):,.0f}"
-            )
-
             df_contrib, _meta = contributions_for_session(sb_service, int(res["session_id"]))
             sigs = get_signatures(sb_service, "payout", int(res["session_id"]))
 
@@ -975,13 +1029,21 @@ def render_payouts(sb_service, schema: str):
                 int(res["session_id"]),
                 int(res["beneficiary_id"]),
             )
-            st.download_button(
-                "⬇️ Download Payout Receipt (PDF)",
-                data=pdf_bytes,
-                file_name=filename,
-                mime="application/pdf",
-                use_container_width=True,
-            )
+
+            # ✅ store PDF to survive rerun
+            st.session_state["last_payout_pdf"] = pdf_bytes
+            st.session_state["last_payout_filename"] = filename
+
+            # ✅ force app refresh so Dashboard updates immediately
+            try:
+                st.cache_data.clear()
+                st.cache_resource.clear()
+            except Exception:
+                pass
+
+            st.success("✅ Payout completed. Moving to next cycle...")
+            st.rerun()
+
         else:
             st.error(res.get("reason", "Payout failed"))
 
