@@ -6,4 +6,4 @@ supabase
 postgrest
 plotly
 fpdf
-reportlab
+
