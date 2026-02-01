@@ -1,11 +1,12 @@
-# dashboard_panel.py ✅ COMPLETE UPDATED + BEAUTIFUL THEME (dark dotted grid like your image)
-# FIXED:
-# ✅ Option A enforced: "Current Pot" = CURRENT ACTIVE SESSION contributions ONLY
-#    -> No more reading old pot from dashboard_next_view.current_pot
-# ✅ Cycle Contributions always shows 0 (not "—") when empty
+
+# dashboard_panel.py ✅ COMPLETE SINGLE CODE (FINAL + AUTO-REFRESH ON CYCLE CHANGE)
+# ✅ Dark dotted grid theme + glass KPI cards
+# ✅ Option A enforced: Current Pot = CURRENT ACTIVE SESSION contributions ONLY (v_current_cycle_kpis.cycle_total)
+# ✅ Cycle Contributions shows 0 (not "—") when empty
 # ✅ Members Paid defaults to 0 when empty
 # ✅ Interest KPI FIXED: shows PAID interest (generated - unpaid) from loans_legacy (ACTIVE loans)
-# ✅ Finance view forced to PUBLIC schema (because your views are in public)
+# ✅ Finance view forced to PUBLIC schema (views are in public)
+# ✅ NEW: Auto-refresh dashboard when payout advances cycle (detects app_state change)
 #
 # Requires:
 # - sb_anon: supabase client (anon)
@@ -42,7 +43,7 @@ def inject_dashboard_theme():
 
         header, footer { background: transparent !important; }
 
-        /* Typography tweaks */
+        /* Typography */
         h1, h2, h3, h4, h5, h6, p, div, span, label {
             color: #e5e7eb;
         }
@@ -207,8 +208,7 @@ def compute_interest_paid_all_time(sb, schema: str = "public") -> float:
       SUM(total_interest_generated - unpaid_interest)
     for ACTIVE loans only.
 
-    This matches your verified totals:
-      generated=950, unpaid=400 -> paid=550.
+    Example: generated=950, unpaid=400 -> paid=550.
     """
     try:
         rows = (
@@ -232,10 +232,63 @@ def compute_interest_paid_all_time(sb, schema: str = "public") -> float:
 
 
 # ------------------------------------------------------------
+# NEW: cycle change detector (auto-rerun if app_state changed)
+# ------------------------------------------------------------
+def _read_cycle_stamp(sb, schema: str) -> str:
+    """
+    Creates a stable stamp representing 'current cycle' state.
+    If payout advanced the cycle, this stamp changes and we rerun.
+
+    Uses app_state:
+      - current_session_id (if present)
+      - next_payout_index
+      - next_payout_date
+      - updated_at (if present)
+    """
+    rows = safe_view(sb, schema, "app_state", limit=1)
+    r = rows[0] if rows else {}
+    return "|".join(
+        [
+            str(_pick(r, "current_session_id", default="")),
+            str(_pick(r, "next_payout_index", default="")),
+            str(_pick(r, "next_payout_date", default="")),
+            str(_pick(r, "updated_at", default="")),
+        ]
+    )
+
+
+def _auto_refresh_if_cycle_changed(sb_anon, schema: str):
+    """
+    If cycle stamp changed since last dashboard render, clear caches and rerun.
+    This makes dashboard immediately reflect the next cycle after payout.
+    """
+    stamp = _read_cycle_stamp(sb_anon, schema)
+
+    prev = st.session_state.get("_cycle_stamp_dashboard")
+    st.session_state["_cycle_stamp_dashboard"] = stamp
+
+    # First load: nothing to compare
+    if prev is None:
+        return
+
+    # If cycle changed, refresh
+    if stamp != prev:
+        try:
+            st.cache_data.clear()
+            st.cache_resource.clear()
+        except Exception:
+            pass
+        st.rerun()
+
+
+# ------------------------------------------------------------
 # Dashboard renderer
 # ------------------------------------------------------------
 def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     inject_dashboard_theme()
+
+    # ✅ Auto refresh if payout advanced the cycle
+    _auto_refresh_if_cycle_changed(sb_anon, schema)
 
     st.markdown("## 📊 Dashboard")
 
@@ -407,6 +460,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     # DEBUG
     # =========================================================
     with st.expander("🔎 Debug (raw rows)", expanded=False):
+        st.write("app_state stamp", st.session_state.get("_cycle_stamp_dashboard"))
         st.write("dashboard_next_view", dash)
         st.write("sessions_legacy (resolved window)", {"start_date": start_date, "end_date": end_date, "session_number": session_number})
         st.write("v_current_cycle_kpis", kpis)
