@@ -1,17 +1,10 @@
 
-# payout.py ✅ COMPLETED SINGLE CODE (FINAL — MATCHES YOUR REAL DB)
-# ✅ signatures columns (confirmed): id, entity_type, entity_id, role, signer_name, signer_member_id, signed_at
-# ✅ payouts_legacy columns (confirmed): id, member_id, member_name, payout_amount, payout_date, created_at, updated_at, payout_index
-# ✅ payout allowed ON/AFTER payout day: app_state.next_payout_date
-# ✅ in-app signatures (handles uq_signatures_once duplicates)
-# ✅ prevents double-pay in same cycle using payouts_legacy.payout_date within cycle window
-# ✅ after successful payout: download PDF receipt with:
-#    - list of members + amount contributed
-#    - total pot received
-#    - beneficiary + amount received
-#    - signatures
-#
-# Dependency: reportlab (add to requirements.txt if missing)
+# payout.py ✅ COMPLETED SINGLE CODE (WORKING)
+# ✅ signatures: id, entity_type, entity_id, role, signer_name, signer_member_id, signed_at
+# ✅ payouts_legacy: id, member_id, member_name, payout_amount, payout_date, created_at, updated_at, payout_index
+# ✅ payout allowed ON/AFTER app_state.next_payout_date
+# ✅ prevents double-pay by checking payouts_legacy.payout_date within the cycle window
+# ✅ after payout: PDF receipt with member contributions + totals + signatures
 
 from __future__ import annotations
 
@@ -150,7 +143,9 @@ def _session_window_from_sessions_table(c, session_id: int) -> Optional[Tuple[st
     if not end_iso:
         try:
             d0 = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-            end_iso = (d0 + timedelta(days=13, hours=23, minutes=59, seconds=59)).replace(microsecond=0).isoformat()
+            end_iso = (
+                d0 + timedelta(days=13, hours=23, minutes=59, seconds=59)
+            ).replace(microsecond=0).isoformat()
         except Exception:
             end_iso = ""
 
@@ -172,8 +167,12 @@ def _fallback_biweekly_window_from_app_state(c) -> Tuple[str, str, Optional[str]
 
     if npd_str:
         try:
-            end_dt = datetime.fromisoformat(npd_str).replace(hour=23, minute=59, second=59, microsecond=0)
-            start_dt = (end_dt - timedelta(days=13)).replace(hour=0, minute=0, second=0, microsecond=0)
+            end_dt = datetime.fromisoformat(npd_str).replace(
+                hour=23, minute=59, second=59, microsecond=0
+            )
+            start_dt = (end_dt - timedelta(days=13)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
             return start_dt.isoformat(), end_dt.isoformat(), npd_str
         except Exception:
             pass
@@ -458,10 +457,6 @@ def _insert_payout_row(
     payout_date_iso: str,
     payout_index: int,
 ) -> dict:
-    """
-    Insert into payouts_legacy using REAL columns:
-      member_id, member_name, payout_amount, payout_date, payout_index, created_at, updated_at
-    """
     payload = {
         "member_id": int(member_id),
         "member_name": (member_name or "").strip() or f"Member {int(member_id):02d}",
@@ -614,7 +609,7 @@ def execute_payout_option_b(
 
 
 # ============================================================
-# PDF RECEIPT (members + contributions + total + signatures)
+# PDF RECEIPT
 # ============================================================
 def build_payout_receipt_pdf(
     *,
@@ -629,6 +624,7 @@ def build_payout_receipt_pdf(
     signatures: list[dict] | None,
     total_paid: float,
 ) -> bytes:
+    # Requires reportlab
     from reportlab.lib.pagesizes import LETTER
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
     from reportlab.lib.styles import getSampleStyleSheet
@@ -675,14 +671,13 @@ def build_payout_receipt_pdf(
 
     story.append(Paragraph(f"<b>{group_name} — Payout Receipt</b>", styles["Title"]))
     story.append(Spacer(1, 10))
-
     story.append(Paragraph(f"<b>Session ID:</b> {session_id}", styles["Normal"]))
     if payout_day:
         story.append(Paragraph(f"<b>Scheduled payout day:</b> {payout_day}", styles["Normal"]))
     story.append(Paragraph(f"<b>Actual payout date:</b> {payout_date}", styles["Normal"]))
     story.append(Paragraph(f"<b>Beneficiary:</b> {beneficiary_id:02d} • {beneficiary_name}", styles["Normal"]))
     story.append(Paragraph(f"<b>Total amount received (pot):</b> {total_pot:,.0f}", styles["Normal"]))
-    story.append(Paragraph(f"<b>Total amount paid to beneficiary:</b> {total_paid:,.0f}", styles["Normal"]))
+    story.append(Paragraph(f"<b>Total amount paid to beneficiary:</b> {float(total_paid):,.0f}", styles["Normal"]))
     story.append(Spacer(1, 12))
 
     story.append(Paragraph("<b>Member Contributions</b>", styles["Heading2"]))
@@ -737,7 +732,7 @@ def build_payout_receipt_pdf(
         ]))
         story.append(stbl)
 
-    story.append(Spacer(1, 14))
+    story.append(Spacer(1, 12))
     story.append(Paragraph(f"<i>Generated: {now_iso()}</i>", styles["Normal"]))
 
     doc.build(story)
@@ -953,7 +948,7 @@ def render_payouts(sb_service, schema: str):
                 f"Amount={float(res['amount_paid']):,.0f}"
             )
 
-            df_contrib, _meta = contributions_for_session(sb_service, int(res["session_id"]))
+            df_contrib, meta = contributions_for_session(sb_service, int(res["session_id"]))
             sigs = get_signatures(sb_service, "payout", int(res["session_id"]))
 
             try:
@@ -993,3 +988,9 @@ def render_payouts(sb_service, schema: str):
         st.json(pre)
         st.write("Gate details JSON:")
         st.json(comp)
+        st.write("Contribution source:")
+        try:
+            _dfc, _meta = contributions_for_session(sb_service, session_id) if session_id else (pd.DataFrame([]), {})
+            st.json(_meta)
+        except Exception:
+            pass
