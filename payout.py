@@ -1,5 +1,5 @@
 
-# payout.py ✅ COMPLETE UPDATED — payout allowed ON payout day + in-app signatures
+# payout.py ✅ COMPLETE UPDATED — payout allowed ON payout day + in-app signatures (matches your signatures schema)
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
@@ -55,7 +55,7 @@ ALLOWED_CONTRIB_KINDS = ["paid", "contributed"]
 # ✅ REQUIRED payout signatures (3 roles)
 PAYOUT_SIG_REQUIRED = ["president", "beneficiary", "treasury"]
 
-# ✅ "Payout day" is controlled by this field in app_state
+# ✅ payout day comes from app_state.next_payout_date
 APP_STATE_PAYOUT_DATE_FIELD = "next_payout_date"
 
 
@@ -182,10 +182,7 @@ def _fallback_biweekly_window_from_app_state(c) -> Tuple[str, str, Optional[str]
 
 
 def _get_app_state_payout_day(c) -> Optional[date]:
-    """
-    Reads app_state.next_payout_date (or configured field) and returns date.
-    If missing, returns None (legacy mode).
-    """
+    """Reads app_state.next_payout_date and returns date. If missing, returns None (legacy mode)."""
     try:
         rows = _safe_select(c, "app_state", limit=1)
         if rows:
@@ -239,16 +236,18 @@ def get_rotation_pointer(c) -> int:
 
 
 # ============================================================
-# SIGNATURES
+# SIGNATURES (✅ matches your real schema)
+# signatures columns:
+# id, entity_type, entity_id, role, signer_name, signer_member_id, signed_at
 # ============================================================
-def get_signatures(c, context: str, ref_id: int) -> list[dict]:
+def get_signatures(c, entity_type: str, entity_id: int) -> list[dict]:
     if not _table_exists(c, "signatures"):
         return []
     return _safe_select(
         c,
         "signatures",
-        filters=[("context", "eq", context), ("ref_id", "eq", int(ref_id))],
-        order_col="created_at",
+        filters=[("entity_type", "eq", entity_type), ("entity_id", "eq", int(entity_id))],
+        order_col="signed_at",
         desc=True,
         limit=500,
     )
@@ -260,27 +259,29 @@ def missing_roles(sign_rows: list[dict], required_roles: list[str]) -> list[str]
     return [r for r in req if r not in got]
 
 
-def insert_signature(c, context: str, ref_id: int, role: str, signed_by: str) -> None:
-    """Insert one signature row. Works even if your table has extra columns."""
+def insert_signature(
+    c,
+    entity_type: str,
+    entity_id: int,
+    role: str,
+    signer_name: str,
+    signer_member_id: int | None = None,
+) -> None:
+    """Insert into signatures using your real columns."""
     if not _table_exists(c, "signatures"):
         raise Exception("signatures table not found.")
 
-    payload_variants = [
-        {"context": context, "ref_id": int(ref_id), "role": role, "signed_by": signed_by, "created_at": now_iso()},
-        {"context": context, "ref_id": int(ref_id), "role": role, "name": signed_by, "created_at": now_iso()},
-        {"context": context, "ref_id": int(ref_id), "role": role, "actor_user_id": signed_by, "created_at": now_iso()},
-    ]
+    payload = {
+        "entity_type": entity_type,       # e.g., "payout"
+        "entity_id": int(entity_id),      # session_id
+        "role": str(role),
+        "signer_name": str(signer_name),
+        "signed_at": now_iso(),
+    }
+    if signer_member_id is not None:
+        payload["signer_member_id"] = int(signer_member_id)
 
-    last_err = None
-    for p in payload_variants:
-        try:
-            c.table("signatures").insert(p).execute()
-            return
-        except Exception as e:
-            last_err = e
-            continue
-
-    raise Exception(f"Could not insert signature: {repr(last_err)}")
+    c.table("signatures").insert(payload).execute()
 
 
 # ============================================================
@@ -501,8 +502,9 @@ def compliance_for_payout(c, active_ids: list[int], session_id: int, rotation_po
     problems = contribution_problems(active_ids, df_contrib)
     gate2_ok = (len(problems) == 0)
 
-    signs = get_signatures(c, context="payout", ref_id=int(session_id)) if session_id else []
-    missing = missing_roles(signs, PAYOUT_SIG_REQUIRED) if signs is not None else []
+    # ✅ signatures for this session: entity_type="payout", entity_id=session_id
+    sign_rows = get_signatures(c, entity_type="payout", entity_id=int(session_id)) if session_id else []
+    missing = missing_roles(sign_rows, PAYOUT_SIG_REQUIRED) if sign_rows is not None else []
     sig_ok = (len(missing) == 0) if _table_exists(c, "signatures") else True
     sig_msg = "OK" if sig_ok else f"Missing roles: {missing}"
 
@@ -550,29 +552,20 @@ def payout_precheck_option_b(c, active_ids: list[int], allow_override: bool = Fa
     if not comp["gate2_ok"]:
         return {"ok": False, "reason": "Contribution problems for this bi-weekly session.", "details": comp}
 
-    # ✅ Enforce payout day: allow payout ON payout day (today >= payout_date)
+    # ✅ Allow payout ON payout day (today >= payout_day), block before payout day unless override
     payout_day = _get_app_state_payout_day(c)  # date | None
     today = date.today()
 
-    if payout_day is not None:
-        if today < payout_day and not allow_override:
-            return {
-                "ok": False,
-                "reason": f"Payout allowed on {payout_day.isoformat()} (today is {today.isoformat()}).",
-                "details": comp,
-            }
+    if payout_day is not None and today < payout_day and not allow_override:
+        return {
+            "ok": False,
+            "reason": f"Payout allowed on {payout_day.isoformat()} (today is {today.isoformat()}).",
+            "details": comp,
+        }
 
-    # ✅ Signatures enforced BEFORE payout day, but NOT blocking on payout day (if today >= payout_day)
-    if _table_exists(c, "signatures") and not comp["signatures_ok"]:
-        if payout_day is None:
-            # legacy mode: signatures required unless override
-            if not allow_override:
-                return {"ok": False, "reason": comp["signatures_msg"], "details": comp}
-        else:
-            # if still before payout day, signatures required unless override
-            if today < payout_day and not allow_override:
-                return {"ok": False, "reason": comp["signatures_msg"], "details": comp}
-            # on payout day or after: do NOT block payout (still show warning in UI)
+    # ✅ Signatures required (unless admin override)
+    if _table_exists(c, "signatures") and not comp["signatures_ok"] and not allow_override:
+        return {"ok": False, "reason": comp["signatures_msg"], "details": comp}
 
     beneficiary_id = int(comp["beneficiary_id"]) if comp.get("beneficiary_id") else 0
     if beneficiary_id <= 0:
@@ -698,8 +691,6 @@ def compute_cycle_kpi_row(
     rows_count = int(summ.get("rows", 0))
     missing = max(len(active_ids) - contributors, 0)
 
-    already_paid = False  # filled by caller
-
     df = pd.DataFrame([{
         "session_number": session_id,
         "pot_total": pot_total,
@@ -709,7 +700,7 @@ def compute_cycle_kpi_row(
         "beneficiary_id": beneficiary_id,
         "beneficiary_name": beneficiary_name,
         "next_payout_date": next_payout_date or meta.get("next_payout_date") or "—",
-        "already_paid": already_paid,
+        "already_paid": False,
         "contrib_source": meta.get("source", "—"),
         "window_start": meta.get("start", "—"),
         "window_end": meta.get("end", "—"),
@@ -789,7 +780,7 @@ def render_payouts(sb_service, schema: str):
     if payout_day:
         st.info(f"📅 Payout day: {payout_day.isoformat()} • Today: {today.isoformat()} • Allowed: {'YES' if today >= payout_day else 'NO'}")
     else:
-        st.info("📅 Payout day not set in app_state (legacy mode) — payout day restriction disabled.")
+        st.info("📅 Payout day not set in app_state — payout day restriction disabled.")
 
     st.divider()
 
@@ -816,25 +807,33 @@ def render_payouts(sb_service, schema: str):
     st.subheader("Signatures")
 
     if _table_exists(sb_service, "signatures"):
-        sign_rows = get_signatures(sb_service, context="payout", ref_id=int(session_id)) if session_id else []
+        sign_rows = get_signatures(sb_service, entity_type="payout", entity_id=int(session_id)) if session_id else []
         missing = missing_roles(sign_rows, PAYOUT_SIG_REQUIRED)
 
         if not missing:
             st.success("All required payout signatures are present (for this bi-weekly session).")
         else:
             st.warning("Missing required signatures: " + ", ".join(missing))
-            st.caption(f"Required roles: {PAYOUT_SIG_REQUIRED} • Context=payout • RefID=session_id ({session_id})")
-            st.caption("✅ Members can sign below. After all required signatures are added, payout will enable.")
+            st.caption(f"Required roles: {PAYOUT_SIG_REQUIRED} • entity_type=payout • entity_id=session_id ({session_id})")
 
         with st.expander("✍️ Add signature (for this session)", expanded=True):
             role = st.selectbox("Role", options=PAYOUT_SIG_REQUIRED, index=0)
-            signed_by = st.text_input("Signed by (name)", value="")
+            signer_name = st.text_input("Signer name", value="")
+            signer_member_id = st.number_input("Signer member ID (optional)", min_value=0, step=1, value=0)
+
             if st.button("Add signature", use_container_width=True):
                 try:
-                    if not signed_by.strip():
-                        st.error("Please enter a name.")
+                    if not signer_name.strip():
+                        st.error("Signer name is required.")
                     else:
-                        insert_signature(sb_service, context="payout", ref_id=int(session_id), role=str(role), signed_by=signed_by.strip())
+                        insert_signature(
+                            sb_service,
+                            entity_type="payout",
+                            entity_id=int(session_id),
+                            role=str(role),
+                            signer_name=signer_name.strip(),
+                            signer_member_id=int(signer_member_id) if signer_member_id > 0 else None,
+                        )
                         st.success(f"Signature recorded: {role} ✅")
                         st.rerun()
                 except Exception as e:
@@ -847,7 +846,7 @@ def render_payouts(sb_service, schema: str):
 
     st.divider()
 
-    # ✅ Optional admin override (only used if needed)
+    # ✅ Optional admin override
     force = st.checkbox("⚠️ Admin override (force payout)", value=False)
     pre = payout_precheck_option_b(sb_service, active_ids, allow_override=force)
 
@@ -869,6 +868,11 @@ def render_payouts(sb_service, schema: str):
         st.json(pre)
         st.write("Gate details JSON:")
         st.json(comp)
+        st.write("Signatures rows:")
+        try:
+            st.dataframe(pd.DataFrame(get_signatures(sb_service, "payout", int(session_id))), use_container_width=True)
+        except Exception:
+            pass
         st.write("Contributions sample (top 30):")
         try:
             dfc, meta = contributions_for_session(sb_service, session_id) if session_id else (pd.DataFrame([]), {})
