@@ -1,10 +1,11 @@
-# pdfs.py ✅ COMPLETE FILE (UPDATED)
+
+# pdfs.py ✅ COMPLETE FILE (FINAL)
 # Includes:
 # - Loan Statement PDF (with optional digital signature block)
 # - ZIP export for all loan statements
 # - Minutes PDF (meeting_minutes_legacy)
 # - Attendance PDF (meeting_attendance_legacy)
-# - ✅ NEW: Payout Receipt PDF (per beneficiary)
+# - ✅ Payout Receipt PDF (per beneficiary) WITH contributions list + totals + signatures
 
 from __future__ import annotations
 
@@ -438,31 +439,24 @@ def make_attendance_pdf(
 
 
 # ============================================================
-# ✅ NEW: Payout Receipt PDF (per beneficiary)
+# ✅ Payout Receipt PDF (WITH contributions + totals + signatures)
 # ============================================================
 def make_payout_receipt_pdf(
     brand: str,
     beneficiary: dict,
     payout_info: dict,
+    contributions_breakdown: list[dict] | None = None,
     signatures: list[dict] | None = None,
     currency: str = "$",
     logo_path: str = "assets/logo.png",
 ) -> bytes:
     """
-    Payout receipt for ONE beneficiary.
+    Payout receipt for ONE beneficiary (WITH contributions list).
 
-    beneficiary keys (best effort):
-      - legacy_member_id / member_id / id
-      - name / member_name / full_name
-
-    payout_info keys (best effort):
-      - session_number
-      - payout_index
-      - payout_date
+    contributions_breakdown list items (best effort keys):
+      - member_id / legacy_member_id / id
+      - member_name / name
       - amount
-      - pot_amount
-      - notes
-      - receipt_id / payout_id
     """
     buf = BytesIO()
     pdf = canvas.Canvas(buf, pagesize=LETTER)
@@ -496,13 +490,30 @@ def make_payout_receipt_pdf(
     session_number = payout_info.get("session_number")
     payout_index = payout_info.get("payout_index")
     payout_date = payout_info.get("payout_date") or payout_info.get("date") or ""
-    amount = payout_info.get("amount")
+    amount_paid = payout_info.get("payout_amount")
+    if amount_paid is None:
+        amount_paid = payout_info.get("amount")
     pot_amount = payout_info.get("pot_amount")
     notes = payout_info.get("notes") or ""
 
-    bid = beneficiary.get("legacy_member_id") or beneficiary.get("member_id") or beneficiary.get("id") or ""
-    bname = beneficiary.get("name") or beneficiary.get("member_name") or beneficiary.get("full_name") or ""
+    bid = beneficiary.get("member_id") or beneficiary.get("legacy_member_id") or beneficiary.get("id") or ""
+    bname = beneficiary.get("member_name") or beneficiary.get("name") or beneficiary.get("full_name") or ""
 
+    rows = contributions_breakdown or []
+
+    def _amt(r):
+        try:
+            return float(r.get("amount") or 0)
+        except Exception:
+            return 0.0
+
+    computed_total = sum(_amt(r) for r in rows)
+    if pot_amount is None:
+        pot_amount = computed_total
+    if amount_paid is None:
+        amount_paid = pot_amount
+
+    # Beneficiary block
     pdf.setFont("Helvetica-Bold", 11)
     pdf.drawString(left, y, "Beneficiary")
     y -= 0.22 * inch
@@ -510,6 +521,7 @@ def make_payout_receipt_pdf(
     pdf.drawString(left, y, f"ID: {bid}    Name: {bname}")
     y -= 0.30 * inch
 
+    # Payout details
     pdf.setFont("Helvetica-Bold", 11)
     pdf.drawString(left, y, "Payout Details")
     y -= 0.22 * inch
@@ -521,17 +533,69 @@ def make_payout_receipt_pdf(
 
     pdf.drawString(left, y, f"Session #: {session_number if session_number is not None else '—'}"); y -= 0.16 * inch
     pdf.drawString(left, y, f"Payout Index: {payout_index if payout_index is not None else '—'}"); y -= 0.16 * inch
-    pdf.drawString(left, y, f"Payout Date: {str(payout_date)[:10] if payout_date else '—'}"); y -= 0.20 * inch
+    pdf.drawString(left, y, f"Payout Date: {str(payout_date)[:10] if payout_date else '—'}"); y -= 0.22 * inch
 
     pdf.setFont("Helvetica-Bold", 10)
-    pdf.drawString(left, y, "Amounts")
+    pdf.drawString(left, y, "Totals")
     y -= 0.18 * inch
     pdf.setFont("Helvetica", 10)
+    pdf.drawString(left, y, f"Total amount received (pot): {_money(pot_amount, currency)}"); y -= 0.16 * inch
+    pdf.drawString(left, y, f"Total amount paid to beneficiary: {_money(amount_paid, currency)}"); y -= 0.24 * inch
 
-    if pot_amount is not None:
-        pdf.drawString(left, y, f"Pot Amount: {_money(pot_amount, currency)}"); y -= 0.16 * inch
-    pdf.drawString(left, y, f"Amount Paid: {_money(amount or 0, currency)}"); y -= 0.24 * inch
+    # Contributions list
+    pdf.setFont("Helvetica-Bold", 11)
+    pdf.drawString(left, y, "Member Contributions")
+    y -= 0.20 * inch
 
+    if not rows:
+        pdf.setFont("Helvetica", 10)
+        pdf.drawString(left, y, "No contribution breakdown provided.")
+        y -= 0.18 * inch
+    else:
+        pdf.setFont("Helvetica-Bold", 9)
+        pdf.drawString(left, y, "#")
+        pdf.drawString(left + 0.35 * inch, y, "ID")
+        pdf.drawString(left + 1.05 * inch, y, "Member Name")
+        pdf.drawRightString(left + 5.8 * inch, y, "Amount")
+        y -= 0.16 * inch
+        pdf.setFont("Helvetica", 9)
+
+        def _mid(r):
+            try:
+                return int(r.get("member_id") or r.get("legacy_member_id") or r.get("id") or 0)
+            except Exception:
+                return 0
+
+        for i, r in enumerate(sorted(rows, key=_mid), start=1):
+            if y < 1.2 * inch:
+                pdf.showPage()
+                y = height - 1.0 * inch
+                pdf.setFont("Helvetica-Bold", 9)
+                pdf.drawString(left, y, "#")
+                pdf.drawString(left + 0.35 * inch, y, "ID")
+                pdf.drawString(left + 1.05 * inch, y, "Member Name")
+                pdf.drawRightString(left + 5.8 * inch, y, "Amount")
+                y -= 0.16 * inch
+                pdf.setFont("Helvetica", 9)
+
+            mid = r.get("member_id") or r.get("legacy_member_id") or r.get("id") or ""
+            mname = str(r.get("member_name") or r.get("name") or "")[:40]
+            amt = _amt(r)
+
+            pdf.drawString(left, y, str(i))
+            pdf.drawString(left + 0.35 * inch, y, str(mid))
+            pdf.drawString(left + 1.05 * inch, y, mname)
+            pdf.drawRightString(left + 5.8 * inch, y, _money(amt, currency))
+            y -= 0.14 * inch
+
+        y -= 0.06 * inch
+        pdf.setFont("Helvetica-Bold", 9)
+        pdf.drawString(left + 1.05 * inch, y, "TOTAL")
+        pdf.drawRightString(left + 5.8 * inch, y, _money(computed_total, currency))
+        pdf.setFont("Helvetica", 9)
+        y -= 0.22 * inch
+
+    # Notes
     if notes:
         pdf.setFont("Helvetica-Bold", 10)
         pdf.drawString(left, y, "Notes")
@@ -564,18 +628,20 @@ def make_payout_receipt_pdf(
         y -= 0.16 * inch
         pdf.setFont("Helvetica", 9)
 
-        for s in sigs[:15]:
-            role = str(s.get("role") or "")
-            signer = str(s.get("signer_name") or "")
-            signed_at = str(s.get("signed_at") or "")[:19]
-            pdf.drawString(left, y, role[:18])
-            pdf.drawString(left + 1.3 * inch, y, signer[:35])
-            pdf.drawString(left + 4.3 * inch, y, signed_at)
-            y -= 0.14 * inch
+        for s in sigs[:20]:
             if y < 1.1 * inch:
                 pdf.showPage()
                 y = height - 1.0 * inch
                 pdf.setFont("Helvetica", 9)
+
+            role = str(s.get("role") or "")[:18]
+            signer = str(s.get("signer_name") or "")[:35]
+            signed_at = str(s.get("signed_at") or "")[:19]
+
+            pdf.drawString(left, y, role)
+            pdf.drawString(left + 1.3 * inch, y, signer)
+            pdf.drawString(left + 4.3 * inch, y, signed_at)
+            y -= 0.14 * inch
 
     pdf.showPage()
     pdf.save()
