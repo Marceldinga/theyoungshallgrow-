@@ -1,104 +1,140 @@
 
-# dashboard_panel.py ✅ COMPLETE SINGLE FILE (NO SQL) — NJANGI STANDARD (NO legacy)
-# ✅ FIX ImportError: exports render_dashboard at module level
-# ✅ Attendance: shows COUNTS (Present + Absent) — NOT percentage
-# ✅ Attendance duplicate fix: dedupe by (member_id, session_id) keep latest created_at/id
-# ✅ Finance model (your rule): Cash Available = foundation + loan_payments + interest_ledger + fines_paid − outstanding_principal
-# ✅ Payouts are informational only
-# ✅ Dark dotted grid theme + glass KPI cards
-# ✅ Auto-refresh on app_state stamp change
+# app.py ✅ COMPLETE SINGLE CODE — NJANGI STANDARD (NO legacy)
+# ✅ Built to STOP Streamlit blank-screen crashes:
+#    - ALL optional modules are lazy-imported inside page blocks (no import-time crash)
+#    - Secrets/env validated with visible errors
+#    - Service key optional (writes disabled if missing)
+#    - Safe Mode switch to run Dashboard-only
+#
+# ✅ Uses NEW tables/views only:
+#   tables: members, sessions, app_state, minutes, attendance, contributions, foundation_contributions,
+#           payouts, loans, loan_payments, fines, interest_ledger, audit_log
+#   views (optional): v_next_beneficiary, v_contributions_with_member, v_attendance_with_member
+#
+# ✅ Dashboard: delegates to dashboard_panel.render_dashboard (no duplicate header)
+# ✅ Minutes & Attendance:
+#    - Attendance save = delete session rows then insert (prevents duplicates)
+#    - Minutes = update if session exists else insert
+#    - Summaries = minutes + attendance + contributions
+#
+# NOTE: This file does NOT reference any "legacy" tables.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Tuple
+import os
+from datetime import date, datetime, timezone
+from typing import Any, Callable, Optional
 
 import pandas as pd
 import streamlit as st
+from postgrest.exceptions import APIError
+from supabase import create_client
 
-DUE_DAYS = 28
+from dashboard_panel import render_dashboard
+
+APP_BRAND = "theyoungshallgrow"
+
+st.set_page_config(
+    page_title=f"{APP_BRAND} • Bank Dashboard",
+    layout="wide",
+    page_icon="🏦",
+)
 
 
 # ============================================================
-# THEME
+# TIME
 # ============================================================
-def inject_dashboard_theme():
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ============================================================
+# GLOBAL THEME
+# ============================================================
+def inject_global_theme():
     st.markdown(
         """
         <style>
         .stApp {
-            background-color: #0b0f1a;
+            background-color: #0b0f1a !important;
             background-image:
-                radial-gradient(circle at 1px 1px, rgba(255,255,255,0.06) 1px, transparent 0);
-            background-size: 24px 24px;
-            color: #e5e7eb;
-        }
-        section[data-testid="stSidebar"]{
-            background: #0b0f1a;
-            border-right: 1px solid rgba(255,255,255,0.06);
+                radial-gradient(circle at 1px 1px, rgba(255,255,255,0.06) 1px, transparent 0) !important;
+            background-size: 24px 24px !important;
+            color: #e5e7eb !important;
         }
         header, footer { background: transparent !important; }
-        h1, h2, h3, h4, h5, h6, p, div, span, label { color: #e5e7eb; }
+
+        section[data-testid="stSidebar"]{
+            background: #0b0f1a !important;
+            border-right: 1px solid rgba(255,255,255,0.06) !important;
+        }
+
+        html, body, p, div, span, label, small,
+        h1, h2, h3, h4, h5, h6 {
+            color: #e5e7eb !important;
+        }
+        a { color: #60a5fa !important; }
 
         .glass {
-            background: rgba(255,255,255,0.04);
-            border: 1px solid rgba(255,255,255,0.06);
-            border-radius: 18px;
-            padding: 18px 18px;
-            box-shadow: 0 14px 45px rgba(0,0,0,0.45);
+            background: rgba(255,255,255,0.04) !important;
+            border: 1px solid rgba(255,255,255,0.06) !important;
+            border-radius: 18px !important;
+            padding: 18px 18px !important;
+            box-shadow: 0 14px 45px rgba(0,0,0,0.45) !important;
             backdrop-filter: blur(10px);
             -webkit-backdrop-filter: blur(10px);
         }
 
-        .kpi {
-            background: rgba(255,255,255,0.04);
-            border: 1px solid rgba(255,255,255,0.06);
-            border-radius: 16px;
-            padding: 14px 16px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.35);
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
+        .stButton button, .stDownloadButton button {
+            border-radius: 14px !important;
+            border: 1px solid rgba(255,255,255,0.12) !important;
+            background: rgba(255,255,255,0.04) !important;
+            color: #e5e7eb !important;
+        }
+        .stButton button:hover, .stDownloadButton button:hover {
+            border: 1px solid rgba(255,255,255,0.22) !important;
+            background: rgba(255,255,255,0.06) !important;
         }
 
-        .kpi-label {
-            font-size: 12px;
-            letter-spacing: 0.10em;
-            text-transform: uppercase;
-            opacity: 0.7;
+        /* Inputs */
+        [data-baseweb="input"] input,
+        [data-testid="stTextInput"] input,
+        [data-testid="stNumberInput"] input,
+        [data-testid="stDateInput"] input {
+            background: rgba(255,255,255,0.03) !important;
+            color: #e5e7eb !important;
+            border: 1px solid rgba(255,255,255,0.12) !important;
+            border-radius: 12px !important;
         }
-        .kpi-value {
-            font-size: 28px;
-            font-weight: 750;
-            margin-top: 8px;
-            line-height: 1.1;
+        [data-baseweb="textarea"] textarea,
+        [data-testid="stTextArea"] textarea {
+            background: rgba(255,255,255,0.03) !important;
+            color: #e5e7eb !important;
+            border: 1px solid rgba(255,255,255,0.12) !important;
+            border-radius: 12px !important;
         }
-        .kpi-sub {
-            margin-top: 6px;
-            font-size: 12px;
-            opacity: 0.65;
-            word-break: break-word;
+        [data-baseweb="select"] > div {
+            background: rgba(255,255,255,0.03) !important;
+            border: 1px solid rgba(255,255,255,0.12) !important;
+            color: #e5e7eb !important;
+            border-radius: 12px !important;
         }
+        [data-baseweb="menu"] {
+            background: #0f172a !important;
+            border: 1px solid rgba(255,255,255,0.12) !important;
+        }
+        [data-baseweb="menu"] * { color: #e5e7eb !important; }
 
-        .blue { color: #60a5fa; }
-        .green { color: #34d399; }
-        .purple { color: #a78bfa; }
-        .orange { color: #fb923c; }
-        .red { color: #f87171; }
+        div[data-testid="stDataFrame"]{
+            border-radius: 14px !important;
+            overflow: hidden !important;
+            border: 1px solid rgba(255,255,255,0.08) !important;
+            background: rgba(255,255,255,0.02) !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
-
-
-def kpi_card(label: str, value: str, color: str = "blue", sub: str | None = None) -> str:
-    sub_html = f"<div class='kpi-sub'>{sub}</div>" if sub else ""
-    return f"""
-    <div class="kpi">
-        <div class="kpi-label">{label}</div>
-        <div class="kpi-value {color}">{value}</div>
-        {sub_html}
-    </div>
-    """
 
 
 def glass_open() -> str:
@@ -109,680 +145,657 @@ def glass_close() -> str:
     return "</div>"
 
 
+inject_global_theme()
+
+
 # ============================================================
-# SAFE HELPERS (NO RAW SQL)
+# SECRETS / ENV
 # ============================================================
-def safe_table(
-    sb,
-    schema: str,
-    table: str,
-    cols: str = "*",
-    limit: int | None = 20000,
-    order_by: str | None = None,
-    desc: bool = True,
-) -> List[dict]:
+def get_secret(key: str, default: str | None = None) -> str | None:
+    v = os.getenv(key)
+    if v not in (None, ""):
+        return v
     try:
-        q = sb.schema(schema).table(table).select(cols)
-        if order_by:
-            q = q.order(order_by, desc=desc)
-        if limit is not None:
-            q = q.limit(int(limit))
-        res = q.execute()
-        return res.data or []
+        return st.secrets.get(key, default)
     except Exception:
-        return []
+        return default
 
 
-def safe_table_order_fallback(
-    sb,
-    schema: str,
-    table: str,
-    cols: str = "*",
-    limit: int | None = 20000,
-    order_candidates: List[str] | None = None,
-    desc: bool = True,
-) -> List[dict]:
-    order_candidates = order_candidates or []
-    for c in order_candidates:
-        rows = safe_table(sb, schema, table, cols=cols, limit=limit, order_by=c, desc=desc)
-        # If the column doesn't exist, safe_table returns [] via exception path.
-        # We still accept [] as a valid return, and continue only if it errors (already handled).
-        if rows is not None:
-            return rows or []
-    return safe_table(sb, schema, table, cols=cols, limit=limit, order_by=None, desc=desc)
+SUPABASE_URL = (get_secret("SUPABASE_URL") or "").strip()
+SUPABASE_ANON_KEY = (get_secret("SUPABASE_ANON_KEY") or "").strip()
+SUPABASE_SERVICE_KEY = (get_secret("SUPABASE_SERVICE_KEY") or "").strip()
+SUPABASE_SCHEMA = (get_secret("SUPABASE_SCHEMA", "public") or "public").strip()
+
+if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    st.error(
+        "Missing SUPABASE_URL or SUPABASE_ANON_KEY.\n\n"
+        "If you are on Streamlit Cloud: Manage app → Settings → Secrets.\n"
+        "Add:\n"
+        "SUPABASE_URL\nSUPABASE_ANON_KEY\n(optional) SUPABASE_SERVICE_KEY\nSUPABASE_SCHEMA"
+    )
+    st.stop()
+
+if not SUPABASE_SERVICE_KEY:
+    st.warning("SUPABASE_SERVICE_KEY not set. Writes (Admin/Loans/Payouts/Minutes/Attendance) may be disabled.")
 
 
-def safe_single(sb, schema: str, table: str, cols: str = "*", **eq_filters) -> dict:
+# ============================================================
+# CLIENTS
+# ============================================================
+@st.cache_resource
+def get_anon_client(url: str, anon_key: str):
+    return create_client(url.strip(), anon_key.strip())
+
+
+@st.cache_resource
+def get_service_client(url: str, service_key: str):
+    return create_client(url.strip(), service_key.strip())
+
+
+sb_anon = get_anon_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+sb_service = get_service_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_SERVICE_KEY else None
+
+
+# ============================================================
+# SAFE ERROR TEXT
+# ============================================================
+def _api_msg(e: Exception) -> str:
+    if isinstance(e, APIError):
+        payload = e.args[0] if getattr(e, "args", None) else {}
+        if isinstance(payload, dict):
+            return str(payload.get("message") or payload.get("details") or payload.get("hint") or "APIError")
+        return str(e)
+    return repr(e)
+
+
+def table_readable(client, schema: str, table_name: str) -> bool:
     try:
-        q = sb.schema(schema).table(table).select(cols)
-        for k, v in eq_filters.items():
-            q = q.eq(k, v)
-        q = q.limit(1)
-        rows = q.execute().data or []
-        return rows[0] if rows else {}
-    except Exception:
-        return {}
-
-
-def _table_exists(sb, schema: str, table: str) -> bool:
-    try:
-        sb.schema(schema).table(table).select("*").limit(1).execute()
+        client.schema(schema).table(table_name).select("*").limit(1).execute()
         return True
     except Exception:
         return False
 
 
-def _num(x, default=0.0) -> float:
+def safe_select(
+    client,
+    table_name: str,
+    select_cols: str = "*",
+    schema: str = "public",
+    order_by: str | None = None,
+    order_desc: bool = False,
+    limit: int | None = None,
+    **filters,
+) -> list[dict]:
     try:
-        if x is None or x == "":
-            return float(default)
-        return float(x)
-    except Exception:
-        return float(default)
-
-
-def _fmt_money(x, decimals: int = 0) -> str:
-    try:
-        v = float(x)
-        return f"{v:,.{decimals}f}" if decimals else f"{v:,.0f}"
-    except Exception:
-        return "—"
-
-
-def _to_date(x) -> date | None:
-    if x is None:
-        return None
-    if isinstance(x, date) and not isinstance(x, datetime):
-        return x
-    if isinstance(x, datetime):
-        return x.date()
-    s = str(x).strip()
-    if not s:
-        return None
-    if "T" in s:
-        s = s.split("T")[0]
-    try:
-        return datetime.fromisoformat(s).date()
-    except Exception:
-        return None
+        q = client.schema(schema).table(table_name).select(select_cols)
+        for col, val in (filters or {}).items():
+            if val is None:
+                continue
+            q = q.eq(col, val)
+        if order_by:
+            q = q.order(order_by, desc=order_desc)
+        if limit is not None:
+            q = q.limit(int(limit))
+        return (q.execute().data or [])
+    except Exception as e:
+        st.error(f"Error reading {schema}.{table_name}")
+        st.code(_api_msg(e), language="text")
+        return []
 
 
 # ============================================================
-# AUTO-REFRESH ON app_state CHANGE
+# LAZY IMPORT HELPER (PREVENTS BLACK SCREEN)
 # ============================================================
-def _read_state_stamp(sb, schema: str) -> str:
-    r = safe_single(sb, schema, "app_state", "*", id=1)
-    return "|".join(
-        [
-            str(r.get("current_session_id") or ""),
-            str(r.get("next_member_id") or ""),
-            str(r.get("next_payout_date") or ""),
-            str(r.get("updated_at") or ""),
-        ]
-    )
+def lazy_import(path: str, attr: str | None = None) -> tuple[Any | None, str | None]:
+    """
+    Returns (obj, error_text). Never raises.
+    """
+    try:
+        mod = __import__(path, fromlist=["*"])
+        if attr:
+            return getattr(mod, attr), None
+        return mod, None
+    except Exception as e:
+        return None, repr(e)
 
 
-def _auto_refresh_if_state_changed(sb, schema: str):
-    stamp = _read_state_stamp(sb, schema)
-    prev = st.session_state.get("_state_stamp_dashboard")
-    st.session_state["_state_stamp_dashboard"] = stamp
-    if prev is None:
-        return
-    if stamp != prev:
-        try:
-            st.cache_data.clear()
-            st.cache_resource.clear()
-        except Exception:
-            pass
+# ============================================================
+# TOP BAR
+# ============================================================
+left, right = st.columns([1, 0.25])
+with left:
+    st.markdown(f"## 🏦 {APP_BRAND} • Bank Dashboard")
+with right:
+    if st.button("🔄 Refresh data", use_container_width=True):
+        st.cache_data.clear()
+        st.cache_resource.clear()
         st.rerun()
 
 
 # ============================================================
-# FINANCE COMPUTATIONS
+# SIDEBAR SAFE MODE
 # ============================================================
-def compute_interest_ledger(sb, schema: str) -> Tuple[float, float]:
-    if not _table_exists(sb, schema, "interest_ledger"):
-        return 0.0, 0.0
-
-    rows = safe_table_order_fallback(
-        sb,
-        schema,
-        "interest_ledger",
-        "*",
-        limit=20000,
-        order_candidates=["interest_month", "created_at", "id"],
-        desc=True,
-    )
-    if not rows:
-        return 0.0, 0.0
-
-    month_prefix = date.today().strftime("%Y-%m")
-    this_month = 0.0
-    all_time = 0.0
-
-    for r in rows:
-        v = _num(r.get("amount"), 0.0)
-        all_time += v
-        im = str(r.get("interest_month") or "").strip()
-        if im.startswith(month_prefix):
-            this_month += v
-
-    return float(this_month), float(all_time)
-
-
-def compute_loan_payments(sb, schema: str) -> Tuple[float, Dict[int, date]]:
-    if not _table_exists(sb, schema, "loan_payments"):
-        return 0.0, {}
-
-    rows = safe_table_order_fallback(
-        sb,
-        schema,
-        "loan_payments",
-        "*",
-        limit=20000,
-        order_candidates=["paid_at", "created_at", "id"],
-        desc=True,
+with st.sidebar.expander("🛟 Safe Mode", expanded=False):
+    SAFE_MODE = st.checkbox(
+        "Run Dashboard only (disable optional pages)",
+        value=False,
+        help="Use this if Streamlit Cloud shows a blank screen; it avoids importing other modules.",
     )
 
-    total = 0.0
-    last_by_loan: Dict[int, date] = {}
-    for r in rows or []:
-        total += _num(r.get("amount"), 0.0)
-        try:
-            lid = int(r.get("loan_id"))
-        except Exception:
-            continue
-        d = _to_date(r.get("paid_at") or r.get("created_at"))
-        if d is not None and (lid not in last_by_loan or d > last_by_loan[lid]):
-            last_by_loan[lid] = d
 
-    return float(total), last_by_loan
-
-
-def compute_loans_kpis(sb, schema: str) -> Dict[str, Any]:
-    if not _table_exists(sb, schema, "loans"):
-        return {"active_loans": 0, "principal_active": 0.0, "total_due_active": 0.0}
-
-    rows = safe_table(sb, schema, "loans", "*", limit=20000)
-    active = 0
-    principal_sum = 0.0
-    due_sum = 0.0
-
-    for r in rows or []:
-        status = str(r.get("status") or "").lower().strip()
-        if status not in ("active", "open"):
-            continue
-        active += 1
-        pc = _num(r.get("principal_current") or r.get("principal"), 0.0)
-        principal_sum += pc
-        due_sum += _num(r.get("total_due"), pc + _num(r.get("unpaid_interest"), 0.0))
-
-    return {
-        "active_loans": int(active),
-        "principal_active": float(principal_sum),
-        "total_due_active": float(due_sum),
-    }
-
-
-def sum_table_amount(sb, schema: str, table: str, amount_cols: List[str]) -> float:
-    if not _table_exists(sb, schema, table):
-        return 0.0
-    rows = safe_table(sb, schema, table, "*", limit=20000)
-    total = 0.0
-    for r in rows or []:
-        val = None
-        for c in amount_cols:
-            if c in r:
-                val = r.get(c)
-                break
-        total += _num(val, 0.0)
-    return float(total)
-
-
-def compute_fines_paid_total(sb, schema: str) -> float:
-    if not _table_exists(sb, schema, "fines"):
-        return 0.0
-
-    rows = safe_table_order_fallback(
-        sb,
-        schema,
-        "fines",
-        "*",
-        limit=20000,
-        order_candidates=["paid_at", "created_at", "id"],
-        desc=True,
+# ============================================================
+# CACHED LOADERS
+# ============================================================
+@st.cache_data(ttl=90)
+def load_members(url: str, anon_key: str, schema: str) -> pd.DataFrame:
+    client = create_client(url, anon_key)
+    rows = (
+        client.schema(schema)
+        .table("members")
+        .select("id,name,display_name,phone")
+        .order("id", desc=False)
+        .limit(5000)
+        .execute()
+        .data
+        or []
     )
-    total = 0.0
-    for r in rows or []:
-        if str(r.get("status") or "").lower().strip() == "paid":
-            total += _num(r.get("amount"), 0.0)
-    return float(total)
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["id", "name", "display_name", "phone", "member_name", "label"])
+    df["id"] = pd.to_numeric(df["id"], errors="coerce").fillna(0).astype(int)
+    df = df[df["id"] > 0].copy()
+    df["name"] = df["name"].astype(str)
+    df["display_name"] = df.get("display_name", "").astype(str).replace({"None": "", "nan": ""})
+    df["phone"] = df.get("phone", "").astype(str).replace({"None": "", "nan": ""})
+    df["member_name"] = df["display_name"].where(df["display_name"].str.strip() != "", df["name"])
+    df["label"] = df.apply(lambda r: f"{int(r['id']):02d} • {r['member_name']}", axis=1)
+    return df
 
 
-def get_session_window(sb, schema: str, session_id: int) -> str:
-    if not session_id:
-        return "—"
-    srow = safe_single(sb, schema, "sessions", "*", session_id=int(session_id))
-    sd = srow.get("start_date")
-    ed = srow.get("end_date")
-    return f"{sd} → {ed}" if (sd and ed) else "—"
-
-
-def build_repayment_plan(sb, schema: str, last_payment_dates: Dict[int, date]) -> pd.DataFrame:
-    loans = safe_table(sb, schema, "loans", "*", limit=20000)
-    out: List[dict] = []
-
-    for r in loans or []:
-        status = str(r.get("status") or "").lower().strip()
-        if status not in ("active", "open"):
-            continue
-
-        try:
-            lid = int(r.get("id"))
-        except Exception:
-            continue
-
-        principal = _num(r.get("principal_current") or r.get("principal"), 0.0)
-        unpaid_interest = _num(r.get("unpaid_interest"), 0.0)
-        total_due = _num(r.get("total_due"), principal + unpaid_interest)
-
-        borrow_date = _to_date(r.get("borrow_date")) or _to_date(r.get("created_at")) or date.today()
-
-        if lid in last_payment_dates:
-            last_paid = last_payment_dates[lid]
-            next_due = last_paid + timedelta(days=DUE_DAYS)
-        else:
-            last_paid = None
-            next_due = borrow_date + timedelta(days=DUE_DAYS)
-
-        out.append(
-            {
-                "loan_id": lid,
-                "member_id": r.get("member_id"),
-                "principal_current": principal,
-                "unpaid_interest": unpaid_interest,
-                "total_due": total_due,
-                "last_paid": last_paid.isoformat() if isinstance(last_paid, date) else "—",
-                "next_due_date": next_due.isoformat(),
-            }
+@st.cache_data(ttl=60)
+def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFrame:
+    client = create_client(url, anon_key)
+    try:
+        rows = (
+            client.schema(schema)
+            .table("v_contributions_with_member")
+            .select("id,member_id,member_name,session_id,amount,paid_at,note,created_at")
+            .order("created_at", desc=True)
+            .limit(1000)
+            .execute()
+            .data
+            or []
         )
-
-    df = pd.DataFrame(out)
-    return df.sort_values("next_due_date", ascending=True) if not df.empty else df
-
-
-# ============================================================
-# ATTENDANCE — COUNTS + DEDUPE
-# ============================================================
-def _dedupe_attendance_rows(dfa: pd.DataFrame) -> pd.DataFrame:
-    if dfa is None or dfa.empty:
-        return dfa
-
-    for c in ("id", "member_id", "session_id", "present", "created_at"):
-        if c not in dfa.columns:
-            dfa[c] = None
-
-    dfa["member_id"] = pd.to_numeric(dfa["member_id"], errors="coerce")
-    dfa["session_id"] = pd.to_numeric(dfa["session_id"], errors="coerce")
-    dfa["_created_at_sort"] = pd.to_datetime(dfa["created_at"], errors="coerce")
-    dfa["_id_sort"] = pd.to_numeric(dfa["id"], errors="coerce")
-
-    dfa = dfa.sort_values(["_created_at_sort", "_id_sort"], ascending=[False, False])
-    dfa = dfa.drop_duplicates(subset=["member_id", "session_id"], keep="first")
-
-    return dfa.drop(columns=["_created_at_sort", "_id_sort"], errors="ignore")
-
-
-def load_attendance_counts(read_sb, schema: str) -> pd.DataFrame:
-    """
-    Output columns:
-      member_id, member_name, phone, present_count, absent_count, total_sessions
-    """
-    # Try optional view (if it has counts)
-    view_name = "v_attendance_member_totals"
-    if _table_exists(read_sb, schema, view_name):
-        rows = safe_table(read_sb, schema, view_name, "*", limit=5000, order_by="member_id", desc=False)
-        if rows:
-            dv = pd.DataFrame(rows)
-
-            if "member_name" not in dv.columns:
-                dv["member_name"] = dv.get("name", dv.get("display_name", ""))
-
-            if "phone" not in dv.columns:
-                dv["phone"] = dv.get("member_phone")
-
-            pcol = next((c for c in ["present_count", "total_present", "present"] if c in dv.columns), None)
-            acol = next((c for c in ["absent_count", "total_absent", "absent"] if c in dv.columns), None)
-            tcol = next((c for c in ["total_sessions", "total", "sessions_count"] if c in dv.columns), None)
-
-            if pcol and tcol:
-                dv["present_count"] = pd.to_numeric(dv[pcol], errors="coerce").fillna(0).astype(int)
-                dv["total_sessions"] = pd.to_numeric(dv[tcol], errors="coerce").fillna(0).astype(int)
-                dv["absent_count"] = (dv["total_sessions"] - dv["present_count"]).clip(lower=0).astype(int)
-                keep = ["member_id", "member_name", "phone", "present_count", "absent_count", "total_sessions"]
-                for c in keep:
-                    if c not in dv.columns:
-                        dv[c] = None
-                return dv[keep].sort_values("member_id", ascending=True)
-
-            if pcol and acol:
-                dv["present_count"] = pd.to_numeric(dv[pcol], errors="coerce").fillna(0).astype(int)
-                dv["absent_count"] = pd.to_numeric(dv[acol], errors="coerce").fillna(0).astype(int)
-                dv["total_sessions"] = (dv["present_count"] + dv["absent_count"]).astype(int)
-                keep = ["member_id", "member_name", "phone", "present_count", "absent_count", "total_sessions"]
-                for c in keep:
-                    if c not in dv.columns:
-                        dv[c] = None
-                return dv[keep].sort_values("member_id", ascending=True)
-
-    # Fallback compute from attendance table
-    members = safe_table(read_sb, schema, "members", "id,name,display_name,phone", limit=5000, order_by="id", desc=False)
-    attendance = safe_table(read_sb, schema, "attendance", "id,member_id,session_id,present,note,created_at", limit=20000)
-
-    dfm = pd.DataFrame(members or [])
-    dfa = pd.DataFrame(attendance or [])
-
-    if dfm.empty:
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+    except Exception:
         return pd.DataFrame()
 
-    for col in ("id", "name", "display_name", "phone"):
-        if col not in dfm.columns:
-            dfm[col] = None
-
-    out = dfm.rename(columns={"id": "member_id"}).copy()
-    out["member_name"] = out["display_name"].fillna("").astype(str).str.strip()
-    out.loc[out["member_name"] == "", "member_name"] = out["name"].fillna("").astype(str).str.strip()
-
-    if dfa.empty:
-        out["present_count"] = 0
-        out["absent_count"] = 0
-        out["total_sessions"] = 0
-        return out[["member_id", "member_name", "phone", "present_count", "absent_count", "total_sessions"]].sort_values("member_id")
-
-    dfa["present"] = dfa.get("present", False)
-    dfa["present"] = dfa["present"].fillna(False).astype(bool)
-
-    # ✅ dedupe duplicates
-    dfa = _dedupe_attendance_rows(dfa)
-
-    grp = (
-        dfa.groupby("member_id", dropna=True)
-        .agg(
-            total_sessions=("session_id", "nunique"),
-            present_count=("present", lambda s: int(s.sum())),
-        )
-        .reset_index()
-    )
-    grp["absent_count"] = (grp["total_sessions"] - grp["present_count"]).clip(lower=0).astype(int)
-
-    out["member_id"] = pd.to_numeric(out["member_id"], errors="coerce")
-    out = out.merge(grp[["member_id", "present_count", "absent_count", "total_sessions"]], on="member_id", how="left")
-
-    out["present_count"] = out["present_count"].fillna(0).astype(int)
-    out["absent_count"] = out["absent_count"].fillna(0).astype(int)
-    out["total_sessions"] = out["total_sessions"].fillna(0).astype(int)
-
-    return out[["member_id", "member_name", "phone", "present_count", "absent_count", "total_sessions"]].sort_values("member_id")
-
-
-def render_attendance_counts_chart(att_df: pd.DataFrame):
-    if att_df is None or att_df.empty:
-        st.info("No attendance data yet.")
-        return
-
-    df = att_df.copy()
-    df["present_count"] = pd.to_numeric(df["present_count"], errors="coerce").fillna(0).astype(int)
-    df["absent_count"] = pd.to_numeric(df["absent_count"], errors="coerce").fillna(0).astype(int)
-    df["total_sessions"] = pd.to_numeric(df["total_sessions"], errors="coerce").fillna(0).astype(int)
-
-    rank_by = st.selectbox("Rank members by", ["present_count", "absent_count", "total_sessions"], index=0)
-    max_n = max(5, min(50, len(df)))
-    default_n = min(17, len(df))
-    top_n = st.slider("Show top N members", min_value=5, max_value=max_n, value=default_n)
-
-    df = df.sort_values(rank_by, ascending=False).head(int(top_n)).copy()
-
-    chart_df = df.set_index("member_name")[["present_count", "absent_count"]]
-    chart_df = chart_df.rename(columns={"present_count": "Present", "absent_count": "Absent"})
-
-    # Streamlit native multi-series chart (no extra libs)
-    st.bar_chart(chart_df)
-
 
 # ============================================================
-# MAIN DASHBOARD ENTRY (THIS IS WHAT app.py IMPORTS)
+# SESSION HELPERS (Minutes/Attendance)
 # ============================================================
-def render_dashboard(sb_anon, sb_service, schema: str = "public"):
-    inject_dashboard_theme()
+def get_app_state(sb, schema: str) -> dict:
+    rows = safe_select(sb, "app_state", "*", schema=schema, limit=1, id=1)
+    if rows:
+        return rows[0]
+    rows2 = safe_select(sb, "app_state", "*", schema=schema, limit=1)
+    return rows2[0] if rows2 else {}
 
-    read_sb = sb_service if sb_service is not None else sb_anon
-    finance_sb = sb_service if sb_service is not None else sb_anon
 
-    _auto_refresh_if_state_changed(read_sb, schema)
-
-    st.markdown("## 🏦 theyoungshallgrow • Bank Dashboard")
-
-    # --- App state ---
-    state = safe_single(read_sb, schema, "app_state", "*", id=1)
-    if not state:
-        rows = safe_table(read_sb, schema, "app_state", "*", limit=1)
-        state = rows[0] if rows else {}
-
-    # --- Current session id (robust) ---
-    raw_cs = state.get("current_session_id")
+def get_effective_session_id(sb_read, schema: str) -> tuple[int | None, str]:
+    """
+    Returns (session_id, note): from app_state OR fallback to latest session.
+    """
+    state = get_app_state(sb_read, schema)
+    raw = state.get("current_session_id")
     try:
-        current_session_id = int(raw_cs) if raw_cs is not None and str(raw_cs).strip() != "" else None
+        cs = int(raw) if raw is not None and str(raw).strip() != "" else None
     except Exception:
-        current_session_id = None
+        cs = None
+
+    if cs is not None:
+        return cs, "from app_state"
+
+    srows = safe_select(
+        sb_read,
+        "sessions",
+        "session_id,start_date,end_date,created_at",
+        schema=schema,
+        order_by="session_id",
+        order_desc=True,
+        limit=1,
+    )
+    if srows:
+        try:
+            return int(srows[0].get("session_id")), "fallback: latest session"
+        except Exception:
+            return None, "fallback failed"
+    return None, "no sessions"
+
+
+# ============================================================
+# NAVIGATION
+# ============================================================
+if SAFE_MODE:
+    PAGES = ["Dashboard"]
+else:
+    PAGES = [
+        "Dashboard",
+        "Contributions",
+        "Payouts",
+        "Loans",
+        "🤖 AI Risk Panel",
+        "Minutes & Attendance",
+        "Admin",
+        "Audit",
+        "Health",
+    ]
+
+page = st.sidebar.radio("Menu", PAGES, key="main_menu")
+
+
+# ============================================================
+# PAGES
+# ============================================================
+if page == "Dashboard":
+    # Dashboard panel must NOT render big header (app.py owns it)
+    render_dashboard(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
+
+
+elif page == "Contributions":
+    st.markdown(glass_open(), unsafe_allow_html=True)
+    st.subheader("Contributions")
+    st.caption("Stored by member_id. Names shown via view if available.")
+
+    df = load_contributions_view(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
+    if df.empty:
+        # fallback: show raw contributions without names
+        rows = safe_select(sb_anon, "contributions", "*", schema=SUPABASE_SCHEMA, order_by="created_at", order_desc=True, limit=500)
+        df2 = pd.DataFrame(rows)
+        if df2.empty:
+            st.info("No contributions found.")
+        else:
+            st.warning("View v_contributions_with_member not readable. Showing raw contributions.")
+            st.dataframe(df2, use_container_width=True, hide_index=True)
+    else:
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.markdown(glass_close(), unsafe_allow_html=True)
+
+
+elif page == "Payouts":
+    if not sb_service:
+        st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY to enable payout writes.")
+        st.stop()
+
+    payout_fn, payout_err = lazy_import("payout", "render_payouts")
+    if payout_fn is None:
+        st.error("Payout module failed to load.")
+        st.code(payout_err or "", language="text")
+    else:
+        payout_fn(sb_service, SUPABASE_SCHEMA)
+
+
+elif page == "Loans":
+    if not sb_service:
+        st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY to enable loans writes.")
+        st.stop()
+
+    needed = ["members", "loans", "loan_payments", "loan_requests", "signatures", "interest_ledger"]
+    missing = [t for t in needed if not table_readable(sb_service, SUPABASE_SCHEMA, t)]
+    if missing:
+        st.error("Loans module is not ready — missing required table(s):")
+        st.write(", ".join([f"{SUPABASE_SCHEMA}.{t}" for t in missing]))
+        st.stop()
+
+    loans_mod, loans_err = lazy_import("loans", None)  # expects show_loans or render_loans
+    if loans_mod is None:
+        st.error("Loans module failed to import.")
+        st.code(loans_err or "", language="text")
+    else:
+        loans_fn = getattr(loans_mod, "show_loans", None) or getattr(loans_mod, "render_loans", None)
+        if loans_fn is None:
+            st.error("loans.py must define show_loans() or render_loans().")
+        else:
+            loans_fn(sb_service, SUPABASE_SCHEMA, actor_user_id="")
+
+
+elif page == "🤖 AI Risk Panel":
+    fn, err = lazy_import("ai_risk_panel", "render_ai_risk_panel")
+    if fn is None:
+        st.error("AI Risk Panel failed to load.")
+        st.code(err or "", language="text")
+    else:
+        fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
+
+
+elif page == "Minutes & Attendance":
+    st.subheader("📝 Minutes & ✅ Attendance")
+
+    if not sb_service:
+        st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY to enable writing.")
+        st.stop()
+
+    read_for_session = sb_service if sb_service is not None else sb_anon
+    current_session_id, session_note = get_effective_session_id(read_for_session, SUPABASE_SCHEMA)
 
     if current_session_id is None:
-        srows = safe_table_order_fallback(
-            read_sb,
-            schema,
-            "sessions",
-            "session_id,start_date,end_date,created_at",
-            limit=1,
-            order_candidates=["session_id", "start_date", "created_at"],
-            desc=True,
-        )
-        if srows:
-            try:
-                current_session_id = int(srows[0].get("session_id"))
-            except Exception:
-                current_session_id = None
+        st.error("No sessions found. Create a session first in Admin → Sessions.")
+        st.stop()
 
-    session_note = "from app_state" if state.get("current_session_id") else "fallback: latest session"
-    next_member_id = state.get("next_member_id")
+    if session_note != "from app_state":
+        st.warning("app_state.current_session_id is not set. Using latest session as fallback. Set it in Admin → Rotation.")
 
-    # --- Members ---
-    members_rows = safe_table(read_sb, schema, "members", "id,name,display_name", limit=5000, order_by="id", desc=False)
+    with st.sidebar.expander("🔐 Role (Minutes/Attendance)", expanded=False):
+        role = st.selectbox("Role", ["admin", "treasury", "member"], index=0, key="ma_role")
+    can_write = role in ("admin", "treasury")
 
-    # Dedup safety
-    seen = set()
-    dedup = []
-    for m in members_rows or []:
-        mid = m.get("id")
-        if mid in seen:
-            continue
-        seen.add(mid)
-        dedup.append(m)
-    members_rows = dedup
+    df_members = load_members(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
+    if df_members.empty:
+        st.error("No members found in members.")
+        st.stop()
 
-    total_members = int(len(members_rows or []))
+    tab1, tab2, tab3 = st.tabs(["Minutes / Documentation", "Attendance", "Summaries"])
 
-    # --- Beneficiary ---
-    beneficiary_name = "—"
-    beneficiary_id = next_member_id
-
-    if _table_exists(read_sb, schema, "v_next_beneficiary"):
-        v = safe_single(read_sb, schema, "v_next_beneficiary", "*")
-        if v:
-            beneficiary_name = str(v.get("beneficiary_name") or v.get("member_name") or "—")
-            beneficiary_id = v.get("beneficiary_id") or v.get("member_id") or beneficiary_id
-    else:
-        try:
-            bid = int(beneficiary_id) if beneficiary_id is not None else None
-        except Exception:
-            bid = None
-        if bid is not None:
-            for m in members_rows or []:
-                if str(m.get("id")) == str(bid):
-                    dn = str(m.get("display_name") or "").strip()
-                    nm = str(m.get("name") or "").strip()
-                    beneficiary_name = dn or nm or f"Member {bid:02d}"
-                    break
-
-    window = "—"
-    if isinstance(current_session_id, int) and current_session_id > 0:
-        window = get_session_window(read_sb, schema, int(current_session_id))
-
-    # --- Current pot (cycle contributions only) ---
-    pot = 0.0
-    members_paid = 0
-    if isinstance(current_session_id, int) and current_session_id > 0:
-        crows = safe_table(finance_sb, schema, "contributions", "member_id,session_id,amount", limit=20000)
-        dfc = pd.DataFrame(crows or [])
-        if not dfc.empty and "session_id" in dfc.columns:
-            dfc["session_id"] = pd.to_numeric(dfc["session_id"], errors="coerce").fillna(-1).astype(int)
-            dfc = dfc[dfc["session_id"] == int(current_session_id)].copy()
-            dfc["amount"] = pd.to_numeric(dfc.get("amount"), errors="coerce").fillna(0.0)
-            pot = float(dfc["amount"].sum())
-            members_paid = int(dfc["member_id"].nunique()) if "member_id" in dfc.columns else 0
-
-    # --- Header KPIs ---
-    st.markdown(glass_open(), unsafe_allow_html=True)
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.markdown(kpi_card("Session ID", str(current_session_id or "—"), "blue", sub=session_note), unsafe_allow_html=True)
-    with c2:
-        st.markdown(kpi_card("Session Window", window, "orange"), unsafe_allow_html=True)
-    with c3:
-        st.markdown(kpi_card("Total Members", str(total_members), "purple", sub="members"), unsafe_allow_html=True)
-    with c4:
-        st.markdown(
-            kpi_card("Current Beneficiary", beneficiary_name, "green", sub=f"member_id: {beneficiary_id if beneficiary_id is not None else '—'}"),
-            unsafe_allow_html=True,
-        )
-    st.markdown(glass_close(), unsafe_allow_html=True)
-
-    st.divider()
-
-    # --- Cycle KPIs ---
-    st.markdown(glass_open(), unsafe_allow_html=True)
-    p1, p2, p3 = st.columns(3)
-    with p1:
-        st.markdown(kpi_card("Current Pot", _fmt_money(pot, 0), "green"), unsafe_allow_html=True)
-    with p2:
-        st.markdown(kpi_card("Cycle Contributions", _fmt_money(pot, 0), "blue"), unsafe_allow_html=True)
-    with p3:
-        st.markdown(kpi_card("Members Paid", str(members_paid), "purple"), unsafe_allow_html=True)
-    st.markdown(glass_close(), unsafe_allow_html=True)
-
-    st.divider()
-
-    # --- Financial Summary ---
-    foundation_total = sum_table_amount(finance_sb, schema, "foundation_contributions", ["amount"])
-    payouts_total = sum_table_amount(finance_sb, schema, "payouts", ["payout_amount", "amount"])  # info only
-    interest_this_month, interest_all_time = compute_interest_ledger(finance_sb, schema)
-    repayments_total, last_payment_dates = compute_loan_payments(finance_sb, schema)
-    fines_paid_total = compute_fines_paid_total(finance_sb, schema)
-    loan_kpis = compute_loans_kpis(finance_sb, schema)
-    loans_outstanding = float(loan_kpis["principal_active"])
-
-    cash_available_raw = foundation_total + repayments_total + interest_all_time + fines_paid_total - loans_outstanding
-    cash_available = max(cash_available_raw, 0.0)
-    net_available = cash_available + float(pot)
-
-    st.markdown("### 🏦 Financial Summary")
-
-    st.markdown(glass_open(), unsafe_allow_html=True)
-    f1, f2, f3, f4, f5, f6, f7, f8, f9 = st.columns(9)
-    with f1:
-        st.markdown(kpi_card("Foundation Total", _fmt_money(foundation_total, 0), "blue", sub="foundation_contributions"), unsafe_allow_html=True)
-    with f2:
-        st.markdown(kpi_card("Payouts Total", _fmt_money(payouts_total, 0), "orange", sub="pot redistribution (info)"), unsafe_allow_html=True)
-    with f3:
-        st.markdown(kpi_card("Interest This Month", _fmt_money(interest_this_month, 2), "green", sub="interest_ledger (YYYY-MM)"), unsafe_allow_html=True)
-    with f4:
-        st.markdown(kpi_card("Interest All-time", _fmt_money(interest_all_time, 2), "green", sub="interest_ledger (all)"), unsafe_allow_html=True)
-    with f5:
-        st.markdown(kpi_card("Loan Payments", _fmt_money(repayments_total, 0), "green", sub="loan_payments"), unsafe_allow_html=True)
-    with f6:
-        st.markdown(kpi_card("Total Fines Paid", _fmt_money(fines_paid_total, 0), "purple", sub="fines.status='paid'"), unsafe_allow_html=True)
-    with f7:
-        st.markdown(kpi_card("Outstanding Principal", _fmt_money(loans_outstanding, 0), "red", sub="loans.principal_current"), unsafe_allow_html=True)
-    with f8:
-        st.markdown(kpi_card("Cash Available", _fmt_money(cash_available, 0), "green", sub="foundation + payments + interest + fines − principal"), unsafe_allow_html=True)
-    with f9:
-        st.markdown(kpi_card("Net Available", _fmt_money(net_available, 0), "blue", sub="Cash Available + Current Pot"), unsafe_allow_html=True)
-    st.markdown(glass_close(), unsafe_allow_html=True)
-
-    if cash_available_raw < 0:
-        st.warning(
-            f"⚠️ Cash Available RAW is negative ({cash_available_raw:,.0f}) before flooring to 0. "
-            "Outstanding loans exceed foundation cash-in."
-        )
-
-    st.divider()
-
-    # --- Attendance (Counts) ---
-    st.markdown("### ✅ Attendance • All-time Summary (Counts)")
-    att_df = load_attendance_counts(read_sb, schema)
-    render_attendance_counts_chart(att_df)
-
-    st.divider()
-
-    # --- Loans summary + repayment plan ---
-    st.markdown("### 💳 Loans")
-    st.markdown(glass_open(), unsafe_allow_html=True)
-    l1, l2, l3 = st.columns(3)
-    with l1:
-        st.markdown(kpi_card("Active Loans", str(int(loan_kpis["active_loans"])), "purple"), unsafe_allow_html=True)
-    with l2:
-        st.markdown(kpi_card("Principal Current", _fmt_money(loan_kpis["principal_active"], 0), "orange"), unsafe_allow_html=True)
-    with l3:
-        st.markdown(kpi_card("Total Due", _fmt_money(loan_kpis["total_due_active"], 0), "red"), unsafe_allow_html=True)
-    st.markdown(glass_close(), unsafe_allow_html=True)
-
-    plan_df = build_repayment_plan(finance_sb, schema, last_payment_dates)
-    if plan_df.empty:
-        st.info("No active/open loans found.")
-    else:
+    # -------------------------
+    # Minutes
+    # -------------------------
+    with tab1:
         st.markdown(glass_open(), unsafe_allow_html=True)
-        st.markdown("#### 🗓️ Loan Repayment Plan")
-        st.caption(f"Due = {DUE_DAYS} days from last payment (or borrow_date if never paid).")
-        st.dataframe(plan_df, use_container_width=True, hide_index=True)
+        st.subheader("Meeting Minutes / Documentation")
+        st.caption(f"Linked session_id: {current_session_id}  •  {session_note}")
+
+        if can_write:
+            with st.form("minutes_form", clear_on_submit=False):
+                title = st.text_input("Title", key="minutes_title")
+                body = st.text_area("Minutes / Documentation", height=260, key="minutes_body")
+                ok = st.form_submit_button("💾 Save minutes", use_container_width=True)
+
+            if ok:
+                if not title.strip() or not body.strip():
+                    st.error("Title and body are required.")
+                else:
+                    existing = (
+                        sb_service.schema(SUPABASE_SCHEMA)
+                        .table("minutes")
+                        .select("id,session_id")
+                        .eq("session_id", int(current_session_id))
+                        .limit(1)
+                        .execute()
+                        .data
+                        or []
+                    )
+                    try:
+                        if existing:
+                            mid = int(existing[0]["id"])
+                            sb_service.schema(SUPABASE_SCHEMA).table("minutes").update(
+                                {"title": title.strip(), "body": body.strip(), "updated_at": now_iso(), "created_by": role}
+                            ).eq("id", mid).execute()
+                            st.success("Minutes updated.")
+                        else:
+                            sb_service.schema(SUPABASE_SCHEMA).table("minutes").insert(
+                                {
+                                    "session_id": int(current_session_id),
+                                    "title": title.strip(),
+                                    "body": body.strip(),
+                                    "created_by": role,
+                                    "created_at": now_iso(),
+                                    "updated_at": now_iso(),
+                                }
+                            ).execute()
+                            st.success("Minutes saved.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error("Failed to save minutes.")
+                        st.code(_api_msg(e), language="text")
+
+        st.divider()
+        st.markdown("### Current session minutes")
+        rows = safe_select(
+            sb_service, "minutes", "*",
+            schema=SUPABASE_SCHEMA,
+            order_by="updated_at",
+            order_desc=True,
+            limit=10,
+            session_id=int(current_session_id),
+        )
+        dfm = pd.DataFrame(rows)
+        if dfm.empty:
+            st.info("No minutes recorded yet.")
+        else:
+            st.dataframe(dfm, use_container_width=True, hide_index=True)
+
         st.markdown(glass_close(), unsafe_allow_html=True)
 
-    # --- Debug ---
-    with st.expander("🔎 Debug", expanded=False):
-        st.write("Using read client:", "service" if sb_service is not None else "anon")
-        st.write("app_state", state)
-        st.write("current_session_id", current_session_id)
-        st.write("next_member_id", next_member_id)
-        st.write("beneficiary_id", beneficiary_id)
-        st.write("beneficiary_name", beneficiary_name)
-        st.write("current_pot", pot)
-        st.write("members_paid", members_paid)
-        st.write("foundation_total", foundation_total)
-        st.write("payouts_total (info)", payouts_total)
-        st.write("interest_this_month", interest_this_month)
-        st.write("interest_all_time", interest_all_time)
-        st.write("loan_payments_total", repayments_total)
-        st.write("fines_paid_total", fines_paid_total)
-        st.write("loan_kpis", loan_kpis)
-        st.write("cash_available_raw", cash_available_raw)
-        st.write("cash_available", cash_available)
-        st.write("net_available", net_available)
-        st.write("attendance_rows", 0 if att_df is None else int(len(att_df)))
+    # -------------------------
+    # Attendance
+    # -------------------------
+    with tab2:
+        st.markdown(glass_open(), unsafe_allow_html=True)
+        st.subheader("Attendance")
+        st.caption(f"Linked session_id: {current_session_id}  •  {session_note}")
+        st.caption("Mark each member as Present or Absent. Add a reason/note if needed.")
+
+        attendance_rows: list[dict] = []
+        for _, r in df_members.sort_values("id").iterrows():
+            mid = int(r["id"])
+            name = str(r.get("member_name") or r.get("name") or "")
+            label = f"{mid:02d} • {name}"
+
+            c_status, c_note = st.columns([0.42, 0.58])
+            with c_status:
+                status_key = f"att_status_{mid}_{current_session_id}"
+                status = st.radio(label, options=["present", "absent"], index=0, horizontal=True, key=status_key)
+            with c_note:
+                note_key = f"att_note_{mid}_{current_session_id}"
+                note = st.text_input(
+                    "Reason / Note",
+                    value="",
+                    placeholder="e.g., Sick, Travel, Excused…",
+                    key=note_key,
+                    label_visibility="collapsed",
+                )
+
+            attendance_rows.append({"member_id": mid, "present": (status == "present"), "note": note.strip() or None})
+
+        st.divider()
+        save = st.button("💾 Save attendance (ALL members)", use_container_width=True)
+
+        if save:
+            if not can_write:
+                st.warning("Only admin/treasury can save attendance.")
+            else:
+                payload_rows = [
+                    {
+                        "session_id": int(current_session_id),
+                        "member_id": int(row["member_id"]),
+                        "present": bool(row["present"]),
+                        "note": row["note"],
+                        "created_at": now_iso(),
+                    }
+                    for row in attendance_rows
+                ]
+
+                # delete-then-insert for this session (prevents duplicates)
+                try:
+                    sb_service.schema(SUPABASE_SCHEMA).table("attendance").delete().eq("session_id", int(current_session_id)).execute()
+                except Exception:
+                    pass
+
+                try:
+                    sb_service.schema(SUPABASE_SCHEMA).table("attendance").insert(payload_rows).execute()
+                    present_count = sum(1 for r in payload_rows if r.get("present") is True)
+                    absent_count = len(payload_rows) - present_count
+                    st.success(f"Attendance saved ✅ Present: {present_count} • Absent: {absent_count}")
+                    st.rerun()
+                except Exception as e:
+                    st.error("Failed to save attendance.")
+                    st.code(_api_msg(e), language="text")
+
+        st.divider()
+        st.markdown("### Current session attendance")
+
+        # Try optional view; fallback to join in python
+        if table_readable(sb_anon, SUPABASE_SCHEMA, "v_attendance_with_member"):
+            arows = safe_select(
+                sb_anon,
+                "v_attendance_with_member",
+                "*",
+                schema=SUPABASE_SCHEMA,
+                order_by="member_id",
+                order_desc=False,
+                limit=2000,
+                session_id=int(current_session_id),
+            )
+            dfa = pd.DataFrame(arows)
+            if dfa.empty:
+                st.info("No attendance recorded for this session yet.")
+            else:
+                st.dataframe(dfa, use_container_width=True, hide_index=True)
+        else:
+            arows = safe_select(
+                sb_anon,
+                "attendance",
+                "id,member_id,session_id,present,note,created_at",
+                schema=SUPABASE_SCHEMA,
+                order_by="member_id",
+                order_desc=False,
+                limit=2000,
+                session_id=int(current_session_id),
+            )
+            dfa = pd.DataFrame(arows)
+            if dfa.empty:
+                st.info("No attendance recorded for this session yet.")
+            else:
+                dm = df_members[["id", "member_name"]].rename(columns={"id": "member_id"})
+                dfa["member_id"] = pd.to_numeric(dfa["member_id"], errors="coerce")
+                dfa = dfa.merge(dm, on="member_id", how="left")
+                dfa = dfa[["member_id", "member_name", "present", "note", "created_at"]]
+                st.warning("View v_attendance_with_member not readable. Showing attendance joined in Python.")
+                st.dataframe(dfa, use_container_width=True, hide_index=True)
+
+        st.markdown(glass_close(), unsafe_allow_html=True)
+
+    # -------------------------
+    # Summaries
+    # -------------------------
+    with tab3:
+        st.markdown(glass_open(), unsafe_allow_html=True)
+        st.subheader("Summaries")
+        st.caption("Summaries for Minutes, Attendance, and Contributions.")
+
+        st.markdown("### 📝 Minutes summary")
+        m_rows = safe_select(sb_anon, "minutes", "*", schema=SUPABASE_SCHEMA, order_by="updated_at", order_desc=True, limit=20)
+        dfm = pd.DataFrame(m_rows)
+        if dfm.empty:
+            st.info("No minutes recorded yet.")
+        else:
+            pick_id = st.selectbox("Pick minutes ID", dfm["id"].tolist(), index=0, key="sum_minutes_pick")
+            row = dfm[dfm["id"] == pick_id].iloc[0].to_dict()
+            st.write(f"**{row.get('title','')}**  •  session {row.get('session_id','')}")
+            content = str(row.get("body", ""))
+            lines = [ln.strip("-• ").strip() for ln in content.splitlines() if ln.strip()]
+            bullets = [ln for ln in lines if len(ln) > 6][:8]
+            if bullets:
+                st.markdown("**Highlights**")
+                for b in bullets:
+                    st.write(f"• {b}")
+            else:
+                st.write((content[:700] + "…") if len(content) > 700 else content)
+
+        st.divider()
+        st.markdown("### ✅ Attendance summary (current session)")
+        a_rows = safe_select(
+            sb_anon,
+            "attendance",
+            "id,member_id,session_id,present,created_at",
+            schema=SUPABASE_SCHEMA,
+            order_by="created_at",
+            order_desc=True,
+            limit=2000,
+            session_id=int(current_session_id),
+        )
+        dfa = pd.DataFrame(a_rows)
+        if dfa.empty:
+            st.info("No attendance for current session.")
+        else:
+            present_count = int(dfa["present"].astype(bool).sum()) if "present" in dfa.columns else 0
+            st.metric("Present count", f"{present_count:,}")
+            st.metric("Absent count", f"{(len(dfa)-present_count):,}")
+
+        st.divider()
+        st.markdown("### 💰 Contributions summary (current session)")
+        dfc = load_contributions_view(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
+        if dfc.empty:
+            st.info("No contributions view available. Showing raw contributions.")
+            c_rows = safe_select(
+                sb_anon,
+                "contributions",
+                "member_id,session_id,amount,paid_at,created_at",
+                schema=SUPABASE_SCHEMA,
+                order_by="created_at",
+                order_desc=True,
+                limit=2000,
+                session_id=int(current_session_id),
+            )
+            dfc = pd.DataFrame(c_rows)
+            if dfc.empty:
+                st.info("No contributions for current session.")
+            else:
+                dfc["amount"] = pd.to_numeric(dfc["amount"], errors="coerce").fillna(0)
+                st.metric("Rows", f"{len(dfc):,}")
+                st.metric("Sum", f"{float(dfc['amount'].sum()):,.0f}")
+                st.dataframe(dfc, use_container_width=True, hide_index=True)
+        else:
+            dfc = dfc[dfc["session_id"].astype(str) == str(current_session_id)].copy()
+            if dfc.empty:
+                st.info("No contributions for current session.")
+            else:
+                dfc["amount"] = pd.to_numeric(dfc["amount"], errors="coerce").fillna(0)
+                st.metric("Rows", f"{len(dfc):,}")
+                st.metric("Sum", f"{float(dfc['amount'].sum()):,.0f}")
+                top = (
+                    dfc.groupby(["member_id", "member_name"], dropna=False)["amount"].sum()
+                    .sort_values(ascending=False)
+                    .head(10)
+                    .reset_index()
+                )
+                st.caption("Top contributors (current session)")
+                st.dataframe(top, use_container_width=True, hide_index=True)
+
+        st.markdown(glass_close(), unsafe_allow_html=True)
 
 
-# ============================================================
-# COMPATIBILITY (typo safety)
-# ============================================================
-def render_dashbaord(sb_anon, sb_service, schema: str = "public"):
-    # if app.py has typo import, this prevents crash
-    return render_dashboard(sb_anon, sb_service, schema=schema)
+elif page == "Admin":
+    if not sb_service:
+        st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY.")
+        st.stop()
+
+    admin_fn, admin_err = lazy_import("admin_panels", "render_admin")
+    if admin_fn is None:
+        st.error("Admin panel failed to load.")
+        st.code(admin_err or "", language="text")
+    else:
+        admin_fn(sb_service=sb_service, schema=SUPABASE_SCHEMA, actor_email="admin@yourorg.com")
 
 
-__all__ = ["render_dashboard", "render_dashbaord"]
+elif page == "Audit":
+    if not sb_service:
+        st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY.")
+        st.stop()
+
+    audit_fn, audit_err = lazy_import("audit_panel", "render_audit")
+    if audit_fn is None:
+        st.error("Audit panel failed to load.")
+        st.code(audit_err or "", language="text")
+    else:
+        audit_fn(sb_service=sb_service, schema=SUPABASE_SCHEMA)
+
+
+elif page == "Health":
+    health_fn, health_err = lazy_import("health_panel", "render_health")
+    if health_fn is None:
+        st.error("Health panel failed to load.")
+        st.code(health_err or "", language="text")
+    else:
+        health_fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
