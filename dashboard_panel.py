@@ -9,27 +9,31 @@
 # ✅ FINANCE MODEL (your rule):
 #    - Payouts are pot redistribution → NOT cash flow (informational only)
 #    - Adds FINES PAID as cash flow (fines.status='paid')
-#    - Interest is LEDGER-based (interest_ledger)
+#    - Interest is LEDGER-based (interest_ledger):
+#         - Interest this month = sum(amount) where interest_month startswith YYYY-MM
+#         - Interest all-time  = sum(amount) all rows
 #    - Cash Available = foundation + loan_payments + interest(ledger) + fines_paid − outstanding_principal
 #
-# ✅ Attendance dashboard table (ALL-TIME per member):
-#    - Reads from view: public.v_attendance_member_totals (or fallback v_attendance_member_totals)
-#    - If view is missing, it will compute totals from attendance table in Python (no SQL)
+# ✅ Attendance (ALL-TIME) on dashboard:
+#    - CHART ONLY (no dataframe numbers shown)
+#    - Reads from view public.v_attendance_member_totals if available
+#    - Fallback: computes from attendance table (no SQL)
 #
 # NEW TABLES ONLY:
-#   - app_state
-#   - sessions
-#   - members
-#   - contributions
-#   - foundation_contributions
-#   - loans
-#   - loan_payments
-#   - interest_ledger
-#   - payouts (informational only)
-#   - fines
-#   - attendance
-#   - (optional) v_next_beneficiary
-#   - (recommended) v_attendance_member_totals (view)
+#   - app_state                (id=1, current_session_id, next_member_id, optional next_payout_date, updated_at)
+#   - sessions                 (session_id, start_date, end_date, created_at)
+#   - members                  (id, name, phone, display_name optional)
+#   - contributions            (member_id, session_id, amount, paid_at, created_at)
+#   - foundation_contributions (member_id, session_id, amount, paid_at, created_at)
+#   - loans                    (id, member_id, status, principal_current, principal, unpaid_interest, total_interest_generated,
+#                               interest_rate_monthly, total_due (generated), borrow_date, due_cycle_days, last_paid_at, created_at, updated_at)
+#   - loan_payments            (loan_id, member_id, amount, paid_at, created_at)
+#   - interest_ledger          (id, loan_id, member_id, interest_month, amount, created_at, ...)
+#   - payouts                  (session_id, member_id, payout_amount, payout_date, payout_index, created_at, updated_at)  # informational only
+#   - fines                    (id, member_id, session_id, amount, reason, issued_by, status, paid_at, created_at, updated_at)
+#   - attendance               (id, member_id, session_id, present, note, created_at)
+#   - v_next_beneficiary       (optional view)
+#   - v_attendance_member_totals (recommended view)
 
 from __future__ import annotations
 
@@ -274,8 +278,9 @@ def _auto_refresh_if_state_changed(sb, schema: str):
 def compute_interest_ledger(sb, schema: str) -> tuple[float, float]:
     """
     ✅ Interest ledger-based:
-      - this_month: sum(amount) where interest_month starts with YYYY-MM (works for 'YYYY-MM' or 'YYYY-MM-01')
+      - this_month: sum(amount) where interest_month startswith YYYY-MM
       - all_time:   sum(amount) all rows
+    Works whether interest_month is 'YYYY-MM' OR 'YYYY-MM-01' OR ISO string.
     """
     if not _table_exists(sb, schema, "interest_ledger"):
         return 0.0, 0.0
@@ -355,6 +360,7 @@ def compute_loans_kpis(sb, schema: str) -> dict[str, Any]:
         pc = _num(r.get("principal_current") or r.get("principal"), 0.0)
         principal_sum += pc
 
+        # total_due is generated in DB (read-only)
         td = _num(r.get("total_due"), pc + _num(r.get("unpaid_interest"), 0.0))
         total_due_sum += td
 
@@ -408,7 +414,6 @@ def compute_fines_paid_total(sb, schema: str) -> float:
 def get_session_window(sb, schema: str, session_id: int) -> str:
     if not session_id:
         return "—"
-    # sessions has session_id, start_date, end_date
     srow = safe_single(sb, schema, "sessions", "*", session_id=int(session_id))
     sd = srow.get("start_date")
     ed = srow.get("end_date")
@@ -467,21 +472,22 @@ def build_repayment_plan(sb, schema: str, last_payment_dates: dict[int, date]) -
 
 
 # ============================================================
-# ATTENDANCE (ALL-TIME PER MEMBER)
+# ATTENDANCE (ALL-TIME PER MEMBER) — CHART ONLY
 # ============================================================
 def load_attendance_totals(read_sb, schema: str) -> pd.DataFrame:
     """
-    Preferred: read from view v_attendance_member_totals (fast, clean, dashboard-ready).
-    Fallback: compute from attendance table in Python if view missing or blocked by RLS.
+    Preferred: read from view v_attendance_member_totals (fast).
+    Fallback: compute from attendance table in Python.
+    Returns columns at least: member_name, attendance_percent.
     """
-    # 1) Try view (either name)
-    for view_name in ("v_attendance_member_totals", "v_attendance_member_totals".strip()):
-        if _table_exists(read_sb, schema, view_name):
-            rows = safe_table(read_sb, schema, view_name, "*", limit=5000, order_by="member_id", desc=False)
-            if rows:
-                return pd.DataFrame(rows)
+    # 1) Try view by name (your created view name)
+    view_name = "v_attendance_member_totals"
+    if _table_exists(read_sb, schema, view_name):
+        rows = safe_table(read_sb, schema, view_name, "*", limit=5000, order_by="member_id", desc=False)
+        if rows:
+            return pd.DataFrame(rows)
 
-    # 2) Fallback compute from tables (no SQL)
+    # 2) Fallback compute
     members = safe_table(read_sb, schema, "members", "id,name,display_name,phone", limit=5000, order_by="id", desc=False)
     attendance = safe_table(read_sb, schema, "attendance", "id,member_id,session_id,present,note,created_at", limit=20000)
 
@@ -491,57 +497,63 @@ def load_attendance_totals(read_sb, schema: str) -> pd.DataFrame:
     if dfm.empty:
         return pd.DataFrame()
 
-    # Ensure columns exist
     for col in ("id", "name", "display_name", "phone"):
         if col not in dfm.columns:
             dfm[col] = None
 
-    if dfa.empty:
-        # members with zeros
-        df = dfm.rename(columns={"id": "member_id"}).copy()
-        df["member_name"] = df["display_name"].fillna("").astype(str).str.strip()
-        df.loc[df["member_name"] == "", "member_name"] = df["name"].fillna("").astype(str).str.strip()
-        df["total_sessions_recorded"] = 0
-        df["total_present"] = 0
-        df["total_absent"] = 0
-        df["attendance_percent"] = 0.0
-        df["last_session_marked"] = None
-        df["last_marked_at"] = None
-        keep = ["member_id", "member_name", "phone", "total_sessions_recorded", "total_present", "total_absent", "attendance_percent", "last_session_marked", "last_marked_at"]
-        return df[keep].sort_values("member_id")
-
-    # Coerce types
-    dfa["present"] = dfa.get("present").fillna(False).astype(bool)
-    dfa["member_id"] = pd.to_numeric(dfa.get("member_id"), errors="coerce")
-    dfa["session_id"] = pd.to_numeric(dfa.get("session_id"), errors="coerce")
-
-    # Aggregate
-    grp = dfa.groupby("member_id", dropna=True).agg(
-        total_sessions_recorded=("id", "count"),
-        total_present=("present", lambda s: int(s.sum())),
-        total_absent=("present", lambda s: int((~s).sum())),
-        last_session_marked=("session_id", "max"),
-        last_marked_at=("created_at", "max"),
-    ).reset_index()
-
-    grp["attendance_percent"] = grp.apply(
-        lambda r: round((r["total_present"] / r["total_sessions_recorded"]) * 100, 2) if r["total_sessions_recorded"] else 0.0,
-        axis=1,
-    )
-
-    df = dfm.rename(columns={"id": "member_id"}).merge(grp, on="member_id", how="left")
-
-    # Fill names
+    df = dfm.rename(columns={"id": "member_id"}).copy()
     df["member_name"] = df["display_name"].fillna("").astype(str).str.strip()
     df.loc[df["member_name"] == "", "member_name"] = df["name"].fillna("").astype(str).str.strip()
 
-    # Fill totals
-    for c in ("total_sessions_recorded", "total_present", "total_absent"):
-        df[c] = df[c].fillna(0).astype(int)
+    if dfa.empty:
+        df["attendance_percent"] = 0.0
+        return df[["member_id", "member_name", "phone", "attendance_percent"]].sort_values("member_id")
+
+    dfa["present"] = dfa.get("present").fillna(False).astype(bool)
+    dfa["member_id"] = pd.to_numeric(dfa.get("member_id"), errors="coerce")
+
+    grp = dfa.groupby("member_id", dropna=True).agg(
+        total_sessions=("id", "count"),
+        total_present=("present", lambda s: int(s.sum())),
+    ).reset_index()
+
+    grp["attendance_percent"] = grp.apply(
+        lambda r: round((r["total_present"] / r["total_sessions"]) * 100, 2) if r["total_sessions"] else 0.0,
+        axis=1,
+    )
+
+    df = df.merge(grp[["member_id", "attendance_percent"]], on="member_id", how="left")
     df["attendance_percent"] = df["attendance_percent"].fillna(0.0).astype(float)
 
-    keep = ["member_id", "member_name", "phone", "total_sessions_recorded", "total_present", "total_absent", "attendance_percent", "last_session_marked", "last_marked_at"]
-    return df[keep].sort_values("member_id")
+    return df[["member_id", "member_name", "phone", "attendance_percent"]].sort_values("member_id")
+
+
+def render_attendance_chart(att_df: pd.DataFrame):
+    if att_df is None or att_df.empty:
+        st.info("No attendance data yet.")
+        return
+
+    # normalize columns
+    name_col = "member_name" if "member_name" in att_df.columns else ("Member" if "Member" in att_df.columns else None)
+    pct_col = "attendance_percent" if "attendance_percent" in att_df.columns else ("Attendance %" if "Attendance %" in att_df.columns else None)
+
+    if name_col is None or pct_col is None:
+        st.warning("Attendance chart unavailable (missing columns).")
+        return
+
+    plot_df = att_df[[name_col, pct_col]].copy()
+    plot_df[pct_col] = pd.to_numeric(plot_df[pct_col], errors="coerce").fillna(0.0)
+
+    # Keep chart readable: top N only
+    max_n = min(50, len(plot_df))
+    default_n = min(17, len(plot_df))
+    top_n = st.slider("Show top N members", min_value=5, max_value=max_n, value=default_n)
+
+    plot_df = plot_df.sort_values(pct_col, ascending=False).head(int(top_n))
+    plot_df = plot_df.set_index(name_col)
+
+    # CHART ONLY (no dataframe shown)
+    st.bar_chart(plot_df[pct_col])
 
 
 # ============================================================
@@ -550,11 +562,11 @@ def load_attendance_totals(read_sb, schema: str) -> pd.DataFrame:
 def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     inject_dashboard_theme()
 
-    # ✅ Use service client if available for app_state/sessions/contributions (fixes RLS)
+    # ✅ Use service client if available for reads (RLS-safe)
     read_sb = sb_service if sb_service is not None else sb_anon
     finance_sb = sb_service if sb_service is not None else sb_anon
 
-    # ✅ Auto-refresh stamp should read from service if available
+    # ✅ Auto-refresh when app_state changes
     _auto_refresh_if_state_changed(read_sb, schema)
 
     st.markdown("## 🏦 theyoungshallgrow • Bank Dashboard")
@@ -670,7 +682,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
 
     st.divider()
 
-    # --- Financial Totals (FOUNDATION CASHFLOW MODEL) ---
+    # --- Financial Totals ---
     foundation_total = sum_table_amount(finance_sb, schema, "foundation_contributions", ["amount"])
     payouts_total = sum_table_amount(finance_sb, schema, "payouts", ["payout_amount", "amount"])  # informational only
     interest_this_month, interest_all_time = compute_interest_ledger(finance_sb, schema)
@@ -679,7 +691,6 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     loan_kpis = compute_loans_kpis(finance_sb, schema)
     loans_outstanding = float(loan_kpis["principal_active"])
 
-    # ✅ Cash Available (FOUNDATION ONLY): payouts excluded, fines included, interest from ledger
     cash_available_raw = foundation_total + repayments_total + interest_all_time + fines_paid_total - loans_outstanding
     cash_available = max(cash_available_raw, 0.0)
     net_available = cash_available + float(pot)
@@ -716,50 +727,10 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
 
     st.divider()
 
-    # --- Attendance Summary (All-Time) ---
-    st.markdown("### ✅ Attendance • All-time Summary (Per Member)")
+    # --- Attendance (Chart Only) ---
+    st.markdown("### ✅ Attendance • All-time Summary (Chart)")
     att_df = load_attendance_totals(read_sb, schema)
-
-    if att_df.empty:
-        st.info("No attendance summary available yet.")
-    else:
-        # Clean display columns
-        rename_map = {
-            "member_name": "Member",
-            "total_sessions_recorded": "Sessions Recorded",
-            "total_present": "Present",
-            "total_absent": "Absent",
-            "attendance_percent": "Attendance %",
-            "last_session_marked": "Last Session",
-            "last_marked_at": "Last Marked At",
-        }
-        for k in list(rename_map.keys()):
-            if k not in att_df.columns:
-                # views may have different column names; ignore if missing
-                rename_map.pop(k, None)
-
-        display_df = att_df.rename(columns=rename_map).copy()
-
-        # Preferred ordering
-        preferred = [c for c in ["member_id", "Member", "phone", "Sessions Recorded", "Present", "Absent", "Attendance %", "Last Session", "Last Marked At"] if c in display_df.columns]
-        if preferred:
-            display_df = display_df[preferred]
-
-        # Metrics
-        try:
-            sessions_recorded_max = int(display_df.get("Sessions Recorded", pd.Series([0])).max())
-        except Exception:
-            sessions_recorded_max = 0
-        try:
-            avg_percent = float(display_df.get("Attendance %", pd.Series([0.0])).mean())
-        except Exception:
-            avg_percent = 0.0
-
-        c1, c2 = st.columns(2)
-        c1.metric("📅 Sessions Recorded (max)", sessions_recorded_max)
-        c2.metric("📈 Avg Attendance %", f"{avg_percent:.2f}%")
-
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+    render_attendance_chart(att_df)
 
     st.divider()
 
