@@ -5,7 +5,7 @@
 #    - sessions (session_id OR id, start_date, end_date)
 #    - members (id, name)
 #    - contributions (member_id, session_id, amount, paid_at, ...)
-#    - payouts (session_id, member_id, payout_amount/payout_amount, payout_date, payout_index?, created_at)
+#    - payouts (session_id, member_id, payout_amount, payout_date, payout_index, created_at, updated_at)
 #    - signatures (optional)
 #
 # ✅ Payout logic (Njangi standard):
@@ -16,18 +16,18 @@
 #    - Auto-advance after payout:
 #         next_member_id: 1..17 wrap
 #         current_session_id: +1
-#         next_payout_date: +14 days from scheduled day if column exists
+#         next_payout_date: +14 days from existing next_payout_date if column exists
 #    - Generates PDF receipt (contrib + signatures) and keeps it after rerun (st.session_state)
+#    - NEW: Regenerate / Download receipt for any existing payout_id (download-only)
 
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
-from typing import Any, Optional, Tuple, Set
+from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
-
 
 # ============================================================
 # CONFIG
@@ -35,7 +35,6 @@ import streamlit as st
 EXPECTED_ACTIVE_MEMBERS = 17
 CYCLE_DAYS = 14
 PAYOUT_SIG_REQUIRED = ["president", "beneficiary", "treasury"]
-
 
 # ============================================================
 # TIME
@@ -140,6 +139,7 @@ def _sessions_pk_col(sb, schema: str) -> str:
 def get_cycle_window(sb, schema: str, session_id: int) -> tuple[str, str]:
     """
     Uses sessions table if available, else falls back to [today-13, today].
+    Returns ISO start/end strings (end inclusive).
     """
     if _table_exists(sb, schema, "sessions"):
         pk = _sessions_pk_col(sb, schema)
@@ -216,13 +216,16 @@ def _advance_app_state(sb, schema: str, new_session_id: int, new_next_member: in
 # MEMBERS
 # ============================================================
 def load_members(sb, schema: str) -> pd.DataFrame:
-    rows = _safe_select_schema(sb, schema, "members", "id,name", order_col="id", desc=False, limit=5000)
+    rows = _safe_select_schema(sb, schema, "members", "id,name,display_name", order_col="id", desc=False, limit=5000)
     df = pd.DataFrame(rows or [])
     if df.empty:
-        return pd.DataFrame(columns=["id", "name"])
+        return pd.DataFrame(columns=["id", "name", "display_name"])
     df["id"] = pd.to_numeric(df["id"], errors="coerce").fillna(0).astype(int)
     df = df[df["id"] > 0].copy()
-    df["name"] = df["name"].astype(str)
+    df["name"] = df.get("name", "").astype(str)
+    if "display_name" not in df.columns:
+        df["display_name"] = ""
+    df["display_name"] = df["display_name"].astype(str).replace({"None": "", "nan": ""})
     return df
 
 
@@ -230,7 +233,9 @@ def member_name(df_members: pd.DataFrame, member_id: int) -> str:
     try:
         r = df_members.loc[df_members["id"] == int(member_id)]
         if not r.empty:
-            return str(r.iloc[0].get("name") or "").strip()
+            dn = str(r.iloc[0].get("display_name") or "").strip()
+            nm = str(r.iloc[0].get("name") or "").strip()
+            return dn or nm or f"Member {int(member_id):02d}"
     except Exception:
         pass
     return f"Member {int(member_id):02d}"
@@ -277,6 +282,28 @@ def insert_payout(sb, schema: str, payload: dict) -> dict:
     return (res.data or [None])[0] or payload2
 
 
+def get_latest_payout_for_session(sb, schema: str, session_id: int) -> Optional[dict]:
+    rows = _safe_select_schema(
+        sb, schema, "payouts",
+        "id,session_id,member_id,payout_amount,payout_date,payout_index,created_at,updated_at",
+        filters=[("session_id", "eq", int(session_id))],
+        order_col="id",
+        desc=True,
+        limit=1,
+    )
+    return rows[0] if rows else None
+
+
+def get_payout_by_id(sb, schema: str, payout_id: int) -> Optional[dict]:
+    rows = _safe_select_schema(
+        sb, schema, "payouts",
+        "id,session_id,member_id,payout_amount,payout_date,payout_index,created_at,updated_at",
+        filters=[("id", "eq", int(payout_id))],
+        limit=1,
+    )
+    return rows[0] if rows else None
+
+
 # ============================================================
 # SIGNATURES (optional)
 # ============================================================
@@ -303,7 +330,15 @@ def missing_roles(sign_rows: list[dict], required_roles: list[str]) -> list[str]
     return [r for r in req if r not in got]
 
 
-def insert_signature(sb, schema: str, entity_type: str, entity_id: int, role: str, signer_name: str, signer_member_id: int | None = None):
+def insert_signature(
+    sb,
+    schema: str,
+    entity_type: str,
+    entity_id: int,
+    role: str,
+    signer_name: str,
+    signer_member_id: int | None = None,
+):
     if not signatures_exist(sb, schema):
         raise Exception("signatures table not found.")
     payload = {
@@ -449,6 +484,48 @@ def build_payout_receipt_pdf(
     return buf.getvalue()
 
 
+def generate_receipt_for_payout_id(sb_service, schema: str, payout_id: int) -> tuple[bytes, str]:
+    """
+    Regenerate receipt PDF for an existing payout row.
+    """
+    payout = get_payout_by_id(sb_service, schema, payout_id)
+    if not payout:
+        raise Exception(f"Payout id={payout_id} not found.")
+
+    session_id = int(payout.get("session_id") or 0)
+    member_id = int(payout.get("member_id") or 0)
+    payout_date = str(payout.get("payout_date") or date.today().isoformat())
+
+    dfm = load_members(sb_service, schema)
+    bname = member_name(dfm, member_id)
+
+    dfc = contributions_for_session(sb_service, schema, session_id)
+    pot = pot_total(dfc)
+
+    # read next_payout_date only if exists (optional)
+    state = get_app_state(sb_service, schema)
+    payout_day = None
+    if "next_payout_date" in _infer_columns(sb_service, schema, "app_state"):
+        payout_day = _parse_date_only(state.get("next_payout_date"))
+    payout_day_s = payout_day.isoformat() if payout_day else None
+
+    sigs = get_signatures(sb_service, schema, "payout", session_id) if signatures_exist(sb_service, schema) else []
+    pdf_bytes = build_payout_receipt_pdf(
+        group_name="theyoungshallgrow",
+        session_id=session_id,
+        payout_day=payout_day_s,
+        payout_date=payout_date,
+        beneficiary_id=member_id,
+        beneficiary_name=bname,
+        contributions_df=dfc,
+        members_df=dfm,
+        signatures=sigs,
+        total_paid=float(payout.get("payout_amount") or pot),
+    )
+    filename = f"payout_receipt_payout_{payout_id}_session_{session_id}_beneficiary_{member_id:02d}.pdf"
+    return pdf_bytes, filename
+
+
 # ============================================================
 # UI ENTRYPOINT
 # ============================================================
@@ -469,18 +546,11 @@ def render_payouts(sb_service, schema: str):
         )
         st.divider()
 
-    if not _table_exists(sb_service, schema, "app_state"):
-        st.error("Missing table: app_state")
-        return
-    if not _table_exists(sb_service, schema, "payouts"):
-        st.error("Missing table: payouts")
-        return
-    if not _table_exists(sb_service, schema, "contributions"):
-        st.error("Missing table: contributions")
-        return
-    if not _table_exists(sb_service, schema, "members"):
-        st.error("Missing table: members")
-        return
+    # table sanity
+    for t in ["app_state", "payouts", "contributions", "members"]:
+        if not _table_exists(sb_service, schema, t):
+            st.error(f"Missing table: {t}")
+            return
 
     state = ensure_app_state(sb_service, schema)
     session_id = state.get("current_session_id")
@@ -532,6 +602,37 @@ def render_payouts(sb_service, schema: str):
 
     if already_paid:
         st.warning("⚠️ This session_id already has a payout recorded. Double payout is blocked.")
+
+    st.divider()
+
+    # ========================================================
+    # RECEIPT (download-only) — regenerate for any payout_id
+    # ========================================================
+    st.subheader("📄 Receipt PDF (Download)")
+    latest = get_latest_payout_for_session(sb_service, schema, session_id)
+    latest_id = int(latest["id"]) if latest and latest.get("id") is not None else 1
+
+    colA, colB = st.columns([2, 1])
+    with colA:
+        payout_id_pick = st.number_input("Payout ID", min_value=1, step=1, value=latest_id, key="receipt_payout_id")
+    with colB:
+        gen_btn = st.button("Generate receipt", use_container_width=True, key="gen_receipt_btn")
+
+    if gen_btn:
+        try:
+            pdf_bytes, filename = generate_receipt_for_payout_id(sb_service, schema, int(payout_id_pick))
+            st.download_button(
+                "⬇️ Download Receipt (PDF)",
+                data=pdf_bytes,
+                file_name=filename,
+                mime="application/pdf",
+                use_container_width=True,
+                key="dl_receipt_pdf",
+            )
+            st.success("Receipt generated.")
+        except Exception as e:
+            st.error("Could not generate receipt PDF.")
+            st.code(str(e), language="text")
 
     st.divider()
 
@@ -605,13 +706,13 @@ def render_payouts(sb_service, schema: str):
             "member_id": int(next_member_id),
             "payout_amount": float(pot),
             "payout_date": today.isoformat(),
-            "payout_index": int(next_member_id),  # position == member id (Njangi standard)
+            "payout_index": int(session_id),  # payout index == session id (standard)
             "created_at": now_iso(),
             "updated_at": now_iso(),
         }
         payout_row = insert_payout(sb_service, schema, payout_payload)
 
-        # Generate PDF
+        # Generate PDF (and keep it in session_state)
         sigs = get_signatures(sb_service, schema, "payout", session_id) if signatures_exist(sb_service, schema) else []
         pdf_bytes = build_payout_receipt_pdf(
             group_name="theyoungshallgrow",
@@ -646,6 +747,6 @@ def render_payouts(sb_service, schema: str):
 
     with st.expander("Debug", expanded=False):
         st.write("app_state:", state)
-        st.write("payout_row:", payout_row if "payout_row" in locals() else None)
+        st.write("latest_payout_for_session:", latest)
         st.write("cycle_window:", get_cycle_window(sb_service, schema, session_id))
-        st.write("contributions_rows:", len(dfc) if dfc is not None else 0)
+        st.write("contributions_rows:", int(len(dfc)) if dfc is not None else 0)
