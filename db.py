@@ -1,11 +1,18 @@
-# db.py
+
+# db.py ✅ NJANGI STANDARD (NO "legacy") — COMPLETE UPDATED
 # ============================================================
 # Database helpers for Njangi system (Railway + Streamlit Cloud safe)
 # - Secrets handling
 # - Canonical Supabase clients (public + service)
 # - Safe loaders (NO streamlit UI calls here)
-# - Canonical session UUID + session-scoped pot helpers
-# ============================================================
+# - Canonical app_state helpers (integer sessions + 17-member rotation)
+# - Canonical pot helpers (contributions by session_id)
+#
+# ✅ Uses NEW tables only:
+#   - app_state (id=1, current_session_id INT, next_member_id INT, optional next_payout_date)
+#   - sessions  (session_id OR id INT, start_date, end_date)
+#   - members   (id INT 1..17, name)
+#   - contributions (member_id, session_id, amount, paid_at, created_at)
 
 from __future__ import annotations
 
@@ -57,13 +64,13 @@ def get_secret(name: str, default: str | None = None) -> str | None:
 
 
 # ============================================================
-# CANONICAL CLIENTS (single source of truth)
+# CANONICAL CLIENTS
 # ============================================================
 def _validate_supabase_env(url: str | None, key: str | None) -> tuple[str, str]:
     if not url or not str(url).strip():
         raise RuntimeError("Missing SUPABASE_URL. Set it in Railway Variables.")
     if not key or not str(key).strip():
-        raise RuntimeError("Missing SUPABASE_ANON_KEY (or SUPABASE_SERVICE_KEY). Set it in Railway Variables.")
+        raise RuntimeError("Missing Supabase key. Set SUPABASE_ANON_KEY / SUPABASE_SERVICE_KEY.")
 
     url = str(url).strip()
     key = str(key).strip()
@@ -77,7 +84,7 @@ def _validate_supabase_env(url: str | None, key: str | None) -> tuple[str, str]:
         raise RuntimeError(
             "Forbidden Postgres env vars detected: "
             + ", ".join(bad)
-            + ". Delete them from Railway Variables (including the auto-added ones)."
+            + ". Delete them from Railway Variables (including auto-added ones)."
         )
 
     return url, key
@@ -88,11 +95,7 @@ def get_schema() -> str:
 
 
 def get_public_client():
-    """
-    Public (anon) Supabase client.
-    - Used for dashboard + read-only views
-    - RLS enforced
-    """
+    """Anon client (read-only; RLS enforced if you enable it later)."""
     url = get_secret("SUPABASE_URL")
     anon = get_secret("SUPABASE_ANON_KEY")
     url, anon = _validate_supabase_env(url, anon)
@@ -100,13 +103,9 @@ def get_public_client():
 
 
 def get_service_client():
-    """
-    Service-role Supabase client (admin/write).
-    - Bypasses RLS
-    - Use ONLY for admin/server-side operations
-    """
+    """Service-role client (admin/write). Returns None if missing."""
     url = get_secret("SUPABASE_URL")
-    sk = get_secret("SUPABASE_SERVICE_KEY")
+    sk = get_secret("SUPABASE_SERVICE_KEY") or get_secret("SUPABASE_SERVICE_ROLE_KEY")
     if not sk or not str(sk).strip():
         return None
     url, sk = _validate_supabase_env(url, sk)
@@ -158,246 +157,210 @@ def _safe_execute(resp: Any) -> List[Dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
-# ============================================================
-# SIMPLE DB HELPERS
-# ============================================================
 def fetch_one(resp: Any) -> Dict[str, Any]:
     """Return first row from a Supabase response or {}."""
     rows = _safe_execute(resp)
     return rows[0] if rows else {}
 
 
-def _looks_like_uuid(s: Any) -> bool:
+# ============================================================
+# TABLE INTROSPECTION
+# ============================================================
+def table_exists(c, table: str) -> bool:
     try:
-        t = str(s)
+        c.schema(get_schema()).table(table).select("*").limit(1).execute()
+        return True
     except Exception:
         return False
-    if len(t) != 36:
-        return False
-    parts = t.split("-")
-    return len(parts) == 5 and all(parts)
+
+
+def sessions_pk_col(c) -> str:
+    """
+    sessions table may use (session_id) or (id). Return the correct PK column name.
+    """
+    schema = get_schema()
+    try:
+        rows = _safe_execute(c.schema(schema).table("sessions").select("*").limit(1).execute())
+        if rows:
+            return "session_id" if "session_id" in rows[0] else ("id" if "id" in rows[0] else "session_id")
+    except Exception:
+        pass
+    return "session_id"
 
 
 # ============================================================
-# CANONICAL STATE HELPERS
+# CANONICAL STATE HELPERS (NJANGI STANDARD)
 # ============================================================
 def get_app_state(c) -> Dict[str, Any]:
-    """Returns the singleton app_state row (first row). Safe fallback to {}."""
+    """Returns the singleton app_state row (id=1)."""
+    schema = get_schema()
     try:
         rows = _safe_execute(
-            c.schema(get_schema()).table("app_state").select("*").limit(1).execute()
+            c.schema(schema).table("app_state").select("*").eq("id", 1).limit(1).execute()
         )
         return rows[0] if rows else {}
     except Exception:
         return {}
 
 
+def ensure_app_state(c) -> Dict[str, Any]:
+    """
+    Ensures app_state has id=1 row with:
+      - current_session_id (int or None)
+      - next_member_id (int 1..17)
+      - updated_at
+    """
+    schema = get_schema()
+    state = get_app_state(c)
+    if state and any(v is not None for v in state.values()):
+        return state
+
+    payload = {"id": 1, "current_session_id": None, "next_member_id": 1, "updated_at": now_iso()}
+    try:
+        c.schema(schema).table("app_state").upsert(payload, on_conflict="id").execute()
+    except Exception:
+        try:
+            c.schema(schema).table("app_state").insert(payload).execute()
+        except Exception:
+            pass
+    return get_app_state(c)
+
+
+def current_session_id(c) -> int | None:
+    """
+    ✅ Single source of truth for current session (integer).
+    Reads app_state.id=1.current_session_id
+    """
+    stt = ensure_app_state(c)
+    v = stt.get("current_session_id")
+    try:
+        return int(v) if v is not None and str(v).strip() != "" else None
+    except Exception:
+        return None
+
+
+def next_member_id(c) -> int:
+    """
+    ✅ Single source of truth for next beneficiary member_id (1..17).
+    Reads app_state.id=1.next_member_id
+    """
+    stt = ensure_app_state(c)
+    v = stt.get("next_member_id")
+    try:
+        x = int(v) if v is not None else 1
+        return x if 1 <= x <= 17 else 1
+    except Exception:
+        return 1
+
+
+# Backward-compatible alias (some files may import this name)
 def current_payout_index(c) -> int | None:
     """
-    Returns current rotation pointer as an integer (business index).
-    This is NOT the UUID session_id. Use current_session_uuid() for that.
+    Backward-compatible alias for rotation pointer.
+    In Njangi standard, this is the beneficiary position which equals next_member_id.
+    """
+    try:
+        return int(next_member_id(c))
+    except Exception:
+        return None
+
+
+# ============================================================
+# POT HELPERS (CONTRIBUTIONS)
+# ============================================================
+def pot_for_session(c, session_id: int) -> float:
+    """
+    Returns total contribution pot for a given integer session_id.
+    Uses contributions.amount where contributions.session_id == session_id
     """
     schema = get_schema()
     try:
-        rows = _safe_execute(
-            c.schema(schema).table("app_state").select("next_payout_index").limit(1).execute()
+        resp = (
+            c.schema(schema)
+            .table("contributions")
+            .select("amount,session_id")
+            .eq("session_id", int(session_id))
+            .limit(20000)
+            .execute()
         )
-        if rows and rows[0].get("next_payout_index") is not None:
-            return int(rows[0]["next_payout_index"])
+        rows = resp.data or []
+        return float(sum(float(r.get("amount") or 0) for r in rows))
     except Exception:
-        pass
-    return None
+        return 0.0
 
 
-def current_session_uuid(c) -> str | None:
-    """
-    ✅ Single source of truth for the current cycle/session UUID.
-
-    Priority:
-    1) app_state.current_session_id (if it is a UUID)
-    2) app_state.next_payout_index -> lookup sessions_legacy by payout_index (if present)
-    3) sessions_legacy latest row -> try UUID-like keys
-    """
-    schema = get_schema()
-
-    # 1) app_state.current_session_id if it's already a UUID
-    try:
-        rows = _safe_execute(
-            c.schema(schema).table("app_state").select("current_session_id,next_payout_index").limit(1).execute()
-        )
-        if rows:
-            csid = rows[0].get("current_session_id")
-            if csid and _looks_like_uuid(csid):
-                return str(csid)
-
-            # 2) use next_payout_index to resolve UUID from sessions_legacy
-            npi = rows[0].get("next_payout_index")
-            if npi is not None:
-                try:
-                    npi_int = int(npi)
-                except Exception:
-                    npi_int = None
-
-                if npi_int is not None:
-                    # Try a few select variants to handle schema differences
-                    select_variants = [
-                        "id,payout_index,created_at",
-                        "session_id,payout_index,created_at",
-                        "id,next_payout_index,created_at",
-                        "session_id,next_payout_index,created_at",
-                        "*",
-                    ]
-                    for sel in select_variants:
-                        try:
-                            r = _safe_execute(
-                                c.schema(schema)
-                                .table("sessions_legacy")
-                                .select(sel)
-                                .eq("payout_index", npi_int)
-                                .limit(1)
-                                .execute()
-                            )
-                            if not r:
-                                # sometimes the column is named next_payout_index
-                                r = _safe_execute(
-                                    c.schema(schema)
-                                    .table("sessions_legacy")
-                                    .select(sel)
-                                    .eq("next_payout_index", npi_int)
-                                    .limit(1)
-                                    .execute()
-                                )
-                            if r:
-                                row = r[0]
-                                for k in ("id", "session_id", "current_session_id", "season_id", "legacy_session_id"):
-                                    v = row.get(k)
-                                    if v and _looks_like_uuid(v):
-                                        return str(v)
-                        except Exception:
-                            continue
-    except Exception:
-        pass
-
-    # 3) sessions_legacy latest fallback
-    for order_col in ("created_at", "id", "session_id"):
-        try:
-            rows = _safe_execute(
-                c.schema(schema)
-                .table("sessions_legacy")
-                .select("*")
-                .order(order_col, desc=True)
-                .limit(1)
-                .execute()
-            )
-            if rows:
-                for k in ("id", "session_id", "season_id", "legacy_session_id"):
-                    v = rows[0].get(k)
-                    if v and _looks_like_uuid(v):
-                        return str(v)
-        except Exception:
-            continue
-
-    return None
-
-
-# Backward-compatible name (so existing imports don't break)
-def current_session_id(c) -> str | None:
-    """
-    Backward-compatible alias.
-    ✅ Returns the CURRENT SESSION UUID (not the integer payout index).
-    """
-    return current_session_uuid(c)
+def pot_for_current_session(c) -> float:
+    sid = current_session_id(c)
+    return pot_for_session(c, int(sid)) if sid is not None else 0.0
 
 
 # ============================================================
-# CONTRIBUTION HELPERS ✅ (single source of truth for pot)
+# MEMBERS LOADER (NEW)
 # ============================================================
-def pot_for_session(c, session_uuid: str) -> float:
+def load_members(c) -> Tuple[List[str], Dict[str, int], Dict[str, str], pd.DataFrame]:
     """
-    Returns total contribution pot for a given session UUID.
-    Use this everywhere (Dashboard + Payouts) to avoid mismatches.
-    """
-    resp = (
-        c.schema(get_schema())
-        .table("contributions_legacy")
-        .select("amount")
-        .eq("session_id", session_uuid)
-        .execute()
-    )
-    rows = resp.data or []
-    return float(sum(float(r.get("amount") or 0) for r in rows))
-
-
-# ============================================================
-# MEMBERS LOADER (members_legacy) - supports id OR legacy_member_id
-# ============================================================
-def load_members_legacy(c) -> Tuple[List[str], Dict[str, int], Dict[str, str], pd.DataFrame]:
-    """
-    Loads members_legacy and returns:
+    Loads members and returns:
       labels: list[str]              -> for selectbox
       label_to_id: dict[label -> id]
       label_to_name: dict[label -> name]
-      df_members: pd.DataFrame
+      df_members: pd.DataFrame (id,name,position,label)
     """
     schema = get_schema()
+    try:
+        rows = _safe_execute(
+            c.schema(schema).table("members").select("id,name").order("id", desc=False).limit(5000).execute()
+        )
+    except Exception:
+        rows = []
 
-    select_variants = [
-        "legacy_member_id,name,position,phone,has_benefits,contributed,foundation_contrib,loan_due,payout_total,total_fines_accumulated",
-        "id,name,position,phone,has_benefits,contributed,foundation_contrib,loan_due,payout_total,total_fines_accumulated",
-    ]
-
-    rows: List[Dict[str, Any]] = []
-    key_col: str | None = None
-
-    for sel in select_variants:
-        try:
-            tmp = _safe_execute(
-                c.schema(schema).table("members_legacy").select(sel).execute()
-            )
-            if tmp:
-                rows = tmp
-                key_col = "legacy_member_id" if "legacy_member_id" in tmp[0] else "id"
-                break
-            else:
-                rows = tmp
-                key_col = "legacy_member_id" if "legacy_member_id" in sel else "id"
-                break
-        except Exception:
-            continue
-
-    df = pd.DataFrame(rows) if rows else pd.DataFrame()
-
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["id", "name"])
     if df.empty:
-        df = pd.DataFrame(columns=[key_col or "id", "name"])
         return [], {}, {}, df
 
-    if "name" not in df.columns:
-        df["name"] = ""
-
-    if "legacy_member_id" in df.columns:
-        key_col = "legacy_member_id"
-    elif "id" in df.columns:
-        key_col = "id"
-    else:
-        key_col = df.columns[0]
-
-    try:
-        df[key_col] = pd.to_numeric(df[key_col], errors="coerce")
-        df = df.dropna(subset=[key_col]).copy()
-        df[key_col] = df[key_col].astype(int)
-    except Exception:
-        pass
-
+    df["id"] = pd.to_numeric(df["id"], errors="coerce").fillna(0).astype(int)
+    df = df[df["id"] > 0].copy()
     df["name"] = df["name"].astype(str)
-    df["label"] = df.apply(lambda r: f'{int(r[key_col]):02d} • {r["name"]}', axis=1)
+    df["position"] = df["id"]  # Njangi standard: position == id
+    df["label"] = df.apply(lambda r: f'{int(r["id"]):02d} • {r["name"]}', axis=1)
 
     labels = df["label"].tolist()
-    label_to_id = dict(zip(df["label"], df[key_col].astype(int)))
+    label_to_id = dict(zip(df["label"], df["id"].astype(int)))
     label_to_name = dict(zip(df["label"], df["name"]))
 
-    try:
-        df = df.sort_values(by=key_col, ascending=True).reset_index(drop=True)
-    except Exception:
-        pass
-
+    df = df.sort_values("id", ascending=True).reset_index(drop=True)
     return labels, label_to_id, label_to_name, df
+
+
+# ============================================================
+# SESSIONS LOADER (NEW)
+# ============================================================
+def load_sessions(c) -> pd.DataFrame:
+    """
+    Loads sessions table and returns DataFrame with standardized columns:
+      session_id, start_date, end_date
+    """
+    schema = get_schema()
+    if not table_exists(c, "sessions"):
+        return pd.DataFrame(columns=["session_id", "start_date", "end_date"])
+
+    pk = sessions_pk_col(c)
+    try:
+        rows = _safe_execute(
+            c.schema(schema)
+            .table("sessions")
+            .select(f"{pk},start_date,end_date,created_at")
+            .order(pk, desc=False)
+            .limit(5000)
+            .execute()
+        )
+    except Exception:
+        rows = []
+
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=[pk, "start_date", "end_date"])
+    if df.empty:
+        return pd.DataFrame(columns=["session_id", "start_date", "end_date"])
+
+    df[pk] = pd.to_numeric(df[pk], errors="coerce").fillna(0).astype(int)
+    df = df[df[pk] > 0].copy()
+    df = df.rename(columns={pk: "session_id"})
+    return df
