@@ -1,18 +1,17 @@
 
-# rbac.py ✅ COMPLETE UPDATED (adds aliases to match loans_ui.py + your existing permission names)
+# rbac.py ✅ NJANGI STANDARD (NO "legacy" wording in code)
 # Fixes:
-# - Permission denied: legacy_repayment for role 'admin'
-# - Permission denied: confirm_payments for role 'admin'
-# - Keeps your canonical permission names:
+# - Permission denied errors caused by older UI permission names
+#
+# ✅ Canonical permission names (standard):
 #   view_ledger, submit_request, sign_request, approve_deny,
 #   record_payment, confirm_payment, reject_payment, accrue_interest,
-#   view_delinquency, loan_statement, download_all_statements, legacy_loan_repayment
+#   view_delinquency, loan_statement, download_all_statements, direct_payment
 #
-# ✅ KEY UPGRADE:
-# Adds PERMISSION_ALIASES so loans_ui.py can call:
+# ✅ Aliases kept ONLY to support older UI calls (but the word "legacy" is not used anywhere)
 #   confirm_payments -> confirm_payment
-#   legacy_repayment -> legacy_loan_repayment
-#   (and a few other safe mappings)
+#   direct_repayment -> direct_payment
+#   repayment_direct -> direct_payment
 
 from __future__ import annotations
 
@@ -40,7 +39,7 @@ PERMISSIONS: dict[str, set[str]] = {
         "view_delinquency",
         "loan_statement",
         "download_all_statements",
-        "legacy_loan_repayment",
+        "direct_payment",
     },
     ROLE_TREASURY: {
         "view_ledger",
@@ -53,7 +52,7 @@ PERMISSIONS: dict[str, set[str]] = {
         "view_delinquency",
         "loan_statement",
         "download_all_statements",
-        "legacy_loan_repayment",
+        "direct_payment",
     },
     ROLE_MEMBER: {
         "submit_request",
@@ -66,21 +65,19 @@ PERMISSIONS: dict[str, set[str]] = {
 
 # ============================================================
 # Aliases to support older/alternate perm names used in UI files
+# (No "legacy" token used here)
 # ============================================================
 PERMISSION_ALIASES: dict[str, str] = {
-    # loans_ui.py aliases (your current crash)
+    # pluralization / variations used in some UIs
     "confirm_payments": "confirm_payment",
-    "legacy_repayment": "legacy_loan_repayment",
-
-    # common pluralization / variations (safe)
-    "confirm_payment": "confirm_payment",
-    "reject_payments": "reject_payment",
     "confirm_payment_pending": "confirm_payment",
+    "reject_payments": "reject_payment",
     "reject_payment_pending": "reject_payment",
 
-    # legacy alternative wording
-    "legacy_payment": "legacy_loan_repayment",
-    "legacy_repay": "legacy_loan_repayment",
+    # direct repayment variations
+    "direct_repayment": "direct_payment",
+    "repayment_direct": "direct_payment",
+    "manual_payment": "direct_payment",
 }
 
 def _canon_perm(perm: str) -> str:
@@ -103,8 +100,8 @@ def normalize_role(role: str | None) -> str:
 
 def resolve_role_by_member_id(sb, schema: str, member_id: int) -> str:
     """
-    Looks up role from public.member_roles using member_id.
-    Falls back to 'member' if no record or inactive.
+    Optional: lookup role from public.member_roles using member_id.
+    Falls back to 'member' if table/record missing or inactive.
     """
     try:
         rows = (
@@ -151,7 +148,6 @@ def allowed_sections(actor_role: str) -> list[str]:
     perms = PERMISSIONS.get(normalize_role(actor_role), set())
     sections: list[str] = []
 
-    # Requests screen exists if user can submit/sign/approve
     if {"submit_request", "sign_request", "approve_deny"} & perms:
         sections.append("Requests")
 
@@ -161,15 +157,8 @@ def allowed_sections(actor_role: str) -> list[str]:
     if "record_payment" in perms:
         sections.append("Record Payment")
 
-    # ✅ loans_ui.py implements Confirm Payments (checker)
     if "confirm_payment" in perms:
         sections.append("Confirm Payments")
-
-    # ❗ Only include Reject Payments if you actually implemented a section for it in loans_ui.py
-    # If your loans_ui.py currently shows "enabled but not implemented" for Reject Payments,
-    # comment this out to stop showing it in the menu.
-    # if "reject_payment" in perms:
-    #     sections.append("Reject Payments")
 
     if "accrue_interest" in perms:
         sections.append("Interest")
@@ -180,7 +169,7 @@ def allowed_sections(actor_role: str) -> list[str]:
     if "loan_statement" in perms:
         sections.append("Loan Statement")
 
-    if "legacy_loan_repayment" in perms:
-        sections.append("Loan Repayment (Legacy)")
+    if "direct_payment" in perms:
+        sections.append("Direct Payment")
 
     return sections
