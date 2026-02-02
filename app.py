@@ -14,11 +14,13 @@
 #    - loan_payments
 #    - audit_log
 #    - v_next_beneficiary (optional)
+# ✅ Member identity: all transactions use member_id only (names display via views)
 #
 # ✅ Attendance: saves one row per member per session_id (delete-then-insert to prevent duplicates)
 # ✅ Minutes: one record per session_id (update if exists)
 # ✅ Summaries: minutes + attendance + contributions (new tables)
 # ✅ No duplicate tabs/pages in sidebar
+# ✅ Contributions page shows names using v_contributions_with_member (view)
 
 from __future__ import annotations
 
@@ -321,12 +323,17 @@ def load_members(url: str, anon_key: str, schema: str) -> tuple[list[str], dict,
 
 @st.cache_data(ttl=60)
 def load_contributions(url: str, anon_key: str, schema: str) -> pd.DataFrame:
+    """
+    ✅ Display contributions with member_name via VIEW.
+    Tables still store only member_id.
+    Requires: public.v_contributions_with_member
+    """
     client = create_client(url, anon_key)
     try:
         rows = (
             client.schema(schema)
-            .table("contributions")
-            .select("id,member_id,session_id,amount,paid_at,note,created_at")
+            .table("v_contributions_with_member")
+            .select("id,member_id,member_name,session_id,amount,paid_at,note,created_at")
             .order("created_at", desc=True)
             .limit(500)
             .execute()
@@ -365,9 +372,10 @@ if page == "Dashboard":
 elif page == "Contributions":
     st.markdown(glass_open(), unsafe_allow_html=True)
     st.subheader("Contributions")
+    st.caption("One contribution per member per session (stored by member_id; names shown via view).")
     df = load_contributions(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
     if df.empty:
-        st.info("No contributions found (or table not readable).")
+        st.info("No contributions found (or view not readable).")
     else:
         st.dataframe(df, use_container_width=True, hide_index=True)
     st.markdown(glass_close(), unsafe_allow_html=True)
@@ -419,12 +427,12 @@ elif page == "Minutes & Attendance":
         role = st.selectbox("Role", ["admin", "treasury", "member"], index=0, key="ma_role")
     can_write = role in ("admin", "treasury")
 
-    labels, label_to_id, label_to_name, df_members = load_members(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
+    _, _, _, df_members = load_members(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
 
     tab1, tab2, tab3 = st.tabs(["Minutes / Documentation", "Attendance", "Summaries"])
 
     # -------------------------
-    # Minutes (NEW TABLE: minutes)
+    # Minutes
     # -------------------------
     with tab1:
         st.markdown(glass_open(), unsafe_allow_html=True)
@@ -518,8 +526,7 @@ elif page == "Minutes & Attendance":
         st.markdown(glass_close(), unsafe_allow_html=True)
 
     # -------------------------
-    # Attendance (NEW TABLE: attendance)
-    # One row per member per session (delete then insert to prevent duplicates)
+    # Attendance (write member_id only; display via view)
     # -------------------------
     with tab2:
         st.markdown(glass_open(), unsafe_allow_html=True)
@@ -564,7 +571,6 @@ elif page == "Minutes & Attendance":
             attendance_rows.append(
                 {
                     "member_id": mid,
-                    "member_name": name,
                     "present": (status == "present"),
                     "note": note.strip() or None,
                 }
@@ -605,7 +611,7 @@ elif page == "Minutes & Attendance":
         st.markdown("### Current session attendance")
         arows = safe_select(
             sb_service,
-            "attendance",
+            "v_attendance_with_member",   # ✅ show member_name via view
             "*",
             schema=SUPABASE_SCHEMA,
             order_by="member_id",
@@ -641,12 +647,12 @@ elif page == "Minutes & Attendance":
         st.markdown(glass_close(), unsafe_allow_html=True)
 
     # -------------------------
-    # Summaries
+    # Summaries (show names via views where available)
     # -------------------------
     with tab3:
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.subheader("Summaries")
-        st.caption("Summaries for Minutes, Attendance, and Contributions (new tables).")
+        st.caption("Summaries for Minutes, Attendance, and Contributions (member_id only; names shown via views).")
 
         # Minutes summary
         st.markdown("### 📝 Minutes summary")
@@ -693,12 +699,12 @@ elif page == "Minutes & Attendance":
 
         st.divider()
 
-        # Contributions summary (current session)
+        # Contributions summary (current session) — show names via view
         st.markdown("### 💰 Contributions summary (current session)")
         c_rows = safe_select(
             sb_service,
-            "contributions",
-            "member_id,session_id,amount,paid_at,created_at",
+            "v_contributions_with_member",
+            "member_id,member_name,session_id,amount,paid_at,created_at",
             schema=SUPABASE_SCHEMA,
             order_by="created_at",
             order_desc=True,
@@ -713,7 +719,7 @@ elif page == "Minutes & Attendance":
             st.metric("Rows", f"{len(dfc):,}")
             st.metric("Sum", f"{float(dfc['amount'].sum()):,.0f}")
             top = (
-                dfc.groupby("member_id", dropna=False)["amount"].sum()
+                dfc.groupby(["member_id", "member_name"], dropna=False)["amount"].sum()
                 .sort_values(ascending=False)
                 .head(10)
                 .reset_index()
