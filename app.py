@@ -1,10 +1,10 @@
 
 # app.py ✅ COMPLETE SINGLE CODE — Minutes + Attendance (Present/Absent + Reason) + Summaries (NO "legacy")
-# ✅ Removes ALL "legacy" table usage in this file
+# ✅ NO "legacy" tables referenced in this file
 # ✅ Uses NEW tables only:
 #    - members
 #    - sessions
-#    - app_state  (current_session_id, next_member_id)
+#    - app_state (current_session_id, next_member_id, updated_at)
 #    - minutes
 #    - attendance
 #    - contributions
@@ -13,15 +13,17 @@
 #    - loans
 #    - loan_payments
 #    - audit_log
-#    - v_next_beneficiary
+#    - v_next_beneficiary (optional)
+#
 # ✅ Attendance: saves one row per member per session_id (delete-then-insert to prevent duplicates)
 # ✅ Minutes: one record per session_id (update if exists)
 # ✅ Summaries: minutes + attendance + contributions (new tables)
+# ✅ No duplicate tabs/pages in sidebar
 
 from __future__ import annotations
 
 import os
-from datetime import date
+from datetime import date, datetime, timezone
 import streamlit as st
 import pandas as pd
 from supabase import create_client
@@ -65,6 +67,14 @@ st.set_page_config(
     layout="wide",
     page_icon="🏦",
 )
+
+
+# ============================================================
+# TIME
+# ============================================================
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 # ============================================================
 # GLOBAL THEME
@@ -114,7 +124,7 @@ def inject_global_theme():
             background: rgba(255,255,255,0.06) !important;
         }
 
-        /* BaseWeb inputs (fixes white fields) */
+        /* Inputs */
         [data-baseweb="input"] input,
         [data-testid="stTextInput"] input,
         [data-testid="stNumberInput"] input,
@@ -179,6 +189,7 @@ def glass_close() -> str:
 
 inject_global_theme()
 
+
 # ============================================================
 # SECRETS
 # ============================================================
@@ -204,6 +215,7 @@ if not SUPABASE_URL or not SUPABASE_ANON_KEY:
 if not SUPABASE_SERVICE_KEY:
     st.warning("SUPABASE_SERVICE_KEY not set. Admin/Loans/Payout write features will be disabled.")
 
+
 # ============================================================
 # CLIENTS
 # ============================================================
@@ -220,6 +232,7 @@ def get_service_client(url: str, service_key: str):
 sb_anon = get_anon_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 sb_service = get_service_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_SERVICE_KEY else None
 
+
 # ============================================================
 # TOP BAR
 # ============================================================
@@ -232,8 +245,9 @@ with right:
         st.cache_resource.clear()
         st.rerun()
 
+
 # ============================================================
-# SAFE QUERY HELPERS
+# SAFE HELPERS
 # ============================================================
 def _api_msg(e: Exception) -> str:
     if isinstance(e, APIError):
@@ -279,7 +293,16 @@ def get_app_state(sb, schema: str) -> dict:
 @st.cache_data(ttl=90)
 def load_members(url: str, anon_key: str, schema: str) -> tuple[list[str], dict, dict, pd.DataFrame]:
     client = create_client(url, anon_key)
-    rows = safe_select(client, "members", "id,name", schema=schema, order_by="id", limit=5000)
+    rows = (
+        client.schema(schema)
+        .table("members")
+        .select("id,name")
+        .order("id", desc=False)
+        .limit(5000)
+        .execute()
+        .data
+        or []
+    )
     df = pd.DataFrame(rows)
 
     if df.empty:
@@ -299,36 +322,39 @@ def load_members(url: str, anon_key: str, schema: str) -> tuple[list[str], dict,
 @st.cache_data(ttl=60)
 def load_contributions(url: str, anon_key: str, schema: str) -> pd.DataFrame:
     client = create_client(url, anon_key)
-    rows = safe_select(
-        client,
-        "contributions",
-        "id,member_id,session_id,amount,paid_at,note,created_at",
-        schema=schema,
-        order_by="created_at",
-        order_desc=True,
-        limit=500,
-    )
+    try:
+        rows = (
+            client.schema(schema)
+            .table("contributions")
+            .select("id,member_id,session_id,amount,paid_at,note,created_at")
+            .order("created_at", desc=True)
+            .limit(500)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        rows = []
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
 # ============================================================
-# NAVIGATION
+# NAVIGATION (no duplicates)
 # ============================================================
-page = st.sidebar.radio(
-    "Menu",
-    [
-        "Dashboard",
-        "Contributions",
-        "Payouts",
-        "Loans",
-        "🤖 AI Risk Panel",
-        "Minutes & Attendance",
-        "Admin",
-        "Audit",
-        "Health",
-    ],
-    key="main_menu",
-)
+PAGES = [
+    "Dashboard",
+    "Contributions",
+    "Payouts",
+    "Loans",
+    "🤖 AI Risk Panel",
+    "Minutes & Attendance",
+    "Admin",
+    "Audit",
+    "Health",
+]
+
+page = st.sidebar.radio("Menu", PAGES, key="main_menu")
+
 
 # ============================================================
 # PAGES
@@ -381,7 +407,7 @@ elif page == "Minutes & Attendance":
         st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY to enable writing.")
         st.stop()
 
-    # current session from app_state (integer sessions)
+    # current session from app_state
     state = get_app_state(sb_anon, SUPABASE_SCHEMA)
     current_session_id = state.get("current_session_id")
 
@@ -415,19 +441,26 @@ elif page == "Minutes & Attendance":
                 if not title.strip() or not body.strip():
                     st.error("Title and body are required.")
                 else:
-                    # One minutes row per session_id (update if exists)
                     existing = (
-                        sb_service.schema(SUPABASE_SCHEMA).table("minutes")
+                        sb_service.schema(SUPABASE_SCHEMA)
+                        .table("minutes")
                         .select("id,session_id")
                         .eq("session_id", int(current_session_id))
-                        .limit(1).execute().data
+                        .limit(1)
+                        .execute()
+                        .data
                         or []
                     )
                     if existing:
                         mid = int(existing[0]["id"])
                         try:
                             sb_service.schema(SUPABASE_SCHEMA).table("minutes").update(
-                                {"title": title.strip(), "body": body.strip(), "updated_at": now_iso(), "created_by": role}
+                                {
+                                    "title": title.strip(),
+                                    "body": body.strip(),
+                                    "updated_at": now_iso(),
+                                    "created_by": role,
+                                }
                             ).eq("id", mid).execute()
                             st.success("Minutes updated.")
                             st.rerun()
@@ -453,7 +486,16 @@ elif page == "Minutes & Attendance":
 
         st.divider()
         st.markdown("### Current session minutes")
-        rows = safe_select(sb_service, "minutes", "*", schema=SUPABASE_SCHEMA, order_by="updated_at", order_desc=True, limit=10, session_id=int(current_session_id))
+        rows = safe_select(
+            sb_service,
+            "minutes",
+            "*",
+            schema=SUPABASE_SCHEMA,
+            order_by="updated_at",
+            order_desc=True,
+            limit=10,
+            session_id=int(current_session_id),
+        )
         dfm = pd.DataFrame(rows)
         if dfm.empty:
             st.info("No minutes recorded yet.")
@@ -477,8 +519,7 @@ elif page == "Minutes & Attendance":
 
     # -------------------------
     # Attendance (NEW TABLE: attendance)
-    # attendance schema: member_id, session_id, present(bool), note, created_at
-    # We save ALL members for current session: delete then insert (prevents duplicates)
+    # One row per member per session (delete then insert to prevent duplicates)
     # -------------------------
     with tab2:
         st.markdown(glass_open(), unsafe_allow_html=True)
@@ -533,24 +574,20 @@ elif page == "Minutes & Attendance":
         save = st.button("💾 Save attendance (ALL members)", use_container_width=True)
 
         if save:
-            payload_rows = []
-            for row in attendance_rows:
-                payload_rows.append(
-                    {
-                        "session_id": int(current_session_id),
-                        "member_id": int(row["member_id"]),
-                        "present": bool(row["present"]),
-                        "note": row["note"],
-                        "created_at": now_iso(),
-                    }
-                )
+            payload_rows = [
+                {
+                    "session_id": int(current_session_id),
+                    "member_id": int(row["member_id"]),
+                    "present": bool(row["present"]),
+                    "note": row["note"],
+                    "created_at": now_iso(),
+                }
+                for row in attendance_rows
+            ]
 
             # delete existing attendance for this session then insert full set
             try:
-                sb_service.schema(SUPABASE_SCHEMA).table("attendance") \
-                    .delete() \
-                    .eq("session_id", int(current_session_id)) \
-                    .execute()
+                sb_service.schema(SUPABASE_SCHEMA).table("attendance").delete().eq("session_id", int(current_session_id)).execute()
             except Exception:
                 pass
 
@@ -566,7 +603,16 @@ elif page == "Minutes & Attendance":
 
         st.divider()
         st.markdown("### Current session attendance")
-        arows = safe_select(sb_service, "attendance", "*", schema=SUPABASE_SCHEMA, order_by="member_id", order_desc=False, limit=2000, session_id=int(current_session_id))
+        arows = safe_select(
+            sb_service,
+            "attendance",
+            "*",
+            schema=SUPABASE_SCHEMA,
+            order_by="member_id",
+            order_desc=False,
+            limit=2000,
+            session_id=int(current_session_id),
+        )
         dfa = pd.DataFrame(arows)
         if dfa.empty:
             st.info("No attendance recorded for this session yet.")
@@ -575,7 +621,12 @@ elif page == "Minutes & Attendance":
 
             if make_attendance_pdf is not None:
                 try:
-                    pdf_bytes = make_attendance_pdf(APP_BRAND, str(date.today()), int(current_session_id), dfa.to_dict("records"))
+                    pdf_bytes = make_attendance_pdf(
+                        APP_BRAND,
+                        str(date.today()),
+                        int(current_session_id),
+                        dfa.to_dict("records"),
+                    )
                     st.download_button(
                         "⬇️ Download Attendance (PDF)",
                         pdf_bytes,
@@ -622,7 +673,16 @@ elif page == "Minutes & Attendance":
 
         # Attendance summary
         st.markdown("### ✅ Attendance summary")
-        a_rows = safe_select(sb_service, "attendance", "*", schema=SUPABASE_SCHEMA, order_by="created_at", order_desc=True, limit=2000, session_id=int(current_session_id))
+        a_rows = safe_select(
+            sb_service,
+            "attendance",
+            "*",
+            schema=SUPABASE_SCHEMA,
+            order_by="created_at",
+            order_desc=True,
+            limit=2000,
+            session_id=int(current_session_id),
+        )
         dfa = pd.DataFrame(a_rows)
         if dfa.empty:
             st.info("No attendance for current session.")
@@ -633,9 +693,18 @@ elif page == "Minutes & Attendance":
 
         st.divider()
 
-        # Contributions summary
+        # Contributions summary (current session)
         st.markdown("### 💰 Contributions summary (current session)")
-        c_rows = safe_select(sb_service, "contributions", "member_id,session_id,amount,paid_at,created_at", schema=SUPABASE_SCHEMA, order_by="created_at", order_desc=True, limit=2000, session_id=int(current_session_id))
+        c_rows = safe_select(
+            sb_service,
+            "contributions",
+            "member_id,session_id,amount,paid_at,created_at",
+            schema=SUPABASE_SCHEMA,
+            order_by="created_at",
+            order_desc=True,
+            limit=2000,
+            session_id=int(current_session_id),
+        )
         dfc = pd.DataFrame(c_rows)
         if dfc.empty:
             st.info("No contributions for current session.")
