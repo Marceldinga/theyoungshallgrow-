@@ -1,9 +1,10 @@
 
 # dashboard_panel.py ✅ COMPLETE SINGLE CODE (NO SQL) — NJANGI STANDARD (NO "legacy")
-# ✅ Fixes ImportError: ensures render_dashboard exists at module import time
+# ✅ Removes the BIG Dashboard header ("🏦 theyoungshallgrow • Bank Dashboard")
+# ✅ Removes the Attendance chart + its header section entirely
+# ✅ Keeps everything else (KPIs, Financial Summary, Loans, Repayment Plan, Debug)
+# ✅ Fixes ImportError: render_dashboard exists at module import time
 # ✅ Adds backward alias render_dashbaord (typo safety)
-# ✅ Attendance chart = COUNTS (Present/Absent), NOT percent
-# ✅ Fix duplicates: dedupe attendance by (member_id, session_id) keeping latest created_at/id
 # ✅ Uses sb_service for reads when available (RLS-safe), sb_anon fallback
 # ✅ Dark theme + glass KPI cards
 # ✅ Auto-refresh on app_state stamp change
@@ -28,9 +29,8 @@
 #   - interest_ledger          (id, loan_id, member_id, interest_month, amount, created_at, ...)
 #   - payouts                  (session_id, member_id, payout_amount, payout_date, payout_index, created_at, updated_at)  # informational only
 #   - fines                    (id, member_id, session_id, amount, reason, issued_by, status, paid_at, created_at, updated_at)
-#   - attendance               (id, member_id, session_id, present, note, created_at)
+#   - attendance               (id, member_id, session_id, present, note, created_at)  # still allowed, but NOT shown here
 #   - v_next_beneficiary       (optional view)
-#   - v_attendance_member_totals (optional view; any counts columns; fallback to compute)
 
 from __future__ import annotations
 
@@ -456,191 +456,7 @@ def build_repayment_plan(sb, schema: str, last_payment_dates: dict[int, date]) -
 
 
 # ============================================================
-# ATTENDANCE (ALL-TIME) — COUNTS + DEDUPE
-# ============================================================
-def _dedupe_attendance_rows(dfa: pd.DataFrame) -> pd.DataFrame:
-    if dfa is None or dfa.empty:
-        return dfa
-
-    for c in ("id", "member_id", "session_id", "present", "created_at"):
-        if c not in dfa.columns:
-            dfa[c] = None
-
-    dfa["member_id"] = pd.to_numeric(dfa["member_id"], errors="coerce")
-    dfa["session_id"] = pd.to_numeric(dfa["session_id"], errors="coerce")
-    dfa["_created_at_sort"] = pd.to_datetime(dfa["created_at"], errors="coerce")
-    dfa["_id_sort"] = pd.to_numeric(dfa["id"], errors="coerce")
-
-    dfa = dfa.sort_values(["_created_at_sort", "_id_sort"], ascending=[False, False])
-    dfa = dfa.drop_duplicates(subset=["member_id", "session_id"], keep="first")
-    return dfa.drop(columns=["_created_at_sort", "_id_sort"], errors="ignore")
-
-
-def load_attendance_counts(read_sb, schema: str) -> pd.DataFrame:
-    """
-    Returns columns:
-      member_id, member_name, phone, present_count, absent_count, total_sessions
-    """
-    view_name = "v_attendance_member_totals"
-    if _table_exists(read_sb, schema, view_name):
-        rows = safe_table(read_sb, schema, view_name, "*", limit=5000, order_by="member_id", desc=False)
-        if rows:
-            dv = pd.DataFrame(rows)
-
-            if "member_name" not in dv.columns:
-                if "name" in dv.columns:
-                    dv["member_name"] = dv["name"]
-                elif "display_name" in dv.columns:
-                    dv["member_name"] = dv["display_name"]
-                else:
-                    dv["member_name"] = ""
-
-            if "phone" not in dv.columns:
-                dv["phone"] = dv.get("member_phone")
-
-            pcol = next((c for c in ["present_count", "total_present", "present"] if c in dv.columns), None)
-            acol = next((c for c in ["absent_count", "total_absent", "absent"] if c in dv.columns), None)
-            tcol = next((c for c in ["total_sessions", "total", "sessions_count"] if c in dv.columns), None)
-
-            if pcol and tcol:
-                dv["present_count"] = pd.to_numeric(dv[pcol], errors="coerce").fillna(0).astype(int)
-                dv["total_sessions"] = pd.to_numeric(dv[tcol], errors="coerce").fillna(0).astype(int)
-                dv["absent_count"] = (dv["total_sessions"] - dv["present_count"]).clip(lower=0).astype(int)
-                keep = ["member_id", "member_name", "phone", "present_count", "absent_count", "total_sessions"]
-                for c in keep:
-                    if c not in dv.columns:
-                        dv[c] = None
-                return dv[keep].sort_values("member_id", ascending=True)
-
-            if pcol and acol:
-                dv["present_count"] = pd.to_numeric(dv[pcol], errors="coerce").fillna(0).astype(int)
-                dv["absent_count"] = pd.to_numeric(dv[acol], errors="coerce").fillna(0).astype(int)
-                dv["total_sessions"] = (dv["present_count"] + dv["absent_count"]).astype(int)
-                keep = ["member_id", "member_name", "phone", "present_count", "absent_count", "total_sessions"]
-                for c in keep:
-                    if c not in dv.columns:
-                        dv[c] = None
-                return dv[keep].sort_values("member_id", ascending=True)
-
-    members = safe_table(read_sb, schema, "members", "id,name,display_name,phone", limit=5000, order_by="id", desc=False)
-    attendance = safe_table(read_sb, schema, "attendance", "id,member_id,session_id,present,note,created_at", limit=20000)
-
-    dfm = pd.DataFrame(members or [])
-    dfa = pd.DataFrame(attendance or [])
-
-    if dfm.empty:
-        return pd.DataFrame()
-
-    for col in ("id", "name", "display_name", "phone"):
-        if col not in dfm.columns:
-            dfm[col] = None
-
-    out = dfm.rename(columns={"id": "member_id"}).copy()
-    out["member_name"] = out["display_name"].fillna("").astype(str).str.strip()
-    out.loc[out["member_name"] == "", "member_name"] = out["name"].fillna("").astype(str).str.strip()
-
-    if dfa.empty:
-        out["present_count"] = 0
-        out["absent_count"] = 0
-        out["total_sessions"] = 0
-        return out[["member_id", "member_name", "phone", "present_count", "absent_count", "total_sessions"]].sort_values(
-            "member_id"
-        )
-
-    if "present" not in dfa.columns:
-        dfa["present"] = False
-    dfa["present"] = dfa["present"].fillna(False).astype(bool)
-
-    dfa = _dedupe_attendance_rows(dfa)
-
-    grp = (
-        dfa.groupby("member_id", dropna=True)
-        .agg(
-            total_sessions=("session_id", "nunique"),
-            present_count=("present", lambda s: int(s.sum())),
-        )
-        .reset_index()
-    )
-    grp["absent_count"] = (grp["total_sessions"] - grp["present_count"]).clip(lower=0).astype(int)
-
-    out["member_id"] = pd.to_numeric(out["member_id"], errors="coerce")
-    out = out.merge(grp[["member_id", "present_count", "absent_count", "total_sessions"]], on="member_id", how="left")
-
-    out["present_count"] = out["present_count"].fillna(0).astype(int)
-    out["absent_count"] = out["absent_count"].fillna(0).astype(int)
-    out["total_sessions"] = out["total_sessions"].fillna(0).astype(int)
-
-    return out[["member_id", "member_name", "phone", "present_count", "absent_count", "total_sessions"]].sort_values(
-        "member_id"
-    )
-
-
-def render_attendance_counts_chart(att_df: pd.DataFrame):
-    if att_df is None or att_df.empty:
-        st.info("No attendance data yet.")
-        return
-
-    needed = ["member_name", "present_count", "absent_count", "total_sessions"]
-    for c in needed:
-        if c not in att_df.columns:
-            st.warning("Attendance chart unavailable (missing columns).")
-            return
-
-    df = att_df.copy()
-    df["present_count"] = pd.to_numeric(df["present_count"], errors="coerce").fillna(0).astype(int)
-    df["absent_count"] = pd.to_numeric(df["absent_count"], errors="coerce").fillna(0).astype(int)
-    df["total_sessions"] = pd.to_numeric(df["total_sessions"], errors="coerce").fillna(0).astype(int)
-
-    rank_by = st.selectbox(
-        "Rank members by",
-        ["present_count", "absent_count", "total_sessions"],
-        index=0,
-        help="Controls which members appear in Top N",
-    )
-
-    max_n = max(5, min(50, len(df)))
-    default_n = min(17, len(df))
-    top_n = st.slider("Show top N members", min_value=5, max_value=max_n, value=default_n)
-
-    df = df.sort_values(rank_by, ascending=False).head(int(top_n)).copy()
-
-    # No extra dependencies (ALTair optional)
-    # If altair exists, grouped bars. Else fallback to stacked bar chart with st.bar_chart.
-    try:
-        import altair as alt  # optional dependency
-
-        long_df = df.melt(
-            id_vars=["member_name"],
-            value_vars=["present_count", "absent_count"],
-            var_name="status",
-            value_name="count",
-        )
-        long_df["status"] = long_df["status"].replace({"present_count": "Present", "absent_count": "Absent"})
-
-        chart = (
-            alt.Chart(long_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("member_name:N", sort=None, title="Member"),
-                y=alt.Y("count:Q", title="Count"),
-                color=alt.Color("status:N", title="Status"),
-                tooltip=["member_name:N", "status:N", "count:Q"],
-            )
-            .properties(height=380)
-        )
-        st.altair_chart(chart, use_container_width=True)
-        return
-    except Exception:
-        pass
-
-    # Fallback: stacked-ish display using Streamlit bar_chart (single series at a time)
-    st.caption("Altair not available — showing Present counts (use tooltip on your app for details).")
-    plot_df = df.set_index("member_name")[["present_count"]]
-    st.bar_chart(plot_df)
-
-
-# ============================================================
-# DASHBOARD (STANDARD)
+# DASHBOARD (STANDARD) — HEADER + ATTENDANCE CHART REMOVED
 # ============================================================
 def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     inject_dashboard_theme()
@@ -649,8 +465,6 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     finance_sb = sb_service if sb_service is not None else sb_anon
 
     _auto_refresh_if_state_changed(read_sb, schema)
-
-    st.markdown("## 🏦 theyoungshallgrow • Bank Dashboard")
 
     # --- App state ---
     state = safe_single(read_sb, schema, "app_state", "*", id=1)
@@ -737,7 +551,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
             pot = float(dfc["amount"].sum())
             members_paid = int(dfc["member_id"].nunique()) if "member_id" in dfc.columns else 0
 
-    # --- Header KPIs ---
+    # --- Top KPIs (kept, but NO big header text above) ---
     st.markdown(glass_open(), unsafe_allow_html=True)
     a1, a2, a3, a4 = st.columns(4)
     with a1:
@@ -818,13 +632,6 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
 
     st.divider()
 
-    # --- Attendance (Counts Chart Only) ---
-    st.markdown("### ✅ Attendance • All-time Summary (Counts)")
-    att_df = load_attendance_counts(read_sb, schema)
-    render_attendance_counts_chart(att_df)
-
-    st.divider()
-
     # --- Loans ---
     st.markdown("### 💳 Loans")
 
@@ -869,7 +676,6 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         st.write("cash_available_raw", cash_available_raw)
         st.write("cash_available (floored)", cash_available)
         st.write("net_available", net_available)
-        st.write("attendance_rows", 0 if att_df is None else int(len(att_df)))
 
 
 # ============================================================
