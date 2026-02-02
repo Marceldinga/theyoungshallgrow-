@@ -1,20 +1,38 @@
-# loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED (Ledger-based Interest + compute_dpd complete)
-# Key update you asked for:
-# ✅ Interest accrual now writes to interest_ledger (bank-grade, auditable, consistent)
-# ✅ Keeps your existing loan_interest_snapshots behavior (optional) BUT ledger is source-of-truth
-# ✅ Updates loans_legacy interest fields as before (unpaid_interest/accrued/total_interest_generated)
+# loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED (NEW loan_requests schema + Ledger Interest + compute_dpd complete)
+# -----------------------------------------------------------------------------
+# ✅ FIXED: loan_requests no longer uses requester_user_id / requester_member_id / requester_name / surety_name / amount / created_at
+# ✅ Now matches YOUR NEW TABLE columns:
+#    - id (bigint)
+#    - member_id (int)
+#    - member_name (text)
+#    - requested_amount (numeric)
+#    - purpose (text)
+#    - duration_months (int)
+#    - interest_rate (numeric)
+#    - status (text)
+#    - requested_at (timestamptz)
+#    - reviewed_at (timestamptz)
+#    - approved_at (timestamptz)
+#    - reviewed_by (text)
+#    - notes (text)
+#    - surety_member_id (int)
 #
-# Assumptions:
-# - public.interest_ledger exists with unique(loan_id, interest_month)
-# - loans_legacy has: id, member_id, status, principal_current/principal, interest_rate_monthly (optional),
-#   unpaid_interest/accrued_interest/total_interest_generated/last_interest_at/updated_at (some may be absent)
-# - If columns/tables are missing, code degrades gracefully using filter_payload_to_existing_columns.
+# ✅ Interest accrual writes to interest_ledger (bank-grade, idempotent via unique(loan_id, interest_month))
+# ✅ Keeps optional loan_interest_snapshots (safe if missing)
+# ✅ Updates loans_legacy interest fields for convenience (safe if missing columns)
+# ✅ Maker-checker repayments remain the same
+#
+# IMPORTANT:
+# - This file still uses loans_legacy for the actual loan book (your existing design).
+# - If you later rename loans_legacy to loans, you can switch table name in one place.
+# -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 import uuid
+
 import pandas as pd
 from postgrest.exceptions import APIError
 
@@ -36,8 +54,14 @@ REPAY_DATE_COL = "paid_at"
 # ✅ Bank-grade interest ledger
 INTEREST_LEDGER_TABLE = "interest_ledger"            # public.interest_ledger
 
-# legacy snapshots (keep if you want; safe if missing)
+# optional snapshots (safe if missing)
 INTEREST_SNAPSHOTS_TABLE = "loan_interest_snapshots"
+
+# loan book (still using existing)
+LOANS_TABLE = "loans_legacy"
+
+# loan requests (NEW)
+REQUESTS_TABLE = "loan_requests"
 
 # ------------------------------------------------------------
 # STATEMENT SIGNING (signatures.entity_type is NOT NULL)
@@ -113,6 +137,7 @@ def filter_payload_to_existing_columns(sb, schema: str, table: str, payload: dic
 def _drop_missing_column_from_postgrest_error(payload: dict, e: Exception) -> tuple[dict, bool]:
     """
     If PostgREST says a column doesn't exist, remove it and return (new_payload, changed=True).
+    Handles messages like: Could not find the 'xxx' column of 'table' in the schema cache
     """
     msg = str(e)
     if "Could not find the '" in msg and "' column of '" in msg:
@@ -158,7 +183,9 @@ def sig_df(sb, schema: str, entity_type: str, entity_id: int) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["entity_type", "role", "signer_name", "signer_member_id", "signed_at", "entity_id"])
+        return pd.DataFrame(
+            columns=["entity_type", "role", "signer_name", "signer_member_id", "signed_at", "entity_id"]
+        )
     return df
 
 
@@ -302,7 +329,7 @@ def check_loan_qualification(sb, schema: str, borrower_id: int, surety_id: int, 
 def has_active_loan(sb, schema: str, member_id: int) -> bool:
     rows = (
         sb.schema(schema)
-        .table("loans_legacy")
+        .table(LOANS_TABLE)
         .select("status,member_id")
         .eq("member_id", int(member_id))
         .limit(2000)
@@ -314,56 +341,88 @@ def has_active_loan(sb, schema: str, member_id: int) -> bool:
 
 
 # ============================================================
-# REQUESTS
+# REQUESTS (✅ NEW TABLE SHAPE)
 # ============================================================
 def create_loan_request(
     sb,
     schema: str,
-    borrower_id: int,
-    borrower_name: str,
-    surety_id: int,
-    surety_name: str,
-    amount: float,
-    requester_user_id: str | None = None,
+    member_id: int,
+    member_name: str,
+    surety_member_id: int,
+    requested_amount: float,
+    purpose: str | None = None,
+    duration_months: int | None = None,
+    interest_rate: float | None = None,
+    notes: str | None = None,
 ) -> int:
-    if borrower_id <= 0 or surety_id <= 0:
-        raise ValueError("Invalid borrower/surety.")
-    if amount <= 0:
-        raise ValueError("Amount must be > 0.")
-
-    if requester_user_id is None or str(requester_user_id).strip() == "":
-        requester_user_id = str(uuid.uuid4())
-    else:
-        try:
-            _ = uuid.UUID(str(requester_user_id))
-        except Exception:
-            raise ValueError("requester_user_id must be a valid UUID string.")
+    """
+    Insert a new loan request into public.loan_requests (NEW schema).
+    """
+    if int(member_id) <= 0 or int(surety_member_id) <= 0:
+        raise ValueError("Invalid member_id/surety_member_id.")
+    if float(requested_amount) <= 0:
+        raise ValueError("requested_amount must be > 0.")
 
     payload = {
-        "created_at": now_iso(),
-        "requester_user_id": str(requester_user_id),
-        "requester_member_id": int(borrower_id),
-        "requester_name": str(borrower_name),
-        "surety_member_id": int(surety_id),
-        "surety_name": str(surety_name),
-        "amount": float(amount),
+        "member_id": int(member_id),
+        "member_name": str(member_name or "").strip() or None,
+        "requested_amount": float(requested_amount),
+        "purpose": (str(purpose).strip() if purpose else None),
+        "duration_months": int(duration_months) if duration_months is not None else None,
+        "interest_rate": float(interest_rate) if interest_rate is not None else MONTHLY_INTEREST_RATE,
         "status": "pending",
+        "requested_at": now_iso(),
+        "notes": (str(notes).strip() if notes else None),
+        "surety_member_id": int(surety_member_id),
     }
 
-    res = sb.schema(schema).table("loan_requests").insert(payload).execute()
+    payload = {k: v for k, v in payload.items() if v is not None}
+    payload = filter_payload_to_existing_columns(sb, schema, REQUESTS_TABLE, payload)
+
+    res = sb.schema(schema).table(REQUESTS_TABLE).insert(payload).execute()
     row = (res.data or [None])[0]
-    if not row:
+    if not row or "id" not in row:
         raise RuntimeError("Loan request insert failed.")
     return int(row["id"])
 
 
 def list_pending_requests(sb, schema: str, limit: int = 300) -> list[dict]:
+    cols = ",".join([
+        "id",
+        "member_id",
+        "member_name",
+        "requested_amount",
+        "purpose",
+        "duration_months",
+        "interest_rate",
+        "status",
+        "requested_at",
+        "reviewed_at",
+        "approved_at",
+        "reviewed_by",
+        "notes",
+        "surety_member_id",
+    ])
     return (
         sb.schema(schema)
-        .table("loan_requests")
-        .select("id,requester_user_id,requester_member_id,requester_name,surety_member_id,surety_name,amount,status,created_at")
+        .table(REQUESTS_TABLE)
+        .select(cols)
         .eq("status", "pending")
-        .order("created_at", desc=True)
+        .order("requested_at", desc=True)
+        .limit(int(limit))
+        .execute()
+        .data
+        or []
+    )
+
+
+def list_requests(sb, schema: str, limit: int = 500) -> list[dict]:
+    """All requests (any status)."""
+    return (
+        sb.schema(schema)
+        .table(REQUESTS_TABLE)
+        .select("*")
+        .order("requested_at", desc=True)
         .limit(int(limit))
         .execute()
         .data
@@ -374,7 +433,7 @@ def list_pending_requests(sb, schema: str, limit: int = 300) -> list[dict]:
 def get_request(sb, schema: str, request_id: int) -> dict:
     rows = (
         sb.schema(schema)
-        .table("loan_requests")
+        .table(REQUESTS_TABLE)
         .select("*")
         .eq("id", int(request_id))
         .limit(1)
@@ -388,22 +447,22 @@ def get_request(sb, schema: str, request_id: int) -> dict:
 
 
 # ============================================================
-# ADMIN APPROVAL / DENY
+# ADMIN APPROVAL / DENY (uses NEW request fields)
 # ============================================================
-def approve_loan_request(sb, schema: str, request_id: int, actor_user_id: str) -> int:
+def approve_loan_request(sb, schema: str, request_id: int, actor_name: str) -> int:
     req = get_request(sb, schema, request_id)
     if str(req.get("status") or "").lower().strip() != "pending":
         raise ValueError("Only pending requests can be approved.")
 
+    # signatures keyed by entity_type="loan" entity_id=request_id (kept as-is)
     df_sig = sig_df(sb, schema, "loan", int(request_id))
     miss = missing_roles(df_sig, LOAN_SIG_REQUIRED)
     if miss:
         raise ValueError("Approval blocked. Missing/invalid signatures: " + ", ".join(miss))
 
-    borrower_id = int(req.get("requester_member_id") or 0)
+    borrower_id = int(req.get("member_id") or 0)
     surety_id = int(req.get("surety_member_id") or 0)
-    surety_name = str(req.get("surety_name") or "").strip()
-    amount = float(req.get("amount") or 0)
+    amount = float(req.get("requested_amount") or 0)
 
     if borrower_id <= 0 or surety_id <= 0 or amount <= 0:
         raise ValueError("Invalid request data.")
@@ -414,50 +473,59 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_user_id: str) -
     cap = check_loan_qualification(sb, schema, borrower_id, surety_id, amount)
     if not cap["ok"]:
         raise ValueError(
-            f"Loan rejected: principal {cap['amount']} exceeds combined capacity {cap['cap_total']:.3f} "
-            f"(borrower {cap['cap_borrower']:.3f}"
-            + ("" if cap["self_surety"] else f", surety {cap['cap_surety']:.3f}")
+            f"Loan rejected: principal {cap['amount']} exceeds combined capacity {cap['cap_total']:.2f} "
+            f"(borrower {cap['cap_borrower']:.2f}"
+            + ("" if cap["self_surety"] else f", surety {cap['cap_surety']:.2f}")
             + f", rule={cap['rule']})"
         )
 
     ts = now_iso()
+    # create loan in loan book
     loan_payload = {
         "borrower_member_id": borrower_id,
         "member_id": borrower_id,
         "surety_member_id": surety_id,
-        "surety_name": surety_name or None,
         "borrow_date": str(date.today()),
         "principal": float(amount),
         "principal_current": float(amount),
-        "interest_rate_monthly": MONTHLY_INTEREST_RATE,
+        "interest_rate_monthly": float(req.get("interest_rate") or MONTHLY_INTEREST_RATE),
         "interest_start_at": ts,
         "status": "open",
         "updated_at": ts,
     }
-    loan_payload = filter_payload_to_existing_columns(sb, schema, "loans_legacy", loan_payload)
+    loan_payload = filter_payload_to_existing_columns(sb, schema, LOANS_TABLE, loan_payload)
 
-    loan_res = sb.schema(schema).table("loans_legacy").insert(loan_payload).execute()
+    loan_res = sb.schema(schema).table(LOANS_TABLE).insert(loan_payload).execute()
     loan_row = (loan_res.data or [None])[0]
     if not loan_row:
         raise RuntimeError("Loan creation failed.")
     loan_id = int(loan_row["id"])
 
-    sb.schema(schema).table("loan_requests").update({
+    # update request
+    upd = {
         "status": "approved",
-        "decided_at": ts,
-        "approved_loan_id": loan_id,
-        "admin_note": f"approved by {actor_user_id} | cap_total={cap['cap_total']:.3f}",
-    }).eq("id", int(request_id)).execute()
+        "reviewed_by": str(actor_name or "").strip() or "admin",
+        "reviewed_at": ts,
+        "approved_at": ts,
+        "notes": (str(req.get("notes") or "").strip() + f"\napproved by {actor_name} | cap_total={cap['cap_total']:.2f}").strip(),
+    }
+    upd = filter_payload_to_existing_columns(sb, schema, REQUESTS_TABLE, upd)
+
+    sb.schema(schema).table(REQUESTS_TABLE).update(upd).eq("id", int(request_id)).execute()
 
     return loan_id
 
 
-def deny_loan_request(sb, schema: str, request_id: int, reason: str):
-    sb.schema(schema).table("loan_requests").update({
+def deny_loan_request(sb, schema: str, request_id: int, actor_name: str, reason: str):
+    ts = now_iso()
+    upd = {
         "status": "denied",
-        "decided_at": now_iso(),
-        "admin_note": str(reason or "").strip(),
-    }).eq("id", int(request_id)).execute()
+        "reviewed_by": str(actor_name or "").strip() or "admin",
+        "reviewed_at": ts,
+        "notes": (str(reason or "").strip() or "denied"),
+    }
+    upd = filter_payload_to_existing_columns(sb, schema, REQUESTS_TABLE, upd)
+    sb.schema(schema).table(REQUESTS_TABLE).update(upd).eq("id", int(request_id)).execute()
 
 
 # ============================================================
@@ -503,10 +571,10 @@ def _apply_payment_to_loan_balances(sb, schema: str, loan: dict, loan_id: int, a
         "closed_at": now_iso() if close_now else None,
     }
     update_payload = {k: v for k, v in update_payload.items() if v is not None}
-    update_payload = filter_payload_to_existing_columns(sb, schema, "loans_legacy", update_payload)
+    update_payload = filter_payload_to_existing_columns(sb, schema, LOANS_TABLE, update_payload)
 
     if update_payload:
-        sb.schema(schema).table("loans_legacy").update(update_payload).eq("id", int(loan_id)).execute()
+        sb.schema(schema).table(LOANS_TABLE).update(update_payload).eq("id", int(loan_id)).execute()
 
 
 def record_payment_pending(
@@ -524,7 +592,7 @@ def record_payment_pending(
         raise ValueError("Invalid loan_id.")
 
     loan = fetch_one(
-        sb.schema(schema).table("loans_legacy")
+        sb.schema(schema).table(LOANS_TABLE)
         .select("id,member_id,status")
         .eq("id", int(loan_id))
     )
@@ -588,7 +656,7 @@ def confirm_payment(sb, schema: str, pending_id: int, confirmer_user_id: str):
     sb.schema(schema).table(PAYMENTS_TABLE).insert(repay_payload).execute()
 
     loan = fetch_one(
-        sb.schema(schema).table("loans_legacy")
+        sb.schema(schema).table(LOANS_TABLE)
         .select("id,member_id,principal,principal_current,unpaid_interest,accrued_interest,total_due,total_paid,status")
         .eq("id", int(loan_id))
     )
@@ -684,7 +752,7 @@ def insert_legacy_loan_repayment(
 # ============================================================
 # INTEREST (✅ Ledger-based + optional snapshot)
 # ============================================================
-def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, float]:
+def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> Tuple[int, float]:
     """
     ✅ Source-of-truth: interest_ledger
     Idempotent: relies on unique(loan_id, interest_month) in interest_ledger.
@@ -696,7 +764,7 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, f
     ts = now_iso()
 
     loans = (
-        sb.schema(schema).table("loans_legacy")
+        sb.schema(schema).table(LOANS_TABLE)
         .select("id,member_id,status,principal,principal_current,accrued_interest,total_interest_generated,unpaid_interest,interest_rate_monthly")
         .limit(20000).execute().data or []
     )
@@ -736,7 +804,6 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, f
             sb.schema(schema).table(INTEREST_LEDGER_TABLE).insert(ledger_payload).execute()
         except APIError as e:
             msg = str(e)
-            # duplicate = already accrued for this loan/month
             if "duplicate key value" in msg or "uq_interest_ledger_loan_month" in msg:
                 continue
             raise
@@ -753,8 +820,8 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, f
             "last_interest_at": ts,
             "updated_at": ts,
         }
-        upd = filter_payload_to_existing_columns(sb, schema, "loans_legacy", upd)
-        sb.schema(schema).table("loans_legacy").update(upd).eq("id", loan_id).execute()
+        upd = filter_payload_to_existing_columns(sb, schema, LOANS_TABLE, upd)
+        sb.schema(schema).table(LOANS_TABLE).update(upd).eq("id", loan_id).execute()
 
         updated += 1
         interest_added_total += float(interest)
@@ -796,7 +863,6 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, f
                     if changed:
                         snapshot_payload = new_payload
                         continue
-                    # try snapshot_date as alternate conflict target
                     try:
                         sb.schema(schema).table(INTEREST_SNAPSHOTS_TABLE).upsert(
                             snapshot_payload,
@@ -806,7 +872,6 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> tuple[int, f
                     except Exception:
                         raise
         except Exception:
-            # snapshot failure should never block accrual
             pass
 
     return updated, float(round(interest_added_total, 2))
@@ -882,7 +947,7 @@ def compute_dpd(loan_row: dict, last_paid_on: Optional[date]) -> int:
 def delinquency_table(sb, schema: str, limit: int = 500) -> pd.DataFrame:
     try:
         loans = (
-            sb.schema(schema).table("loans_legacy")
+            sb.schema(schema).table(LOANS_TABLE)
             .select("id,member_id,status,principal,principal_current,unpaid_interest,total_due,due_date,next_due_date,expected_due_date,payment_due_date,borrow_date,updated_at")
             .order("updated_at", desc=True)
             .limit(int(limit))
@@ -920,7 +985,7 @@ def delinquency_table(sb, schema: str, limit: int = 500) -> pd.DataFrame:
 def list_loans(sb, schema: str, limit: int = 500) -> List[Dict[str, Any]]:
     try:
         return (
-            sb.schema(schema).table("loans_legacy")
+            sb.schema(schema).table(LOANS_TABLE)
             .select("*")
             .order("updated_at", desc=True)
             .limit(int(limit))
@@ -932,7 +997,7 @@ def list_loans(sb, schema: str, limit: int = 500) -> List[Dict[str, Any]]:
 
 def get_loan(sb, schema: str, loan_id: int) -> Optional[Dict[str, Any]]:
     return fetch_one(
-        sb.schema(schema).table("loans_legacy")
+        sb.schema(schema).table(LOANS_TABLE)
         .select("*")
         .eq("id", int(loan_id))
     )
@@ -941,7 +1006,7 @@ def get_loan(sb, schema: str, loan_id: int) -> Optional[Dict[str, Any]]:
 def list_member_loans(sb, schema: str, member_id: int, limit: int = 200) -> List[Dict[str, Any]]:
     try:
         return (
-            sb.schema(schema).table("loans_legacy")
+            sb.schema(schema).table(LOANS_TABLE)
             .select("*")
             .eq("member_id", int(member_id))
             .order("updated_at", desc=True)
