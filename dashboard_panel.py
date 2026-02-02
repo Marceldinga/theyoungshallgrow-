@@ -1,781 +1,872 @@
-# dashboard_panel.py ✅ COMPLETE SINGLE CODE (NO SQL) — NJANGI STANDARD (NO "legacy")
-# ✅ Fixes Dashboard not updating:
-#    - Uses sb_service for app_state/sessions/contributions when available (RLS-safe)
-#    - Uses sb_anon only as fallback
-# ✅ Shows Session ID / Session Window / Beneficiary / Pot correctly
-# ✅ Dark theme + glass KPI cards
-# ✅ Auto-refresh on app_state stamp change
+
+# loans_ui.py ✅ COMPLETE UPDATED SINGLE FILE — NEW STANDARD (NO legacy, member_id only)
+# ✅ Fixes your error:
+#    create_loan_request() got an unexpected keyword argument 'borrower_id'
+# ✅ Standardizes on member_id naming:
+#    - borrower_id -> requester_member_id
+#    - surety_id   -> surety_member_id
 #
-# ✅ FINANCE MODEL (your rule):
-#    - Payouts are pot redistribution → NOT cash flow (informational only)
-#    - Adds FINES PAID as cash flow (fines.status='paid')
-#    - Interest is LEDGER-based (interest_ledger):
-#         - Interest this month = sum(amount) where interest_month startswith YYYY-MM
-#         - Interest all-time  = sum(amount) all rows
-#    - Cash Available = foundation + loan_payments + interest(ledger) + fines_paid − outstanding_principal
+# ✅ Uses NEW tables only:
+#    - members (id, name, display_name, phone)
+#    - loans (id, member_id, status, principal_current, principal, unpaid_interest, total_interest_generated, total_due,
+#            borrow_date, last_paid_at, due_cycle_days, interest_rate_monthly, created_at, updated_at)
+#    - loan_payments (id, loan_id, member_id, amount, paid_at, created_at, note)
+#    - interest_ledger (id, loan_id, member_id, amount, interest_month='YYYY-MM-DD', created_at, note)
+#    - loan_requests (id, requester_user_id, requester_member_id, surety_member_id, amount, status, created_at,
+#                    decided_at, approved_loan_id, admin_note)
+#    - signatures (entity_type, entity_id, role, signer_member_id, signer_name, signed_at)
 #
-# ✅ Attendance (ALL-TIME) on dashboard:
-#    - CHART ONLY (no dataframe numbers shown)
-#    - Reads from view public.v_attendance_member_totals if available
-#    - Fallback: computes from attendance table (no SQL)
+# ✅ Governance:
+#    - Member submits request (member_id only)
+#    - Required signatures: borrower + surety + treasury (entity_type='loan_request', entity_id=request_id)
+#    - Admin approves only if signatures complete + cap passes (handled in loans_core)
 #
-# NEW TABLES ONLY:
-#   - app_state                (id=1, current_session_id, next_member_id, optional next_payout_date, updated_at)
-#   - sessions                 (session_id, start_date, end_date, created_at)
-#   - members                  (id, name, phone, display_name optional)
-#   - contributions            (member_id, session_id, amount, paid_at, created_at)
-#   - foundation_contributions (member_id, session_id, amount, paid_at, created_at)
-#   - loans                    (id, member_id, status, principal_current, principal, unpaid_interest, total_interest_generated,
-#                               interest_rate_monthly, total_due (generated), borrow_date, due_cycle_days, last_paid_at, created_at, updated_at)
-#   - loan_payments            (loan_id, member_id, amount, paid_at, created_at)
-#   - interest_ledger          (id, loan_id, member_id, interest_month, amount, created_at, ...)
-#   - payouts                  (session_id, member_id, payout_amount, payout_date, payout_index, created_at, updated_at)  # informational only
-#   - fines                    (id, member_id, session_id, amount, reason, issued_by, status, paid_at, created_at, updated_at)
-#   - attendance               (id, member_id, session_id, present, note, created_at)
-#   - v_next_beneficiary       (optional view)
-#   - v_attendance_member_totals (recommended view)
+# ✅ Payments:
+#    - Record payment into loan_payments via loans_core.record_payment (interest-first → principal)
+#
+# ✅ Interest:
+#    - "Accrue interest now" calls loans_core.accrue_monthly_interest (writes to interest_ledger)
+#    - interest_month is cycle key 'YYYY-MM-DD' so "this month" uses startswith('YYYY-MM')
+#
+# ✅ Maker-checker note:
+#    - Full maker-checker needs created_by/confirmed_by fields (or a confirmations table).
+#    - This UI provides a "Confirm Payments" section safely:
+#      - If core.confirm_payment(...) exists, it will call it.
+#      - Otherwise it shows a clear message and does not crash.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
+from uuid import uuid4, UUID
 from typing import Any
+
 import streamlit as st
 import pandas as pd
+from postgrest.exceptions import APIError
 
-DUE_DAYS = 28
+from rbac import Actor, require, allowed_sections, ROLE_ADMIN, ROLE_TREASURY, ROLE_MEMBER
+import loans_core as core
 
+# Optional PDFs
+try:
+    from pdfs import make_member_loan_statement_pdf, make_loan_statements_zip
+except Exception:
+    make_member_loan_statement_pdf = None
+    make_loan_statements_zip = None
 
-# ============================================================
-# THEME
-# ============================================================
-def inject_dashboard_theme():
-    st.markdown(
-        """
-        <style>
-        .stApp {
-            background-color: #0b0f1a;
-            background-image:
-                radial-gradient(circle at 1px 1px, rgba(255,255,255,0.06) 1px, transparent 0);
-            background-size: 24px 24px;
-            color: #e5e7eb;
-        }
-        section[data-testid="stSidebar"]{
-            background: #0b0f1a;
-            border-right: 1px solid rgba(255,255,255,0.06);
-        }
-        header, footer { background: transparent !important; }
-        h1, h2, h3, h4, h5, h6, p, div, span, label { color: #e5e7eb; }
-
-        .glass {
-            background: rgba(255,255,255,0.04);
-            border: 1px solid rgba(255,255,255,0.06);
-            border-radius: 18px;
-            padding: 18px 18px;
-            box-shadow: 0 14px 45px rgba(0,0,0,0.45);
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
-        }
-
-        .kpi {
-            background: rgba(255,255,255,0.04);
-            border: 1px solid rgba(255,255,255,0.06);
-            border-radius: 16px;
-            padding: 14px 16px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.35);
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
-        }
-
-        .kpi-label {
-            font-size: 12px;
-            letter-spacing: 0.10em;
-            text-transform: uppercase;
-            opacity: 0.7;
-        }
-        .kpi-value {
-            font-size: 28px;
-            font-weight: 750;
-            margin-top: 8px;
-            line-height: 1.1;
-        }
-        .kpi-sub {
-            margin-top: 6px;
-            font-size: 12px;
-            opacity: 0.65;
-            word-break: break-word;
-        }
-
-        .blue { color: #60a5fa; }
-        .green { color: #34d399; }
-        .purple { color: #a78bfa; }
-        .orange { color: #fb923c; }
-        .red { color: #f87171; }
-
-        div[data-testid="stDataFrame"]{
-            border-radius: 14px;
-            overflow: hidden;
-            border: 1px solid rgba(255,255,255,0.06);
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def kpi_card(label: str, value: str, color: str = "blue", sub: str | None = None) -> str:
-    sub_html = f"<div class='kpi-sub'>{sub}</div>" if sub else ""
-    return f"""
-    <div class="kpi">
-        <div class="kpi-label">{label}</div>
-        <div class="kpi-value {color}">{value}</div>
-        {sub_html}
-    </div>
-    """
-
-
-def glass_open() -> str:
-    return "<div class='glass'>"
-
-
-def glass_close() -> str:
-    return "</div>"
-
-
-# ============================================================
-# SAFE HELPERS (NO RAW SQL)
-# ============================================================
-def safe_table(
-    sb,
-    schema: str,
-    table: str,
-    cols: str = "*",
-    limit: int | None = 20000,
-    order_by: str | None = None,
-    desc: bool = True,
-):
-    try:
-        q = sb.schema(schema).table(table).select(cols)
-        if order_by:
-            q = q.order(order_by, desc=desc)
-        if limit is not None:
-            q = q.limit(int(limit))
-        res = q.execute()
-        return res.data or []
-    except Exception:
-        return []
-
-
-def safe_table_order_fallback(
-    sb,
-    schema: str,
-    table: str,
-    cols: str = "*",
-    limit: int | None = 20000,
-    order_candidates: list[str] | None = None,
-    desc: bool = True,
-):
-    order_candidates = order_candidates or []
-    for c in order_candidates:
-        try:
-            rows = safe_table(sb, schema, table, cols=cols, limit=limit, order_by=c, desc=desc)
-            if rows is not None:
-                return rows or []
-        except Exception:
-            continue
-    return safe_table(sb, schema, table, cols=cols, limit=limit, order_by=None, desc=desc)
-
-
-def safe_single(sb, schema: str, table: str, cols: str = "*", **eq_filters) -> dict:
-    try:
-        q = sb.schema(schema).table(table).select(cols)
-        for k, v in eq_filters.items():
-            q = q.eq(k, v)
-        q = q.limit(1)
-        rows = q.execute().data or []
-        return rows[0] if rows else {}
-    except Exception:
-        return {}
-
-
-def _num(x, default=0.0) -> float:
-    try:
-        if x is None or x == "":
-            return float(default)
-        return float(x)
-    except Exception:
-        return float(default)
-
-
-def _fmt_money(x, decimals: int = 0) -> str:
-    try:
-        v = float(x)
-        if decimals == 0:
-            return f"{v:,.0f}"
-        return f"{v:,.{decimals}f}"
-    except Exception:
-        return "—"
-
-
-def _to_date(x) -> date | None:
-    if x is None:
-        return None
-    if isinstance(x, date) and not isinstance(x, datetime):
-        return x
-    if isinstance(x, datetime):
-        return x.date()
-    s = str(x).strip()
-    if not s:
-        return None
-    if "T" in s:
-        s = s.split("T")[0]
-    try:
-        return datetime.fromisoformat(s).date()
-    except Exception:
+# Optional audit (safe)
+try:
+    from audit import audit
+except Exception:
+    def audit(*args, **kwargs):
         return None
 
 
-def _table_exists(sb, schema: str, table: str) -> bool:
+# ============================================================
+# TABLES
+# ============================================================
+MEMBERS_TABLE = "members"
+LOANS_TABLE = "loans"
+PAYMENTS_TABLE = "loan_payments"
+REQUESTS_TABLE = "loan_requests"
+SIGNATURES_TABLE = "signatures"
+INTEREST_LEDGER_TABLE = "interest_ledger"
+
+# Optional views (recommended for names/phones)
+V_LOANS_WITH_MEMBER = "v_loans_with_member"
+V_PAYMENTS_WITH_MEMBER = "v_loan_payments_with_member"
+
+# Signatures settings (must match loans_core)
+REQ_ENTITY_TYPE = "loan_request"
+REQ_SIG_REQUIRED = ["borrower", "surety", "treasury"]
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+def _apierror_message(e: Exception) -> str:
+    if isinstance(e, APIError):
+        payload = e.args[0] if getattr(e, "args", None) else {}
+        if isinstance(payload, dict):
+            return str(payload.get("message") or payload.get("details") or payload.get("hint") or "APIError")
+        return str(e)
+    return str(e)
+
+
+def _is_uuid(s: str) -> bool:
     try:
-        sb.schema(schema).table(table).select("*").limit(1).execute()
+        UUID(str(s))
         return True
     except Exception:
         return False
 
 
-# ============================================================
-# AUTO-REFRESH ON app_state CHANGE
-# ============================================================
-def _read_state_stamp(sb, schema: str) -> str:
-    r = safe_single(sb, schema, "app_state", "*", id=1)
-    return "|".join(
-        [
-            str(r.get("current_session_id") or ""),
-            str(r.get("next_member_id") or ""),
-            str(r.get("next_payout_date") or ""),
-            str(r.get("updated_at") or ""),
-        ]
+def _get_or_make_session_uuid(key: str = "actor_user_uuid") -> str:
+    v = str(st.session_state.get(key) or "").strip()
+    if not v or not _is_uuid(v):
+        st.session_state[key] = str(uuid4())
+    return str(st.session_state[key])
+
+
+def _actor_from_session(default_user_id: str) -> Actor:
+    with st.sidebar.expander("🔐 Role (temporary)", expanded=False):
+        role = st.selectbox("Role", [ROLE_ADMIN, ROLE_TREASURY, ROLE_MEMBER], index=0, key="actor_role")
+        member_id = st.number_input(
+            "Member ID (if member/treasury)",
+            min_value=0, step=1, value=int(st.session_state.get("actor_member_id") or 0),
+            key="actor_member_id",
+        )
+        name = st.text_input(
+            "Name",
+            value=str(st.session_state.get("actor_name") or ("admin" if role != ROLE_MEMBER else "member")),
+            key="actor_name",
+        )
+
+    user_uuid = default_user_id if (default_user_id and _is_uuid(default_user_id)) else _get_or_make_session_uuid()
+
+    return Actor(
+        user_id=user_uuid,
+        role=role,
+        member_id=(int(member_id) if int(member_id) > 0 else None),
+        name=(name.strip() or None),
     )
 
 
-def _auto_refresh_if_state_changed(sb, schema: str):
-    stamp = _read_state_stamp(sb, schema)
-    prev = st.session_state.get("_state_stamp_dashboard")
-    st.session_state["_state_stamp_dashboard"] = stamp
-    if prev is None:
+def _to_iso(d: date) -> str:
+    return datetime.combine(d, datetime.min.time()).isoformat()
+
+
+def _num(x) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+
+def _month_key(d: date | None = None) -> str:
+    d = d or date.today()
+    return f"{d.year:04d}-{d.month:02d}"
+
+
+def _safe_df(rows: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame(rows or [])
+
+
+def _table_exists(sb, schema: str, table_name: str) -> bool:
+    try:
+        sb.schema(schema).table(table_name).select("*").limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
+def _read_members(sb, schema: str) -> pd.DataFrame:
+    rows = (
+        sb.schema(schema).table(MEMBERS_TABLE)
+        .select("id,name,display_name,phone")
+        .order("id", desc=False)
+        .limit(5000)
+        .execute().data or []
+    )
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["id", "name", "display_name", "phone", "label"])
+    df["id"] = pd.to_numeric(df["id"], errors="coerce").fillna(0).astype(int)
+    df["name"] = df["name"].astype(str)
+    if "display_name" in df.columns:
+        df["display_name"] = df["display_name"].astype(str).replace({"None": "", "nan": ""})
+    else:
+        df["display_name"] = ""
+    if "phone" in df.columns:
+        df["phone"] = df["phone"].astype(str).replace({"None": "", "nan": ""})
+    else:
+        df["phone"] = ""
+    df["label"] = df.apply(lambda r: f"{int(r['id']):02d} • {(r['display_name'] or r['name'])}", axis=1)
+    return df
+
+
+def _signature_status(sb, schema: str, request_id: int) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Returns (df_signatures, missing_roles)
+    """
+    try:
+        rows = (
+            sb.schema(schema).table(SIGNATURES_TABLE)
+            .select("entity_type,entity_id,role,signer_member_id,signer_name,signed_at")
+            .eq("entity_type", REQ_ENTITY_TYPE)
+            .eq("entity_id", int(request_id))
+            .order("signed_at", desc=False)
+            .limit(1000)
+            .execute().data or []
+        )
+    except Exception:
+        rows = []
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["role", "signer_member_id", "signer_name", "signed_at"]), REQ_SIG_REQUIRED
+
+    roles = df["role"].astype(str).str.lower().str.strip()
+    ok = set(roles[pd.to_numeric(df["signer_member_id"], errors="coerce").notna()].tolist())
+    missing = [r for r in REQ_SIG_REQUIRED if r.lower() not in ok]
+    return df, missing
+
+
+def _upsert_signature(sb, schema: str, request_id: int, role: str, signer_member_id: int, signer_name: str):
+    core.insert_signature(
+        sb, schema,
+        entity_type=REQ_ENTITY_TYPE,
+        entity_id=int(request_id),
+        role=str(role).strip().lower(),
+        signer_member_id=int(signer_member_id),
+        signer_name=str(signer_name or "").strip(),
+    )
+
+
+# ============================================================
+# SECTION NORMALIZATION (fixes menu mismatch)
+# ============================================================
+_SECTION_CANON: dict[str, str] = {
+    # Aliases coming from RBAC sections
+    "Loan Statement": "Statements",
+    "Statements": "Statements",
+    "Statement": "Statements",
+
+    "Confirm Payment": "Confirm Payments",
+    "Confirm Payments": "Confirm Payments",
+
+    "Direct Payment": "Direct Payment",
+    "Delinquency": "Delinquency",
+
+    # Keep core ones unchanged
+    "Requests": "Requests",
+    "Ledger": "Ledger",
+    "Record Payment": "Record Payment",
+    "Interest": "Interest",
+}
+
+def _canon_section(section: str) -> str:
+    s = (section or "").strip()
+    return _SECTION_CANON.get(s, s)
+
+
+# ============================================================
+# KPIs (top of Loans page)
+# ============================================================
+def _render_kpis(sb, schema: str):
+    try:
+        loans = (
+            sb.schema(schema).table(LOANS_TABLE)
+            .select("id,status,total_due,principal_current,principal,unpaid_interest")
+            .limit(20000).execute().data or []
+        )
+    except Exception:
+        loans = []
+
+    df = pd.DataFrame(loans)
+    if df.empty:
+        active_count = 0
+        active_due = 0.0
+        active_principal_current = 0.0
+    else:
+        df["status"] = df["status"].astype(str).str.lower().str.strip()
+        df["total_due"] = pd.to_numeric(df.get("total_due"), errors="coerce").fillna(0.0)
+        pc = pd.to_numeric(df.get("principal_current"), errors="coerce")
+        p = pd.to_numeric(df.get("principal"), errors="coerce")
+        df["principal_current_eff"] = pc.fillna(p).fillna(0.0)
+
+        active = df[df["status"].isin(["open", "active"])]
+        active_count = len(active)
+        active_due = float(active["total_due"].sum())
+        active_principal_current = float(active["principal_current_eff"].sum())
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Active loans", str(active_count))
+    k2.metric("Principal current (active)", f"{active_principal_current:,.0f}")
+    k3.metric("Total due (active)", f"{active_due:,.0f}")
+    k4.metric("Cycle / Rate", "28 days • 5%")
+    st.divider()
+
+
+# ============================================================
+# REQUESTS (member submits; admin approves with signatures)
+# ============================================================
+def _render_requests(sb, schema: str, actor: Actor):
+    require(actor.role, "submit_request")
+    st.subheader("Requests")
+    st.caption("Member submits request (member_id only). Admin approves only after required signatures.")
+
+    dfm = _read_members(sb, schema)
+    if dfm.empty:
+        st.warning("No members found in members.")
         return
-    if stamp != prev:
+
+    labels = dfm["label"].tolist()
+    label_to_id = dict(zip(dfm["label"], dfm["id"]))
+
+    st.markdown("### Create a loan request")
+    with st.form("loan_request_create", clear_on_submit=True):
+        borrower_pick = st.selectbox("Borrower", labels, key="req_borrower")
+        surety_pick = st.selectbox("Surety", labels, key="req_surety")
+        amount = st.number_input("Amount", min_value=0.0, step=50.0, value=0.0, key="req_amount")
+        ok = st.form_submit_button("Submit request", use_container_width=True)
+
+    if ok:
+        requester_member_id = int(label_to_id[borrower_pick])   # ✅ member_id only
+        surety_member_id = int(label_to_id[surety_pick])        # ✅ member_id only
+
+        if requester_member_id == surety_member_id:
+            st.error("Borrower and surety must be different.")
+        elif float(amount) <= 0:
+            st.error("Amount must be > 0.")
+        else:
+            try:
+                # ✅ FIX: use correct keywords (NO borrower_id)
+                req_id = core.create_loan_request(
+                    sb, schema,
+                    requester_member_id=int(requester_member_id),
+                    surety_member_id=int(surety_member_id),
+                    amount=float(amount),
+                    requester_user_id=str(actor.user_id),
+                )
+                audit(sb, "loan_request_created", "ok", {"request_id": int(req_id)}, actor_user_id=actor.user_id)
+                st.success(f"Request submitted. ID = {req_id}")
+                st.rerun()
+            except Exception as e:
+                st.error("Failed to create request.")
+                st.code(_apierror_message(e), language="text")
+
+    st.divider()
+    st.markdown("### Pending requests")
+
+    pending = core.list_pending_requests(sb, schema, limit=300)
+    dfp = _safe_df(pending)
+    if dfp.empty:
+        st.info("No pending requests.")
+        return
+
+    show_cols = [c for c in ["id", "requester_member_id", "surety_member_id", "amount", "status", "created_at"] if c in dfp.columns]
+    st.dataframe(dfp[show_cols] if show_cols else dfp, use_container_width=True, hide_index=True)
+
+    # ---- Signature collection + approval (admin/treasury only) ----
+    if actor.role not in (ROLE_ADMIN, ROLE_TREASURY):
+        st.info("Only Admin/Treasury can manage signatures and approve requests.")
+        return
+
+    st.markdown("### Signatures & Approval")
+    req_id = st.selectbox("Select request ID", dfp["id"].tolist(), key="req_pick_id")
+
+    df_sig, missing = _signature_status(sb, schema, int(req_id))
+    if df_sig.empty:
+        st.warning(f"No signatures yet. Required: {', '.join(REQ_SIG_REQUIRED)}")
+    else:
+        st.caption("Signatures on file (entity_type=loan_request):")
+        st.dataframe(df_sig, use_container_width=True, hide_index=True)
+        if missing:
+            st.warning("Missing signatures: " + ", ".join(missing))
+        else:
+            st.success("All required signatures are present.")
+
+    st.markdown("#### Add/Update a signature (upsert by role)")
+    role = st.selectbox("Role", REQ_SIG_REQUIRED, index=0, key="sig_role")
+    signer_pick = st.selectbox("Signer member", labels, key="sig_signer_pick")
+    signer_id = int(label_to_id[signer_pick])
+    signer_row = dfm[dfm["id"] == signer_id].iloc[0].to_dict()
+    signer_name = (signer_row.get("display_name") or signer_row.get("name") or "").strip()
+
+    if st.button("✍️ Save Signature", use_container_width=True, key="sig_save_btn"):
         try:
-            st.cache_data.clear()
-            st.cache_resource.clear()
+            _upsert_signature(sb, schema, int(req_id), role=role, signer_member_id=signer_id, signer_name=signer_name)
+            audit(sb, "loan_request_signature_saved", "ok",
+                  {"request_id": int(req_id), "role": role, "signer_member_id": int(signer_id)},
+                  actor_user_id=actor.user_id)
+            st.success("Signature saved.")
+            st.rerun()
+        except Exception as e:
+            st.error("Failed to save signature.")
+            st.code(_apierror_message(e), language="text")
+
+    st.divider()
+    c1, c2 = st.columns(2)
+
+    with c1:
+        if st.button("✅ APPROVE REQUEST", type="primary", use_container_width=True, key="approve_req_btn"):
+            try:
+                loan_id = core.approve_loan_request(sb, schema, request_id=int(req_id), actor_user_id=str(actor.user_id))
+                audit(sb, "loan_request_approved", "ok",
+                      {"request_id": int(req_id), "loan_id": int(loan_id)},
+                      actor_user_id=actor.user_id)
+                st.success(f"Approved. Loan ID = {loan_id}")
+                st.rerun()
+            except Exception as e:
+                st.error("Approval blocked.")
+                st.code(_apierror_message(e), language="text")
+
+    with c2:
+        reason = st.text_input("Deny reason", value="Denied", key="deny_reason")
+        if st.button("❌ DENY REQUEST", use_container_width=True, key="deny_req_btn"):
+            try:
+                core.deny_loan_request(sb, schema, request_id=int(req_id), reason=reason, actor_user_id=str(actor.user_id))
+                audit(sb, "loan_request_denied", "ok",
+                      {"request_id": int(req_id), "reason": reason},
+                      actor_user_id=actor.user_id)
+                st.warning("Denied.")
+                st.rerun()
+            except Exception as e:
+                st.error("Deny failed.")
+                st.code(_apierror_message(e), language="text")
+
+
+# ============================================================
+# LEDGER (Loans table) + Delinquency preview
+# ============================================================
+def _render_ledger(sb, schema: str, actor: Actor):
+    require(actor.role, "view_ledger")
+    st.subheader("Ledger (Loans)")
+    st.caption("Loans are stored by member_id. Names/phones appear via views if available.")
+
+    table = V_LOANS_WITH_MEMBER if _table_exists(sb, schema, V_LOANS_WITH_MEMBER) else LOANS_TABLE
+    try:
+        rows = (
+            sb.schema(schema).table(table)
+            .select("*")
+            .order("updated_at", desc=True)
+            .limit(2000)
+            .execute().data or []
+        )
+    except Exception as e:
+        st.error("Failed to load loans.")
+        st.code(_apierror_message(e), language="text")
+        return
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        st.info("No loans found.")
+        return
+
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("### Delinquency (DPD)")
+    try:
+        dfd = core.delinquency_table(sb, schema, limit=500)
+        if dfd is None or getattr(dfd, "empty", True):
+            st.info("No delinquent active/open loans.")
+        else:
+            st.dataframe(dfd, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.warning("Could not compute delinquency.")
+        st.code(_apierror_message(e), language="text")
+
+
+# ============================================================
+# DELINQUENCY (separate section)
+# ============================================================
+def _render_delinquency(sb, schema: str, actor: Actor):
+    require(actor.role, "view_delinquency")
+    st.subheader("Delinquency")
+    st.caption("Days past due (DPD) for open/active loans.")
+    try:
+        dfd = core.delinquency_table(sb, schema, limit=1000)
+        if dfd is None or getattr(dfd, "empty", True):
+            st.info("No delinquent loans.")
+        else:
+            st.dataframe(dfd, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.error("Failed to compute delinquency.")
+        st.code(_apierror_message(e), language="text")
+
+
+# ============================================================
+# RECORD PAYMENT (direct to loan_payments)
+# ============================================================
+def _render_record_payment(sb, schema: str, actor: Actor):
+    require(actor.role, "record_payment")
+    st.subheader("Record Payment")
+    st.caption("Records a payment into loan_payments and updates loan balances (interest-first).")
+
+    table = V_LOANS_WITH_MEMBER if _table_exists(sb, schema, V_LOANS_WITH_MEMBER) else LOANS_TABLE
+
+    select_cols_view = "id,member_id,status,total_due,principal,principal_current,unpaid_interest,member_display_name,member_name"
+    select_cols_base = "id,member_id,status,total_due,principal,principal_current,unpaid_interest"
+
+    try:
+        loans = (
+            sb.schema(schema).table(table)
+            .select(select_cols_view)
+            .order("id", desc=True)
+            .limit(2000)
+            .execute().data or []
+        )
+    except Exception:
+        loans = (
+            sb.schema(schema).table(LOANS_TABLE)
+            .select(select_cols_base)
+            .order("id", desc=True)
+            .limit(2000)
+            .execute().data or []
+        )
+
+    df = pd.DataFrame(loans)
+    if df.empty:
+        st.warning("No loans found.")
+        return
+
+    def _lbl(r):
+        due = _num(r.get("total_due"))
+        pc = _num(r.get("principal_current") or r.get("principal"))
+        ui = _num(r.get("unpaid_interest"))
+        who = r.get("member_display_name") or r.get("member_name") or f"Member {r.get('member_id')}"
+        return f"Loan {int(r['id'])} • {who} • {str(r.get('status') or '')} • Principal {pc:,.0f} • Interest {ui:,.0f} • Due {due:,.0f}"
+
+    df["label"] = df.apply(_lbl, axis=1)
+    pick = st.selectbox("Select loan", df["label"].tolist(), key="pay_pick_loan")
+    loan_id = int(df[df["label"] == pick].iloc[0]["id"])
+
+    amount = st.number_input("Amount", min_value=0.0, step=50.0, value=0.0, key="pay_amt")
+    paid_on = st.date_input("Paid date", value=date.today(), key="pay_date")
+    note = st.text_input("Note (optional)", value="Loan payment", key="pay_note")
+
+    if st.button("💾 Save payment", type="primary", use_container_width=True, key="pay_save"):
+        if float(amount) <= 0:
+            st.error("Amount must be > 0.")
+            st.stop()
+        try:
+            core.record_payment(
+                sb, schema,
+                loan_id=int(loan_id),
+                amount=float(amount),
+                paid_at=_to_iso(paid_on),
+                note=note,
+            )
+            audit(sb, "loan_payment_recorded", "ok",
+                  {"loan_id": int(loan_id), "amount": float(amount)},
+                  actor_user_id=actor.user_id)
+            st.success("Payment recorded and applied.")
+            st.rerun()
+        except Exception as e:
+            st.error("Failed to record payment.")
+            st.code(_apierror_message(e), language="text")
+
+    st.divider()
+    st.markdown("### Recent payments for selected loan")
+    pay_table = V_PAYMENTS_WITH_MEMBER if _table_exists(sb, schema, V_PAYMENTS_WITH_MEMBER) else PAYMENTS_TABLE
+    try:
+        rows = (
+            sb.schema(schema).table(pay_table)
+            .select("*")
+            .eq("loan_id", int(loan_id))
+            .order("paid_at", desc=True)
+            .limit(200)
+            .execute().data or []
+        )
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.warning("Could not load payments.")
+        st.code(_apierror_message(e), language="text")
+
+
+# ============================================================
+# DIRECT PAYMENT (mapped to Record Payment)
+# ============================================================
+def _render_direct_payment(sb, schema: str, actor: Actor):
+    require(actor.role, "direct_payment")
+    st.subheader("Direct Payment")
+    st.caption("Direct Payment uses the same workflow as Record Payment (writes to loan_payments).")
+    _render_record_payment(sb, schema, actor)
+
+
+# ============================================================
+# CONFIRM PAYMENTS (safe implementation)
+# ============================================================
+def _render_confirm_payments(sb, schema: str, actor: Actor):
+    require(actor.role, "confirm_payment")
+    st.subheader("Confirm Payments")
+    st.caption(
+        "This section requires a maker-checker data model (e.g., confirmed_by/confirmed_at). "
+        "If your loans_core provides confirm_payment(), it will be used."
+    )
+
+    pending_rows: list[dict[str, Any]] = []
+    used_core = False
+
+    if hasattr(core, "list_unconfirmed_payments"):
+        try:
+            pending_rows = core.list_unconfirmed_payments(sb, schema, limit=500) or []
+            used_core = True
+        except Exception as e:
+            st.warning("Could not load unconfirmed payments from core.")
+            st.code(_apierror_message(e), language="text")
+
+    if not used_core:
+        st.info(
+            "No core function found to list unconfirmed payments. "
+            "To enable full maker-checker confirmations, add:\n"
+            "- a column confirmed_by, confirmed_at on loan_payments, OR\n"
+            "- a loan_payment_confirmations table.\n\n"
+            "For now, payments are recorded and applied immediately."
+        )
+        pay_table = V_PAYMENTS_WITH_MEMBER if _table_exists(sb, schema, V_PAYMENTS_WITH_MEMBER) else PAYMENTS_TABLE
+        try:
+            rows = (
+                sb.schema(schema).table(pay_table)
+                .select("*")
+                .order("paid_at", desc=True)
+                .limit(200)
+                .execute().data or []
+            )
+            st.caption("Recent payments (latest 200)")
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         except Exception:
             pass
-        st.rerun()
+        return
 
+    df = pd.DataFrame(pending_rows)
+    if df.empty:
+        st.success("No pending payments to confirm.")
+        return
 
-# ============================================================
-# KPI COMPUTATIONS
-# ============================================================
-def compute_interest_ledger(sb, schema: str) -> tuple[float, float]:
-    """
-    ✅ Interest ledger-based:
-      - this_month: sum(amount) where interest_month startswith YYYY-MM
-      - all_time:   sum(amount) all rows
-    Works whether interest_month is 'YYYY-MM' OR 'YYYY-MM-01' OR ISO string.
-    """
-    if not _table_exists(sb, schema, "interest_ledger"):
-        return 0.0, 0.0
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
-    rows = safe_table_order_fallback(
-        sb,
-        schema,
-        "interest_ledger",
-        "*",
-        limit=20000,
-        order_candidates=["interest_month", "created_at", "id"],
-        desc=True,
-    )
+    if not hasattr(core, "confirm_payment"):
+        st.info("core.confirm_payment(...) not found. Add it in loans_core to enable confirmations.")
+        return
 
-    if not rows:
-        return 0.0, 0.0
-
-    month_prefix = date.today().strftime("%Y-%m")
-    this_month = 0.0
-    all_time = 0.0
-
-    for r in rows:
-        amt = r.get("amount") if "amount" in r else r.get("interest_amount")
-        v = _num(amt, 0.0)
-        all_time += v
-
-        im = str(r.get("interest_month") or "").strip()
-        if im.startswith(month_prefix):
-            this_month += v
-
-    return float(this_month), float(all_time)
-
-
-def compute_loan_payments(sb, schema: str) -> tuple[float, dict[int, date]]:
-    if not _table_exists(sb, schema, "loan_payments"):
-        return 0.0, {}
-
-    rows = safe_table_order_fallback(
-        sb,
-        schema,
-        "loan_payments",
-        "*",
-        limit=20000,
-        order_candidates=["paid_at", "created_at", "id"],
-        desc=True,
-    )
-    total = 0.0
-    last_by_loan: dict[int, date] = {}
-    for r in rows or []:
-        total += _num(r.get("amount"), 0.0)
+    ids = [int(x) for x in df["id"].tolist() if str(x).isdigit()]
+    pick = st.selectbox("Select payment ID to confirm", ids, key="confirm_pick_payment_id")
+    if st.button("✅ Confirm selected payment", type="primary", use_container_width=True, key="confirm_payment_btn"):
         try:
-            lid = int(r.get("loan_id"))
-        except Exception:
-            continue
-        d = _to_date(r.get("paid_at") or r.get("created_at"))
-        if d is not None:
-            if lid not in last_by_loan or d > last_by_loan[lid]:
-                last_by_loan[lid] = d
-    return float(total), last_by_loan
+            core.confirm_payment(sb, schema, payment_id=int(pick), actor_user_id=str(actor.user_id))
+            audit(sb, "loan_payment_confirmed", "ok", {"payment_id": int(pick)}, actor_user_id=actor.user_id)
+            st.success("Payment confirmed.")
+            st.rerun()
+        except Exception as e:
+            st.error("Confirmation failed.")
+            st.code(_apierror_message(e), language="text")
 
 
-def compute_loans_kpis(sb, schema: str) -> dict[str, Any]:
-    if not _table_exists(sb, schema, "loans"):
-        return {"active_loans": 0, "principal_active": 0.0, "total_due_active": 0.0}
+# ============================================================
+# INTEREST (ledger-based + accrual trigger)
+# ============================================================
+def _interest_ledger_totals(sb, schema: str) -> dict:
+    out = {"all_time": 0.0, "this_month": 0.0, "last_row": None, "ok": False, "error": None}
 
-    rows = safe_table(sb, schema, "loans", "*", limit=20000)
-    active = 0
-    principal_sum = 0.0
-    total_due_sum = 0.0
+    if not _table_exists(sb, schema, INTEREST_LEDGER_TABLE):
+        out["error"] = f"Table {schema}.{INTEREST_LEDGER_TABLE} not found/readable."
+        return out
 
-    for r in rows or []:
-        status = str(r.get("status") or "").lower().strip()
-        if status not in ("active", "open"):
-            continue
+    try:
+        rows = (
+            sb.schema(schema).table(INTEREST_LEDGER_TABLE)
+            .select("amount,interest_month,created_at,loan_id,member_id,note")
+            .order("created_at", desc=True)
+            .limit(20000)
+            .execute().data or []
+        )
 
-        active += 1
-        pc = _num(r.get("principal_current") or r.get("principal"), 0.0)
-        principal_sum += pc
+        df = pd.DataFrame(rows)
+        if df.empty:
+            out["ok"] = True
+            return out
 
-        # total_due is generated in DB (read-only)
-        td = _num(r.get("total_due"), pc + _num(r.get("unpaid_interest"), 0.0))
-        total_due_sum += td
+        df["amount"] = pd.to_numeric(df.get("amount"), errors="coerce").fillna(0.0)
+        df["interest_month"] = df.get("interest_month").astype(str)
 
-    return {
-        "active_loans": int(active),
-        "principal_active": float(principal_sum),
-        "total_due_active": float(total_due_sum),
+        mk = _month_key()
+        out["all_time"] = float(df["amount"].sum())
+        out["this_month"] = float(df[df["interest_month"].str.startswith(mk)]["amount"].sum())
+
+        out["last_row"] = rows[0] if rows else None
+        out["ok"] = True
+        return out
+
+    except Exception as e:
+        out["error"] = _apierror_message(e)
+        return out
+
+
+def _render_interest(sb, schema: str, actor: Actor):
+    require(actor.role, "accrue_interest")
+    st.subheader("Interest")
+    st.caption("Interest is ledger-based (interest_ledger). This month is computed by YYYY-MM prefix.")
+
+    totals = _interest_ledger_totals(sb, schema)
+    mk = _month_key()
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Interest this month (ledger)", f"{totals['this_month']:,.2f}")
+    c2.metric("Interest all-time (ledger)", f"{totals['all_time']:,.2f}")
+    last = totals.get("last_row") or {}
+    c3.metric("Last cycle key", str(last.get("interest_month") or "—"))
+
+    if totals.get("error"):
+        st.info("Ledger check:")
+        st.write(totals["error"])
+
+    st.divider()
+
+    if st.button("➕ Accrue interest now", use_container_width=True, key="accrue_interest_btn"):
+        try:
+            updated, added = core.accrue_monthly_interest(sb, schema, actor_user_id=str(actor.user_id))
+            audit(sb, "interest_accrued", "ok",
+                  {"updated": int(updated), "added": float(added), "cycle_prefix": mk},
+                  actor_user_id=actor.user_id)
+
+            if float(added) <= 0 and int(updated) <= 0:
+                st.info("No changes made (no loans due yet or already accrued for this cycle).")
+            else:
+                st.success(f"Loans updated: {int(updated)} • Interest added: {float(added):,.2f}")
+
+            st.rerun()
+
+        except Exception as e:
+            st.error("Interest accrual failed.")
+            st.code(_apierror_message(e), language="text")
+
+    st.divider()
+    st.markdown("### Recent interest ledger rows")
+    try:
+        rows = (
+            sb.schema(schema).table(INTEREST_LEDGER_TABLE)
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(200)
+            .execute().data or []
+        )
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.warning("Could not load ledger rows.")
+        st.code(_apierror_message(e), language="text")
+
+
+# ============================================================
+# STATEMENTS (PDFs)
+# ============================================================
+def _render_statements(sb, schema: str, actor: Actor):
+    require(actor.role, "loan_statement")
+    st.subheader("Statements")
+
+    if make_member_loan_statement_pdf is None:
+        st.info("PDF engine not available (make_member_loan_statement_pdf import failed).")
+        return
+
+    dfm = _read_members(sb, schema)
+    if dfm.empty:
+        st.warning("No members found.")
+        return
+
+    pick = st.selectbox("Select member", dfm["label"].tolist(), key="stmt_pick_member")
+    member_id = int(dfm[dfm["label"] == pick]["id"].iloc[0])
+
+    m = dfm[dfm["id"] == member_id].iloc[0].to_dict()
+    member = {
+        "member_id": int(member_id),
+        "name": str(m.get("name") or ""),
+        "display_name": str(m.get("display_name") or ""),
+        "phone": str(m.get("phone") or ""),
     }
 
-
-def sum_table_amount(sb, schema: str, table: str, amount_cols: list[str]) -> float:
-    if not _table_exists(sb, schema, table):
-        return 0.0
-    rows = safe_table(sb, schema, table, "*", limit=20000)
-    total = 0.0
-    for r in rows or []:
-        val = None
-        for c in amount_cols:
-            if c in r:
-                val = r.get(c)
-                break
-        total += _num(val, 0.0)
-    return float(total)
-
-
-def compute_fines_paid_total(sb, schema: str) -> float:
-    """
-    ✅ Cash flow from fines = SUM(amount) where status='paid'
-    """
-    if not _table_exists(sb, schema, "fines"):
-        return 0.0
-
-    rows = safe_table_order_fallback(
-        sb,
-        schema,
-        "fines",
-        "*",
-        limit=20000,
-        order_candidates=["paid_at", "created_at", "id"],
-        desc=True,
-    )
-    total = 0.0
-    for r in rows or []:
-        status = str(r.get("status") or "").lower().strip()
-        if status != "paid":
-            continue
-        total += _num(r.get("amount"), 0.0)
-    return float(total)
-
-
-def get_session_window(sb, schema: str, session_id: int) -> str:
-    if not session_id:
-        return "—"
-    srow = safe_single(sb, schema, "sessions", "*", session_id=int(session_id))
-    sd = srow.get("start_date")
-    ed = srow.get("end_date")
-    if sd and ed:
-        return f"{sd} → {ed}"
-    return "—"
-
-
-def build_repayment_plan(sb, schema: str, last_payment_dates: dict[int, date]) -> pd.DataFrame:
-    loans = safe_table(sb, schema, "loans", "*", limit=20000)
-    out: list[dict[str, Any]] = []
-
-    for r in loans or []:
-        status = str(r.get("status") or "").lower().strip()
-        if status not in ("active", "open"):
-            continue
-
-        try:
-            lid = int(r.get("id"))
-        except Exception:
-            continue
-
-        principal = _num(r.get("principal_current") or r.get("principal"), 0.0)
-        unpaid_interest = _num(r.get("unpaid_interest"), 0.0)
-        total_due = _num(r.get("total_due"), principal + unpaid_interest)
-
-        borrow_date = (
-            _to_date(r.get("borrow_date"))
-            or _to_date(r.get("created_at"))
-            or date.today()
-        )
-
-        if lid in last_payment_dates:
-            last_paid = last_payment_dates[lid]
-            next_due = last_paid + timedelta(days=DUE_DAYS)
-        else:
-            last_paid = None
-            next_due = borrow_date + timedelta(days=DUE_DAYS)
-
-        out.append(
-            {
-                "loan_id": lid,
-                "member_id": r.get("member_id"),
-                "principal_current": principal,
-                "unpaid_interest": unpaid_interest,
-                "total_due": total_due,
-                "last_paid": last_paid.isoformat() if isinstance(last_paid, date) else "—",
-                "next_due_date": next_due.isoformat(),
-            }
-        )
-
-    df = pd.DataFrame(out)
-    if df.empty:
-        return df
-    return df.sort_values("next_due_date", ascending=True)
-
-
-# ============================================================
-# ATTENDANCE (ALL-TIME PER MEMBER) — CHART ONLY
-# ============================================================
-def load_attendance_totals(read_sb, schema: str) -> pd.DataFrame:
-    """
-    Preferred: read from view v_attendance_member_totals (fast).
-    Fallback: compute from attendance table in Python.
-    Returns columns at least: member_name, attendance_percent.
-    """
-    # 1) Try view by name (your created view name)
-    view_name = "v_attendance_member_totals"
-    if _table_exists(read_sb, schema, view_name):
-        rows = safe_table(read_sb, schema, view_name, "*", limit=5000, order_by="member_id", desc=False)
-        if rows:
-            return pd.DataFrame(rows)
-
-    # 2) Fallback compute
-    members = safe_table(read_sb, schema, "members", "id,name,display_name,phone", limit=5000, order_by="id", desc=False)
-    attendance = safe_table(read_sb, schema, "attendance", "id,member_id,session_id,present,note,created_at", limit=20000)
-
-    dfm = pd.DataFrame(members or [])
-    dfa = pd.DataFrame(attendance or [])
-
-    if dfm.empty:
-        return pd.DataFrame()
-
-    for col in ("id", "name", "display_name", "phone"):
-        if col not in dfm.columns:
-            dfm[col] = None
-
-    df = dfm.rename(columns={"id": "member_id"}).copy()
-    df["member_name"] = df["display_name"].fillna("").astype(str).str.strip()
-    df.loc[df["member_name"] == "", "member_name"] = df["name"].fillna("").astype(str).str.strip()
-
-    if dfa.empty:
-        df["attendance_percent"] = 0.0
-        return df[["member_id", "member_name", "phone", "attendance_percent"]].sort_values("member_id")
-
-    dfa["present"] = dfa.get("present").fillna(False).astype(bool)
-    dfa["member_id"] = pd.to_numeric(dfa.get("member_id"), errors="coerce")
-
-    grp = dfa.groupby("member_id", dropna=True).agg(
-        total_sessions=("id", "count"),
-        total_present=("present", lambda s: int(s.sum())),
-    ).reset_index()
-
-    grp["attendance_percent"] = grp.apply(
-        lambda r: round((r["total_present"] / r["total_sessions"]) * 100, 2) if r["total_sessions"] else 0.0,
-        axis=1,
-    )
-
-    df = df.merge(grp[["member_id", "attendance_percent"]], on="member_id", how="left")
-    df["attendance_percent"] = df["attendance_percent"].fillna(0.0).astype(float)
-
-    return df[["member_id", "member_name", "phone", "attendance_percent"]].sort_values("member_id")
-
-
-def render_attendance_chart(att_df: pd.DataFrame):
-    if att_df is None or att_df.empty:
-        st.info("No attendance data yet.")
+    loans = core.list_member_loans(sb, schema, member_id=int(member_id), limit=2000)
+    if not loans:
+        st.info("No loans found for this member.")
         return
 
-    # normalize columns
-    name_col = "member_name" if "member_name" in att_df.columns else ("Member" if "Member" in att_df.columns else None)
-    pct_col = "attendance_percent" if "attendance_percent" in att_df.columns else ("Attendance %" if "Attendance %" in att_df.columns else None)
+    loan_ids = [int(x.get("id")) for x in loans if str(x.get("id") or "").isdigit()]
+    payments = []
+    if loan_ids:
+        try:
+            pay_rows = (
+                sb.schema(schema).table(PAYMENTS_TABLE)
+                .select("*")
+                .in_("loan_id", loan_ids)
+                .order("paid_at", desc=True)
+                .limit(5000)
+                .execute().data or []
+            )
+            payments = pay_rows
+        except Exception:
+            payments = []
 
-    if name_col is None or pct_col is None:
-        st.warning("Attendance chart unavailable (missing columns).")
+    st.caption("Preview (loans)")
+    st.dataframe(pd.DataFrame(loans), use_container_width=True, hide_index=True)
+    st.caption("Preview (payments)")
+    st.dataframe(pd.DataFrame(payments), use_container_width=True, hide_index=True)
+
+    if st.button("⬇️ Download Member Loan Statement (PDF)", use_container_width=True, key="dl_member_stmt"):
+        try:
+            pdf_bytes = make_member_loan_statement_pdf(
+                brand="theyoungshallgrow",
+                member=member,
+                cycle_info={},
+                loans=loans,
+                payments=payments,
+                currency="$",
+                logo_path=None,
+            )
+            st.download_button(
+                "✅ Click to download",
+                pdf_bytes,
+                file_name=f"loan_statement_member_{member_id}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key="dl_member_stmt_btn",
+            )
+        except Exception as e:
+            st.error("Failed to generate statement PDF.")
+            st.code(_apierror_message(e), language="text")
+
+
+# ============================================================
+# MAIN ENTRY
+# ============================================================
+def render_loans(sb_service, schema: str, actor_user_id: str = ""):
+    required_tables = [MEMBERS_TABLE, LOANS_TABLE, PAYMENTS_TABLE, INTEREST_LEDGER_TABLE, REQUESTS_TABLE, SIGNATURES_TABLE]
+    missing = [t for t in required_tables if not _table_exists(sb_service, schema, t)]
+    if missing:
+        st.error("Missing required table(s) for NEW Loans standard:")
+        st.write(", ".join([f"{schema}.{t}" for t in missing]))
+        st.stop()
+
+    actor_user_uuid = actor_user_id if (actor_user_id and _is_uuid(actor_user_id)) else _get_or_make_session_uuid()
+    actor = _actor_from_session(actor_user_uuid)
+
+    st.header("Loans (Organizational Standard — NEW)")
+    _render_kpis(sb_service, schema)
+
+    raw_sections = allowed_sections(actor.role) or []
+    if not raw_sections:
+        st.warning("No sections available for your role.")
         return
 
-    plot_df = att_df[[name_col, pct_col]].copy()
-    plot_df[pct_col] = pd.to_numeric(plot_df[pct_col], errors="coerce").fillna(0.0)
+    sections: list[str] = []
+    seen = set()
+    for s in raw_sections:
+        cs = _canon_section(s)
+        if cs and cs not in seen:
+            sections.append(cs)
+            seen.add(cs)
 
-    # Keep chart readable: top N only
-    max_n = min(50, len(plot_df))
-    default_n = min(17, len(plot_df))
-    top_n = st.slider("Show top N members", min_value=5, max_value=max_n, value=default_n)
+    if "loans_menu" not in st.session_state or st.session_state["loans_menu"] not in sections:
+        st.session_state["loans_menu"] = sections[0]
 
-    plot_df = plot_df.sort_values(pct_col, ascending=False).head(int(top_n))
-    plot_df = plot_df.set_index(name_col)
+    section = st.selectbox("Loans menu", sections, key="loans_menu")
+    section = _canon_section(section)
 
-    # CHART ONLY (no dataframe shown)
-    st.bar_chart(plot_df[pct_col])
+    if section == "Requests":
+        _render_requests(sb_service, schema, actor); return
+    if section == "Ledger":
+        _render_ledger(sb_service, schema, actor); return
+    if section == "Record Payment":
+        _render_record_payment(sb_service, schema, actor); return
+    if section == "Confirm Payments":
+        _render_confirm_payments(sb_service, schema, actor); return
+    if section == "Interest":
+        _render_interest(sb_service, schema, actor); return
+    if section == "Delinquency":
+        _render_delinquency(sb_service, schema, actor); return
+    if section == "Statements":
+        _render_statements(sb_service, schema, actor); return
+    if section == "Direct Payment":
+        _render_direct_payment(sb_service, schema, actor); return
 
-
-# ============================================================
-# DASHBOARD (STANDARD)
-# ============================================================
-def render_dashboard(sb_anon, sb_service, schema: str = "public"):
-    inject_dashboard_theme()
-
-    # ✅ Use service client if available for reads (RLS-safe)
-    read_sb = sb_service if sb_service is not None else sb_anon
-    finance_sb = sb_service if sb_service is not None else sb_anon
-
-    # ✅ Auto-refresh when app_state changes
-    _auto_refresh_if_state_changed(read_sb, schema)
-
-    st.markdown("## 🏦 theyoungshallgrow • Bank Dashboard")
-
-    # --- App state ---
-    state = safe_single(read_sb, schema, "app_state", "*", id=1)
-    if not state:
-        rows = safe_table(read_sb, schema, "app_state", "*", limit=1)
-        state = rows[0] if rows else {}
-
-    # --- Current session id (robust fallback) ---
-    raw_cs = state.get("current_session_id")
-    try:
-        current_session_id = int(raw_cs) if raw_cs is not None and str(raw_cs).strip() != "" else None
-    except Exception:
-        current_session_id = None
-
-    # If not set, fallback to latest sessions.session_id (read-only)
-    if current_session_id is None:
-        srows = safe_table_order_fallback(
-            read_sb,
-            schema,
-            "sessions",
-            "session_id,start_date,end_date,created_at",
-            limit=1,
-            order_candidates=["session_id", "start_date", "created_at"],
-            desc=True,
-        )
-        if srows:
-            try:
-                current_session_id = int(srows[0].get("session_id"))
-            except Exception:
-                current_session_id = None
-
-    session_note = "from app_state" if state.get("current_session_id") else "fallback: latest session"
-    next_member_id = state.get("next_member_id")
-
-    # --- Members ---
-    members_rows = safe_table(read_sb, schema, "members", "id,name,display_name", limit=5000, order_by="id", desc=False)
-    total_members = int(len(members_rows or []))
-
-    # --- Beneficiary (try optional view; fallback to members lookup) ---
-    beneficiary_name = "—"
-    beneficiary_id = next_member_id
-
-    v = safe_single(read_sb, schema, "v_next_beneficiary", "*")
-    if v:
-        beneficiary_name = str(v.get("beneficiary_name") or v.get("member_name") or "—")
-        beneficiary_id = v.get("beneficiary_id") or v.get("member_id") or beneficiary_id
-    else:
-        try:
-            bid = int(beneficiary_id) if beneficiary_id is not None else None
-        except Exception:
-            bid = None
-        if bid is not None:
-            for m in members_rows or []:
-                if str(m.get("id")) == str(bid):
-                    dn = str(m.get("display_name") or "").strip()
-                    nm = str(m.get("name") or "").strip()
-                    beneficiary_name = dn or nm or f"Member {bid:02d}"
-                    break
-
-    window = "—"
-    if isinstance(current_session_id, int) and current_session_id > 0:
-        window = get_session_window(read_sb, schema, int(current_session_id))
-
-    # --- Current pot (cycle contributions) ---
-    pot = 0.0
-    members_paid = 0
-    if isinstance(current_session_id, int) and current_session_id > 0:
-        crows = safe_table(finance_sb, schema, "contributions", "member_id,session_id,amount", limit=20000)
-        dfc = pd.DataFrame(crows or [])
-        if not dfc.empty and "session_id" in dfc.columns:
-            dfc["session_id"] = pd.to_numeric(dfc["session_id"], errors="coerce").fillna(-1).astype(int)
-            dfc = dfc[dfc["session_id"] == int(current_session_id)].copy()
-            dfc["amount"] = pd.to_numeric(dfc.get("amount"), errors="coerce").fillna(0.0)
-            pot = float(dfc["amount"].sum())
-            members_paid = int(dfc["member_id"].nunique()) if "member_id" in dfc.columns else 0
-
-    # --- Header KPIs ---
-    st.markdown(glass_open(), unsafe_allow_html=True)
-    a1, a2, a3, a4 = st.columns(4)
-    with a1:
-        st.markdown(kpi_card("Session ID", str(current_session_id or "—"), "blue", sub=session_note), unsafe_allow_html=True)
-    with a2:
-        st.markdown(kpi_card("Session Window", window, "orange"), unsafe_allow_html=True)
-    with a3:
-        st.markdown(kpi_card("Total Members", str(total_members), "purple", sub="members"), unsafe_allow_html=True)
-    with a4:
-        st.markdown(
-            kpi_card(
-                "Current Beneficiary",
-                beneficiary_name,
-                "green",
-                sub=f"member_id: {beneficiary_id if beneficiary_id is not None else '—'}",
-            ),
-            unsafe_allow_html=True,
-        )
-    st.markdown(glass_close(), unsafe_allow_html=True)
-
-    st.divider()
-
-    # --- Cycle KPIs ---
-    st.markdown(glass_open(), unsafe_allow_html=True)
-    p1, p2, p3 = st.columns(3)
-    with p1:
-        st.markdown(kpi_card("Current Pot", _fmt_money(pot, 0), "green"), unsafe_allow_html=True)
-    with p2:
-        st.markdown(kpi_card("Cycle Contributions", _fmt_money(pot, 0), "blue"), unsafe_allow_html=True)
-    with p3:
-        st.markdown(kpi_card("Members Paid", str(members_paid), "purple"), unsafe_allow_html=True)
-    st.markdown(glass_close(), unsafe_allow_html=True)
-
-    st.divider()
-
-    # --- Financial Totals ---
-    foundation_total = sum_table_amount(finance_sb, schema, "foundation_contributions", ["amount"])
-    payouts_total = sum_table_amount(finance_sb, schema, "payouts", ["payout_amount", "amount"])  # informational only
-    interest_this_month, interest_all_time = compute_interest_ledger(finance_sb, schema)
-    repayments_total, last_payment_dates = compute_loan_payments(finance_sb, schema)
-    fines_paid_total = compute_fines_paid_total(finance_sb, schema)
-    loan_kpis = compute_loans_kpis(finance_sb, schema)
-    loans_outstanding = float(loan_kpis["principal_active"])
-
-    cash_available_raw = foundation_total + repayments_total + interest_all_time + fines_paid_total - loans_outstanding
-    cash_available = max(cash_available_raw, 0.0)
-    net_available = cash_available + float(pot)
-
-    st.markdown("### 🏦 Financial Summary")
-
-    st.markdown(glass_open(), unsafe_allow_html=True)
-    f1, f2, f3, f4, f5, f6, f7, f8, f9 = st.columns(9)
-    with f1:
-        st.markdown(kpi_card("Foundation Total", _fmt_money(foundation_total, 0), "blue", sub="foundation_contributions"), unsafe_allow_html=True)
-    with f2:
-        st.markdown(kpi_card("Payouts Total", _fmt_money(payouts_total, 0), "orange", sub="pot redistribution (info)"), unsafe_allow_html=True)
-    with f3:
-        st.markdown(kpi_card("Interest This Month", _fmt_money(interest_this_month, 2), "green", sub="interest_ledger (YYYY-MM)"), unsafe_allow_html=True)
-    with f4:
-        st.markdown(kpi_card("Interest All-time", _fmt_money(interest_all_time, 2), "green", sub="interest_ledger (all)"), unsafe_allow_html=True)
-    with f5:
-        st.markdown(kpi_card("Loan Payments", _fmt_money(repayments_total, 0), "green", sub="loan_payments"), unsafe_allow_html=True)
-    with f6:
-        st.markdown(kpi_card("Total Fines Paid", _fmt_money(fines_paid_total, 0), "purple", sub="fines.status='paid'"), unsafe_allow_html=True)
-    with f7:
-        st.markdown(kpi_card("Outstanding Principal", _fmt_money(loans_outstanding, 0), "red", sub="loans.principal_current"), unsafe_allow_html=True)
-    with f8:
-        st.markdown(kpi_card("Cash Available", _fmt_money(cash_available, 0), "green", sub="foundation + payments + interest + fines − principal"), unsafe_allow_html=True)
-    with f9:
-        st.markdown(kpi_card("Net Available", _fmt_money(net_available, 0), "blue", sub="Cash Available + Current Pot"), unsafe_allow_html=True)
-    st.markdown(glass_close(), unsafe_allow_html=True)
-
-    if cash_available_raw < 0:
-        st.warning(
-            f"⚠️ Cash Available RAW is negative ({cash_available_raw:,.0f}) before flooring to 0. "
-            "This means outstanding loans exceed foundation cash-in (payments/interest/fines)."
-        )
-
-    st.divider()
-
-    # --- Attendance (Chart Only) ---
-    st.markdown("### ✅ Attendance • All-time Summary (Chart)")
-    att_df = load_attendance_totals(read_sb, schema)
-    render_attendance_chart(att_df)
-
-    st.divider()
-
-    # --- Loans ---
-    st.markdown("### 💳 Loans")
-
-    st.markdown(glass_open(), unsafe_allow_html=True)
-    l1, l2, l3 = st.columns(3)
-    with l1:
-        st.markdown(kpi_card("Active Loans", str(int(loan_kpis["active_loans"])), "purple"), unsafe_allow_html=True)
-    with l2:
-        st.markdown(kpi_card("Principal Current", _fmt_money(loan_kpis["principal_active"], 0), "orange"), unsafe_allow_html=True)
-    with l3:
-        st.markdown(kpi_card("Total Due", _fmt_money(loan_kpis["total_due_active"], 0), "red"), unsafe_allow_html=True)
-    st.markdown(glass_close(), unsafe_allow_html=True)
-
-    plan_df = build_repayment_plan(finance_sb, schema, last_payment_dates)
-    if plan_df.empty:
-        st.info("No active/open loans found.")
-    else:
-        st.markdown(glass_open(), unsafe_allow_html=True)
-        st.markdown("#### 🗓️ Loan Repayment Plan")
-        st.caption(f"Due = {DUE_DAYS} days from last payment (or borrow_date if never paid).")
-        st.dataframe(plan_df, use_container_width=True, hide_index=True)
-        st.markdown(glass_close(), unsafe_allow_html=True)
-
-    # --- Debug ---
-    with st.expander("🔎 Debug", expanded=False):
-        st.write("Using read client:", "service" if sb_service is not None else "anon")
-        st.write("app_state", state)
-        st.write("session_note", session_note)
-        st.write("current_session_id", current_session_id)
-        st.write("next_member_id", next_member_id)
-        st.write("beneficiary_id", beneficiary_id)
-        st.write("beneficiary_name", beneficiary_name)
-        st.write("current_pot", pot)
-        st.write("members_paid", members_paid)
-        st.write("foundation_total", foundation_total)
-        st.write("payouts_total (informational)", payouts_total)
-        st.write("interest_this_month (ledger)", interest_this_month)
-        st.write("interest_all_time (ledger)", interest_all_time)
-        st.write("loan_payments_total", repayments_total)
-        st.write("fines_paid_total", fines_paid_total)
-        st.write("loan_kpis", loan_kpis)
-        st.write("cash_available_raw", cash_available_raw)
-        st.write("cash_available (floored)", cash_available)
-        st.write("net_available", net_available)
-        st.write("attendance_rows", 0 if att_df is None else int(len(att_df)))
+    st.info(f"Section '{section}' is available but not wired in router.")
