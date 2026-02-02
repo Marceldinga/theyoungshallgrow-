@@ -1,4 +1,3 @@
-
 # app.py ✅ COMPLETE SINGLE CODE — Minutes + Attendance (Present/Absent + Reason) + Summaries (NO "legacy")
 # ✅ NO "legacy" tables referenced in this file
 # ✅ Uses NEW tables only:
@@ -22,6 +21,11 @@
 # ✅ No duplicate tabs/pages in sidebar
 # ✅ Contributions page shows names using v_contributions_with_member (view)
 # ✅ Loans page delegates to loans.py → loans_ui.py (NEW standard). App checks required tables exist.
+#
+# ✅ UPDATE YOU ASKED:
+#    - Removes hard stop when app_state.current_session_id is missing in Minutes & Attendance
+#    - Fallback to latest sessions.session_id (read-only fallback)
+#    - Still shows a warning banner so Admin can set Rotation, but app continues
 
 from __future__ import annotations
 
@@ -282,12 +286,35 @@ def table_readable(client, schema: str, table_name: str) -> bool:
         return False
 
 def get_app_state(sb, schema: str) -> dict:
-    # app_state is intended to be a singleton row. If id exists, prefer id=1; else fetch first row.
     rows = safe_select(sb, "app_state", "*", schema=schema, limit=1, id=1)
     if rows:
         return rows[0]
     rows2 = safe_select(sb, "app_state", "*", schema=schema, limit=1)
     return rows2[0] if rows2 else {}
+
+def get_effective_session_id(sb_read, schema: str) -> tuple[int | None, str]:
+    """
+    ✅ Returns (session_id, note)
+      - note: "from app_state" or "fallback: latest session"
+    """
+    state = get_app_state(sb_read, schema)
+    raw = state.get("current_session_id")
+    try:
+        cs = int(raw) if raw is not None and str(raw).strip() != "" else None
+    except Exception:
+        cs = None
+
+    if cs is not None:
+        return cs, "from app_state"
+
+    # Fallback to latest session_id
+    srows = safe_select(sb_read, "sessions", "session_id,start_date,end_date,created_at", schema=schema, order_by="session_id", order_desc=True, limit=1)
+    if srows:
+        try:
+            return int(srows[0].get("session_id")), "fallback: latest session"
+        except Exception:
+            return None, "fallback failed"
+    return None, "no sessions"
 
 @st.cache_data(ttl=90)
 def load_members(url: str, anon_key: str, schema: str) -> tuple[list[str], dict, dict, pd.DataFrame]:
@@ -421,13 +448,17 @@ elif page == "Minutes & Attendance":
         st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY to enable writing.")
         st.stop()
 
-    # current session from app_state
-    state = get_app_state(sb_anon, SUPABASE_SCHEMA)
-    current_session_id = state.get("current_session_id")
+    # ✅ robust current session (fallback)
+    # Use anon to read state/sessions (RLS-safe). If service exists, it's fine too.
+    read_for_session = sb_service if sb_service is not None else sb_anon
+    current_session_id, session_note = get_effective_session_id(read_for_session, SUPABASE_SCHEMA)
 
     if current_session_id is None:
-        st.warning("app_state.current_session_id is not set. Set it in Admin → Rotation.")
+        st.error("No sessions found. Create a session first in Admin → Sessions.")
         st.stop()
+
+    if session_note != "from app_state":
+        st.warning("app_state.current_session_id is not set. Using latest session as fallback. Set it in Admin → Rotation.")
 
     with st.sidebar.expander("🔐 Role (Minutes/Attendance)", expanded=False):
         role = st.selectbox("Role", ["admin", "treasury", "member"], index=0, key="ma_role")
@@ -443,7 +474,7 @@ elif page == "Minutes & Attendance":
     with tab1:
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.subheader("Meeting Minutes / Documentation")
-        st.caption(f"Linked session_id: {current_session_id}")
+        st.caption(f"Linked session_id: {current_session_id}  •  {session_note}")
 
         if can_write:
             with st.form("minutes_form", clear_on_submit=False):
@@ -537,7 +568,7 @@ elif page == "Minutes & Attendance":
     with tab2:
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.subheader("Attendance")
-        st.caption(f"Linked session_id: {current_session_id}")
+        st.caption(f"Linked session_id: {current_session_id}  •  {session_note}")
 
         if df_members.empty:
             st.warning("No members found in members.")
