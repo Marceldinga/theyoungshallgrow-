@@ -1,7 +1,7 @@
 
-# dashboard_panel.py ✅ COMPLETE SINGLE CODE (NO SQL) — FINAL FIX
-# ✅ Keeps your current dashboard structure + auto-refresh on cycle change
-# ✅ Uses sb_service for finance totals when available (fixes "0 repayments" / "0 interest" due to anon permissions)
+# dashboard_panel.py ✅ COMPLETE SINGLE CODE (NO SQL) — FINAL + 28-DAY DUE RULE
+# ✅ Keeps your dashboard structure + auto-refresh on cycle change
+# ✅ Uses sb_service for finance totals when available (fixes "0 repayments" / "0 interest")
 # ✅ Uses YOUR legacy tables (confirmed):
 #    - foundation_payments_legacy  (CASH vault: amount_paid)
 #    - fines_legacy                (paid fines)
@@ -10,16 +10,23 @@
 #    - loan_repayments_pending     (repayment plan; if empty, build plan from loans_legacy + last repayment date)
 # ✅ Interest source FIXED (per your DB):
 #    interest_paid = SUM(total_interest_generated - unpaid_interest) WHERE status='active'
+# ✅ Loan due rule FIXED:
+#    next_due_date = (last_paid OR borrow_date) + 28 days
 # ✅ Single Financial Pot of Truth:
 #    cash_available_raw = foundation_paid + fines_paid + interest_paid + repayments_paid - loans_disbursed
 #    cash_available = max(cash_available_raw, 0)  (never show negative spendable cash)
-# ✅ Also shows Borrowed (Active), Outstanding (Active), Active Loans, and Repayment Plan table
 
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 import streamlit as st
 import pandas as pd
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+DUE_DAYS = 28  # ✅ Loan due is 28 days from borrow date / last payment
 
 
 # ============================================================
@@ -261,8 +268,8 @@ def _sum_paid_fines(rows: list[dict]) -> float:
 
 def compute_interest_paid_from_loans_legacy(sb, schema: str = "public") -> float:
     """
-    ✅ CONFIRMED by your DB and your SQL result:
-      interest_paid = SUM(total_interest_generated - unpaid_interest) WHERE status='active'
+    ✅ CONFIRMED by your DB and your SQL:
+    interest_paid = SUM(total_interest_generated - unpaid_interest) WHERE status='active'
     """
     rows = safe_table(sb, schema, "loans_legacy", "*", limit=20000)
     if not rows:
@@ -279,7 +286,6 @@ def compute_interest_paid_from_loans_legacy(sb, schema: str = "public") -> float
         paid = generated - unpaid
         if paid < 0:
             paid = 0.0
-
         total_paid += paid
 
     return float(total_paid)
@@ -351,7 +357,7 @@ def compute_loans_borrowed_balance_disbursed(sb, schema: str = "public") -> dict
                 principal = r.get(k)
                 break
         principal_num = _num(principal, 0.0)
-        disbursed_all += principal_num  # legacy: treated as cash-out total disbursed
+        disbursed_all += principal_num
 
         if status != "active":
             continue
@@ -409,7 +415,6 @@ def build_plan_from_loans(sb, schema: str, last_payment_dates: dict[int, date]) 
 
     borrowed_keys = ["loan_amount", "loan_amnt", "principal", "principal_amount", "amount_borrowed", "borrowed_amount", "amount"]
     balance_keys = ["outstanding_balance", "balance", "loan_balance", "remaining_balance", "amount_due", "total_due", "out_prncp"]
-    created_keys = ["issue_date", "issued_at", "start_date", "created_at"]
     installment_keys = ["installment", "monthly_payment", "payment_amount"]
 
     out = []
@@ -444,19 +449,23 @@ def build_plan_from_loans(sb, schema: str, last_payment_dates: dict[int, date]) 
                 inst = r.get(k)
                 break
 
-        created_val = None
-        for k in created_keys:
-            if k in r:
-                created_val = r.get(k)
-                break
-        created_date = _to_date(created_val) or date.today()
+        # ✅ Borrow date preference order (best accuracy):
+        # issue_date -> start_date -> interest_start_at -> created_at -> today
+        borrow_date = (
+            _to_date(r.get("issue_date"))
+            or _to_date(r.get("start_date"))
+            or _to_date(r.get("interest_start_at"))
+            or _to_date(r.get("created_at"))
+            or date.today()
+        )
 
+        # ✅ 28-day rule: last_paid+28 else borrow_date+28
         if loan_id_int is not None and loan_id_int in last_payment_dates:
             last_paid = last_payment_dates[loan_id_int]
-            next_due = last_paid + timedelta(days=30)
+            next_due = last_paid + timedelta(days=DUE_DAYS)
         else:
             last_paid = None
-            next_due = created_date + timedelta(days=30)
+            next_due = borrow_date + timedelta(days=DUE_DAYS)
 
         out.append({
             "loan_id": loan_id_int if loan_id_int is not None else (str(loan_id) if loan_id is not None else "—"),
@@ -481,14 +490,11 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     inject_dashboard_theme()
     _auto_refresh_if_cycle_changed(sb_anon, schema)
 
-    # ✅ Use service key for finance reads when available (fixes 0 rows issue)
     finance_sb = sb_service if sb_service is not None else sb_anon
 
     st.markdown("## 📊 Dashboard")
 
-    # =========================================================
-    # 1) SESSION / ROTATION (dashboard_next_view)
-    # =========================================================
+    # 1) SESSION / ROTATION
     dash = (safe_view(sb_anon, schema, "dashboard_next_view", limit=1) or [{}])[0]
 
     session_number = _pick(dash, "session_number", "current_session_id", "next_payout_index", default="—")
@@ -520,9 +526,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
 
     st.divider()
 
-    # =========================================================
     # 2) CURRENT POT (Option A)
-    # =========================================================
     kpis = (safe_view(sb_anon, schema, "v_current_cycle_kpis", limit=1) or [{}])[0]
     cycle_total_num = _num(_pick(kpis, "cycle_total", default=0.0), 0.0)
     members_paid_num = int(_num(_pick(kpis, "members_paid", default=0), 0))
@@ -540,19 +544,14 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
 
     st.divider()
 
-    # =========================================================
-    # 3) SINGLE FINANCIAL POT OF TRUTH (LEGACY, NO SQL)
-    # =========================================================
+    # 3) FINANCIAL POT OF TRUTH (CASH)
     foundation_rows = safe_table(finance_sb, schema, "foundation_payments_legacy", "*", limit=20000)
     fines_rows = safe_table(finance_sb, schema, "fines_legacy", "*", limit=20000)
 
-    # ✅ CASH vault column confirmed: amount_paid
-    foundation_paid = _sum_amount(foundation_rows, ["amount_paid"])
+    foundation_paid = _sum_amount(foundation_rows, ["amount_paid"])  # ✅ confirmed cash column
     fines_paid = _sum_paid_fines(fines_rows)
 
-    # ✅ Interest paid from loans_legacy (confirmed by your SQL = 900)
-    interest_paid = compute_interest_paid_from_loans_legacy(finance_sb, schema=schema)
-
+    interest_paid = compute_interest_paid_from_loans_legacy(finance_sb, schema=schema)  # ✅ from loans_legacy
     repayments_paid, last_payment_dates = compute_repayments_legacy(finance_sb, schema=schema)
 
     loan_kpis = compute_loans_borrowed_balance_disbursed(finance_sb, schema=schema)
@@ -592,15 +591,12 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     if cash_available_raw < 0:
         st.warning(
             f"⚠️ Cash Available RAW is negative ({cash_available_raw:,.0f}) before flooring to 0. "
-            "That means loans disbursed > recorded cash-in (foundation/fines/interest/repayments). "
-            "If unexpected, check whether any cash-in entries are missing or restricted by RLS."
+            "That means loans disbursed > recorded cash-in (foundation/fines/interest/repayments)."
         )
 
     st.divider()
 
-    # =========================================================
-    # 4) LOANS: Borrowed + Outstanding + Repayment Plan
-    # =========================================================
+    # 4) LOANS + REPAYMENT PLAN
     st.markdown("### 💳 Loans (Legacy)")
 
     st.markdown(glass_open(), unsafe_allow_html=True)
@@ -621,7 +617,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         else:
             st.markdown(glass_open(), unsafe_allow_html=True)
             st.markdown("#### 🗓️ Loan Repayment Plan (Estimated)")
-            st.caption("loan_repayments_pending is empty, so this plan is estimated from loans_legacy + last repayment date.")
+            st.caption(f"loan_repayments_pending is empty; plan estimated from loans_legacy + last repayment date. Due = {DUE_DAYS} days.")
             show_cols = ["loan_id", "member_name", "borrowed", "outstanding_balance", "installment", "last_paid", "next_due_date"]
             st.dataframe(plan_df[show_cols], use_container_width=True, hide_index=True)
             st.markdown(glass_close(), unsafe_allow_html=True)
@@ -631,9 +627,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         st.dataframe(pending_df, use_container_width=True, hide_index=True)
         st.markdown(glass_close(), unsafe_allow_html=True)
 
-    # =========================================================
     # DEBUG
-    # =========================================================
     with st.expander("🔎 Debug (raw)", expanded=False):
         st.write("finance_client", "sb_service" if finance_sb is sb_service else "sb_anon")
         st.write("counts", {
