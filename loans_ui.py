@@ -1,5 +1,10 @@
 
-# loans_ui.py ✅ COMPLETE UPDATED SINGLE FILE — NEW STANDARD (NO legacy, member_id only, request→approve with signatures)
+# loans_ui.py ✅ COMPLETE UPDATED SINGLE FILE — NEW STANDARD (NO legacy, member_id only)
+# ✅ Fixes your issue:
+# - No more "Section 'X' is enabled but not implemented..."
+# - Adds routing + section normalization so RBAC menu matches implemented handlers
+# - Implements: Confirm Payments, Delinquency, Loan Statement (mapped to Statements), Direct Payment (mapped to Record Payment)
+#
 # ✅ Uses NEW tables only:
 #    - members (id, name, display_name, phone)
 #    - loans (id, member_id, status, principal_current, principal, unpaid_interest, total_interest_generated, total_due,
@@ -16,18 +21,23 @@
 #    - Admin approves only if signatures complete + cap passes (handled in loans_core)
 #
 # ✅ Payments:
-#    - Record payment directly into loan_payments via loans_core.record_payment (interest-first → principal)
+#    - Record payment into loan_payments via loans_core.record_payment (interest-first → principal)
 #
 # ✅ Interest:
-#    - Manual "Accrue interest now" calls loans_core.accrue_monthly_interest (writes to interest_ledger)
-#    - interest_ledger interest_month is cycle key 'YYYY-MM-DD', so "this month" uses startswith('YYYY-MM')
+#    - "Accrue interest now" calls loans_core.accrue_monthly_interest (writes to interest_ledger)
+#    - interest_month is cycle key 'YYYY-MM-DD' so "this month" uses startswith('YYYY-MM')
 #
-# ✅ No legacy apply / no applied_to_loan needed (new tables are idempotent by design)
+# ✅ Maker-checker note:
+# - Full maker-checker needs created_by/confirmed_by fields (or a confirmations table).
+# - This UI provides a "Confirm Payments" section safely:
+#   - If core.confirm_payment(...) exists, it will call it.
+#   - Otherwise it shows a clear message and does not crash.
 
 from __future__ import annotations
 
 from datetime import date, datetime
 from uuid import uuid4, UUID
+from typing import Any
 
 import streamlit as st
 import pandas as pd
@@ -213,6 +223,33 @@ def _upsert_signature(sb, schema: str, request_id: int, role: str, signer_member
 
 
 # ============================================================
+# SECTION NORMALIZATION (fixes menu mismatch)
+# ============================================================
+_SECTION_CANON: dict[str, str] = {
+    # Aliases coming from RBAC sections
+    "Loan Statement": "Statements",
+    "Statements": "Statements",
+    "Statement": "Statements",
+
+    "Confirm Payment": "Confirm Payments",
+    "Confirm Payments": "Confirm Payments",
+
+    "Direct Payment": "Direct Payment",
+    "Delinquency": "Delinquency",
+
+    # Keep core ones unchanged
+    "Requests": "Requests",
+    "Ledger": "Ledger",
+    "Record Payment": "Record Payment",
+    "Interest": "Interest",
+}
+
+def _canon_section(section: str) -> str:
+    s = (section or "").strip()
+    return _SECTION_CANON.get(s, s)
+
+
+# ============================================================
 # KPIs (top of Loans page)
 # ============================================================
 def _render_kpis(sb, schema: str):
@@ -316,7 +353,6 @@ def _render_requests(sb, schema: str, actor: Actor):
 
     st.markdown("### Signatures & Approval")
     req_id = st.selectbox("Select request ID", dfp["id"].tolist(), key="req_pick_id")
-    _ = dfp[dfp["id"] == req_id].iloc[0].to_dict()
 
     df_sig, missing = _signature_status(sb, schema, int(req_id))
     if df_sig.empty:
@@ -380,7 +416,7 @@ def _render_requests(sb, schema: str, actor: Actor):
 
 
 # ============================================================
-# LEDGER (Loans table)
+# LEDGER (Loans table) + Delinquency preview
 # ============================================================
 def _render_ledger(sb, schema: str, actor: Actor):
     require(actor.role, "view_ledger")
@@ -422,6 +458,24 @@ def _render_ledger(sb, schema: str, actor: Actor):
 
 
 # ============================================================
+# DELINQUENCY (separate section)
+# ============================================================
+def _render_delinquency(sb, schema: str, actor: Actor):
+    require(actor.role, "view_delinquency")
+    st.subheader("Delinquency")
+    st.caption("Days past due (DPD) for open/active loans.")
+    try:
+        dfd = core.delinquency_table(sb, schema, limit=1000)
+        if dfd is None or getattr(dfd, "empty", True):
+            st.info("No delinquent loans.")
+        else:
+            st.dataframe(dfd, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.error("Failed to compute delinquency.")
+        st.code(_apierror_message(e), language="text")
+
+
+# ============================================================
 # RECORD PAYMENT (direct to loan_payments)
 # ============================================================
 def _render_record_payment(sb, schema: str, actor: Actor):
@@ -431,7 +485,6 @@ def _render_record_payment(sb, schema: str, actor: Actor):
 
     table = V_LOANS_WITH_MEMBER if _table_exists(sb, schema, V_LOANS_WITH_MEMBER) else LOANS_TABLE
 
-    # Try view columns; fallback if not present
     select_cols_view = "id,member_id,status,total_due,principal,principal_current,unpaid_interest,member_display_name,member_name"
     select_cols_base = "id,member_id,status,total_due,principal,principal_current,unpaid_interest"
 
@@ -512,6 +565,88 @@ def _render_record_payment(sb, schema: str, actor: Actor):
 
 
 # ============================================================
+# DIRECT PAYMENT (mapped to Record Payment)
+# ============================================================
+def _render_direct_payment(sb, schema: str, actor: Actor):
+    require(actor.role, "direct_payment")
+    st.subheader("Direct Payment")
+    st.caption("Direct Payment uses the same workflow as Record Payment (writes to loan_payments).")
+    _render_record_payment(sb, schema, actor)
+
+
+# ============================================================
+# CONFIRM PAYMENTS (safe implementation)
+# ============================================================
+def _render_confirm_payments(sb, schema: str, actor: Actor):
+    require(actor.role, "confirm_payment")
+    st.subheader("Confirm Payments")
+    st.caption(
+        "This section requires a maker-checker data model (e.g., confirmed_by/confirmed_at). "
+        "If your loans_core provides confirm_payment(), it will be used."
+    )
+
+    # Try to list "pending confirmations" if core exposes it.
+    pending_rows: list[dict[str, Any]] = []
+    used_core = False
+
+    if hasattr(core, "list_unconfirmed_payments"):
+        try:
+            pending_rows = core.list_unconfirmed_payments(sb, schema, limit=500) or []
+            used_core = True
+        except Exception as e:
+            st.warning("Could not load unconfirmed payments from core.")
+            st.code(_apierror_message(e), language="text")
+
+    if not used_core:
+        st.info(
+            "No core function found to list unconfirmed payments. "
+            "To enable full maker-checker confirmations, add:\n"
+            "- a column confirmed_by, confirmed_at on loan_payments, OR\n"
+            "- a loan_payment_confirmations table.\n\n"
+            "For now, payments are recorded and applied immediately."
+        )
+        # Still show recent payments for visibility:
+        pay_table = V_PAYMENTS_WITH_MEMBER if _table_exists(sb, schema, V_PAYMENTS_WITH_MEMBER) else PAYMENTS_TABLE
+        try:
+            rows = (
+                sb.schema(schema).table(pay_table)
+                .select("*")
+                .order("paid_at", desc=True)
+                .limit(200)
+                .execute().data or []
+            )
+            st.caption("Recent payments (latest 200)")
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        except Exception:
+            pass
+        return
+
+    df = pd.DataFrame(pending_rows)
+    if df.empty:
+        st.success("No pending payments to confirm.")
+        return
+
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    if not hasattr(core, "confirm_payment"):
+        st.info("core.confirm_payment(...) not found. Add it in loans_core to enable confirmations.")
+        return
+
+    # Minimal confirm UI:
+    ids = [int(x) for x in df["id"].tolist() if str(x).isdigit()]
+    pick = st.selectbox("Select payment ID to confirm", ids, key="confirm_pick_payment_id")
+    if st.button("✅ Confirm selected payment", type="primary", use_container_width=True, key="confirm_payment_btn"):
+        try:
+            core.confirm_payment(sb, schema, payment_id=int(pick), actor_user_id=str(actor.user_id))
+            audit(sb, "loan_payment_confirmed", "ok", {"payment_id": int(pick)}, actor_user_id=actor.user_id)
+            st.success("Payment confirmed.")
+            st.rerun()
+        except Exception as e:
+            st.error("Confirmation failed.")
+            st.code(_apierror_message(e), language="text")
+
+
+# ============================================================
 # INTEREST (ledger-based + accrual trigger)
 # ============================================================
 def _interest_ledger_totals(sb, schema: str) -> dict:
@@ -540,8 +675,6 @@ def _interest_ledger_totals(sb, schema: str) -> dict:
 
         mk = _month_key()  # YYYY-MM
         out["all_time"] = float(df["amount"].sum())
-
-        # ✅ cycle keys are YYYY-MM-DD, so this month = prefix match
         out["this_month"] = float(df[df["interest_month"].str.startswith(mk)]["amount"].sum())
 
         out["last_row"] = rows[0] if rows else None
@@ -611,7 +744,8 @@ def _render_interest(sb, schema: str, actor: Actor):
 # STATEMENTS (PDFs)
 # ============================================================
 def _render_statements(sb, schema: str, actor: Actor):
-    require(actor.role, "view_statements")
+    # Use canonical permission name (rbac aliases can still support old calls)
+    require(actor.role, "loan_statement")
     st.subheader("Statements")
 
     if make_member_loan_statement_pdf is None:
@@ -703,35 +837,50 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
 
     _render_kpis(sb_service, schema)
 
-    sections = allowed_sections(actor.role) or []
-    if not sections:
+    # Sections from RBAC
+    raw_sections = allowed_sections(actor.role) or []
+    if not raw_sections:
         st.warning("No sections available for your role.")
         return
 
-    # Ensure defaults exist (won't break if RBAC uses different list)
-    defaults = ["Requests", "Ledger", "Record Payment", "Interest", "Statements"]
-    for s in defaults:
-        if s not in sections:
-            sections.append(s)
-
-    # de-duplicate while preserving order
+    # Normalize sections + keep order + de-dup
+    sections: list[str] = []
     seen = set()
-    sections = [x for x in sections if not (x in seen or seen.add(x))]
+    for s in raw_sections:
+        cs = _canon_section(s)
+        if cs and cs not in seen:
+            sections.append(cs)
+            seen.add(cs)
+
+    # Ensure any RBAC output like "Loan Statement" gets routed (already normalized),
+    # and ensure core useful sections exist only if you can access them.
+    # (Do NOT force-add sections that are not permitted.)
+    # If a role has loan_statement permission but RBAC labels it "Loan Statement",
+    # it becomes "Statements" via normalization.
 
     if "loans_menu" not in st.session_state or st.session_state["loans_menu"] not in sections:
         st.session_state["loans_menu"] = sections[0]
 
     section = st.selectbox("Loans menu", sections, key="loans_menu")
+    section = _canon_section(section)
 
+    # ROUTER (all visible sections are implemented now)
     if section == "Requests":
         _render_requests(sb_service, schema, actor); return
     if section == "Ledger":
         _render_ledger(sb_service, schema, actor); return
     if section == "Record Payment":
         _render_record_payment(sb_service, schema, actor); return
+    if section == "Confirm Payments":
+        _render_confirm_payments(sb_service, schema, actor); return
     if section == "Interest":
         _render_interest(sb_service, schema, actor); return
+    if section == "Delinquency":
+        _render_delinquency(sb_service, schema, actor); return
     if section == "Statements":
         _render_statements(sb_service, schema, actor); return
+    if section == "Direct Payment":
+        _render_direct_payment(sb_service, schema, actor); return
 
-    st.info(f"Section '{section}' is enabled but not implemented in this UI file.")
+    # Fallback (should not happen now)
+    st.info(f"Section '{section}' is available but not wired in router.")
