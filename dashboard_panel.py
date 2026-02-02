@@ -1,4 +1,3 @@
-
 # dashboard_panel.py ✅ COMPLETE SINGLE CODE (NO SQL) — NJANGI STANDARD (NO "legacy")
 # ✅ Fixes Dashboard not updating:
 #    - Uses sb_service for app_state/sessions/contributions when available (RLS-safe)
@@ -6,6 +5,10 @@
 # ✅ Shows Session ID / Session Window / Beneficiary / Pot correctly
 # ✅ Dark theme + glass KPI cards
 # ✅ Auto-refresh on app_state stamp change
+# ✅ Finance FIX:
+#    - Payouts are NOT cash flow (pot redistribution) → DO NOT subtract from Cash Available
+#    - Adds FINES PAID as cash flow (counts only fines.status='paid')
+#    - Cash Available = foundation + loan_payments + interest_paid + fines_paid − outstanding_principal
 #
 # NEW TABLES ONLY:
 #   - app_state                (id=1, current_session_id, next_member_id, optional next_payout_date, updated_at)
@@ -13,9 +16,10 @@
 #   - members                  (id, name, display_name optional)
 #   - contributions            (member_id, session_id, amount, paid_at, created_at)
 #   - foundation_contributions (member_id, session_id, amount, paid_at, created_at)
-#   - loans                    (id, member_id, status, principal_current, principal, unpaid_interest, total_interest_generated, total_due, borrow_date, created_at)
+#   - loans                    (id, member_id, status, principal_current, principal, unpaid_interest, total_interest_generated, total_due (generated), borrow_date, created_at)
 #   - loan_payments            (loan_id, member_id, amount, paid_at, created_at)
-#   - payouts                  (session_id, member_id, payout_amount, payout_date, payout_index, created_at, updated_at)
+#   - payouts                  (session_id, member_id, payout_amount, payout_date, payout_index, created_at, updated_at)  # informational only
+#   - fines                    (id, member_id, session_id, amount, reason, issued_by, status, paid_at, created_at, updated_at)
 #   - v_next_beneficiary       (optional view)
 
 from __future__ import annotations
@@ -142,7 +146,6 @@ def safe_table_order_fallback(sb, schema: str, table: str, cols: str = "*", limi
     for c in order_candidates:
         rows = safe_table(sb, schema, table, cols=cols, limit=limit, order_by=c, desc=desc)
         if rows is not None:
-            # return on first successful call (even if empty) to avoid repeated errors
             return rows or []
     return safe_table(sb, schema, table, cols=cols, limit=limit, order_by=None, desc=desc)
 
@@ -194,6 +197,15 @@ def _to_date(x) -> date | None:
         return datetime.fromisoformat(s).date()
     except Exception:
         return None
+
+
+def _table_exists(sb, schema: str, table: str) -> bool:
+    """Best-effort: try a tiny select. If it errors, treat as not existing."""
+    try:
+        sb.schema(schema).table(table).select("*").limit(1).execute()
+        return True
+    except Exception:
+        return False
 
 
 # ============================================================
@@ -279,6 +291,8 @@ def compute_loans_kpis(sb, schema: str) -> dict:
         active += 1
         pc = _num(r.get("principal_current") or r.get("principal"), 0.0)
         principal_sum += pc
+
+        # total_due is generated in DB, cannot be updated, but can be read
         td = _num(r.get("total_due"), pc + _num(r.get("unpaid_interest"), 0.0))
         total_due_sum += td
     return {
@@ -301,10 +315,31 @@ def sum_table_amount(sb, schema: str, table: str, amount_cols: list[str]) -> flo
     return float(total)
 
 
+def compute_fines_paid_total(sb, schema: str) -> float:
+    """
+    ✅ Cash flow from fines = SUM(amount) where status='paid'.
+    If fines table doesn't exist yet, returns 0 safely.
+    """
+    if not _table_exists(sb, schema, "fines"):
+        return 0.0
+    rows = safe_table_order_fallback(
+        sb, schema, "fines", "*",
+        limit=20000,
+        order_candidates=["paid_at", "created_at", "id"],
+        desc=True,
+    )
+    total = 0.0
+    for r in rows or []:
+        status = str(r.get("status") or "").lower().strip()
+        if status != "paid":
+            continue
+        total += _num(r.get("amount"), 0.0)
+    return float(total)
+
+
 def get_session_window(sb, schema: str, session_id: int) -> str:
     if not session_id:
         return "—"
-    # sessions table uses session_id (confirmed in your DB), fallback to id if needed
     sample = safe_single(sb, schema, "sessions", "*")
     pk = "session_id"
     if sample and "session_id" not in sample and "id" in sample:
@@ -382,8 +417,6 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
 
     # --- App state ---
     state = safe_single(read_sb, schema, "app_state", "*", id=1)
-
-    # If app_state has no id column (rare), fall back to first row
     if not state:
         rows = safe_table(read_sb, schema, "app_state", "*", limit=1)
         state = rows[0] if rows else {}
@@ -399,13 +432,11 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     beneficiary_name = "—"
     beneficiary_id = next_member_id
 
-    # Try view (may not exist or may be blocked by RLS)
     v = safe_single(read_sb, schema, "v_next_beneficiary", "*")
     if v:
         beneficiary_name = str(v.get("beneficiary_name") or v.get("member_name") or "—")
         beneficiary_id = v.get("beneficiary_id") or v.get("member_id") or beneficiary_id
     else:
-        # fallback: lookup by member_id
         try:
             bid = int(beneficiary_id) if beneficiary_id is not None else None
         except Exception:
@@ -422,7 +453,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     if str(current_session_id or "").isdigit():
         window = get_session_window(read_sb, schema, int(current_session_id))
 
-    # --- Current pot ---
+    # --- Current pot (cycle contributions) ---
     pot = 0.0
     members_paid = 0
     if str(current_session_id or "").isdigit():
@@ -471,42 +502,50 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
 
     st.divider()
 
-    # --- Financial Totals ---
+    # --- Financial Totals (FOUNDATION CASHFLOW MODEL) ---
     foundation_total = sum_table_amount(finance_sb, schema, "foundation_contributions", ["amount"])
+
+    # Payouts are pot redistribution → informational only
     payouts_total = sum_table_amount(finance_sb, schema, "payouts", ["payout_amount", "amount"])
+
     interest_paid = compute_interest_paid(finance_sb, schema)
     repayments_total, last_payment_dates = compute_loan_payments(finance_sb, schema)
+    fines_paid_total = compute_fines_paid_total(finance_sb, schema)
     loan_kpis = compute_loans_kpis(finance_sb, schema)
 
     loans_outstanding = float(loan_kpis["principal_active"])
-    cash_available_raw = foundation_total + repayments_total + interest_paid - loans_outstanding - payouts_total
-    cash_available = max(cash_available_raw, 0.0)
+
+    # ✅ Cash Available (FOUNDATION ONLY): payouts excluded, fines included
+    cash_available_raw = foundation_total + repayments_total + interest_paid + fines_paid_total - loans_outstanding
+    cash_available = max(cash_available_raw, 0.0)  # keep floor to 0 for public dashboard
     net_available = cash_available + float(pot)
 
     st.markdown("### 🏦 Financial Summary")
 
     st.markdown(glass_open(), unsafe_allow_html=True)
-    f1, f2, f3, f4, f5, f6, f7 = st.columns(7)
+    f1, f2, f3, f4, f5, f6, f7, f8 = st.columns(8)
     with f1:
         st.markdown(kpi_card("Foundation Total", _fmt_money(foundation_total, 0), "blue", sub="foundation_contributions"), unsafe_allow_html=True)
     with f2:
-        st.markdown(kpi_card("Payouts Total", _fmt_money(payouts_total, 0), "orange", sub="payouts"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Payouts Total", _fmt_money(payouts_total, 0), "orange", sub="pot redistribution"), unsafe_allow_html=True)
     with f3:
         st.markdown(kpi_card("Interest Paid", _fmt_money(interest_paid, 0), "green", sub="loans: generated − unpaid"), unsafe_allow_html=True)
     with f4:
         st.markdown(kpi_card("Loan Payments", _fmt_money(repayments_total, 0), "green", sub="loan_payments"), unsafe_allow_html=True)
     with f5:
-        st.markdown(kpi_card("Outstanding Principal", _fmt_money(loans_outstanding, 0), "red", sub="loans.principal_current"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Total Fines Paid", _fmt_money(fines_paid_total, 0), "purple", sub="fines.status='paid'"), unsafe_allow_html=True)
     with f6:
-        st.markdown(kpi_card("Cash Available", _fmt_money(cash_available, 0), "green", sub="foundation + (payments+interest) − principal − payouts"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Outstanding Principal", _fmt_money(loans_outstanding, 0), "red", sub="loans.principal_current"), unsafe_allow_html=True)
     with f7:
+        st.markdown(kpi_card("Cash Available", _fmt_money(cash_available, 0), "green", sub="foundation + payments + interest + fines − principal"), unsafe_allow_html=True)
+    with f8:
         st.markdown(kpi_card("Net Available", _fmt_money(net_available, 0), "blue", sub="Cash Available + Current Pot"), unsafe_allow_html=True)
     st.markdown(glass_close(), unsafe_allow_html=True)
 
     if cash_available_raw < 0:
         st.warning(
             f"⚠️ Cash Available RAW is negative ({cash_available_raw:,.0f}) before flooring to 0. "
-            "This usually means outstanding loans + payouts exceed foundation + returns."
+            "This means outstanding loans exceed foundation cash-in (payments/interest/fines)."
         )
 
     st.divider()
@@ -546,10 +585,12 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         st.write("current_pot", pot)
         st.write("members_paid", members_paid)
         st.write("foundation_total", foundation_total)
-        st.write("payouts_total", payouts_total)
+        st.write("payouts_total (informational)", payouts_total)
         st.write("interest_paid", interest_paid)
         st.write("loan_payments_total", repayments_total)
+        st.write("fines_paid_total", fines_paid_total)
         st.write("loan_kpis", loan_kpis)
         st.write("cash_available_raw", cash_available_raw)
-        st.write("cash_available", cash_available)
+        st.write("cash_available (floored)", cash_available)
         st.write("net_available", net_available)
+
