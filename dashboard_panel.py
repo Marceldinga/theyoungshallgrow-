@@ -1,35 +1,29 @@
 
 # dashboard_panel.py ✅ COMPLETE SINGLE CODE (NO SQL) — NJANGI STANDARD (NO "legacy")
+# ✅ Standard Dashboard: shows CURRENT MEMBERS (total) + session KPIs
+# ✅ Removes "next member" confusion (uses clear "Current Beneficiary" label)
+# ✅ NO duplicate sections inside this file (single Loans section)
 # ✅ Dark theme + glass KPI cards
-# ✅ Auto-refresh on cycle change (app_state stamp change)
+# ✅ Auto-refresh on app_state stamp change
 # ✅ Uses sb_service for finance totals when available
 #
-# ✅ NEW TABLES ONLY:
-#   - app_state            (id=1, current_session_id, next_member_id, optional next_payout_date, updated_at)
-#   - sessions             (session_id OR id, start_date, end_date)
-#   - members              (id, name)
-#   - contributions         (member_id, session_id, amount, paid_at, created_at)
+# NEW TABLES ONLY:
+#   - app_state                (id=1, current_session_id, next_member_id, optional next_payout_date, updated_at)
+#   - sessions                 (session_id OR id, start_date, end_date)
+#   - members                  (id, name)
+#   - contributions            (member_id, session_id, amount, paid_at, created_at)
 #   - foundation_contributions (member_id, session_id, amount, paid_at, created_at)
-#   - loans                (id, member_id, status, principal_current, principal, unpaid_interest, total_interest_generated, total_due, borrow_date, created_at)
-#   - loan_payments         (loan_id, member_id, amount, paid_at, created_at)
-#   - payouts               (session_id, member_id, payout_amount, payout_date, created_at)
-#   - v_next_beneficiary    (view) — optional
+#   - loans                    (id, member_id, status, principal_current, principal, unpaid_interest, total_interest_generated, total_due, borrow_date, created_at)
+#   - loan_payments            (loan_id, member_id, amount, paid_at, created_at)
+#   - payouts                  (session_id, member_id, payout_amount, payout_date, created_at)
+#   - v_next_beneficiary       (optional view)
 #
-# ✅ Interest PAID source-of-truth (your DB model):
+# Interest PAID source-of-truth:
 #   interest_paid = SUM(total_interest_generated - unpaid_interest) WHERE status IN ('active','open')
 #
-# ✅ Loan due rule:
-#   next_due_date = (last_paid OR borrow_date) + 28 days
-#
-# ✅ Loan KPIs read principal_current (not principal)
-#
-# ✅ Financial KPIs (standard):
-#   foundation_total_all_time = SUM(foundation_contributions.amount)
-#   payouts_total_all_time    = SUM(payouts.payout_amount)
-#   repayments_total_all_time = SUM(loan_payments.amount)
-#   loans_outstanding_active  = SUM(loans.principal_current) for active/open
-#   cash_available_raw        = foundation_total_all_time + repayments_total_all_time + interest_paid - loans_outstanding_active - payouts_total_all_time
-#   cash_available            = max(cash_available_raw, 0)
+# Cash Available:
+#   foundation_total + repayments_total + interest_paid - outstanding_principal - payouts_total
+#   cash_available = max(raw, 0)
 
 from __future__ import annotations
 
@@ -37,11 +31,7 @@ from datetime import date, datetime, timedelta
 import streamlit as st
 import pandas as pd
 
-
-# ============================================================
-# CONFIG
-# ============================================================
-DUE_DAYS = 28  # loan due cycle
+DUE_DAYS = 28
 
 
 # ============================================================
@@ -140,7 +130,7 @@ def glass_close() -> str:
 
 
 # ============================================================
-# SAFE HELPERS
+# SAFE HELPERS (NO RAW SQL)
 # ============================================================
 def safe_table(sb, schema: str, table: str, cols: str = "*", limit: int = 20000, order_by: str | None = None, desc: bool = True):
     try:
@@ -213,7 +203,7 @@ def _to_date(x) -> date | None:
 
 
 # ============================================================
-# AUTO-REFRESH ON STATE CHANGE
+# AUTO-REFRESH ON app_state CHANGE
 # ============================================================
 def _read_state_stamp(sb, schema: str) -> str:
     r = safe_single(sb, schema, "app_state", "*", id=1)
@@ -247,10 +237,8 @@ def _auto_refresh_if_state_changed(sb_anon, schema: str):
 # ============================================================
 def compute_interest_paid(sb, schema: str) -> float:
     rows = safe_table(sb, schema, "loans", "*", limit=20000)
-    if not rows:
-        return 0.0
     total = 0.0
-    for r in rows:
+    for r in rows or []:
         status = str(r.get("status") or "").lower().strip()
         if status not in ("active", "open"):
             continue
@@ -264,33 +252,33 @@ def compute_interest_paid(sb, schema: str) -> float:
 
 
 def compute_loan_payments(sb, schema: str) -> tuple[float, dict[int, date]]:
-    rows = safe_table_order_fallback(sb, schema, "loan_payments", "*", limit=20000, order_candidates=["paid_at", "created_at", "id"], desc=True)
-    if not rows:
-        return 0.0, {}
+    rows = safe_table_order_fallback(
+        sb, schema, "loan_payments", "*",
+        limit=20000,
+        order_candidates=["paid_at", "created_at", "id"],
+        desc=True,
+    )
     total = 0.0
     last_by_loan: dict[int, date] = {}
-    for r in rows:
+    for r in rows or []:
         total += _num(r.get("amount"), 0.0)
-        lid = r.get("loan_id")
         try:
-            lid_int = int(lid)
+            lid = int(r.get("loan_id"))
         except Exception:
-            lid_int = None
+            continue
         d = _to_date(r.get("paid_at") or r.get("created_at"))
-        if lid_int is not None and d is not None:
-            if lid_int not in last_by_loan or d > last_by_loan[lid_int]:
-                last_by_loan[lid_int] = d
+        if d is not None:
+            if lid not in last_by_loan or d > last_by_loan[lid]:
+                last_by_loan[lid] = d
     return float(total), last_by_loan
 
 
 def compute_loans_kpis(sb, schema: str) -> dict:
     rows = safe_table(sb, schema, "loans", "*", limit=20000)
-    if not rows:
-        return {"active_loans": 0, "principal_active": 0.0, "total_due_active": 0.0}
     active = 0
     principal_sum = 0.0
     total_due_sum = 0.0
-    for r in rows:
+    for r in rows or []:
         status = str(r.get("status") or "").lower().strip()
         if status not in ("active", "open"):
             continue
@@ -299,23 +287,17 @@ def compute_loans_kpis(sb, schema: str) -> dict:
         principal_sum += pc
         td = _num(r.get("total_due"), pc + _num(r.get("unpaid_interest"), 0.0))
         total_due_sum += td
-    return {"active_loans": int(active), "principal_active": float(principal_sum), "total_due_active": float(total_due_sum)}
+    return {
+        "active_loans": int(active),
+        "principal_active": float(principal_sum),
+        "total_due_active": float(total_due_sum),
+    }
 
 
-def sum_table_amount(sb, schema: str, table: str, amount_cols: list[str], where: dict | None = None) -> float:
+def sum_table_amount(sb, schema: str, table: str, amount_cols: list[str]) -> float:
     rows = safe_table(sb, schema, table, "*", limit=20000)
-    if not rows:
-        return 0.0
     total = 0.0
-    for r in rows:
-        if where:
-            ok = True
-            for k, v in where.items():
-                if r.get(k) != v:
-                    ok = False
-                    break
-            if not ok:
-                continue
+    for r in rows or []:
         val = None
         for c in amount_cols:
             if c in r:
@@ -328,8 +310,8 @@ def sum_table_amount(sb, schema: str, table: str, amount_cols: list[str], where:
 def get_session_window(sb, schema: str, session_id: int) -> str:
     if not session_id:
         return "—"
-    pk = "session_id"
     sample = safe_single(sb, schema, "sessions", "*")
+    pk = "session_id"
     if sample and "session_id" not in sample and "id" in sample:
         pk = "id"
     srow = safe_single(sb, schema, "sessions", "*", **{pk: int(session_id)})
@@ -342,27 +324,20 @@ def get_session_window(sb, schema: str, session_id: int) -> str:
 
 def build_repayment_plan(sb, schema: str, last_payment_dates: dict[int, date]) -> pd.DataFrame:
     loans = safe_table(sb, schema, "loans", "*", limit=20000)
-    if not loans:
-        return pd.DataFrame()
-
     out = []
-    for r in loans:
+    for r in loans or []:
         status = str(r.get("status") or "").lower().strip()
         if status not in ("active", "open"):
             continue
-
-        loan_id = r.get("id")
         try:
-            lid = int(loan_id)
+            lid = int(r.get("id"))
         except Exception:
             continue
 
-        # Prefer principal_current
         principal = _num(r.get("principal_current") or r.get("principal"), 0.0)
         unpaid_interest = _num(r.get("unpaid_interest"), 0.0)
         total_due = _num(r.get("total_due"), principal + unpaid_interest)
 
-        # Borrow date preference order
         borrow_date = (
             _to_date(r.get("borrow_date"))
             or _to_date(r.get("issued_at"))
@@ -377,15 +352,17 @@ def build_repayment_plan(sb, schema: str, last_payment_dates: dict[int, date]) -
             last_paid = None
             next_due = borrow_date + timedelta(days=DUE_DAYS)
 
-        out.append({
-            "loan_id": lid,
-            "member_id": r.get("member_id"),
-            "principal_current": principal,
-            "unpaid_interest": unpaid_interest,
-            "total_due": total_due,
-            "last_paid": last_paid.isoformat() if isinstance(last_paid, date) else "—",
-            "next_due_date": next_due.isoformat(),
-        })
+        out.append(
+            {
+                "loan_id": lid,
+                "member_id": r.get("member_id"),
+                "principal_current": principal,
+                "unpaid_interest": unpaid_interest,
+                "total_due": total_due,
+                "last_paid": last_paid.isoformat() if isinstance(last_paid, date) else "—",
+                "next_due_date": next_due.isoformat(),
+            }
+        )
 
     df = pd.DataFrame(out)
     if df.empty:
@@ -394,7 +371,7 @@ def build_repayment_plan(sb, schema: str, last_payment_dates: dict[int, date]) -
 
 
 # ============================================================
-# DASHBOARD
+# DASHBOARD (STANDARD)
 # ============================================================
 def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     inject_dashboard_theme()
@@ -404,47 +381,68 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
 
     st.markdown("## 📊 Dashboard")
 
-    # ---------- state + next beneficiary ----------
+    # --- App state ---
     state = safe_single(sb_anon, schema, "app_state", "*", id=1)
     current_session_id = state.get("current_session_id")
-    next_member_id = state.get("next_member_id")
 
-    # v_next_beneficiary is optional, but preferred
-    next_name = "—"
+    # --- Members (CURRENT MEMBERS) ---
+    members_rows = safe_table(finance_sb, schema, "members", "id,name", limit=20000)
+    total_members = int(len(members_rows or []))
+
+    # --- Current beneficiary (label it clearly; use optional view if exists) ---
+    beneficiary_name = "—"
+    beneficiary_id = state.get("next_member_id")  # in your model this points to who is due
     if safe_table(sb_anon, schema, "v_next_beneficiary", "*", limit=1):
         v = safe_single(sb_anon, schema, "v_next_beneficiary", "*")
-        next_name = str(v.get("beneficiary_name") or v.get("member_name") or "—")
-        next_member_id = v.get("beneficiary_id") or v.get("member_id") or next_member_id
+        beneficiary_name = str(v.get("beneficiary_name") or v.get("member_name") or "—")
+        beneficiary_id = v.get("beneficiary_id") or v.get("member_id") or beneficiary_id
+    else:
+        # fallback: lookup name from members table
+        try:
+            bid = int(beneficiary_id) if beneficiary_id is not None else None
+        except Exception:
+            bid = None
+        if bid is not None:
+            for m in members_rows or []:
+                if str(m.get("id")) == str(bid):
+                    beneficiary_name = str(m.get("name") or "—")
+                    break
 
-    window = get_session_window(sb_anon, schema, int(current_session_id)) if str(current_session_id or "").isdigit() else "—"
+    window = (
+        get_session_window(sb_anon, schema, int(current_session_id))
+        if str(current_session_id or "").isdigit()
+        else "—"
+    )
 
-    st.markdown(glass_open(), unsafe_allow_html=True)
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.markdown(kpi_card("Session ID", str(current_session_id or "—"), "blue"), unsafe_allow_html=True)
-    with c2:
-        st.markdown(kpi_card("Next Member ID", str(next_member_id or "—"), "purple"), unsafe_allow_html=True)
-    with c3:
-        st.markdown(kpi_card("Next Beneficiary", str(next_name or "—"), "green"), unsafe_allow_html=True)
-    with c4:
-        st.markdown(kpi_card("Session Window", window, "orange"), unsafe_allow_html=True)
-    st.markdown(glass_close(), unsafe_allow_html=True)
-
-    st.divider()
-
-    # ---------- current pot (contributions for current session) ----------
+    # --- Current session pot (contributions in current session) ---
     pot = 0.0
     members_paid = 0
     if str(current_session_id or "").isdigit():
         crows = safe_table(finance_sb, schema, "contributions", "member_id,session_id,amount", limit=20000)
         dfc = pd.DataFrame(crows or [])
-        if not dfc.empty:
-            dfc["session_id"] = pd.to_numeric(dfc.get("session_id"), errors="coerce").fillna(-1).astype(int)
+        if not dfc.empty and "session_id" in dfc.columns:
+            dfc["session_id"] = pd.to_numeric(dfc["session_id"], errors="coerce").fillna(-1).astype(int)
             dfc = dfc[dfc["session_id"] == int(current_session_id)].copy()
             dfc["amount"] = pd.to_numeric(dfc.get("amount"), errors="coerce").fillna(0.0)
             pot = float(dfc["amount"].sum())
             members_paid = int(dfc["member_id"].nunique()) if "member_id" in dfc.columns else 0
 
+    # --- Header KPIs (STANDARD, NO "NEXT MEMBER" CONFUSION) ---
+    st.markdown(glass_open(), unsafe_allow_html=True)
+    a1, a2, a3, a4 = st.columns(4)
+    with a1:
+        st.markdown(kpi_card("Session ID", str(current_session_id or "—"), "blue"), unsafe_allow_html=True)
+    with a2:
+        st.markdown(kpi_card("Session Window", window, "orange"), unsafe_allow_html=True)
+    with a3:
+        st.markdown(kpi_card("Total Members", str(total_members), "purple", sub="members"), unsafe_allow_html=True)
+    with a4:
+        st.markdown(kpi_card("Current Beneficiary", beneficiary_name, "green", sub=f"member_id: {beneficiary_id or '—'}"), unsafe_allow_html=True)
+    st.markdown(glass_close(), unsafe_allow_html=True)
+
+    st.divider()
+
+    # --- Cycle KPIs ---
     st.markdown(glass_open(), unsafe_allow_html=True)
     p1, p2, p3 = st.columns(3)
     with p1:
@@ -457,7 +455,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
 
     st.divider()
 
-    # ---------- financial totals ----------
+    # --- Financial Totals ---
     foundation_total = sum_table_amount(finance_sb, schema, "foundation_contributions", ["amount"])
     payouts_total = sum_table_amount(finance_sb, schema, "payouts", ["payout_amount", "amount"])
     interest_paid = compute_interest_paid(finance_sb, schema)
@@ -497,7 +495,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
 
     st.divider()
 
-    # ---------- loans KPIs ----------
+    # --- Loans (SINGLE SECTION ONLY) ---
     st.markdown("### 💳 Loans")
 
     st.markdown(glass_open(), unsafe_allow_html=True)
@@ -510,7 +508,6 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         st.markdown(kpi_card("Total Due", _fmt_money(loan_kpis["total_due_active"], 0), "red"), unsafe_allow_html=True)
     st.markdown(glass_close(), unsafe_allow_html=True)
 
-    # ---------- repayment plan ----------
     plan_df = build_repayment_plan(finance_sb, schema, last_payment_dates)
     if plan_df.empty:
         st.info("No active/open loans found.")
@@ -521,15 +518,20 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         st.dataframe(plan_df, use_container_width=True, hide_index=True)
         st.markdown(glass_close(), unsafe_allow_html=True)
 
-    # ---------- debug ----------
+    # --- Debug (optional) ---
     with st.expander("🔎 Debug", expanded=False):
         st.write("app_state", state)
+        st.write("total_members", total_members)
+        st.write("beneficiary_id", beneficiary_id)
+        st.write("beneficiary_name", beneficiary_name)
+        st.write("current_session_id", current_session_id)
+        st.write("current_pot", pot)
+        st.write("members_paid", members_paid)
         st.write("foundation_total", foundation_total)
         st.write("payouts_total", payouts_total)
         st.write("interest_paid", interest_paid)
         st.write("loan_payments_total", repayments_total)
         st.write("loan_kpis", loan_kpis)
-        st.write("current_pot", pot)
         st.write("cash_available_raw", cash_available_raw)
         st.write("cash_available", cash_available)
         st.write("net_available", net_available)
