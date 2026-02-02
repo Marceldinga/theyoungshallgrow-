@@ -5,19 +5,25 @@
 # ✅ Shows Session ID / Session Window / Beneficiary / Pot correctly
 # ✅ Dark theme + glass KPI cards
 # ✅ Auto-refresh on app_state stamp change
-# ✅ Finance FIX:
-#    - Payouts are NOT cash flow (pot redistribution) → DO NOT subtract from Cash Available
-#    - Adds FINES PAID as cash flow (counts only fines.status='paid')
-#    - Cash Available = foundation + loan_payments + interest_paid + fines_paid − outstanding_principal
+#
+# ✅ FINANCE MODEL (your rule):
+#    - Payouts are pot redistribution → NOT cash flow (informational only)
+#    - Adds FINES PAID as cash flow (fines.status='paid')
+#    - Interest is LEDGER-based (interest_ledger):
+#         - Interest this month = sum(amount) where interest_month startswith YYYY-MM
+#         - Interest all-time  = sum(amount) all rows
+#    - Cash Available = foundation + loan_payments + interest(ledger) + fines_paid − outstanding_principal
 #
 # NEW TABLES ONLY:
 #   - app_state                (id=1, current_session_id, next_member_id, optional next_payout_date, updated_at)
-#   - sessions                 (session_id OR id, start_date, end_date)
+#   - sessions                 (session_id, start_date, end_date, created_at)
 #   - members                  (id, name, display_name optional)
 #   - contributions            (member_id, session_id, amount, paid_at, created_at)
 #   - foundation_contributions (member_id, session_id, amount, paid_at, created_at)
-#   - loans                    (id, member_id, status, principal_current, principal, unpaid_interest, total_interest_generated, total_due (generated), borrow_date, created_at)
+#   - loans                    (id, member_id, status, principal_current, principal, unpaid_interest, total_interest_generated,
+#                               interest_rate_monthly, total_due (generated), borrow_date, due_cycle_days, last_paid_at, created_at, updated_at)
 #   - loan_payments            (loan_id, member_id, amount, paid_at, created_at)
+#   - interest_ledger          (loan_id, interest_month (YYYY-MM...), amount, created_at, ...)  # amount is numeric
 #   - payouts                  (session_id, member_id, payout_amount, payout_date, payout_index, created_at, updated_at)  # informational only
 #   - fines                    (id, member_id, session_id, amount, reason, issued_by, status, paid_at, created_at, updated_at)
 #   - v_next_beneficiary       (optional view)
@@ -200,7 +206,6 @@ def _to_date(x) -> date | None:
 
 
 def _table_exists(sb, schema: str, table: str) -> bool:
-    """Best-effort: try a tiny select. If it errors, treat as not existing."""
     try:
         sb.schema(schema).table(table).select("*").limit(1).execute()
         return True
@@ -241,20 +246,46 @@ def _auto_refresh_if_state_changed(sb, schema: str):
 # ============================================================
 # KPI COMPUTATIONS
 # ============================================================
-def compute_interest_paid(sb, schema: str) -> float:
-    rows = safe_table(sb, schema, "loans", "*", limit=20000)
-    total = 0.0
-    for r in rows or []:
-        status = str(r.get("status") or "").lower().strip()
-        if status not in ("active", "open"):
-            continue
-        generated = _num(r.get("total_interest_generated"), 0.0)
-        unpaid = _num(r.get("unpaid_interest"), 0.0)
-        paid = generated - unpaid
-        if paid < 0:
-            paid = 0.0
-        total += paid
-    return float(total)
+def compute_interest_ledger(sb, schema: str) -> tuple[float, float]:
+    """
+    ✅ Interest ledger-based:
+      - this_month: sum(amount) where interest_month starts with YYYY-MM
+      - all_time:   sum(amount) all rows
+    Defensive: if table/columns missing → returns (0,0)
+    """
+    if not _table_exists(sb, schema, "interest_ledger"):
+        return 0.0, 0.0
+
+    rows = safe_table_order_fallback(
+        sb, schema, "interest_ledger", "*",
+        limit=20000,
+        order_candidates=["interest_month", "created_at", "id"],
+        desc=True,
+    )
+
+    if not rows:
+        return 0.0, 0.0
+
+    month_prefix = date.today().strftime("%Y-%m")
+    this_month = 0.0
+    all_time = 0.0
+
+    for r in rows:
+        # amount column (preferred): amount; fallback: interest_amount
+        amt = None
+        if "amount" in r:
+            amt = r.get("amount")
+        elif "interest_amount" in r:
+            amt = r.get("interest_amount")
+
+        v = _num(amt, 0.0)
+        all_time += v
+
+        im = str(r.get("interest_month") or "").strip()
+        if im.startswith(month_prefix):
+            this_month += v
+
+    return float(this_month), float(all_time)
 
 
 def compute_loan_payments(sb, schema: str) -> tuple[float, dict[int, date]]:
@@ -340,11 +371,7 @@ def compute_fines_paid_total(sb, schema: str) -> float:
 def get_session_window(sb, schema: str, session_id: int) -> str:
     if not session_id:
         return "—"
-    sample = safe_single(sb, schema, "sessions", "*")
-    pk = "session_id"
-    if sample and "session_id" not in sample and "id" in sample:
-        pk = "id"
-    srow = safe_single(sb, schema, "sessions", "*", **{pk: int(session_id)})
+    srow = safe_single(sb, schema, "sessions", "*", session_id=int(session_id))
     sd = srow.get("start_date")
     ed = srow.get("end_date")
     if sd and ed:
@@ -370,7 +397,6 @@ def build_repayment_plan(sb, schema: str, last_payment_dates: dict[int, date]) -
 
         borrow_date = (
             _to_date(r.get("borrow_date"))
-            or _to_date(r.get("issued_at"))
             or _to_date(r.get("created_at"))
             or date.today()
         )
@@ -421,7 +447,32 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         rows = safe_table(read_sb, schema, "app_state", "*", limit=1)
         state = rows[0] if rows else {}
 
-    current_session_id = state.get("current_session_id")
+    # --- Current session id (robust fallback) ---
+    raw_cs = state.get("current_session_id")
+    try:
+        current_session_id = int(raw_cs) if raw_cs is not None and str(raw_cs).strip() != "" else None
+    except Exception:
+        current_session_id = None
+
+    # If not set, fallback to latest sessions.session_id (read-only)
+    if current_session_id is None:
+        srows = safe_table_order_fallback(
+            read_sb,
+            schema,
+            "sessions",
+            "session_id,start_date,end_date",
+            limit=1,
+            order_candidates=["session_id", "start_date", "created_at"],
+            desc=True,
+        )
+        if srows:
+            try:
+                current_session_id = int(srows[0].get("session_id"))
+            except Exception:
+                current_session_id = None
+
+    session_note = "from app_state" if state.get("current_session_id") else "fallback: latest session"
+
     next_member_id = state.get("next_member_id")
 
     # --- Members ---
@@ -450,13 +501,13 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
                     break
 
     window = "—"
-    if str(current_session_id or "").isdigit():
+    if isinstance(current_session_id, int) and current_session_id > 0:
         window = get_session_window(read_sb, schema, int(current_session_id))
 
     # --- Current pot (cycle contributions) ---
     pot = 0.0
     members_paid = 0
-    if str(current_session_id or "").isdigit():
+    if isinstance(current_session_id, int) and current_session_id > 0:
         crows = safe_table(finance_sb, schema, "contributions", "member_id,session_id,amount", limit=20000)
         dfc = pd.DataFrame(crows or [])
         if not dfc.empty and "session_id" in dfc.columns:
@@ -470,7 +521,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     st.markdown(glass_open(), unsafe_allow_html=True)
     a1, a2, a3, a4 = st.columns(4)
     with a1:
-        st.markdown(kpi_card("Session ID", str(current_session_id or "—"), "blue"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Session ID", str(current_session_id or "—"), "blue", sub=session_note), unsafe_allow_html=True)
     with a2:
         st.markdown(kpi_card("Session Window", window, "orange"), unsafe_allow_html=True)
     with a3:
@@ -508,37 +559,41 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     # Payouts are pot redistribution → informational only
     payouts_total = sum_table_amount(finance_sb, schema, "payouts", ["payout_amount", "amount"])
 
-    interest_paid = compute_interest_paid(finance_sb, schema)
+    # Interest is LEDGER-based
+    interest_this_month, interest_all_time = compute_interest_ledger(finance_sb, schema)
+
     repayments_total, last_payment_dates = compute_loan_payments(finance_sb, schema)
     fines_paid_total = compute_fines_paid_total(finance_sb, schema)
     loan_kpis = compute_loans_kpis(finance_sb, schema)
 
     loans_outstanding = float(loan_kpis["principal_active"])
 
-    # ✅ Cash Available (FOUNDATION ONLY): payouts excluded, fines included
-    cash_available_raw = foundation_total + repayments_total + interest_paid + fines_paid_total - loans_outstanding
-    cash_available = max(cash_available_raw, 0.0)  # keep floor to 0 for public dashboard
+    # ✅ Cash Available (FOUNDATION ONLY): payouts excluded, fines included, interest from ledger
+    cash_available_raw = foundation_total + repayments_total + interest_all_time + fines_paid_total - loans_outstanding
+    cash_available = max(cash_available_raw, 0.0)
     net_available = cash_available + float(pot)
 
     st.markdown("### 🏦 Financial Summary")
 
     st.markdown(glass_open(), unsafe_allow_html=True)
-    f1, f2, f3, f4, f5, f6, f7, f8 = st.columns(8)
+    f1, f2, f3, f4, f5, f6, f7, f8, f9 = st.columns(9)
     with f1:
         st.markdown(kpi_card("Foundation Total", _fmt_money(foundation_total, 0), "blue", sub="foundation_contributions"), unsafe_allow_html=True)
     with f2:
         st.markdown(kpi_card("Payouts Total", _fmt_money(payouts_total, 0), "orange", sub="pot redistribution"), unsafe_allow_html=True)
     with f3:
-        st.markdown(kpi_card("Interest Paid", _fmt_money(interest_paid, 0), "green", sub="loans: generated − unpaid"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Interest This Month", _fmt_money(interest_this_month, 2), "green", sub="interest_ledger (YYYY-MM)"), unsafe_allow_html=True)
     with f4:
-        st.markdown(kpi_card("Loan Payments", _fmt_money(repayments_total, 0), "green", sub="loan_payments"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Interest All-time", _fmt_money(interest_all_time, 2), "green", sub="interest_ledger (all)"), unsafe_allow_html=True)
     with f5:
-        st.markdown(kpi_card("Total Fines Paid", _fmt_money(fines_paid_total, 0), "purple", sub="fines.status='paid'"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Loan Payments", _fmt_money(repayments_total, 0), "green", sub="loan_payments"), unsafe_allow_html=True)
     with f6:
-        st.markdown(kpi_card("Outstanding Principal", _fmt_money(loans_outstanding, 0), "red", sub="loans.principal_current"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Total Fines Paid", _fmt_money(fines_paid_total, 0), "purple", sub="fines.status='paid'"), unsafe_allow_html=True)
     with f7:
-        st.markdown(kpi_card("Cash Available", _fmt_money(cash_available, 0), "green", sub="foundation + payments + interest + fines − principal"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Outstanding Principal", _fmt_money(loans_outstanding, 0), "red", sub="loans.principal_current"), unsafe_allow_html=True)
     with f8:
+        st.markdown(kpi_card("Cash Available", _fmt_money(cash_available, 0), "green", sub="foundation + payments + interest + fines − principal"), unsafe_allow_html=True)
+    with f9:
         st.markdown(kpi_card("Net Available", _fmt_money(net_available, 0), "blue", sub="Cash Available + Current Pot"), unsafe_allow_html=True)
     st.markdown(glass_close(), unsafe_allow_html=True)
 
@@ -577,7 +632,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     with st.expander("🔎 Debug", expanded=False):
         st.write("Using read client:", "service" if sb_service is not None else "anon")
         st.write("app_state", state)
-        st.write("total_members", total_members)
+        st.write("session_note", session_note)
         st.write("current_session_id", current_session_id)
         st.write("next_member_id", next_member_id)
         st.write("beneficiary_id", beneficiary_id)
@@ -586,11 +641,11 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         st.write("members_paid", members_paid)
         st.write("foundation_total", foundation_total)
         st.write("payouts_total (informational)", payouts_total)
-        st.write("interest_paid", interest_paid)
+        st.write("interest_this_month (ledger)", interest_this_month)
+        st.write("interest_all_time (ledger)", interest_all_time)
         st.write("loan_payments_total", repayments_total)
         st.write("fines_paid_total", fines_paid_total)
         st.write("loan_kpis", loan_kpis)
         st.write("cash_available_raw", cash_available_raw)
         st.write("cash_available (floored)", cash_available)
         st.write("net_available", net_available)
-
