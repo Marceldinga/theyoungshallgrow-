@@ -1,21 +1,18 @@
 
-# loans_ui.py ✅ COMPLETE UPDATED (Bank-grade Interest Ledger + loan_repayments for payments)
-# What’s updated vs your version:
-# ✅ Interest is ledger-based (reads from public.interest_ledger)
-# ✅ Interest UI shows: This month / All-time totals from interest_ledger (no more app_state drift)
-# ✅ After clicking "Accrue monthly interest" it refreshes totals and shows a clearer message
-# ✅ Still uses loan_repayments for loan-linked payments (record + statements + delinquency)
+# loans_ui.py ✅ COMPLETE SINGLE FILE — FINAL FIX
+# ✅ Fixes legacy repayment save (member_id was NULL) by ALWAYS writing member_id
+# ✅ Adds 28-day due handling is in dashboard_panel.py (separate file) — not here
+# ✅ Fixes "interest_due generated should add to total amount borrow and update interest too":
+#    After monthly interest accrual, we sync loans_legacy so:
+#      unpaid_interest increases -> total_due increases
+#      total_due = principal_current (or principal) + unpaid_interest
+#      (optional) interest column mirrors unpaid_interest if present
 #
-# ✅ IMPORTANT UPGRADE (fixes your crash):
-# - Auto-detects repayments table:
-#     uses public.loan_repayments if it exists,
-#     otherwise uses public.loan_repayments_legacy (your current DB).
-# - Interest ledger totals do NOT assume interest_ledger.member_id exists.
-#   If member_id is missing, totals are still computed safely.
-#
-# ✅ ALSO FIXES YOUR UI STUBS:
-# - Implements "Confirm Payments"
-# - Implements "Loan Repayment (Legacy)"
+# ✅ IMPORTANT:
+# - Your DB shows interest is stored in loans_legacy:
+#     total_interest_generated, unpaid_interest, accrued_interest, etc.
+# - Your dashboard uses interest_paid = total_interest_generated - unpaid_interest (ACTIVE loans)
+# - This file keeps your interest_ledger UI but ALSO syncs loans_legacy totals so “Due” includes interest.
 
 from __future__ import annotations
 
@@ -59,7 +56,7 @@ REPAY_DATE_COL = "paid_at"
 # Maker–checker pending table (if you use it)
 PAYMENTS_PENDING_TABLE = "loan_repayments_pending"
 
-# ✅ Bank-grade Interest Ledger
+# ✅ Bank-grade Interest Ledger (optional)
 INTEREST_LEDGER_TABLE = "interest_ledger"   # public.interest_ledger
 INTEREST_MONTH_FMT = "%Y-%m"
 
@@ -107,6 +104,7 @@ def _actor_from_session(default_user_id: str) -> Actor:
 
 
 def _to_iso(d: date) -> str:
+    # store as ISO datetime string (UTC-naive); Supabase accepts it for timestamptz
     return datetime.combine(d, datetime.min.time()).isoformat()
 
 
@@ -115,7 +113,6 @@ def _safe_df(rows: list[dict]) -> pd.DataFrame:
 
 
 def _apierror_message(e: Exception) -> str:
-    """Extracts PostgREST / Supabase error payload message cleanly."""
     if isinstance(e, APIError):
         payload = e.args[0] if getattr(e, "args", None) else {}
         if isinstance(payload, dict):
@@ -137,7 +134,6 @@ def _month_key(d: date | None = None) -> str:
 
 
 def _table_exists(sb_service, schema: str, table_name: str) -> bool:
-    """Best-effort existence check (works even without SQL access)."""
     try:
         sb_service.schema(schema).table(table_name).select("*").limit(1).execute()
         return True
@@ -146,17 +142,12 @@ def _table_exists(sb_service, schema: str, table_name: str) -> bool:
 
 
 def _pick_payments_table(sb_service, schema: str) -> str:
-    """Chooses the best repayments table for this DB."""
     if _table_exists(sb_service, schema, PAYMENTS_TABLE_PRIMARY):
         return PAYMENTS_TABLE_PRIMARY
     return PAYMENTS_TABLE_FALLBACK
 
 
 def _columns_exist(sb_service, schema: str, table_name: str, cols: list[str]) -> dict[str, bool]:
-    """
-    Cheap "does column exist" check: try selecting it.
-    Returns dict col->bool.
-    """
     out = {c: False for c in cols}
     for c in cols:
         try:
@@ -167,14 +158,112 @@ def _columns_exist(sb_service, schema: str, table_name: str, cols: list[str]) ->
     return out
 
 
+def _read_app_state(sb_service, schema: str) -> dict:
+    try:
+        rows = sb_service.schema(schema).table("app_state").select("*").limit(1).execute().data or []
+        return rows[0] if rows else {}
+    except Exception:
+        return {}
+
+
+def _get_current_session_id(sb_service, schema: str):
+    r = _read_app_state(sb_service, schema)
+    return r.get("current_session_id") or None
+
+
+# ============================================================
+# ✅ Sync: total_due must include interest due
+# ============================================================
+def _sync_total_due_with_interest(sb_service, schema: str, only_active: bool = True) -> dict:
+    """
+    Ensures loans_legacy.total_due reflects principal + unpaid_interest.
+    Also mirrors 'interest' column (if present) to unpaid_interest so UI shows correct interest due.
+    Returns counts for UI feedback.
+    """
+    out = {"checked": 0, "updated": 0, "skipped": 0, "error": None}
+
+    # detect columns
+    col_ok = _columns_exist(
+        sb_service,
+        schema,
+        "loans_legacy",
+        ["id", "status", "principal_current", "principal", "unpaid_interest", "total_due", "interest"],
+    )
+
+    needed = ["id"]
+    if col_ok.get("status"):
+        needed.append("status")
+    if col_ok.get("principal_current"):
+        needed.append("principal_current")
+    if col_ok.get("principal"):
+        needed.append("principal")
+    if col_ok.get("unpaid_interest"):
+        needed.append("unpaid_interest")
+    if col_ok.get("total_due"):
+        needed.append("total_due")
+    if col_ok.get("interest"):
+        needed.append("interest")
+
+    try:
+        rows = (
+            sb_service.schema(schema).table("loans_legacy")
+            .select(",".join(needed))
+            .order("id", desc=False)
+            .limit(20000)
+            .execute().data
+            or []
+        )
+    except Exception as e:
+        out["error"] = _apierror_message(e)
+        return out
+
+    if not rows:
+        return out
+
+    for r in rows:
+        out["checked"] += 1
+
+        status = str(r.get("status") or "").lower().strip()
+        if only_active and status not in ("active", "open"):
+            out["skipped"] += 1
+            continue
+
+        principal = _num(r.get("principal_current") or r.get("principal"))
+        unpaid_interest = _num(r.get("unpaid_interest"))
+        desired_total_due = principal + unpaid_interest
+
+        # compare against current total_due (if exists)
+        current_total_due = _num(r.get("total_due"))
+        needs_update = abs(desired_total_due - current_total_due) > 1e-6
+
+        update_payload = {}
+        if col_ok.get("total_due") and needs_update:
+            update_payload["total_due"] = float(desired_total_due)
+
+        # Optional: keep 'interest' column synced to unpaid_interest if that column exists
+        # This makes your loan detail line show Interest as due (not 0)
+        if col_ok.get("interest"):
+            current_interest = _num(r.get("interest"))
+            if abs(current_interest - unpaid_interest) > 1e-6:
+                update_payload["interest"] = float(unpaid_interest)
+
+        if not update_payload:
+            continue
+
+        try:
+            sb_service.schema(schema).table("loans_legacy").update(update_payload).eq("id", int(r["id"])).execute()
+            out["updated"] += 1
+        except Exception:
+            # do not hard-fail; keep going
+            out["skipped"] += 1
+
+    return out
+
+
+# ============================================================
+# Interest Ledger totals (optional UI)
+# ============================================================
 def _interest_ledger_totals(sb_service, schema: str) -> dict:
-    """
-    Returns totals from interest_ledger:
-      - all_time
-      - this_month
-      - last_row (latest accrual record)
-    Robust to missing member_id in interest_ledger.
-    """
     out = {"all_time": 0.0, "this_month": 0.0, "last_row": None, "ok": False, "error": None}
 
     if not _table_exists(sb_service, schema, INTEREST_LEDGER_TABLE):
@@ -182,8 +271,10 @@ def _interest_ledger_totals(sb_service, schema: str) -> dict:
         return out
 
     try:
-        col_ok = _columns_exist(sb_service, schema, INTEREST_LEDGER_TABLE,
-                               ["amount", "interest_month", "created_at", "loan_id", "member_id", "note"])
+        col_ok = _columns_exist(
+            sb_service, schema, INTEREST_LEDGER_TABLE,
+            ["amount", "interest_month", "created_at", "loan_id", "member_id", "note"]
+        )
         select_cols = ["amount", "interest_month", "created_at"]
         if col_ok.get("loan_id"):
             select_cols.append("loan_id")
@@ -222,7 +313,6 @@ def _interest_ledger_totals(sb_service, schema: str) -> dict:
 
 
 def _build_statement_pdf(member: dict, mloans: list[dict], mpay: list[dict], statement_sig: dict | None) -> bytes:
-    """Calls pdfs.make_member_loan_statement_pdf safely."""
     if make_member_loan_statement_pdf is None:
         raise RuntimeError("PDF engine not available (make_member_loan_statement_pdf import failed).")
 
@@ -542,7 +632,6 @@ def _render_confirm_payments(sb_service, schema: str, actor: Actor):
 
     st.dataframe(dfp, use_container_width=True, hide_index=True)
 
-    # pick pending id
     id_col = "id" if "id" in dfp.columns else None
     if not id_col:
         st.warning("Pending table has no 'id' column. Cannot confirm.")
@@ -556,15 +645,12 @@ def _render_confirm_payments(sb_service, schema: str, actor: Actor):
     with col1:
         if st.button("✅ CONFIRM", type="primary", use_container_width=True, key="btn_confirm_payment"):
             try:
-                # Preferred: core function / RPC handles atomic move + balances
                 if hasattr(core, "confirm_payment_pending"):
                     core.confirm_payment_pending(sb_service, schema, pending_id=int(pick_id), actor_user_id=str(actor.user_id))
                 else:
-                    # Fallback: try RPC if exists
                     try:
                         sb_service.rpc("confirm_loan_repayment", {"pending_id": int(pick_id)}).execute()
                     except Exception:
-                        # Minimal fallback (moves row only; balances may not update)
                         payments_table = _pick_payments_table(sb_service, schema)
                         ins = row.copy()
                         ins.pop("id", None)
@@ -573,6 +659,10 @@ def _render_confirm_payments(sb_service, schema: str, actor: Actor):
                         sb_service.schema(schema).table(PAYMENTS_PENDING_TABLE).update({"status": "confirmed"}).eq("id", int(pick_id)).execute()
 
                 audit(sb_service, "loan_payment_confirmed", "ok", {"pending_id": int(pick_id)}, actor_user_id=actor.user_id)
+
+                # ✅ optional: after confirming, re-sync total_due with interest (no harm)
+                _sync_total_due_with_interest(sb_service, schema, only_active=True)
+
                 st.success("Confirmed.")
                 st.rerun()
             except Exception as e:
@@ -599,7 +689,7 @@ def _render_confirm_payments(sb_service, schema: str, actor: Actor):
 
 
 # ============================================================
-# Loan Repayment (Legacy) — direct insert
+# Loan Repayment (Legacy) — direct insert (FIXED: member_id required)
 # ============================================================
 def _render_legacy_repayment(sb_service, schema: str, actor: Actor):
     require(actor.role, "legacy_repayment")
@@ -632,7 +722,15 @@ def _render_legacy_repayment(sb_service, schema: str, actor: Actor):
 
     df["label"] = df.apply(_lbl, axis=1)
     pick = st.selectbox("Select loan", df["label"].tolist(), key="legacy_pick_loan")
-    loan_id = int(df[df["label"] == pick].iloc[0]["id"])
+    row = df[df["label"] == pick].iloc[0].to_dict()
+    loan_id = int(row["id"])
+    member_id = row.get("member_id")
+
+    # HARD GUARD: member_id must be present (your DB constraint)
+    try:
+        member_id = int(member_id) if member_id is not None else None
+    except Exception:
+        member_id = None
 
     amount = st.number_input("Amount", min_value=0.0, step=50.0, value=0.0, key="legacy_amt")
     paid_on = st.date_input("Paid date", value=date.today(), key="legacy_date")
@@ -643,23 +741,56 @@ def _render_legacy_repayment(sb_service, schema: str, actor: Actor):
             st.error("Amount must be > 0.")
             st.stop()
 
+        # ✅ Always derive member_id from loans_legacy if UI row is missing it
+        if member_id is None:
+            try:
+                r2 = (
+                    sb_service.schema(schema).table("loans_legacy")
+                    .select("member_id")
+                    .eq("id", int(loan_id))
+                    .limit(1)
+                    .execute().data
+                    or []
+                )
+                member_id = int(r2[0]["member_id"]) if r2 and r2[0].get("member_id") is not None else None
+            except Exception:
+                member_id = None
+
+        if member_id is None:
+            st.error("❌ Cannot save repayment: member_id is missing for this loan in loans_legacy.")
+            st.stop()
+
+        session_id = _get_current_session_id(sb_service, schema)
+
         payload = {
             "loan_id": int(loan_id),
+            "member_id": int(member_id),        # ✅ FIXED (was NULL before)
             "amount": float(amount),
             "paid_at": _to_iso(paid_on),
             "recorded_by": str(actor.user_id),
             "notes": note,
         }
+        # add session_id if column exists
+        try:
+            ok = _columns_exist(sb_service, schema, payments_table, ["session_id"]).get("session_id", False)
+            if ok and session_id:
+                payload["session_id"] = session_id
+        except Exception:
+            pass
 
         try:
-            # If core has a direct applier that updates balances, prefer that
             if hasattr(core, "record_payment_direct"):
                 core.record_payment_direct(sb_service, schema, **payload)
             else:
                 sb_service.schema(schema).table(payments_table).insert(payload).execute()
 
             audit(sb_service, "loan_payment_legacy_saved", "ok",
-                  {"loan_id": int(loan_id), "amount": float(amount)}, actor_user_id=actor.user_id)
+                  {"loan_id": int(loan_id), "member_id": int(member_id), "amount": float(amount)},
+                  actor_user_id=actor.user_id)
+
+            # ✅ After recording repayment, keep totals consistent
+            _sync_total_due_with_interest(sb_service, schema, only_active=True)
+
             st.success("Saved.")
             st.rerun()
         except Exception as e:
@@ -685,24 +816,29 @@ def _render_legacy_repayment(sb_service, schema: str, actor: Actor):
 
 
 # ============================================================
-# Interest UI (Ledger-based)
+# Interest UI
 # ============================================================
 def _render_interest(sb_service, schema: str, actor: Actor):
     require(actor.role, "accrue_interest")
-    st.subheader("Interest (Ledger-based)")
-    st.caption("Source of truth: interest_ledger. Accrual should be idempotent per loan per month.")
+    st.subheader("Interest")
 
+    # Info panel: loans_legacy truth
+    st.caption("Your DB stores interest on loans_legacy (unpaid_interest, total_interest_generated, etc.).")
+    st.caption("After accrual, we sync loans_legacy.total_due = principal + unpaid_interest so the 'Due' includes interest.")
+
+    # Optional interest_ledger panel (if you use it)
     totals = _interest_ledger_totals(sb_service, schema)
     mk = _month_key()
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Interest this month", f"{totals['this_month']:,.2f}")
-    c2.metric("Interest all-time", f"{totals['all_time']:,.2f}")
+    c1.metric("Interest this month (ledger)", f"{totals['this_month']:,.2f}")
+    c2.metric("Interest all-time (ledger)", f"{totals['all_time']:,.2f}")
     last = totals.get("last_row") or {}
-    c3.metric("Last accrual month", str(last.get("interest_month") or "—"))
+    c3.metric("Last accrual month (ledger)", str(last.get("interest_month") or "—"))
 
     if totals.get("error"):
-        st.warning(totals["error"])
+        st.info("Ledger not available (ok):")
+        st.write(totals["error"])
 
     st.divider()
 
@@ -710,26 +846,50 @@ def _render_interest(sb_service, schema: str, actor: Actor):
         try:
             updated, added = core.accrue_monthly_interest(sb_service, schema, actor_user_id=str(actor.user_id))
             audit(sb_service, "interest_accrued", "ok",
-                  {"updated": int(updated), "added": float(added), "month": mk}, actor_user_id=actor.user_id)
+                  {"updated": int(updated), "added": float(added), "month": mk},
+                  actor_user_id=actor.user_id)
 
-            totals2 = _interest_ledger_totals(sb_service, schema)
+            # ✅ CRITICAL: sync total_due + interest display after accrual
+            sync = _sync_total_due_with_interest(sb_service, schema, only_active=True)
 
             if float(added) <= 0 and int(updated) <= 0:
                 st.info(f"No changes made (already accrued for {mk} or no eligible loans).")
             else:
                 st.success(f"Updated loans: {int(updated)} • Interest added: {float(added):,.2f}")
 
-            st.caption("Ledger totals (after run):")
-            st.write(
-                {
-                    "interest_this_month": round(float(totals2["this_month"]), 2),
-                    "interest_all_time": round(float(totals2["all_time"]), 2),
-                    "last_row": totals2.get("last_row"),
-                }
-            )
+            if sync.get("error"):
+                st.warning("Interest accrued, but could not sync total_due/interest columns.")
+                st.code(str(sync["error"]), language="text")
+            else:
+                st.caption("Synced loan totals so Due includes interest:")
+                st.write(sync)
+
+            st.rerun()
+
         except Exception as e:
             st.error("Interest accrual failed.")
             st.code(_apierror_message(e), language="text")
+
+    st.divider()
+    st.markdown("### Quick view (active loans)")
+    try:
+        rows = (
+            sb_service.schema(schema).table("loans_legacy")
+            .select("id,member_id,status,principal_current,principal,unpaid_interest,total_due,interest,total_interest_generated")
+            .order("id", desc=True)
+            .limit(2000)
+            .execute().data
+            or []
+        )
+        df = pd.DataFrame(rows)
+        if df.empty:
+            st.info("No loans found.")
+        else:
+            df["status"] = df["status"].astype(str).str.lower().str.strip()
+            df = df[df["status"].isin(["active", "open"])]
+            st.dataframe(df, use_container_width=True, hide_index=True)
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -909,7 +1069,6 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
         st.warning("No sections available for your role.")
         return
 
-    # Ensure menu has a valid default
     if "loans_menu" not in st.session_state or st.session_state["loans_menu"] not in sections:
         st.session_state["loans_menu"] = sections[0]
 
