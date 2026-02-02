@@ -21,6 +21,7 @@
 # ✅ Summaries: minutes + attendance + contributions (new tables)
 # ✅ No duplicate tabs/pages in sidebar
 # ✅ Contributions page shows names using v_contributions_with_member (view)
+# ✅ Loans page delegates to loans.py → loans_ui.py (NEW standard). App checks required tables exist.
 
 from __future__ import annotations
 
@@ -48,7 +49,7 @@ except Exception:
 loans_entry = None
 loans_import_error = None
 try:
-    import loans as loans_entry  # noqa: F401
+    import loans as loans_entry  # expects show_loans(sb_service, schema, actor_user_id="")
 except Exception as e:
     loans_entry = None
     loans_import_error = e
@@ -57,7 +58,7 @@ except Exception as e:
 ai_render_fn = None
 ai_import_error = None
 try:
-    from ai_risk_panel import render_ai_risk_panel as ai_render_fn  # noqa: F401
+    from ai_risk_panel import render_ai_risk_panel as ai_render_fn
 except Exception as e:
     ai_render_fn = None
     ai_import_error = e
@@ -287,6 +288,14 @@ def safe_select(
         return []
 
 
+def table_readable(client, schema: str, table_name: str) -> bool:
+    try:
+        client.schema(schema).table(table_name).select("*").limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
 def get_app_state(sb, schema: str) -> dict:
     rows = safe_select(sb, "app_state", "*", schema=schema, limit=1, id=1)
     return rows[0] if rows else {}
@@ -298,7 +307,7 @@ def load_members(url: str, anon_key: str, schema: str) -> tuple[list[str], dict,
     rows = (
         client.schema(schema)
         .table("members")
-        .select("id,name")
+        .select("id,name,display_name")
         .order("id", desc=False)
         .limit(5000)
         .execute()
@@ -308,12 +317,16 @@ def load_members(url: str, anon_key: str, schema: str) -> tuple[list[str], dict,
     df = pd.DataFrame(rows)
 
     if df.empty:
-        return [], {}, {}, pd.DataFrame(columns=["id", "name"])
+        return [], {}, {}, pd.DataFrame(columns=["id", "name", "display_name"])
 
     df["id"] = pd.to_numeric(df["id"], errors="coerce").fillna(0).astype(int)
     df = df[df["id"] > 0].copy()
     df["name"] = df["name"].astype(str)
-    df["label"] = df.apply(lambda r: f'{int(r["id"]):02d} • {r["name"]}', axis=1)
+    if "display_name" in df.columns:
+        df["display_name"] = df["display_name"].astype(str).replace({"None": "", "nan": ""})
+    else:
+        df["display_name"] = ""
+    df["label"] = df.apply(lambda r: f'{int(r["id"]):02d} • {(r["display_name"] or r["name"])}', axis=1)
 
     labels = df["label"].tolist()
     label_to_id = dict(zip(df["label"], df["id"]))
@@ -390,6 +403,14 @@ elif page == "Loans":
     if not sb_service:
         st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY.")
     else:
+        # Friendly DB readiness check for NEW loans standard
+        needed = ["members", "loans", "loan_payments", "loan_requests", "signatures", "interest_ledger"]
+        missing = [t for t in needed if not table_readable(sb_service, SUPABASE_SCHEMA, t)]
+        if missing:
+            st.error("Loans module is not ready — missing required table(s):")
+            st.write(", ".join([f"{SUPABASE_SCHEMA}.{t}" for t in missing]))
+            st.stop()
+
         if loans_entry is None:
             st.error("Loans UI not available. loans.py failed to import.")
             if loans_import_error is not None:
@@ -399,7 +420,8 @@ elif page == "Loans":
             if loans_fn is None:
                 st.error("Loans UI not available. loans.py must define show_loans() or render_loans().")
             else:
-                loans_fn(sb_service, SUPABASE_SCHEMA, actor_user_id="admin")
+                # Pass empty user id → loans_ui will generate a session UUID if needed
+                loans_fn(sb_service, SUPABASE_SCHEMA, actor_user_id="")
 
 elif page == "🤖 AI Risk Panel":
     if ai_render_fn is None:
@@ -526,7 +548,7 @@ elif page == "Minutes & Attendance":
         st.markdown(glass_close(), unsafe_allow_html=True)
 
     # -------------------------
-    # Attendance (write member_id only; display via view)
+    # Attendance
     # -------------------------
     with tab2:
         st.markdown(glass_open(), unsafe_allow_html=True)
@@ -543,20 +565,14 @@ elif page == "Minutes & Attendance":
         attendance_rows: list[dict] = []
         for _, r in df_members.sort_values("id").iterrows():
             mid = int(r["id"])
-            name = str(r["name"])
+            name = str(r.get("display_name") or r.get("name") or "")
             label = f"{mid:02d} • {name}"
 
             c_status, c_note = st.columns([0.42, 0.58])
 
             with c_status:
                 status_key = f"att_status_{mid}_{current_session_id}"
-                status = st.radio(
-                    label,
-                    options=["present", "absent"],
-                    index=0,
-                    horizontal=True,
-                    key=status_key,
-                )
+                status = st.radio(label, options=["present", "absent"], index=0, horizontal=True, key=status_key)
 
             with c_note:
                 note_key = f"att_note_{mid}_{current_session_id}"
@@ -568,13 +584,7 @@ elif page == "Minutes & Attendance":
                     label_visibility="collapsed",
                 )
 
-            attendance_rows.append(
-                {
-                    "member_id": mid,
-                    "present": (status == "present"),
-                    "note": note.strip() or None,
-                }
-            )
+            attendance_rows.append({"member_id": mid, "present": (status == "present"), "note": note.strip() or None})
 
         st.divider()
         save = st.button("💾 Save attendance (ALL members)", use_container_width=True)
@@ -591,7 +601,6 @@ elif page == "Minutes & Attendance":
                 for row in attendance_rows
             ]
 
-            # delete existing attendance for this session then insert full set
             try:
                 sb_service.schema(SUPABASE_SCHEMA).table("attendance").delete().eq("session_id", int(current_session_id)).execute()
             except Exception:
@@ -611,7 +620,7 @@ elif page == "Minutes & Attendance":
         st.markdown("### Current session attendance")
         arows = safe_select(
             sb_service,
-            "v_attendance_with_member",   # ✅ show member_name via view
+            "v_attendance_with_member",
             "*",
             schema=SUPABASE_SCHEMA,
             order_by="member_id",
@@ -627,12 +636,7 @@ elif page == "Minutes & Attendance":
 
             if make_attendance_pdf is not None:
                 try:
-                    pdf_bytes = make_attendance_pdf(
-                        APP_BRAND,
-                        str(date.today()),
-                        int(current_session_id),
-                        dfa.to_dict("records"),
-                    )
+                    pdf_bytes = make_attendance_pdf(APP_BRAND, str(date.today()), int(current_session_id), dfa.to_dict("records"))
                     st.download_button(
                         "⬇️ Download Attendance (PDF)",
                         pdf_bytes,
@@ -647,14 +651,13 @@ elif page == "Minutes & Attendance":
         st.markdown(glass_close(), unsafe_allow_html=True)
 
     # -------------------------
-    # Summaries (show names via views where available)
+    # Summaries
     # -------------------------
     with tab3:
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.subheader("Summaries")
         st.caption("Summaries for Minutes, Attendance, and Contributions (member_id only; names shown via views).")
 
-        # Minutes summary
         st.markdown("### 📝 Minutes summary")
         m_rows = safe_select(sb_service, "minutes", "*", schema=SUPABASE_SCHEMA, order_by="updated_at", order_desc=True, limit=20)
         dfm = pd.DataFrame(m_rows)
@@ -677,7 +680,6 @@ elif page == "Minutes & Attendance":
 
         st.divider()
 
-        # Attendance summary
         st.markdown("### ✅ Attendance summary")
         a_rows = safe_select(
             sb_service,
@@ -699,7 +701,6 @@ elif page == "Minutes & Attendance":
 
         st.divider()
 
-        # Contributions summary (current session) — show names via view
         st.markdown("### 💰 Contributions summary (current session)")
         c_rows = safe_select(
             sb_service,
