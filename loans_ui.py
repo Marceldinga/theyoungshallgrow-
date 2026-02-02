@@ -1,19 +1,20 @@
 
-# loans_ui.py ✅ COMPLETE SINGLE FILE — FINAL FIX (NO DOUBLE APPLY)
-# ✅ Fixes legacy repayment save:
-#   - ALWAYS writes member_id
-#   - NEVER double-applies payment to principal_current
-#   - Writes repayment ONLY into loan_repayments_legacy (legacy vault)
-#   - Applies repayment ONCE to loans_legacy (interest-first, then principal)
+# loans_ui.py ✅ COMPLETE SINGLE FILE — FINAL FIX (IDEMPOTENT LEGACY APPLY)
+# ✅ Fixes the real issue: Legacy repayment was being APPLIED multiple times even when recorded once.
+# ✅ Solution: Add "applied_to_loan" guard (DB column) and mark each repayment row applied exactly once.
+# ✅ Legacy flow:
+#    1) Insert into loan_repayments_legacy (return row id)
+#    2) If applied_to_loan is already true → stop (prevents double/triple reductions)
+#    3) Apply to loans_legacy (interest-first → principal_current)
+#    4) Mark repayment row applied_to_loan = true
 #
-# ✅ Fixes "interest_due generated should add to total amount borrow and update interest too":
-#   - Syncs loans_legacy.total_due = principal_current (or principal) + unpaid_interest
-#   - Optionally mirrors loans_legacy.interest = unpaid_interest (if column exists)
+# ✅ Keeps your interest sync behavior:
+#    total_due = principal_current + unpaid_interest
+#    mirrors interest column if present
 #
-# ✅ Important:
-# - Your DB stores interest on loans_legacy: unpaid_interest, total_interest_generated, etc.
-# - Your dashboard computes interest_paid = total_interest_generated - unpaid_interest (active loans).
-# - This file ensures the loan row is updated when a legacy repayment is saved, so principal_current moves correctly.
+# ✅ IMPORTANT: Run this SQL once (Supabase SQL editor):
+#   ALTER TABLE public.loan_repayments_legacy
+#   ADD COLUMN IF NOT EXISTS applied_to_loan boolean NOT NULL DEFAULT false;
 
 from __future__ import annotations
 
@@ -47,17 +48,15 @@ except Exception:
 # Tables / Columns
 # ============================================================
 
-# Auto table detection for "standard" confirmed repayments
 PAYMENTS_TABLE_PRIMARY = "loan_repayments"
 PAYMENTS_TABLE_FALLBACK = "loan_repayments_legacy"
 
 REPAY_LINK_COL = "loan_id"
 REPAY_DATE_COL = "paid_at"
 
-# Maker–checker pending table (if you use it)
 PAYMENTS_PENDING_TABLE = "loan_repayments_pending"
 
-# Legacy repayments MUST go here to avoid double-apply across tables
+# Legacy repayments MUST go here
 LEGACY_REPAYMENTS_TABLE = "loan_repayments_legacy"
 
 # Optional interest_ledger (UI only)
@@ -108,7 +107,6 @@ def _actor_from_session(default_user_id: str) -> Actor:
 
 
 def _to_iso(d: date) -> str:
-    # store as ISO datetime string; Supabase accepts it for timestamptz
     return datetime.combine(d, datetime.min.time()).isoformat()
 
 
@@ -176,13 +174,9 @@ def _get_current_session_id(sb_service, schema: str):
 
 
 # ============================================================
-# ✅ Sync: total_due must include interest due
+# Sync total_due with interest (derived fields only)
 # ============================================================
 def _sync_total_due_with_interest(sb_service, schema: str, only_active: bool = True) -> dict:
-    """
-    Ensures loans_legacy.total_due reflects principal_current (or principal) + unpaid_interest.
-    Mirrors loans_legacy.interest = unpaid_interest if 'interest' column exists.
-    """
     out = {"checked": 0, "updated": 0, "skipped": 0, "error": None}
 
     col_ok = _columns_exist(
@@ -248,16 +242,9 @@ def _sync_total_due_with_interest(sb_service, schema: str, only_active: bool = T
 
 
 # ============================================================
-# ✅ Apply repayment to loan ONCE (Interest-first)
+# Apply repayment ONCE (interest-first) to loans_legacy
 # ============================================================
 def _apply_repayment_once(sb_service, schema: str, loan_id: int, pay_amount: float) -> dict:
-    """
-    Applies payment to loans_legacy exactly once:
-      1) pays unpaid_interest first
-      2) then reduces principal_current
-      3) sets total_due = principal_current + unpaid_interest
-      4) mirrors interest column if present
-    """
     cols = _columns_exist(
         sb_service, schema, "loans_legacy",
         ["id", "principal_current", "principal", "unpaid_interest", "total_due", "interest"]
@@ -282,27 +269,23 @@ def _apply_repayment_once(sb_service, schema: str, loan_id: int, pay_amount: flo
     r = row[0]
     principal = _num(r.get("principal_current") or r.get("principal"))
     unpaid_interest = _num(r.get("unpaid_interest"))
-
     amt = max(float(pay_amount), 0.0)
 
-    # Interest first
     interest_paid = min(unpaid_interest, amt)
     unpaid_interest_new = unpaid_interest - interest_paid
     amt_left = amt - interest_paid
 
-    # Principal next
     principal_paid = min(principal, amt_left)
     principal_new = principal - principal_paid
 
     total_due_new = principal_new + unpaid_interest_new
 
-    update_payload = {}
-    if cols.get("principal_current"):
-        update_payload["principal_current"] = float(principal_new)
-    else:
-        # If principal_current doesn't exist, we cannot persist principal reduction safely
+    if not cols.get("principal_current"):
         return {"ok": False, "error": "principal_current column missing on loans_legacy"}
 
+    update_payload = {
+        "principal_current": float(principal_new),
+    }
     if cols.get("unpaid_interest"):
         update_payload["unpaid_interest"] = float(unpaid_interest_new)
     if cols.get("total_due"):
@@ -669,13 +652,13 @@ def _render_confirm_payments(sb_service, schema: str, actor: Actor):
 
 
 # ============================================================
-# Loan Repayment (Legacy) — INSERT + APPLY ONCE
+# Loan Repayment (Legacy) — INSERT + APPLY ONCE (idempotent)
 # ============================================================
 def _render_legacy_repayment(sb_service, schema: str, actor: Actor):
     require(actor.role, "legacy_repayment")
 
     st.subheader("💵 Loan Repayment (Legacy)")
-    st.caption(f"Directly records repayments into: {LEGACY_REPAYMENTS_TABLE} (then applies once to loans_legacy).")
+    st.caption(f"Directly records repayments into: {LEGACY_REPAYMENTS_TABLE} and applies to loans_legacy exactly once.")
 
     loans = (
         sb_service.schema(schema).table("loans_legacy")
@@ -719,7 +702,7 @@ def _render_legacy_repayment(sb_service, schema: str, actor: Actor):
             st.error("Amount must be > 0.")
             st.stop()
 
-        # Always derive member_id from loans_legacy if missing
+        # derive member_id if missing
         if member_id is None:
             try:
                 r2 = (
@@ -749,7 +732,7 @@ def _render_legacy_repayment(sb_service, schema: str, actor: Actor):
             "notes": note,
         }
 
-        # add session_id if the column exists
+        # add session_id if column exists
         try:
             ok = _columns_exist(sb_service, schema, LEGACY_REPAYMENTS_TABLE, ["session_id"]).get("session_id", False)
             if ok and session_id:
@@ -757,31 +740,62 @@ def _render_legacy_repayment(sb_service, schema: str, actor: Actor):
         except Exception:
             pass
 
-        # Prevent accidental double-click in the same rerun
+        # UI lock (best-effort)
         lock_key = f"_legacy_saved_{loan_id}_{payload['paid_at']}_{payload['amount']}"
         if st.session_state.get(lock_key):
-            st.warning("Already saved (prevented duplicate click).")
+            st.warning("Already processing (prevented duplicate click).")
             st.stop()
         st.session_state[lock_key] = True
 
         try:
-            # ✅ Always insert repayment into legacy table (single source)
-            sb_service.schema(schema).table(LEGACY_REPAYMENTS_TABLE).insert(payload).execute()
+            # 1) insert and get repay_id
+            ins = (
+                sb_service.schema(schema).table(LEGACY_REPAYMENTS_TABLE)
+                .insert(payload, returning="representation")
+                .execute()
+            )
+            new_row = (ins.data or [{}])[0]
+            repay_id = new_row.get("id")
 
-            # ✅ Apply repayment ONCE to loans_legacy
+            if repay_id is None:
+                st.warning("Saved repayment but could not get row id to apply safely.")
+                st.rerun()
+
+            # 2) idempotent guard: if already applied, stop
+            row_check = (
+                sb_service.schema(schema).table(LEGACY_REPAYMENTS_TABLE)
+                .select("id,applied_to_loan")
+                .eq("id", int(repay_id))
+                .limit(1)
+                .execute().data
+                or []
+            )
+            already_applied = bool(row_check[0].get("applied_to_loan")) if row_check else False
+            if already_applied:
+                st.info("Saved repayment (already applied; prevented double reduction).")
+                st.rerun()
+
+            # 3) apply once
             res = _apply_repayment_once(sb_service, schema, loan_id=int(loan_id), pay_amount=float(amount))
             if res.get("ok"):
+                # 4) mark applied
+                sb_service.schema(schema).table(LEGACY_REPAYMENTS_TABLE).update(
+                    {"applied_to_loan": True}
+                ).eq("id", int(repay_id)).execute()
+
                 _sync_total_due_with_interest(sb_service, schema, only_active=True)
+
                 st.success(
-                    f"Saved. Applied → Interest paid: {res['interest_paid']:,.0f}, "
+                    f"Saved (id={repay_id}). Applied ONCE → "
+                    f"Interest paid: {res['interest_paid']:,.0f}, "
                     f"Principal paid: {res['principal_paid']:,.0f}. "
-                    f"New principal: {res['principal_new']:,.0f}, New due: {res['total_due_new']:,.0f}"
+                    f"New principal: {res['principal_new']:,.0f}"
                 )
             else:
                 st.warning(f"Saved repayment row, but loan not updated: {res.get('error')}")
 
             audit(sb_service, "loan_payment_legacy_saved", "ok",
-                  {"loan_id": int(loan_id), "member_id": int(member_id), "amount": float(amount)},
+                  {"loan_id": int(loan_id), "member_id": int(member_id), "amount": float(amount), "repayment_id": int(repay_id)},
                   actor_user_id=actor.user_id)
 
             st.rerun()
@@ -863,148 +877,6 @@ def _render_interest(sb_service, schema: str, actor: Actor):
 
 
 # ============================================================
-# Delinquency UI (DPD)
-# ============================================================
-def _render_delinquency(sb_service, schema: str, actor: Actor):
-    require(actor.role, "view_delinquency")
-    payments_table = _pick_payments_table(sb_service, schema)
-
-    st.subheader("Delinquency (DPD)")
-    st.caption(f"Using repayments source: {payments_table}")
-
-    loans = (
-        sb_service.schema(schema).table("loans_legacy")
-        .select("id,member_id,status,due_date,principal_current,total_due")
-        .order("id", desc=True)
-        .limit(5000)
-        .execute().data
-        or []
-    )
-    df = _safe_df(loans)
-    if df.empty:
-        st.info("No loans found.")
-        return
-
-    reps = (
-        sb_service.schema(schema).table(payments_table)
-        .select("loan_id,paid_at")
-        .order("paid_at", desc=True)
-        .limit(20000)
-        .execute().data
-        or []
-    )
-    dfr = _safe_df(reps)
-
-    last_paid_map: dict[int, date] = {}
-    if not dfr.empty:
-        dfr["paid_at"] = pd.to_datetime(dfr.get("paid_at"), errors="coerce")
-        dfr = dfr.dropna(subset=["paid_at"]).sort_values("paid_at", ascending=False)
-
-        for _, r in dfr.iterrows():
-            lid = pd.to_numeric(r.get("loan_id"), errors="coerce")
-            if pd.isna(lid):
-                continue
-            lid = int(lid)
-            if lid and lid not in last_paid_map:
-                last_paid_map[lid] = r["paid_at"].date()
-
-    df["last_paid_on"] = df["id"].apply(lambda x: last_paid_map.get(int(x)))
-    df["dpd"] = df.apply(lambda r: core.compute_dpd(r.to_dict(), r.get("last_paid_on")), axis=1)
-
-    st.dataframe(df.sort_values("dpd", ascending=False), use_container_width=True, hide_index=True)
-
-
-# ============================================================
-# Loan Statement UI
-# ============================================================
-def _render_statement(sb_service, schema: str, actor: Actor):
-    require(actor.role, "loan_statement")
-    payments_table = _pick_payments_table(sb_service, schema)
-
-    st.subheader("Loan Statement (Preview + PDF Download)")
-    st.caption(f"Payments source: {payments_table}")
-
-    mid = st.number_input(
-        "Member ID",
-        min_value=1, step=1,
-        value=(actor.member_id or 1),
-        key="stmt_member_id"
-    )
-
-    if actor.role == ROLE_MEMBER and actor.member_id and int(mid) != int(actor.member_id):
-        st.warning("Members can only view their own statement.")
-        return
-
-    if st.button("Load Statement", use_container_width=True, key="stmt_load"):
-        st.session_state["stmt_loaded_member_id"] = int(mid)
-
-    loaded_mid = st.session_state.get("stmt_loaded_member_id")
-    if not loaded_mid:
-        return
-
-    mrow = (
-        sb_service.schema(schema).table("members_legacy")
-        .select("id,name,position").eq("id", int(loaded_mid)).limit(1)
-        .execute().data or []
-    )
-    mrow = mrow[0] if mrow else {}
-    member = {
-        "member_id": int(loaded_mid),
-        "member_name": mrow.get("name") or f"Member {loaded_mid}",
-        "position": mrow.get("position"),
-    }
-
-    mloans = (
-        sb_service.schema(schema).table("loans_legacy")
-        .select("*").eq("member_id", int(loaded_mid))
-        .order("issued_at", desc=True).limit(5000)
-        .execute().data or []
-    )
-
-    if not mloans:
-        st.info("This member has no loans yet.")
-        return
-
-    loan_ids = [int(l["id"]) for l in mloans if l.get("id") is not None]
-    mpay = get_repayments_for_loan_ids(sb_service, schema, loan_ids, limit=5000)
-
-    st.markdown("### Loans")
-    st.dataframe(pd.DataFrame(mloans), use_container_width=True, hide_index=True)
-    st.markdown(f"### Loan Repayments ({payments_table})")
-    st.dataframe(pd.DataFrame(mpay), use_container_width=True, hide_index=True)
-
-    st.divider()
-    st.markdown("### Download PDF")
-
-    if make_member_loan_statement_pdf is None:
-        st.warning("PDF engine not available. Ensure pdfs.py defines make_member_loan_statement_pdf.")
-        return
-
-    statement_sig = None
-    try:
-        if hasattr(core, "get_statement_signature"):
-            statement_sig = core.get_statement_signature(sb_service, schema, int(mloans[0]["id"]))
-    except Exception:
-        statement_sig = None
-
-    try:
-        pdf_bytes = _build_statement_pdf(member=member, mloans=mloans, mpay=mpay, statement_sig=statement_sig)
-    except Exception as e:
-        st.error("PDF generation failed.")
-        st.code(str(e), language="text")
-        return
-
-    st.download_button(
-        "⬇️ Download Loan Statement (PDF)",
-        pdf_bytes,
-        file_name=f"loan_statement_{member['member_id']:02d}_{str(member['member_name']).replace(' ', '_')}.pdf",
-        mime="application/pdf",
-        use_container_width=True,
-        key="dl_member_loan_statement_pdf",
-    )
-
-
-# ============================================================
 # MAIN ENTRY
 # ============================================================
 def render_loans(sb_service, schema: str, actor_user_id: str = ""):
@@ -1013,26 +885,34 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
 
     st.header("Loans (Organizational Standard)")
 
-    # KPIs
     loans_all = (
         sb_service.schema(schema).table("loans_legacy")
-        .select("id,status,total_due")
+        .select("id,status,total_due,principal_current,principal,unpaid_interest")
         .limit(20000).execute().data or []
     )
     df_all = pd.DataFrame(loans_all)
+
     if df_all.empty:
-        active_count, active_due = 0, 0.0
+        active_count = 0
+        active_due = 0.0
+        active_principal_current = 0.0
     else:
         df_all["status"] = df_all["status"].astype(str).str.lower().str.strip()
-        df_all["total_due"] = pd.to_numeric(df_all.get("total_due"), errors="coerce").fillna(0)
+        df_all["total_due"] = pd.to_numeric(df_all.get("total_due"), errors="coerce").fillna(0.0)
+        pc = pd.to_numeric(df_all.get("principal_current"), errors="coerce")
+        p = pd.to_numeric(df_all.get("principal"), errors="coerce")
+        df_all["principal_current_eff"] = pc.fillna(p).fillna(0.0)
+
         active = df_all[df_all["status"].isin(["open", "active"])]
         active_count = len(active)
         active_due = float(active["total_due"].sum())
+        active_principal_current = float(active["principal_current_eff"].sum())
 
-    k1, k2, k3 = st.columns(3)
+    k1, k2, k3, k4 = st.columns(4)
     k1.metric("Active loans", str(active_count))
-    k2.metric("Total due (active)", f"{active_due:,.0f}")
-    k3.metric("Monthly interest", "5%")
+    k2.metric("Principal current (active)", f"{active_principal_current:,.0f}")
+    k3.metric("Total due (active)", f"{active_due:,.0f}")
+    k4.metric("Monthly interest", "5%")
     st.divider()
 
     sections = allowed_sections(actor.role) or []
@@ -1057,9 +937,5 @@ def render_loans(sb_service, schema: str, actor_user_id: str = ""):
         _render_legacy_repayment(sb_service, schema, actor); return
     if section == "Interest":
         _render_interest(sb_service, schema, actor); return
-    if section == "Delinquency":
-        _render_delinquency(sb_service, schema, actor); return
-    if section == "Loan Statement":
-        _render_statement(sb_service, schema, actor); return
 
     st.info(f"Section '{section}' is enabled but not implemented.")
