@@ -1,30 +1,11 @@
-# loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED (NEW loan_requests schema + Ledger Interest + compute_dpd complete)
+# loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED (NEW loan_requests schema + Maker–Checker + Ledger Interest + compute_dpd)
 # -----------------------------------------------------------------------------
-# ✅ FIXED: loan_requests no longer uses requester_user_id / requester_member_id / requester_name / surety_name / amount / created_at
-# ✅ Now matches YOUR NEW TABLE columns:
-#    - id (bigint)
-#    - member_id (int)
-#    - member_name (text)
-#    - requested_amount (numeric)
-#    - purpose (text)
-#    - duration_months (int)
-#    - interest_rate (numeric)
-#    - status (text)
-#    - requested_at (timestamptz)
-#    - reviewed_at (timestamptz)
-#    - approved_at (timestamptz)
-#    - reviewed_by (text)
-#    - notes (text)
-#    - surety_member_id (int)
-#
-# ✅ Interest accrual writes to interest_ledger (bank-grade, idempotent via unique(loan_id, interest_month))
-# ✅ Keeps optional loan_interest_snapshots (safe if missing)
-# ✅ Updates loans_legacy interest fields for convenience (safe if missing columns)
-# ✅ Maker-checker repayments remain the same
-#
-# IMPORTANT:
-# - This file still uses loans_legacy for the actual loan book (your existing design).
-# - If you later rename loans_legacy to loans, you can switch table name in one place.
+# ✅ FIXED: loan_requests matches YOUR NEW table (member_id, member_name, requested_amount, ...)
+# ✅ COMPAT: also provides OLD alias keys (requester_member_id, requester_name, amount, created_at, requester_user_id)
+#           so older loans_ui.py won't crash.
+# ✅ Maker–Checker: adds list_unconfirmed_payments() (and helpers) so UI can confirm/reject.
+# ✅ Interest: writes to interest_ledger (idempotent by unique(loan_id, interest_month))
+# ✅ Loans table: still uses loans_legacy as your loan book
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -51,17 +32,11 @@ LEGACY_PAYMENTS_TABLE = "loan_repayments_legacy"
 REPAY_LINK_COL = "loan_id"
 REPAY_DATE_COL = "paid_at"
 
-# ✅ Bank-grade interest ledger
 INTEREST_LEDGER_TABLE = "interest_ledger"            # public.interest_ledger
+INTEREST_SNAPSHOTS_TABLE = "loan_interest_snapshots" # optional
 
-# optional snapshots (safe if missing)
-INTEREST_SNAPSHOTS_TABLE = "loan_interest_snapshots"
-
-# loan book (still using existing)
-LOANS_TABLE = "loans_legacy"
-
-# loan requests (NEW)
-REQUESTS_TABLE = "loan_requests"
+LOANS_TABLE = "loans_legacy"                         # loan book
+REQUESTS_TABLE = "loan_requests"                     # NEW requests table
 
 # ------------------------------------------------------------
 # STATEMENT SIGNING (signatures.entity_type is NOT NULL)
@@ -341,6 +316,33 @@ def has_active_loan(sb, schema: str, member_id: int) -> bool:
 
 
 # ============================================================
+# REQUEST NORMALIZATION (keeps old UI code alive)
+# ============================================================
+def _normalize_request_row(r: dict) -> dict:
+    """
+    Normalize NEW loan_requests row to include OLD alias keys:
+      requester_member_id, requester_name, amount, created_at, requester_user_id
+    So older loans_ui.py that still references them won't crash.
+    """
+    out = dict(r)
+
+    # NEW -> OLD aliases
+    out.setdefault("requester_member_id", out.get("member_id"))
+    out.setdefault("requester_name", out.get("member_name"))
+    out.setdefault("amount", out.get("requested_amount"))
+    out.setdefault("created_at", out.get("requested_at"))
+
+    # requester_user_id no longer exists; provide stable placeholder
+    rid = out.get("id")
+    out.setdefault("requester_user_id", f"req-{rid}" if rid is not None else str(uuid.uuid4()))
+
+    # surety_name no longer exists in new table
+    out.setdefault("surety_name", None)
+
+    return out
+
+
+# ============================================================
 # REQUESTS (✅ NEW TABLE SHAPE)
 # ============================================================
 def create_loan_request(
@@ -355,9 +357,6 @@ def create_loan_request(
     interest_rate: float | None = None,
     notes: str | None = None,
 ) -> int:
-    """
-    Insert a new loan request into public.loan_requests (NEW schema).
-    """
     if int(member_id) <= 0 or int(surety_member_id) <= 0:
         raise ValueError("Invalid member_id/surety_member_id.")
     if float(requested_amount) <= 0:
@@ -387,47 +386,43 @@ def create_loan_request(
 
 
 def list_pending_requests(sb, schema: str, limit: int = 300) -> list[dict]:
-    cols = ",".join([
-        "id",
-        "member_id",
-        "member_name",
-        "requested_amount",
-        "purpose",
-        "duration_months",
-        "interest_rate",
-        "status",
-        "requested_at",
-        "reviewed_at",
-        "approved_at",
-        "reviewed_by",
-        "notes",
-        "surety_member_id",
-    ])
-    return (
-        sb.schema(schema)
-        .table(REQUESTS_TABLE)
-        .select(cols)
-        .eq("status", "pending")
-        .order("requested_at", desc=True)
-        .limit(int(limit))
-        .execute()
-        .data
-        or []
-    )
+    """
+    ✅ Bulletproof: uses select('*') to avoid missing-column crashes.
+    Returns normalized rows (with alias keys) so old UI code can keep working.
+    """
+    try:
+        rows = (
+            sb.schema(schema)
+            .table(REQUESTS_TABLE)
+            .select("*")
+            .eq("status", "pending")
+            .order("requested_at", desc=True)
+            .limit(int(limit))
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        rows = []
+
+    return [_normalize_request_row(r) for r in (rows or [])]
 
 
 def list_requests(sb, schema: str, limit: int = 500) -> list[dict]:
-    """All requests (any status)."""
-    return (
-        sb.schema(schema)
-        .table(REQUESTS_TABLE)
-        .select("*")
-        .order("requested_at", desc=True)
-        .limit(int(limit))
-        .execute()
-        .data
-        or []
-    )
+    try:
+        rows = (
+            sb.schema(schema)
+            .table(REQUESTS_TABLE)
+            .select("*")
+            .order("requested_at", desc=True)
+            .limit(int(limit))
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        rows = []
+    return [_normalize_request_row(r) for r in (rows or [])]
 
 
 def get_request(sb, schema: str, request_id: int) -> dict:
@@ -443,7 +438,7 @@ def get_request(sb, schema: str, request_id: int) -> dict:
     )
     if not rows:
         raise RuntimeError("Request not found.")
-    return rows[0]
+    return _normalize_request_row(rows[0])
 
 
 # ============================================================
@@ -454,15 +449,14 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_name: str) -> i
     if str(req.get("status") or "").lower().strip() != "pending":
         raise ValueError("Only pending requests can be approved.")
 
-    # signatures keyed by entity_type="loan" entity_id=request_id (kept as-is)
     df_sig = sig_df(sb, schema, "loan", int(request_id))
     miss = missing_roles(df_sig, LOAN_SIG_REQUIRED)
     if miss:
         raise ValueError("Approval blocked. Missing/invalid signatures: " + ", ".join(miss))
 
-    borrower_id = int(req.get("member_id") or 0)
+    borrower_id = int(req.get("member_id") or req.get("requester_member_id") or 0)
     surety_id = int(req.get("surety_member_id") or 0)
-    amount = float(req.get("requested_amount") or 0)
+    amount = float(req.get("requested_amount") or req.get("amount") or 0)
 
     if borrower_id <= 0 or surety_id <= 0 or amount <= 0:
         raise ValueError("Invalid request data.")
@@ -480,7 +474,6 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_name: str) -> i
         )
 
     ts = now_iso()
-    # create loan in loan book
     loan_payload = {
         "borrower_member_id": borrower_id,
         "member_id": borrower_id,
@@ -501,7 +494,6 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_name: str) -> i
         raise RuntimeError("Loan creation failed.")
     loan_id = int(loan_row["id"])
 
-    # update request
     upd = {
         "status": "approved",
         "reviewed_by": str(actor_name or "").strip() or "admin",
@@ -510,7 +502,6 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_name: str) -> i
         "notes": (str(req.get("notes") or "").strip() + f"\napproved by {actor_name} | cap_total={cap['cap_total']:.2f}").strip(),
     }
     upd = filter_payload_to_existing_columns(sb, schema, REQUESTS_TABLE, upd)
-
     sb.schema(schema).table(REQUESTS_TABLE).update(upd).eq("id", int(request_id)).execute()
 
     return loan_id
@@ -526,6 +517,46 @@ def deny_loan_request(sb, schema: str, request_id: int, actor_name: str, reason:
     }
     upd = filter_payload_to_existing_columns(sb, schema, REQUESTS_TABLE, upd)
     sb.schema(schema).table(REQUESTS_TABLE).update(upd).eq("id", int(request_id)).execute()
+
+
+# ============================================================
+# MAKER–CHECKER READ HELPERS (this fixes your "No core function found..." warning)
+# ============================================================
+def list_unconfirmed_payments(sb, schema: str, limit: int = 500) -> List[Dict[str, Any]]:
+    """
+    Maker–checker queue: pending payments waiting for confirmation.
+    """
+    try:
+        return (
+            sb.schema(schema)
+            .table(PENDING_PAYMENTS_TABLE)
+            .select("*")
+            .eq("status", "pending")
+            .order("created_at", desc=True)
+            .limit(int(limit))
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        return []
+
+
+def list_rejected_pending_payments(sb, schema: str, limit: int = 500) -> List[Dict[str, Any]]:
+    try:
+        return (
+            sb.schema(schema)
+            .table(PENDING_PAYMENTS_TABLE)
+            .select("*")
+            .eq("status", "rejected")
+            .order("checked_at", desc=True)
+            .limit(int(limit))
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        return []
 
 
 # ============================================================
@@ -652,7 +683,6 @@ def confirm_payment(sb, schema: str, pending_id: int, confirmer_user_id: str):
     }
     repay_payload = {k: v for k, v in repay_payload.items() if v is not None}
     repay_payload = filter_payload_to_existing_columns(sb, schema, PAYMENTS_TABLE, repay_payload)
-
     sb.schema(schema).table(PAYMENTS_TABLE).insert(repay_payload).execute()
 
     loan = fetch_one(
@@ -702,7 +732,7 @@ def reject_payment(sb, schema: str, pending_id: int, rejecter_user_id: str, reas
 
 
 # ============================================================
-# LEGACY REPAYMENTS INSERT (loan_repayments_legacy)
+# LEGACY REPAYMENTS INSERT (loan_repayments_legacy) — safe retry
 # ============================================================
 def insert_legacy_loan_repayment(
     sb,
@@ -753,12 +783,6 @@ def insert_legacy_loan_repayment(
 # INTEREST (✅ Ledger-based + optional snapshot)
 # ============================================================
 def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> Tuple[int, float]:
-    """
-    ✅ Source-of-truth: interest_ledger
-    Idempotent: relies on unique(loan_id, interest_month) in interest_ledger.
-    Also updates loans_legacy interest fields for convenience.
-    Optionally writes loan_interest_snapshots if table exists.
-    """
     month = _month_key()
     today_str = str(date.today())
     ts = now_iso()
@@ -788,7 +812,6 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> Tuple[int, f
         if interest <= 0:
             continue
 
-        # ✅ 1) Insert into interest_ledger (unique loan_id+interest_month blocks duplicates)
         ledger_payload = {
             "loan_id": loan_id,
             "member_id": (member_id if member_id > 0 else None),
@@ -808,7 +831,6 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> Tuple[int, f
                 continue
             raise
 
-        # ✅ 2) Update loans_legacy fields (keeps your current behavior)
         accrued_interest = float(r.get("accrued_interest") or 0) + float(interest)
         total_interest_generated = float(r.get("total_interest_generated") or 0) + float(interest)
         unpaid_interest = float(r.get("unpaid_interest") or 0) + float(interest)
@@ -826,10 +848,8 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> Tuple[int, f
         updated += 1
         interest_added_total += float(interest)
 
-    # ✅ Optional snapshot table (if it exists)
     if _table_readable(sb, schema, INTEREST_SNAPSHOTS_TABLE):
         try:
-            # ledger lifetime total is authoritative
             try:
                 led = (
                     sb.schema(schema).table(INTEREST_LEDGER_TABLE)
@@ -882,8 +902,7 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> Tuple[int, f
 # ============================================================
 def _parse_due_date(loan_row: dict) -> Optional[date]:
     for k in ("due_date", "next_due_date", "expected_due_date", "payment_due_date"):
-        v = loan_row.get(k)
-        d = _to_date(v)
+        d = _to_date(loan_row.get(k))
         if d:
             return d
     return None
@@ -892,15 +911,12 @@ def _parse_due_date(loan_row: dict) -> Optional[date]:
 def _get_last_paid_on(sb, schema: str, loan_id: int) -> Optional[date]:
     try:
         rows = (
-            sb.schema(schema)
-            .table(PAYMENTS_TABLE)
+            sb.schema(schema).table(PAYMENTS_TABLE)
             .select(REPAY_DATE_COL)
             .eq(REPAY_LINK_COL, int(loan_id))
             .order(REPAY_DATE_COL, desc=True)
             .limit(1)
-            .execute()
-            .data
-            or []
+            .execute().data or []
         )
         if rows:
             return _to_date(rows[0].get(REPAY_DATE_COL))
@@ -909,15 +925,12 @@ def _get_last_paid_on(sb, schema: str, loan_id: int) -> Optional[date]:
 
     try:
         rows = (
-            sb.schema(schema)
-            .table(LEGACY_PAYMENTS_TABLE)
+            sb.schema(schema).table(LEGACY_PAYMENTS_TABLE)
             .select(REPAY_DATE_COL)
             .eq(REPAY_LINK_COL, int(loan_id))
             .order(REPAY_DATE_COL, desc=True)
             .limit(1)
-            .execute()
-            .data
-            or []
+            .execute().data or []
         )
         if rows:
             return _to_date(rows[0].get(REPAY_DATE_COL))
@@ -980,7 +993,7 @@ def delinquency_table(sb, schema: str, limit: int = 500) -> pd.DataFrame:
 
 
 # ============================================================
-# SIMPLE READ HELPERS (used by loans_ui / loans.py)
+# SIMPLE READ HELPERS
 # ============================================================
 def list_loans(sb, schema: str, limit: int = 500) -> List[Dict[str, Any]]:
     try:
@@ -1018,6 +1031,7 @@ def list_member_loans(sb, schema: str, member_id: int, limit: int = 200) -> List
 
 
 def list_pending_payments(sb, schema: str, limit: int = 500) -> List[Dict[str, Any]]:
+    """All pending table rows (any status)."""
     try:
         return (
             sb.schema(schema).table(PENDING_PAYMENTS_TABLE)
