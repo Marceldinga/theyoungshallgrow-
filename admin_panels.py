@@ -1,4 +1,5 @@
-# admin_panels.py ✅ ORGANIZATIONAL STANDARD ADMIN PANEL (SERVICE KEY) — UPDATED (Streamlit width=)
+
+# admin_panels.py ✅ UPDATED — adds Members tab + avoids duplicate tabs
 from __future__ import annotations
 
 from datetime import datetime, timezone, date
@@ -94,7 +95,7 @@ def audit_log(
     actor_role: str = "admin",
 ):
     """
-    Writes to audit_log if present. If audit_log table is missing, it silently skips.
+    Writes to audit_log if present. If audit_log table is missing or schema differs, silently skips.
     """
     try:
         record = {
@@ -112,16 +113,32 @@ def audit_log(
         }
         sb_service.schema(schema).table("audit_log").insert(record).execute()
     except Exception:
-        # Do not break admin workflow if audit table has slightly different schema
         pass
+
+
+# ============================================================
+# Table detection (supports members OR members_legacy)
+# ============================================================
+def pick_members_table(sb_service, schema: str) -> str:
+    # Prefer NEW table: members
+    rows = safe_select(sb_service, schema, "members", "id", limit=1)
+    if rows is not None and isinstance(rows, list):
+        # if select succeeded, we use it
+        return "members"
+    return "members_legacy"
 
 
 # ============================================================
 # Data loaders
 # ============================================================
 def load_members(sb_service, schema: str) -> pd.DataFrame:
-    rows = safe_select(sb_service, schema, "members_legacy", "id,name,position", order_by="id", desc=False, limit=5000)
-    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["id","name","position"])
+    mt = pick_members_table(sb_service, schema)
+
+    # columns: support both schemas
+    cols = "id,name,position" if mt == "members_legacy" else "id,name"
+    rows = safe_select(sb_service, schema, mt, cols, order_by="id", desc=False, limit=5000)
+
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["id", "name"])
     if not df.empty:
         df["id"] = pd.to_numeric(df["id"], errors="coerce")
         df = df.dropna(subset=["id"]).copy()
@@ -132,20 +149,72 @@ def load_members(sb_service, schema: str) -> pd.DataFrame:
     return df
 
 def ensure_app_state(sb_service, schema: str) -> dict:
-    """
-    Ensures app_state has id=1 row.
-    """
     state = safe_single(sb_service, schema, "app_state", "*", id=1)
     if state and any(state.values()):
         return state
-    ok = safe_upsert(sb_service, schema, "app_state", {"id": 1, "next_payout_index": 1})
+    ok = safe_upsert(sb_service, schema, "app_state", {"id": 1, "next_payout_index": 1, "updated_at": now_iso()})
     if ok:
         return safe_single(sb_service, schema, "app_state", "*", id=1)
     return {}
 
 
 # ============================================================
-# Panels
+# NEW: Members panel (Admin can add members)
+# ============================================================
+def panel_members(sb_service, schema: str, actor_email: str):
+    st.subheader("Members (Admin)")
+    mt = pick_members_table(sb_service, schema)
+    st.caption(f"Members table in use: **{schema}.{mt}**")
+
+    # --- Add new member
+    st.markdown("### Add New Member")
+    name = st.text_input("Member name", value="", placeholder="e.g., John N.", key="member_add_name")
+    # position is only for legacy members table
+    position = None
+    if mt == "members_legacy":
+        position = st.number_input("Position (optional)", min_value=1, step=1, value=1, key="member_add_position")
+
+    if st.button("✅ Add Member", width="stretch", key="member_add_btn"):
+        if not name.strip():
+            st.error("Member name is required.")
+            return
+
+        payload = {"name": name.strip()}
+        if mt == "members_legacy":
+            payload["position"] = int(position) if position is not None else None
+            payload["created_at"] = now_iso()
+            payload["updated_at"] = now_iso()
+
+        ok = safe_insert(sb_service, schema, mt, payload)
+        if ok:
+            audit_log(
+                sb_service, schema,
+                action="member_inserted",
+                status="ok",
+                table_name=mt,
+                entity="member",
+                details=f"Added member name={name.strip()}",
+                payload=payload,
+                actor_email=actor_email,
+                actor_role="admin",
+            )
+            st.success("Member added.")
+            st.cache_data.clear()
+            st.rerun()
+
+    # --- List members
+    st.divider()
+    st.markdown("### Current Members")
+    dfm = load_members(sb_service, schema)
+    if dfm.empty:
+        st.info("No members found.")
+        return
+
+    st.dataframe(dfm, width="stretch", hide_index=True)
+
+
+# ============================================================
+# Existing panels (your original code)
 # ============================================================
 def panel_rotation_state(sb_service, schema: str, actor_email: str):
     st.subheader("Rotation State (Governed)")
@@ -167,9 +236,7 @@ def panel_rotation_state(sb_service, schema: str, actor_email: str):
     st.caption("Organizational rule: every override requires confirmation + reason and is audit-logged.")
 
     new_idx = st.number_input("Set next_payout_index", min_value=1, step=1, value=current_idx)
-
     reason = st.text_input("Reason for override (required)", value="", placeholder="e.g., member absent, approved swap, correction")
-
     confirm = st.checkbox("I confirm this override is intentional and approved.")
 
     if st.button("💾 Save Rotation Override", width="stretch"):
@@ -211,10 +278,15 @@ def panel_contributions(sb_service, schema: str, actor_email: str):
 
     dfm = load_members(sb_service, schema)
     if dfm.empty:
-        st.warning("No members in members_legacy.")
+        st.warning("No members found.")
         return
 
-    dfm["label"] = dfm.apply(lambda r: f"{int(r['id']):02d} • {r['name']}", axis=1)
+    # uses legacy members label format if position exists
+    if "position" in dfm.columns:
+        dfm["label"] = dfm.apply(lambda r: f"{int(r['id']):02d} • {r['name']}", axis=1)
+    else:
+        dfm["label"] = dfm.apply(lambda r: f"{int(r['id']):02d} • {r['name']}", axis=1)
+
     labels = dfm["label"].tolist()
     label_to_id = dict(zip(dfm["label"], dfm["id"]))
     label_to_name = dict(zip(dfm["label"], dfm["name"]))
@@ -271,9 +343,7 @@ def panel_contributions(sb_service, schema: str, actor_email: str):
             df_bulk,
             hide_index=True,
             width="stretch",
-            column_config={
-                "amount": st.column_config.NumberColumn("amount", step=500, min_value=0),
-            },
+            column_config={"amount": st.column_config.NumberColumn("amount", step=500, min_value=0)},
             key="contrib_bulk_editor",
         )
         bulk_kind = st.selectbox("Bulk kind", ["paid", "contributed"], index=0, key="contrib_bulk_kind")
@@ -336,10 +406,9 @@ def panel_contributions(sb_service, schema: str, actor_email: str):
 
 def panel_fines(sb_service, schema: str, actor_email: str):
     st.subheader("Fines (Admin)")
-
     dfm = load_members(sb_service, schema)
     if dfm.empty:
-        st.warning("No members in members_legacy.")
+        st.warning("No members found.")
         return
 
     dfm["label"] = dfm.apply(lambda r: f"{int(r['id']):02d} • {r['name']}", axis=1)
@@ -397,10 +466,9 @@ def panel_fines(sb_service, schema: str, actor_email: str):
 
 def panel_foundation(sb_service, schema: str, actor_email: str):
     st.subheader("Foundation Payments (Admin)")
-
     dfm = load_members(sb_service, schema)
     if dfm.empty:
-        st.warning("No members in members_legacy.")
+        st.warning("No members found.")
         return
 
     dfm["label"] = dfm.apply(lambda r: f"{int(r['id']):02d} • {r['name']}", axis=1)
@@ -452,11 +520,6 @@ def panel_foundation(sb_service, schema: str, actor_email: str):
 # Main entry called from app router
 # ============================================================
 def render_admin(sb_service, schema: str, actor_email: str = ""):
-    """
-    Call this from app.py router:
-        from admin_panels import render_admin
-        render_admin(sb_service, schema, actor_email="...optional...")
-    """
     st.header("Admin (Service Key)")
     st.caption("Organizational standard: governed changes, confirmations, and audit logs.")
 
@@ -464,7 +527,6 @@ def render_admin(sb_service, schema: str, actor_email: str = ""):
         st.warning("Service key not configured.")
         return
 
-    # Top-level meeting admin: initialize state
     st.markdown("### System Initialization")
     if st.button("✅ Initialize app_state (id=1)", width="stretch"):
         ok = safe_upsert(sb_service, schema, "app_state", {"id": 1, "next_payout_index": 1, "updated_at": now_iso()})
@@ -486,8 +548,11 @@ def render_admin(sb_service, schema: str, actor_email: str = ""):
 
     st.divider()
 
-    # Tabs inside Admin (clean organization)
-    t1, t2, t3, t4 = st.tabs(["Rotation", "Contributions", "Fines", "Foundation"])
+    # ✅ Unique tab names = no duplicates inside Admin
+    t_members, t1, t2, t3, t4 = st.tabs(["Members", "Rotation", "Contributions", "Fines", "Foundation"])
+
+    with t_members:
+        panel_members(sb_service, schema, actor_email)
 
     with t1:
         panel_rotation_state(sb_service, schema, actor_email)
