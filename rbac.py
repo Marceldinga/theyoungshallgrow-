@@ -12,6 +12,7 @@
 #   confirm_payments -> confirm_payment
 #   direct_repayment -> direct_payment
 #   repayment_direct -> direct_payment
+#   view_statements -> loan_statement  ✅ (fixes your error)
 
 from __future__ import annotations
 
@@ -78,10 +79,15 @@ PERMISSION_ALIASES: dict[str, str] = {
     "direct_repayment": "direct_payment",
     "repayment_direct": "direct_payment",
     "manual_payment": "direct_payment",
+
+    # statements variations (fixes: Permission denied: view_statements)
+    "view_statements": "loan_statement",
+    "view_statement": "loan_statement",
+    "statements": "loan_statement",
 }
 
 def _canon_perm(perm: str) -> str:
-    p = (perm or "").strip()
+    p = (perm or "").strip().lower()
     return PERMISSION_ALIASES.get(p, p)
 
 
@@ -167,6 +173,7 @@ def allowed_sections(actor_role: str) -> list[str]:
         sections.append("Delinquency")
 
     if "loan_statement" in perms:
+        # Some UIs label this as "Statements" but permission stays canonical
         sections.append("Loan Statement")
 
     if "direct_payment" in perms:
