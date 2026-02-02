@@ -1,29 +1,22 @@
 
 # dashboard_panel.py ✅ COMPLETE SINGLE CODE (NO SQL) — NJANGI STANDARD (NO "legacy")
-# ✅ Standard Dashboard: shows CURRENT MEMBERS (total) + session KPIs
-# ✅ Removes "next member" confusion (uses clear "Current Beneficiary" label)
-# ✅ NO duplicate sections inside this file (single Loans section)
+# ✅ Fixes Dashboard not updating:
+#    - Uses sb_service for app_state/sessions/contributions when available (RLS-safe)
+#    - Uses sb_anon only as fallback
+# ✅ Shows Session ID / Session Window / Beneficiary / Pot correctly
 # ✅ Dark theme + glass KPI cards
 # ✅ Auto-refresh on app_state stamp change
-# ✅ Uses sb_service for finance totals when available
 #
 # NEW TABLES ONLY:
 #   - app_state                (id=1, current_session_id, next_member_id, optional next_payout_date, updated_at)
 #   - sessions                 (session_id OR id, start_date, end_date)
-#   - members                  (id, name)
+#   - members                  (id, name, display_name optional)
 #   - contributions            (member_id, session_id, amount, paid_at, created_at)
 #   - foundation_contributions (member_id, session_id, amount, paid_at, created_at)
 #   - loans                    (id, member_id, status, principal_current, principal, unpaid_interest, total_interest_generated, total_due, borrow_date, created_at)
 #   - loan_payments            (loan_id, member_id, amount, paid_at, created_at)
-#   - payouts                  (session_id, member_id, payout_amount, payout_date, created_at)
+#   - payouts                  (session_id, member_id, payout_amount, payout_date, payout_index, created_at, updated_at)
 #   - v_next_beneficiary       (optional view)
-#
-# Interest PAID source-of-truth:
-#   interest_paid = SUM(total_interest_generated - unpaid_interest) WHERE status IN ('active','open')
-#
-# Cash Available:
-#   foundation_total + repayments_total + interest_paid - outstanding_principal - payouts_total
-#   cash_available = max(raw, 0)
 
 from __future__ import annotations
 
@@ -148,8 +141,9 @@ def safe_table_order_fallback(sb, schema: str, table: str, cols: str = "*", limi
     order_candidates = order_candidates or []
     for c in order_candidates:
         rows = safe_table(sb, schema, table, cols=cols, limit=limit, order_by=c, desc=desc)
-        if rows:
-            return rows
+        if rows is not None:
+            # return on first successful call (even if empty) to avoid repeated errors
+            return rows or []
     return safe_table(sb, schema, table, cols=cols, limit=limit, order_by=None, desc=desc)
 
 
@@ -217,8 +211,8 @@ def _read_state_stamp(sb, schema: str) -> str:
     )
 
 
-def _auto_refresh_if_state_changed(sb_anon, schema: str):
-    stamp = _read_state_stamp(sb_anon, schema)
+def _auto_refresh_if_state_changed(sb, schema: str):
+    stamp = _read_state_stamp(sb, schema)
     prev = st.session_state.get("_state_stamp_dashboard")
     st.session_state["_state_stamp_dashboard"] = stamp
     if prev is None:
@@ -310,6 +304,7 @@ def sum_table_amount(sb, schema: str, table: str, amount_cols: list[str]) -> flo
 def get_session_window(sb, schema: str, session_id: int) -> str:
     if not session_id:
         return "—"
+    # sessions table uses session_id (confirmed in your DB), fallback to id if needed
     sample = safe_single(sb, schema, "sessions", "*")
     pk = "session_id"
     if sample and "session_id" not in sample and "id" in sample:
@@ -375,29 +370,42 @@ def build_repayment_plan(sb, schema: str, last_payment_dates: dict[int, date]) -
 # ============================================================
 def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     inject_dashboard_theme()
-    _auto_refresh_if_state_changed(sb_anon, schema)
 
+    # ✅ Use service client if available for app_state/sessions/contributions (fixes RLS)
+    read_sb = sb_service if sb_service is not None else sb_anon
     finance_sb = sb_service if sb_service is not None else sb_anon
+
+    # ✅ Auto-refresh stamp should also read from service if available
+    _auto_refresh_if_state_changed(read_sb, schema)
 
     st.markdown("## 📊 Dashboard")
 
     # --- App state ---
-    state = safe_single(sb_anon, schema, "app_state", "*", id=1)
-    current_session_id = state.get("current_session_id")
+    state = safe_single(read_sb, schema, "app_state", "*", id=1)
 
-    # --- Members (CURRENT MEMBERS) ---
-    members_rows = safe_table(finance_sb, schema, "members", "id,name", limit=20000)
+    # If app_state has no id column (rare), fall back to first row
+    if not state:
+        rows = safe_table(read_sb, schema, "app_state", "*", limit=1)
+        state = rows[0] if rows else {}
+
+    current_session_id = state.get("current_session_id")
+    next_member_id = state.get("next_member_id")
+
+    # --- Members ---
+    members_rows = safe_table(read_sb, schema, "members", "id,name,display_name", limit=5000, order_by="id", desc=False)
     total_members = int(len(members_rows or []))
 
-    # --- Current beneficiary (label it clearly; use optional view if exists) ---
+    # --- Beneficiary (try optional view; fallback to members lookup) ---
     beneficiary_name = "—"
-    beneficiary_id = state.get("next_member_id")  # in your model this points to who is due
-    if safe_table(sb_anon, schema, "v_next_beneficiary", "*", limit=1):
-        v = safe_single(sb_anon, schema, "v_next_beneficiary", "*")
+    beneficiary_id = next_member_id
+
+    # Try view (may not exist or may be blocked by RLS)
+    v = safe_single(read_sb, schema, "v_next_beneficiary", "*")
+    if v:
         beneficiary_name = str(v.get("beneficiary_name") or v.get("member_name") or "—")
         beneficiary_id = v.get("beneficiary_id") or v.get("member_id") or beneficiary_id
     else:
-        # fallback: lookup name from members table
+        # fallback: lookup by member_id
         try:
             bid = int(beneficiary_id) if beneficiary_id is not None else None
         except Exception:
@@ -405,16 +413,16 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         if bid is not None:
             for m in members_rows or []:
                 if str(m.get("id")) == str(bid):
-                    beneficiary_name = str(m.get("name") or "—")
+                    dn = str(m.get("display_name") or "").strip()
+                    nm = str(m.get("name") or "").strip()
+                    beneficiary_name = dn or nm or f"Member {bid:02d}"
                     break
 
-    window = (
-        get_session_window(sb_anon, schema, int(current_session_id))
-        if str(current_session_id or "").isdigit()
-        else "—"
-    )
+    window = "—"
+    if str(current_session_id or "").isdigit():
+        window = get_session_window(read_sb, schema, int(current_session_id))
 
-    # --- Current session pot (contributions in current session) ---
+    # --- Current pot ---
     pot = 0.0
     members_paid = 0
     if str(current_session_id or "").isdigit():
@@ -427,7 +435,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
             pot = float(dfc["amount"].sum())
             members_paid = int(dfc["member_id"].nunique()) if "member_id" in dfc.columns else 0
 
-    # --- Header KPIs (STANDARD, NO "NEXT MEMBER" CONFUSION) ---
+    # --- Header KPIs ---
     st.markdown(glass_open(), unsafe_allow_html=True)
     a1, a2, a3, a4 = st.columns(4)
     with a1:
@@ -437,7 +445,15 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     with a3:
         st.markdown(kpi_card("Total Members", str(total_members), "purple", sub="members"), unsafe_allow_html=True)
     with a4:
-        st.markdown(kpi_card("Current Beneficiary", beneficiary_name, "green", sub=f"member_id: {beneficiary_id or '—'}"), unsafe_allow_html=True)
+        st.markdown(
+            kpi_card(
+                "Current Beneficiary",
+                beneficiary_name,
+                "green",
+                sub=f"member_id: {beneficiary_id if beneficiary_id is not None else '—'}",
+            ),
+            unsafe_allow_html=True,
+        )
     st.markdown(glass_close(), unsafe_allow_html=True)
 
     st.divider()
@@ -495,7 +511,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
 
     st.divider()
 
-    # --- Loans (SINGLE SECTION ONLY) ---
+    # --- Loans ---
     st.markdown("### 💳 Loans")
 
     st.markdown(glass_open(), unsafe_allow_html=True)
@@ -518,13 +534,15 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         st.dataframe(plan_df, use_container_width=True, hide_index=True)
         st.markdown(glass_close(), unsafe_allow_html=True)
 
-    # --- Debug (optional) ---
+    # --- Debug ---
     with st.expander("🔎 Debug", expanded=False):
+        st.write("Using read client:", "service" if sb_service is not None else "anon")
         st.write("app_state", state)
         st.write("total_members", total_members)
+        st.write("current_session_id", current_session_id)
+        st.write("next_member_id", next_member_id)
         st.write("beneficiary_id", beneficiary_id)
         st.write("beneficiary_name", beneficiary_name)
-        st.write("current_session_id", current_session_id)
         st.write("current_pot", pot)
         st.write("members_paid", members_paid)
         st.write("foundation_total", foundation_total)
@@ -535,8 +553,3 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         st.write("cash_available_raw", cash_available_raw)
         st.write("cash_available", cash_available)
         st.write("net_available", net_available)
-
-    if sb_service is None:
-        st.warning("Write/admin features disabled (no service key).")
-    else:
-        st.success("Service key available.")
