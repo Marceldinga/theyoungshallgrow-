@@ -1,13 +1,12 @@
 
-# dashboard_panel.py ✅ COMPLETE SINGLE FILE (NO SQL, NO legacy)
-# 🚫 NO big page header here — app.py already renders the top header (prevents duplicate)
-# ✅ Exports: render_dashboard (what app.py imports)
-# ✅ Attendance: Present/Absent COUNTS (NOT percent) + dedupe by (member_id, session_id)
-# ✅ Finance model preserved:
-#    Cash Available = foundation + loan_payments + interest_ledger + fines_paid − outstanding_principal
-#    Net Available  = Cash Available + Current Pot
-# ✅ Auto-refresh when app_state changes
-# ✅ No raw SQL; only Supabase client .table().select()
+# dashboard_panel.py ✅ COMPLETE SINGLE FILE (NO SQL) — NJANGI STANDARD (NO legacy)
+# ✅ FIX ImportError: exports render_dashboard at module level
+# ✅ Attendance: shows COUNTS (Present + Absent) — NOT percentage
+# ✅ Attendance duplicate fix: dedupe by (member_id, session_id) keep latest created_at/id
+# ✅ Finance model (your rule): Cash Available = foundation + loan_payments + interest_ledger + fines_paid − outstanding_principal
+# ✅ Payouts are informational only
+# ✅ Dark dotted grid theme + glass KPI cards
+# ✅ Auto-refresh on app_state stamp change
 
 from __future__ import annotations
 
@@ -21,12 +20,26 @@ DUE_DAYS = 28
 
 
 # ============================================================
-# THEME (NO HEADER TEXT HERE)
+# THEME
 # ============================================================
 def inject_dashboard_theme():
     st.markdown(
         """
         <style>
+        .stApp {
+            background-color: #0b0f1a;
+            background-image:
+                radial-gradient(circle at 1px 1px, rgba(255,255,255,0.06) 1px, transparent 0);
+            background-size: 24px 24px;
+            color: #e5e7eb;
+        }
+        section[data-testid="stSidebar"]{
+            background: #0b0f1a;
+            border-right: 1px solid rgba(255,255,255,0.06);
+        }
+        header, footer { background: transparent !important; }
+        h1, h2, h3, h4, h5, h6, p, div, span, label { color: #e5e7eb; }
+
         .glass {
             background: rgba(255,255,255,0.04);
             border: 1px solid rgba(255,255,255,0.06);
@@ -36,6 +49,7 @@ def inject_dashboard_theme():
             backdrop-filter: blur(10px);
             -webkit-backdrop-filter: blur(10px);
         }
+
         .kpi {
             background: rgba(255,255,255,0.04);
             border: 1px solid rgba(255,255,255,0.06);
@@ -45,6 +59,7 @@ def inject_dashboard_theme():
             backdrop-filter: blur(10px);
             -webkit-backdrop-filter: blur(10px);
         }
+
         .kpi-label {
             font-size: 12px;
             letter-spacing: 0.10em;
@@ -52,7 +67,7 @@ def inject_dashboard_theme():
             opacity: 0.7;
         }
         .kpi-value {
-            font-size: 26px;
+            font-size: 28px;
             font-weight: 750;
             margin-top: 8px;
             line-height: 1.1;
@@ -63,6 +78,7 @@ def inject_dashboard_theme():
             opacity: 0.65;
             word-break: break-word;
         }
+
         .blue { color: #60a5fa; }
         .green { color: #34d399; }
         .purple { color: #a78bfa; }
@@ -72,14 +88,6 @@ def inject_dashboard_theme():
         """,
         unsafe_allow_html=True,
     )
-
-
-def glass_open() -> str:
-    return "<div class='glass'>"
-
-
-def glass_close() -> str:
-    return "</div>"
 
 
 def kpi_card(label: str, value: str, color: str = "blue", sub: str | None = None) -> str:
@@ -93,8 +101,16 @@ def kpi_card(label: str, value: str, color: str = "blue", sub: str | None = None
     """
 
 
+def glass_open() -> str:
+    return "<div class='glass'>"
+
+
+def glass_close() -> str:
+    return "</div>"
+
+
 # ============================================================
-# SAFE HELPERS (NO SQL)
+# SAFE HELPERS (NO RAW SQL)
 # ============================================================
 def safe_table(
     sb,
@@ -111,7 +127,8 @@ def safe_table(
             q = q.order(order_by, desc=desc)
         if limit is not None:
             q = q.limit(int(limit))
-        return q.execute().data or []
+        res = q.execute()
+        return res.data or []
     except Exception:
         return []
 
@@ -127,11 +144,11 @@ def safe_table_order_fallback(
 ) -> List[dict]:
     order_candidates = order_candidates or []
     for c in order_candidates:
-        try:
-            rows = safe_table(sb, schema, table, cols=cols, limit=limit, order_by=c, desc=desc)
+        rows = safe_table(sb, schema, table, cols=cols, limit=limit, order_by=c, desc=desc)
+        # If the column doesn't exist, safe_table returns [] via exception path.
+        # We still accept [] as a valid return, and continue only if it errors (already handled).
+        if rows is not None:
             return rows or []
-        except Exception:
-            continue
     return safe_table(sb, schema, table, cols=cols, limit=limit, order_by=None, desc=desc)
 
 
@@ -147,7 +164,7 @@ def safe_single(sb, schema: str, table: str, cols: str = "*", **eq_filters) -> d
         return {}
 
 
-def table_exists(sb, schema: str, table: str) -> bool:
+def _table_exists(sb, schema: str, table: str) -> bool:
     try:
         sb.schema(schema).table(table).select("*").limit(1).execute()
         return True
@@ -155,7 +172,7 @@ def table_exists(sb, schema: str, table: str) -> bool:
         return False
 
 
-def _num(x, default: float = 0.0) -> float:
+def _num(x, default=0.0) -> float:
     try:
         if x is None or x == "":
             return float(default)
@@ -224,11 +241,14 @@ def _auto_refresh_if_state_changed(sb, schema: str):
 # FINANCE COMPUTATIONS
 # ============================================================
 def compute_interest_ledger(sb, schema: str) -> Tuple[float, float]:
-    if not table_exists(sb, schema, "interest_ledger"):
+    if not _table_exists(sb, schema, "interest_ledger"):
         return 0.0, 0.0
 
     rows = safe_table_order_fallback(
-        sb, schema, "interest_ledger", "*",
+        sb,
+        schema,
+        "interest_ledger",
+        "*",
         limit=20000,
         order_candidates=["interest_month", "created_at", "id"],
         desc=True,
@@ -239,21 +259,26 @@ def compute_interest_ledger(sb, schema: str) -> Tuple[float, float]:
     month_prefix = date.today().strftime("%Y-%m")
     this_month = 0.0
     all_time = 0.0
+
     for r in rows:
         v = _num(r.get("amount"), 0.0)
         all_time += v
         im = str(r.get("interest_month") or "").strip()
         if im.startswith(month_prefix):
             this_month += v
+
     return float(this_month), float(all_time)
 
 
 def compute_loan_payments(sb, schema: str) -> Tuple[float, Dict[int, date]]:
-    if not table_exists(sb, schema, "loan_payments"):
+    if not _table_exists(sb, schema, "loan_payments"):
         return 0.0, {}
 
     rows = safe_table_order_fallback(
-        sb, schema, "loan_payments", "*",
+        sb,
+        schema,
+        "loan_payments",
+        "*",
         limit=20000,
         order_candidates=["paid_at", "created_at", "id"],
         desc=True,
@@ -275,7 +300,7 @@ def compute_loan_payments(sb, schema: str) -> Tuple[float, Dict[int, date]]:
 
 
 def compute_loans_kpis(sb, schema: str) -> Dict[str, Any]:
-    if not table_exists(sb, schema, "loans"):
+    if not _table_exists(sb, schema, "loans"):
         return {"active_loans": 0, "principal_active": 0.0, "total_due_active": 0.0}
 
     rows = safe_table(sb, schema, "loans", "*", limit=20000)
@@ -300,7 +325,7 @@ def compute_loans_kpis(sb, schema: str) -> Dict[str, Any]:
 
 
 def sum_table_amount(sb, schema: str, table: str, amount_cols: List[str]) -> float:
-    if not table_exists(sb, schema, table):
+    if not _table_exists(sb, schema, table):
         return 0.0
     rows = safe_table(sb, schema, table, "*", limit=20000)
     total = 0.0
@@ -315,11 +340,14 @@ def sum_table_amount(sb, schema: str, table: str, amount_cols: List[str]) -> flo
 
 
 def compute_fines_paid_total(sb, schema: str) -> float:
-    if not table_exists(sb, schema, "fines"):
+    if not _table_exists(sb, schema, "fines"):
         return 0.0
 
     rows = safe_table_order_fallback(
-        sb, schema, "fines", "*",
+        sb,
+        schema,
+        "fines",
+        "*",
         limit=20000,
         order_candidates=["paid_at", "created_at", "id"],
         desc=True,
@@ -384,7 +412,7 @@ def build_repayment_plan(sb, schema: str, last_payment_dates: Dict[int, date]) -
 
 
 # ============================================================
-# ATTENDANCE (COUNTS + DEDUPE)
+# ATTENDANCE — COUNTS + DEDUPE
 # ============================================================
 def _dedupe_attendance_rows(dfa: pd.DataFrame) -> pd.DataFrame:
     if dfa is None or dfa.empty:
@@ -401,12 +429,55 @@ def _dedupe_attendance_rows(dfa: pd.DataFrame) -> pd.DataFrame:
 
     dfa = dfa.sort_values(["_created_at_sort", "_id_sort"], ascending=[False, False])
     dfa = dfa.drop_duplicates(subset=["member_id", "session_id"], keep="first")
+
     return dfa.drop(columns=["_created_at_sort", "_id_sort"], errors="ignore")
 
 
 def load_attendance_counts(read_sb, schema: str) -> pd.DataFrame:
+    """
+    Output columns:
+      member_id, member_name, phone, present_count, absent_count, total_sessions
+    """
+    # Try optional view (if it has counts)
+    view_name = "v_attendance_member_totals"
+    if _table_exists(read_sb, schema, view_name):
+        rows = safe_table(read_sb, schema, view_name, "*", limit=5000, order_by="member_id", desc=False)
+        if rows:
+            dv = pd.DataFrame(rows)
+
+            if "member_name" not in dv.columns:
+                dv["member_name"] = dv.get("name", dv.get("display_name", ""))
+
+            if "phone" not in dv.columns:
+                dv["phone"] = dv.get("member_phone")
+
+            pcol = next((c for c in ["present_count", "total_present", "present"] if c in dv.columns), None)
+            acol = next((c for c in ["absent_count", "total_absent", "absent"] if c in dv.columns), None)
+            tcol = next((c for c in ["total_sessions", "total", "sessions_count"] if c in dv.columns), None)
+
+            if pcol and tcol:
+                dv["present_count"] = pd.to_numeric(dv[pcol], errors="coerce").fillna(0).astype(int)
+                dv["total_sessions"] = pd.to_numeric(dv[tcol], errors="coerce").fillna(0).astype(int)
+                dv["absent_count"] = (dv["total_sessions"] - dv["present_count"]).clip(lower=0).astype(int)
+                keep = ["member_id", "member_name", "phone", "present_count", "absent_count", "total_sessions"]
+                for c in keep:
+                    if c not in dv.columns:
+                        dv[c] = None
+                return dv[keep].sort_values("member_id", ascending=True)
+
+            if pcol and acol:
+                dv["present_count"] = pd.to_numeric(dv[pcol], errors="coerce").fillna(0).astype(int)
+                dv["absent_count"] = pd.to_numeric(dv[acol], errors="coerce").fillna(0).astype(int)
+                dv["total_sessions"] = (dv["present_count"] + dv["absent_count"]).astype(int)
+                keep = ["member_id", "member_name", "phone", "present_count", "absent_count", "total_sessions"]
+                for c in keep:
+                    if c not in dv.columns:
+                        dv[c] = None
+                return dv[keep].sort_values("member_id", ascending=True)
+
+    # Fallback compute from attendance table
     members = safe_table(read_sb, schema, "members", "id,name,display_name,phone", limit=5000, order_by="id", desc=False)
-    attendance = safe_table(read_sb, schema, "attendance", "id,member_id,session_id,present,created_at", limit=20000)
+    attendance = safe_table(read_sb, schema, "attendance", "id,member_id,session_id,present,note,created_at", limit=20000)
 
     dfm = pd.DataFrame(members or [])
     dfa = pd.DataFrame(attendance or [])
@@ -426,7 +497,7 @@ def load_attendance_counts(read_sb, schema: str) -> pd.DataFrame:
         out["present_count"] = 0
         out["absent_count"] = 0
         out["total_sessions"] = 0
-        return out[["member_id", "member_name", "phone", "present_count", "absent_count", "total_sessions"]]
+        return out[["member_id", "member_name", "phone", "present_count", "absent_count", "total_sessions"]].sort_values("member_id")
 
     dfa["present"] = dfa.get("present", False)
     dfa["present"] = dfa["present"].fillna(False).astype(bool)
@@ -451,7 +522,7 @@ def load_attendance_counts(read_sb, schema: str) -> pd.DataFrame:
     out["absent_count"] = out["absent_count"].fillna(0).astype(int)
     out["total_sessions"] = out["total_sessions"].fillna(0).astype(int)
 
-    return out[["member_id", "member_name", "phone", "present_count", "absent_count", "total_sessions"]]
+    return out[["member_id", "member_name", "phone", "present_count", "absent_count", "total_sessions"]].sort_values("member_id")
 
 
 def render_attendance_counts_chart(att_df: pd.DataFrame):
@@ -462,34 +533,34 @@ def render_attendance_counts_chart(att_df: pd.DataFrame):
     df = att_df.copy()
     df["present_count"] = pd.to_numeric(df["present_count"], errors="coerce").fillna(0).astype(int)
     df["absent_count"] = pd.to_numeric(df["absent_count"], errors="coerce").fillna(0).astype(int)
+    df["total_sessions"] = pd.to_numeric(df["total_sessions"], errors="coerce").fillna(0).astype(int)
 
-    rank_by = st.selectbox("Rank members by", ["present_count", "absent_count"], index=0)
+    rank_by = st.selectbox("Rank members by", ["present_count", "absent_count", "total_sessions"], index=0)
     max_n = max(5, min(50, len(df)))
     default_n = min(17, len(df))
     top_n = st.slider("Show top N members", min_value=5, max_value=max_n, value=default_n)
 
     df = df.sort_values(rank_by, ascending=False).head(int(top_n)).copy()
-    chart_df = df.set_index("member_name")[["present_count", "absent_count"]].rename(
-        columns={"present_count": "Present", "absent_count": "Absent"}
-    )
+
+    chart_df = df.set_index("member_name")[["present_count", "absent_count"]]
+    chart_df = chart_df.rename(columns={"present_count": "Present", "absent_count": "Absent"})
+
+    # Streamlit native multi-series chart (no extra libs)
     st.bar_chart(chart_df)
 
 
 # ============================================================
-# MAIN DASHBOARD ENTRY (NO DUPLICATE HEADER)
+# MAIN DASHBOARD ENTRY (THIS IS WHAT app.py IMPORTS)
 # ============================================================
 def render_dashboard(sb_anon, sb_service, schema: str = "public"):
-    """
-    NOTE: This function intentionally DOES NOT render the big page header.
-    app.py already renders the top bar header + refresh button.
-    """
     inject_dashboard_theme()
 
     read_sb = sb_service if sb_service is not None else sb_anon
     finance_sb = sb_service if sb_service is not None else sb_anon
 
-    # Auto-refresh if app_state changes
     _auto_refresh_if_state_changed(read_sb, schema)
+
+    st.markdown("## 🏦 theyoungshallgrow • Bank Dashboard")
 
     # --- App state ---
     state = safe_single(read_sb, schema, "app_state", "*", id=1)
@@ -497,7 +568,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         rows = safe_table(read_sb, schema, "app_state", "*", limit=1)
         state = rows[0] if rows else {}
 
-    # --- Current session id (fallback to latest sessions.session_id) ---
+    # --- Current session id (robust) ---
     raw_cs = state.get("current_session_id")
     try:
         current_session_id = int(raw_cs) if raw_cs is not None and str(raw_cs).strip() != "" else None
@@ -525,23 +596,25 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
 
     # --- Members ---
     members_rows = safe_table(read_sb, schema, "members", "id,name,display_name", limit=5000, order_by="id", desc=False)
+
     # Dedup safety
-    seen_ids = set()
-    dedup_members = []
+    seen = set()
+    dedup = []
     for m in members_rows or []:
         mid = m.get("id")
-        if mid in seen_ids:
+        if mid in seen:
             continue
-        seen_ids.add(mid)
-        dedup_members.append(m)
-    members_rows = dedup_members
+        seen.add(mid)
+        dedup.append(m)
+    members_rows = dedup
+
     total_members = int(len(members_rows or []))
 
     # --- Beneficiary ---
     beneficiary_name = "—"
     beneficiary_id = next_member_id
 
-    if table_exists(read_sb, schema, "v_next_beneficiary"):
+    if _table_exists(read_sb, schema, "v_next_beneficiary"):
         v = safe_single(read_sb, schema, "v_next_beneficiary", "*")
         if v:
             beneficiary_name = str(v.get("beneficiary_name") or v.get("member_name") or "—")
@@ -576,23 +649,18 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
             pot = float(dfc["amount"].sum())
             members_paid = int(dfc["member_id"].nunique()) if "member_id" in dfc.columns else 0
 
-    # --- KPIs (no big header) ---
+    # --- Header KPIs ---
     st.markdown(glass_open(), unsafe_allow_html=True)
-    a1, a2, a3, a4 = st.columns(4)
-    with a1:
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
         st.markdown(kpi_card("Session ID", str(current_session_id or "—"), "blue", sub=session_note), unsafe_allow_html=True)
-    with a2:
+    with c2:
         st.markdown(kpi_card("Session Window", window, "orange"), unsafe_allow_html=True)
-    with a3:
-        st.markdown(kpi_card("Total Members", str(total_members), "purple"), unsafe_allow_html=True)
-    with a4:
+    with c3:
+        st.markdown(kpi_card("Total Members", str(total_members), "purple", sub="members"), unsafe_allow_html=True)
+    with c4:
         st.markdown(
-            kpi_card(
-                "Current Beneficiary",
-                beneficiary_name,
-                "green",
-                sub=f"member_id: {beneficiary_id if beneficiary_id is not None else '—'}",
-            ),
+            kpi_card("Current Beneficiary", beneficiary_name, "green", sub=f"member_id: {beneficiary_id if beneficiary_id is not None else '—'}"),
             unsafe_allow_html=True,
         )
     st.markdown(glass_close(), unsafe_allow_html=True)
@@ -626,26 +694,27 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     net_available = cash_available + float(pot)
 
     st.markdown("### 🏦 Financial Summary")
+
     st.markdown(glass_open(), unsafe_allow_html=True)
     f1, f2, f3, f4, f5, f6, f7, f8, f9 = st.columns(9)
     with f1:
-        st.markdown(kpi_card("Foundation Total", _fmt_money(foundation_total, 0), "blue"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Foundation Total", _fmt_money(foundation_total, 0), "blue", sub="foundation_contributions"), unsafe_allow_html=True)
     with f2:
-        st.markdown(kpi_card("Payouts Total", _fmt_money(payouts_total, 0), "orange", sub="info only"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Payouts Total", _fmt_money(payouts_total, 0), "orange", sub="pot redistribution (info)"), unsafe_allow_html=True)
     with f3:
-        st.markdown(kpi_card("Interest This Month", _fmt_money(interest_this_month, 2), "green"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Interest This Month", _fmt_money(interest_this_month, 2), "green", sub="interest_ledger (YYYY-MM)"), unsafe_allow_html=True)
     with f4:
-        st.markdown(kpi_card("Interest All-time", _fmt_money(interest_all_time, 2), "green"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Interest All-time", _fmt_money(interest_all_time, 2), "green", sub="interest_ledger (all)"), unsafe_allow_html=True)
     with f5:
-        st.markdown(kpi_card("Loan Payments", _fmt_money(repayments_total, 0), "green"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Loan Payments", _fmt_money(repayments_total, 0), "green", sub="loan_payments"), unsafe_allow_html=True)
     with f6:
-        st.markdown(kpi_card("Fines Paid", _fmt_money(fines_paid_total, 0), "purple"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Total Fines Paid", _fmt_money(fines_paid_total, 0), "purple", sub="fines.status='paid'"), unsafe_allow_html=True)
     with f7:
-        st.markdown(kpi_card("Outstanding Principal", _fmt_money(loans_outstanding, 0), "red"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Outstanding Principal", _fmt_money(loans_outstanding, 0), "red", sub="loans.principal_current"), unsafe_allow_html=True)
     with f8:
-        st.markdown(kpi_card("Cash Available", _fmt_money(cash_available, 0), "green"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Cash Available", _fmt_money(cash_available, 0), "green", sub="foundation + payments + interest + fines − principal"), unsafe_allow_html=True)
     with f9:
-        st.markdown(kpi_card("Net Available", _fmt_money(net_available, 0), "blue"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Net Available", _fmt_money(net_available, 0), "blue", sub="Cash Available + Current Pot"), unsafe_allow_html=True)
     st.markdown(glass_close(), unsafe_allow_html=True)
 
     if cash_available_raw < 0:
@@ -685,16 +754,18 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         st.dataframe(plan_df, use_container_width=True, hide_index=True)
         st.markdown(glass_close(), unsafe_allow_html=True)
 
+    # --- Debug ---
     with st.expander("🔎 Debug", expanded=False):
-        st.write("session_note", session_note)
+        st.write("Using read client:", "service" if sb_service is not None else "anon")
+        st.write("app_state", state)
         st.write("current_session_id", current_session_id)
         st.write("next_member_id", next_member_id)
         st.write("beneficiary_id", beneficiary_id)
         st.write("beneficiary_name", beneficiary_name)
-        st.write("pot", pot)
+        st.write("current_pot", pot)
         st.write("members_paid", members_paid)
         st.write("foundation_total", foundation_total)
-        st.write("payouts_total(info)", payouts_total)
+        st.write("payouts_total (info)", payouts_total)
         st.write("interest_this_month", interest_this_month)
         st.write("interest_all_time", interest_all_time)
         st.write("loan_payments_total", repayments_total)
@@ -703,12 +774,14 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         st.write("cash_available_raw", cash_available_raw)
         st.write("cash_available", cash_available)
         st.write("net_available", net_available)
+        st.write("attendance_rows", 0 if att_df is None else int(len(att_df)))
 
 
 # ============================================================
 # COMPATIBILITY (typo safety)
 # ============================================================
 def render_dashbaord(sb_anon, sb_service, schema: str = "public"):
+    # if app.py has typo import, this prevents crash
     return render_dashboard(sb_anon, sb_service, schema=schema)
 
 
