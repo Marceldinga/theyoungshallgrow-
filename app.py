@@ -71,13 +71,11 @@ st.set_page_config(
     page_icon="🏦",
 )
 
-
 # ============================================================
 # TIME
 # ============================================================
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 # ============================================================
 # GLOBAL THEME
@@ -181,17 +179,13 @@ def inject_global_theme():
         unsafe_allow_html=True,
     )
 
-
 def glass_open() -> str:
     return "<div class='glass'>"
-
 
 def glass_close() -> str:
     return "</div>"
 
-
 inject_global_theme()
-
 
 # ============================================================
 # SECRETS
@@ -205,7 +199,6 @@ def get_secret(key: str, default: str | None = None) -> str | None:
     except Exception:
         return default
 
-
 SUPABASE_URL = (get_secret("SUPABASE_URL") or "").strip()
 SUPABASE_ANON_KEY = (get_secret("SUPABASE_ANON_KEY") or "").strip()
 SUPABASE_SERVICE_KEY = (get_secret("SUPABASE_SERVICE_KEY") or "").strip()
@@ -218,7 +211,6 @@ if not SUPABASE_URL or not SUPABASE_ANON_KEY:
 if not SUPABASE_SERVICE_KEY:
     st.warning("SUPABASE_SERVICE_KEY not set. Admin/Loans/Payout write features will be disabled.")
 
-
 # ============================================================
 # CLIENTS
 # ============================================================
@@ -226,15 +218,12 @@ if not SUPABASE_SERVICE_KEY:
 def get_anon_client(url: str, anon_key: str):
     return create_client(url.strip(), anon_key.strip())
 
-
 @st.cache_resource
 def get_service_client(url: str, service_key: str):
     return create_client(url.strip(), service_key.strip())
 
-
 sb_anon = get_anon_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 sb_service = get_service_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_SERVICE_KEY else None
-
 
 # ============================================================
 # TOP BAR
@@ -248,7 +237,6 @@ with right:
         st.cache_resource.clear()
         st.rerun()
 
-
 # ============================================================
 # SAFE HELPERS
 # ============================================================
@@ -259,7 +247,6 @@ def _api_msg(e: Exception) -> str:
             return str(payload.get("message") or payload.get("details") or payload.get("hint") or "APIError")
         return str(e)
     return str(e)
-
 
 def safe_select(
     client,
@@ -287,7 +274,6 @@ def safe_select(
         st.code(_api_msg(e), language="text")
         return []
 
-
 def table_readable(client, schema: str, table_name: str) -> bool:
     try:
         client.schema(schema).table(table_name).select("*").limit(1).execute()
@@ -295,11 +281,13 @@ def table_readable(client, schema: str, table_name: str) -> bool:
     except Exception:
         return False
 
-
 def get_app_state(sb, schema: str) -> dict:
+    # app_state is intended to be a singleton row. If id exists, prefer id=1; else fetch first row.
     rows = safe_select(sb, "app_state", "*", schema=schema, limit=1, id=1)
-    return rows[0] if rows else {}
-
+    if rows:
+        return rows[0]
+    rows2 = safe_select(sb, "app_state", "*", schema=schema, limit=1)
+    return rows2[0] if rows2 else {}
 
 @st.cache_data(ttl=90)
 def load_members(url: str, anon_key: str, schema: str) -> tuple[list[str], dict, dict, pd.DataFrame]:
@@ -333,7 +321,6 @@ def load_members(url: str, anon_key: str, schema: str) -> tuple[list[str], dict,
     label_to_name = dict(zip(df["label"], df["name"]))
     return labels, label_to_id, label_to_name, df
 
-
 @st.cache_data(ttl=60)
 def load_contributions(url: str, anon_key: str, schema: str) -> pd.DataFrame:
     """
@@ -357,7 +344,6 @@ def load_contributions(url: str, anon_key: str, schema: str) -> pd.DataFrame:
         rows = []
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
-
 # ============================================================
 # NAVIGATION (no duplicates)
 # ============================================================
@@ -374,7 +360,6 @@ PAGES = [
 ]
 
 page = st.sidebar.radio("Menu", PAGES, key="main_menu")
-
 
 # ============================================================
 # PAGES
@@ -420,7 +405,6 @@ elif page == "Loans":
             if loans_fn is None:
                 st.error("Loans UI not available. loans.py must define show_loans() or render_loans().")
             else:
-                # Pass empty user id → loans_ui will generate a session UUID if needed
                 loans_fn(sb_service, SUPABASE_SCHEMA, actor_user_id="")
 
 elif page == "🤖 AI Risk Panel":
