@@ -1,11 +1,16 @@
-# loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED (NEW loan_requests schema + Maker–Checker + Ledger Interest + compute_dpd)
+
+# loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED
 # -----------------------------------------------------------------------------
-# ✅ FIXED: loan_requests matches YOUR NEW table (member_id, member_name, requested_amount, ...)
-# ✅ COMPAT: also provides OLD alias keys (requester_member_id, requester_name, amount, created_at, requester_user_id)
+# ✅ FIXED: create_loan_request now accepts BOTH:
+#    - NEW UI style: borrower_id, surety_id, amount
+#    - NEW table style: member_id, member_name, surety_member_id, requested_amount
+# ✅ loan_requests matches YOUR NEW table (member_id, member_name, requested_amount, surety_member_id, ...)
+# ✅ COMPAT: adds OLD alias keys (requester_member_id, requester_name, amount, created_at, requester_user_id)
 #           so older loans_ui.py won't crash.
-# ✅ Maker–Checker: adds list_unconfirmed_payments() (and helpers) so UI can confirm/reject.
+# ✅ Maker–Checker: list_unconfirmed_payments() + confirm/reject pending queue
 # ✅ Interest: writes to interest_ledger (idempotent by unique(loan_id, interest_month))
-# ✅ Loans table: still uses loans_legacy as your loan book
+# ✅ Loans table: uses loans_legacy as your loan book
+# ✅ compute_dpd + delinquency_table fallback
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -343,36 +348,58 @@ def _normalize_request_row(r: dict) -> dict:
 
 
 # ============================================================
-# REQUESTS (✅ NEW TABLE SHAPE)
+# REQUESTS (✅ NEW TABLE SHAPE) — COMPATIBLE API
 # ============================================================
 def create_loan_request(
     sb,
     schema: str,
-    member_id: int,
-    member_name: str,
-    surety_member_id: int,
-    requested_amount: float,
+    *,
+    # ✅ NEW UI style (your screenshot error)
+    borrower_id: Optional[int] = None,
+    surety_id: Optional[int] = None,
+    amount: Optional[float] = None,
+    # ✅ NEW table style (direct)
+    member_id: Optional[int] = None,
+    member_name: Optional[str] = None,
+    surety_member_id: Optional[int] = None,
+    requested_amount: Optional[float] = None,
+    # optional extras
     purpose: str | None = None,
     duration_months: int | None = None,
     interest_rate: float | None = None,
     notes: str | None = None,
 ) -> int:
-    if int(member_id) <= 0 or int(surety_member_id) <= 0:
-        raise ValueError("Invalid member_id/surety_member_id.")
-    if float(requested_amount) <= 0:
-        raise ValueError("requested_amount must be > 0.")
+    """
+    Inserts a row into loan_requests (NEW schema).
+
+    Accepts BOTH calling styles:
+      A) UI style: create_loan_request(..., borrower_id=, surety_id=, amount=)
+      B) Table style: create_loan_request(..., member_id=, member_name=, surety_member_id=, requested_amount=)
+    """
+
+    # Normalize
+    b_id = borrower_id if borrower_id is not None else member_id
+    s_id = surety_id if surety_id is not None else surety_member_id
+    amt = amount if amount is not None else requested_amount
+
+    if b_id is None or int(b_id) <= 0:
+        raise ValueError("Invalid borrower/member id.")
+    if s_id is None or int(s_id) <= 0:
+        raise ValueError("Invalid surety id.")
+    if amt is None or float(amt) <= 0:
+        raise ValueError("Amount must be > 0.")
 
     payload = {
-        "member_id": int(member_id),
-        "member_name": str(member_name or "").strip() or None,
-        "requested_amount": float(requested_amount),
+        "member_id": int(b_id),
+        "member_name": (str(member_name).strip() if member_name else None),
+        "requested_amount": float(amt),
         "purpose": (str(purpose).strip() if purpose else None),
         "duration_months": int(duration_months) if duration_months is not None else None,
         "interest_rate": float(interest_rate) if interest_rate is not None else MONTHLY_INTEREST_RATE,
         "status": "pending",
         "requested_at": now_iso(),
         "notes": (str(notes).strip() if notes else None),
-        "surety_member_id": int(surety_member_id),
+        "surety_member_id": int(s_id),
     }
 
     payload = {k: v for k, v in payload.items() if v is not None}
@@ -520,12 +547,10 @@ def deny_loan_request(sb, schema: str, request_id: int, actor_name: str, reason:
 
 
 # ============================================================
-# MAKER–CHECKER READ HELPERS (this fixes your "No core function found..." warning)
+# MAKER–CHECKER READ HELPERS
 # ============================================================
 def list_unconfirmed_payments(sb, schema: str, limit: int = 500) -> List[Dict[str, Any]]:
-    """
-    Maker–checker queue: pending payments waiting for confirmation.
-    """
+    """Maker–checker queue: pending payments waiting for confirmation."""
     try:
         return (
             sb.schema(schema)
