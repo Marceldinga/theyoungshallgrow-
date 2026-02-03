@@ -2,16 +2,15 @@
 # loans_ui.py ✅ COMPLETE UPDATED SINGLE FILE — NEW STANDARD (NO LEGACY)
 # -----------------------------------------------------------------------------
 # ✅ NO legacy tables used
-# ✅ MATCHES YOUR REAL loan_requests schema (from your screenshot):
+# ✅ MATCHES loan_requests schema:
 #   id, member_id, member_name, requested_amount, purpose, duration_months, interest_rate, status,
 #   requested_at, reviewed_at, approved_at, reviewed_by, notes, surety_member_id, requester_user_id
 #
-# ✅ FIXES your NOT NULL error:
-#   - Always passes member_name from the borrower dropdown when creating a request
-#
-# ✅ UPDATED PER YOUR RULE:
-#   - ✅ ALLOW borrower_id == surety_id (borrower and surety can be the same)
-#     (Removed the blocking validation in the UI)
+# ✅ DOES NOT REQUIRE phone number anywhere (members can have no phone column)
+# ✅ ALLOWS borrower_id == surety_id (per your rule)
+# ✅ Uses views when available:
+#   - v_loans_with_member
+#   - v_loan_payments_with_member
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -46,11 +45,11 @@ except Exception:
 MEMBERS_TABLE = "members"
 LOANS_TABLE = "loans"
 PAYMENTS_TABLE = "loan_payments"
-REQUESTS_TABLE = "loan_requests"          # ✅ your table name
+REQUESTS_TABLE = "loan_requests"
 SIGNATURES_TABLE = "signatures"
 INTEREST_LEDGER_TABLE = "interest_ledger"
 
-# Optional views (if you created them)
+# Views (you have these)
 V_LOANS_WITH_MEMBER = "v_loans_with_member"
 V_PAYMENTS_WITH_MEMBER = "v_loan_payments_with_member"
 
@@ -140,9 +139,10 @@ def _table_exists(sb, schema: str, table_name: str) -> bool:
 
 def _read_members(sb, schema: str) -> pd.DataFrame:
     """
-    members expected columns: id, name, display_name, phone
+    ✅ No phone required.
+    members expected columns: id, name, display_name (phone optional/ignored)
     """
-    preferred = ["id", "name", "display_name", "phone"]
+    preferred = ["id", "name", "display_name"]
     try:
         rows = (
             sb.schema(schema).table(MEMBERS_TABLE)
@@ -162,7 +162,7 @@ def _read_members(sb, schema: str) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["id", "name", "display_name", "phone", "best_name", "label"])
+        return pd.DataFrame(columns=["id", "name", "display_name", "best_name", "label"])
 
     df["id"] = pd.to_numeric(df.get("id"), errors="coerce").fillna(0).astype(int)
 
@@ -170,14 +170,10 @@ def _read_members(sb, schema: str) -> pd.DataFrame:
         df["name"] = ""
     if "display_name" not in df.columns:
         df["display_name"] = ""
-    if "phone" not in df.columns:
-        df["phone"] = ""
 
     df["name"] = df["name"].astype(str).replace({"None": "", "nan": ""})
     df["display_name"] = df["display_name"].astype(str).replace({"None": "", "nan": ""})
-    df["phone"] = df["phone"].astype(str).replace({"None": "", "nan": ""})
 
-    # ✅ member_name MUST be non-null for loan_requests
     df["best_name"] = df.apply(
         lambda r: (r["display_name"] or r["name"] or f"Member {int(r['id'])}").strip(),
         axis=1,
@@ -211,6 +207,7 @@ def _signature_status(sb, schema: str, request_id: int) -> tuple[pd.DataFrame, l
 
 
 def _upsert_signature(sb, schema: str, request_id: int, role: str, signer_member_id: int, signer_name: str):
+    # ✅ requires loans_core.insert_signature to exist (we fixed that in loans_core)
     core.insert_signature(
         sb, schema,
         entity_type=REQ_ENTITY_TYPE,
@@ -228,19 +225,15 @@ _SECTION_CANON: dict[str, str] = {
     "Loan Statement": "Statements",
     "Statements": "Statements",
     "Statement": "Statements",
-
     "Confirm Payment": "Confirm Payments",
     "Confirm Payments": "Confirm Payments",
-
     "Direct Payment": "Direct Payment",
     "Delinquency": "Delinquency",
-
     "Requests": "Requests",
     "Ledger": "Ledger",
     "Record Payment": "Record Payment",
     "Interest": "Interest",
 }
-
 
 def _canon_section(section: str) -> str:
     s = (section or "").strip()
@@ -300,7 +293,7 @@ def _render_requests(sb, schema: str, actor: Actor):
 
     labels = dfm["label"].tolist()
     label_to_id = dict(zip(dfm["label"], dfm["id"]))
-    label_to_name = dict(zip(dfm["label"], dfm["best_name"]))  # ✅ guaranteed non-empty
+    label_to_name = dict(zip(dfm["label"], dfm["best_name"]))
 
     st.markdown("### Create a loan request")
     with st.form("loan_request_create", clear_on_submit=True):
@@ -309,7 +302,6 @@ def _render_requests(sb, schema: str, actor: Actor):
         amount = st.number_input("Amount", min_value=0.0, step=50.0, value=0.0, key="req_amount")
         purpose = st.text_input("Purpose (optional)", value="", key="req_purpose")
 
-        # ✅ DB column is duration_months
         duration_months = st.number_input(
             "Duration months (optional)",
             min_value=0, step=1, value=0,
@@ -324,24 +316,22 @@ def _render_requests(sb, schema: str, actor: Actor):
         borrower_name = str(label_to_name[borrower_pick]).strip() or f"Member {borrower_id}"
         surety_id = int(label_to_id[surety_pick])
 
-        # ✅ YOUR RULE: allow borrower == surety
-        # (We removed the UI validation that used to block this.)
+        # ✅ YOUR RULE: allow borrower == surety (no blocking validation)
 
         if float(amount) <= 0:
             st.error("Amount must be > 0.")
         else:
             try:
-                # ✅ FIX: pass member_name so member_name NOT NULL never fails
                 req_id = core.create_loan_request(
                     sb, schema,
                     borrower_id=borrower_id,
-                    surety_id=surety_id,                         # ✅ can be same as borrower now
+                    surety_id=surety_id,
                     amount=float(amount),
-                    member_name=borrower_name,                   # ✅ CRITICAL FIX
+                    member_name=borrower_name,
                     purpose=(purpose.strip() or None),
                     duration_months=(int(duration_months) if int(duration_months) > 0 else None),
                     notes=(notes.strip() or None),
-                    requester_user_id=str(actor.user_id),        # ✅ real column exists
+                    requester_user_id=str(actor.user_id),
                 )
                 audit(sb, "loan_request_created", "ok", {"request_id": int(req_id)}, actor_user_id=actor.user_id)
                 st.success(f"Request submitted. ID = {req_id}")
@@ -408,7 +398,6 @@ def _render_requests(sb, schema: str, actor: Actor):
     with c1:
         if st.button("✅ APPROVE REQUEST", type="primary", use_container_width=True, key="approve_req_btn"):
             try:
-                # support actor_name OR actor_user_id depending on your core
                 try:
                     loan_id = core.approve_loan_request(sb, schema, request_id=int(req_id), actor_name=str(actor.name or "admin"))
                 except TypeError:
@@ -448,7 +437,6 @@ def _render_requests(sb, schema: str, actor: Actor):
 def _render_ledger(sb, schema: str, actor: Actor):
     require(actor.role, "view_ledger")
     st.subheader("Ledger (Loans)")
-    st.caption("Loans are stored by member_id. Names/phones appear via views if available.")
 
     table = V_LOANS_WITH_MEMBER if _table_exists(sb, schema, V_LOANS_WITH_MEMBER) else LOANS_TABLE
     try:
@@ -490,7 +478,6 @@ def _render_ledger(sb, schema: str, actor: Actor):
 def _render_delinquency(sb, schema: str, actor: Actor):
     require(actor.role, "view_delinquency")
     st.subheader("Delinquency")
-    st.caption("Days past due (DPD) for open/active loans.")
     try:
         dfd = core.delinquency_table(sb, schema, limit=1000)
         if dfd is None or getattr(dfd, "empty", True):
@@ -508,7 +495,6 @@ def _render_delinquency(sb, schema: str, actor: Actor):
 def _render_record_payment(sb, schema: str, actor: Actor):
     require(actor.role, "record_payment")
     st.subheader("Record Payment")
-    st.caption("Records a payment into loan_payments and updates loan balances (interest-first).")
 
     table = V_LOANS_WITH_MEMBER if _table_exists(sb, schema, V_LOANS_WITH_MEMBER) else LOANS_TABLE
     try:
@@ -554,7 +540,7 @@ def _render_record_payment(sb, schema: str, actor: Actor):
             st.stop()
 
         if not hasattr(core, "record_payment"):
-            st.error("loans_core.record_payment(...) not found. Add it in loans_core.py for NEW standard.")
+            st.error("loans_core.record_payment(...) not found.")
             st.stop()
 
         try:
@@ -598,20 +584,15 @@ def _render_record_payment(sb, schema: str, actor: Actor):
 def _render_direct_payment(sb, schema: str, actor: Actor):
     require(actor.role, "direct_payment")
     st.subheader("Direct Payment")
-    st.caption("Direct Payment uses the same workflow as Record Payment.")
     _render_record_payment(sb, schema, actor)
 
 
 # ============================================================
-# CONFIRM PAYMENTS (safe)
+# CONFIRM PAYMENTS
 # ============================================================
 def _render_confirm_payments(sb, schema: str, actor: Actor):
     require(actor.role, "confirm_payment")
     st.subheader("Confirm Payments")
-    st.caption(
-        "If your loans_core provides maker-checker (list_unconfirmed_payments + confirm_payment), it will be used. "
-        "Otherwise this section shows recent payments only."
-    )
 
     if not hasattr(core, "list_unconfirmed_payments"):
         st.info("Maker-checker not enabled in core. Showing recent payments instead.")
@@ -644,7 +625,7 @@ def _render_confirm_payments(sb, schema: str, actor: Actor):
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     if not hasattr(core, "confirm_payment"):
-        st.info("core.confirm_payment(...) not found. Add it in loans_core.py to enable confirmations.")
+        st.info("core.confirm_payment(...) not found.")
         return
 
     ids = [int(x) for x in df["id"].tolist() if str(x).isdigit()]
@@ -706,7 +687,6 @@ def _interest_ledger_totals(sb, schema: str) -> dict:
 def _render_interest(sb, schema: str, actor: Actor):
     require(actor.role, "accrue_interest")
     st.subheader("Interest")
-    st.caption("Interest is ledger-based (interest_ledger). This month is computed by YYYY-MM prefix.")
 
     totals = _interest_ledger_totals(sb, schema)
     mk = _month_key()
@@ -758,7 +738,7 @@ def _render_interest(sb, schema: str, actor: Actor):
 
 
 # ============================================================
-# STATEMENTS
+# STATEMENTS (NO PHONE REQUIRED)
 # ============================================================
 def _render_statements(sb, schema: str, actor: Actor):
     require(actor.role, "loan_statement")
@@ -781,7 +761,7 @@ def _render_statements(sb, schema: str, actor: Actor):
         "member_id": int(member_id),
         "name": str(m.get("name") or ""),
         "display_name": str(m.get("display_name") or ""),
-        "phone": str(m.get("phone") or ""),
+        "phone": "",  # ✅ ALWAYS BLANK (no phone in DB)
     }
 
     loans = core.list_member_loans(sb, schema, member_id=int(member_id), limit=2000)
