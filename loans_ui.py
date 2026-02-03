@@ -9,9 +9,9 @@
 # ✅ FIXES your NOT NULL error:
 #   - Always passes member_name from the borrower dropdown when creating a request
 #
-# ✅ IMPORTANT FIX from your screenshot:
-#   - Column name is duration_months (NOT duration_months)
-#   - loan_requests table name is loan_requests (NOT loan_requests)
+# ✅ UPDATED PER YOUR RULE:
+#   - ✅ ALLOW borrower_id == surety_id (borrower and surety can be the same)
+#     (Removed the blocking validation in the UI)
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ except Exception:
 MEMBERS_TABLE = "members"
 LOANS_TABLE = "loans"
 PAYMENTS_TABLE = "loan_payments"
-REQUESTS_TABLE = "loan_requests"          # ✅ your table name in screenshot
+REQUESTS_TABLE = "loan_requests"          # ✅ your table name
 SIGNATURES_TABLE = "signatures"
 INTEREST_LEDGER_TABLE = "interest_ledger"
 
@@ -241,6 +241,7 @@ _SECTION_CANON: dict[str, str] = {
     "Interest": "Interest",
 }
 
+
 def _canon_section(section: str) -> str:
     s = (section or "").strip()
     return _SECTION_CANON.get(s, s)
@@ -308,8 +309,12 @@ def _render_requests(sb, schema: str, actor: Actor):
         amount = st.number_input("Amount", min_value=0.0, step=50.0, value=0.0, key="req_amount")
         purpose = st.text_input("Purpose (optional)", value="", key="req_purpose")
 
-        # ✅ IMPORTANT: your DB column is duration_months
-        duration_months = st.number_input("Duration months (optional)", min_value=0, step=1, value=0, key="req_duration_months")
+        # ✅ DB column is duration_months
+        duration_months = st.number_input(
+            "Duration months (optional)",
+            min_value=0, step=1, value=0,
+            key="req_duration_months"
+        )
 
         notes = st.text_area("Notes (optional)", value="", key="req_notes")
         ok = st.form_submit_button("Submit request", use_container_width=True)
@@ -319,9 +324,10 @@ def _render_requests(sb, schema: str, actor: Actor):
         borrower_name = str(label_to_name[borrower_pick]).strip() or f"Member {borrower_id}"
         surety_id = int(label_to_id[surety_pick])
 
-        if borrower_id == surety_id:
-            st.error("Borrower and surety must be different.")
-        elif float(amount) <= 0:
+        # ✅ YOUR RULE: allow borrower == surety
+        # (We removed the UI validation that used to block this.)
+
+        if float(amount) <= 0:
             st.error("Amount must be > 0.")
         else:
             try:
@@ -329,13 +335,13 @@ def _render_requests(sb, schema: str, actor: Actor):
                 req_id = core.create_loan_request(
                     sb, schema,
                     borrower_id=borrower_id,
-                    surety_id=surety_id,
+                    surety_id=surety_id,                         # ✅ can be same as borrower now
                     amount=float(amount),
-                    member_name=borrower_name,                    # ✅ CRITICAL FIX
+                    member_name=borrower_name,                   # ✅ CRITICAL FIX
                     purpose=(purpose.strip() or None),
                     duration_months=(int(duration_months) if int(duration_months) > 0 else None),
                     notes=(notes.strip() or None),
-                    requester_user_id=str(actor.user_id),         # ✅ real column exists
+                    requester_user_id=str(actor.user_id),        # ✅ real column exists
                 )
                 audit(sb, "loan_request_created", "ok", {"request_id": int(req_id)}, actor_user_id=actor.user_id)
                 st.success(f"Request submitted. ID = {req_id}")
