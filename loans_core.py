@@ -1,13 +1,15 @@
 
-# loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED (NEW loan_requests schema + Maker–Checker + Ledger Interest + compute_dpd)
+# loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED
 # -----------------------------------------------------------------------------
-# ✅ FIXED: create_loan_request accepts borrower_id / surety_id / amount (so your UI won't crash)
-# ✅ ALSO supports new-table params: member_id, member_name, surety_member_id, requested_amount
-# ✅ loan_requests matches your NEW table (member_id, member_name, requested_amount, surety_member_id, ...)
-# ✅ COMPAT: adds OLD alias keys (requester_member_id, requester_name, amount, created_at, requester_user_id)
-# ✅ Maker–Checker: list_unconfirmed_payments() + confirm/reject pending queue
-# ✅ Interest: writes to interest_ledger (idempotent by unique(loan_id, interest_month))
-# ✅ Loans table: uses loans_legacy as your loan book
+# ✅ FIXED: create_loan_request accepts ALL call styles:
+#   (A) borrower_id / surety_id / amount
+#   (B) requester_user_id / requester_member_id / requester_name / surety_member_id / amount
+#   (C) member_id / member_name / surety_member_id / requested_amount
+# ✅ loan_requests uses NEW schema: member_id, member_name, requested_amount, surety_member_id, ...
+# ✅ COMPAT: normalizes request rows adding OLD alias keys to prevent old UI crashes
+# ✅ Maker–Checker: pending repayments confirm/reject + list_unconfirmed_payments()
+# ✅ Interest: ledger-based (interest_ledger unique(loan_id, interest_month))
+# ✅ Loans book: loans_legacy
 # ✅ compute_dpd + delinquency_table fallback
 # -----------------------------------------------------------------------------
 
@@ -322,42 +324,38 @@ def has_active_loan(sb, schema: str, member_id: int) -> bool:
 # REQUEST NORMALIZATION (keeps old UI code alive)
 # ============================================================
 def _normalize_request_row(r: dict) -> dict:
-    """
-    Normalize NEW loan_requests row to include OLD alias keys:
-      requester_member_id, requester_name, amount, created_at, requester_user_id
-    So older loans_ui.py that still references them won't crash.
-    """
     out = dict(r)
 
-    # NEW -> OLD aliases
     out.setdefault("requester_member_id", out.get("member_id"))
     out.setdefault("requester_name", out.get("member_name"))
     out.setdefault("amount", out.get("requested_amount"))
     out.setdefault("created_at", out.get("requested_at"))
 
-    # requester_user_id no longer exists; provide stable placeholder
     rid = out.get("id")
     out.setdefault("requester_user_id", f"req-{rid}" if rid is not None else str(uuid.uuid4()))
 
-    # surety_name no longer exists in new table
     out.setdefault("surety_name", None)
-
     return out
 
 
 # ============================================================
-# REQUESTS (✅ NEW TABLE SHAPE) — FIXED FOR borrower_id
+# REQUESTS (✅ NEW TABLE SHAPE) — ACCEPTS borrower_id + requester_user_id
 # ============================================================
 def create_loan_request(
     sb,
     schema: str,
     *,
-    # ✅ UI style (this is what your page calls)
+    # A) NEW UI style
     borrower_id: Optional[int] = None,
     surety_id: Optional[int] = None,
     amount: Optional[float] = None,
 
-    # ✅ NEW table style (direct)
+    # B) OLD UI style (your app is now passing requester_user_id)
+    requester_user_id: Optional[str] = None,
+    requester_member_id: Optional[int] = None,
+    requester_name: Optional[str] = None,
+
+    # C) NEW table style
     member_id: Optional[int] = None,
     member_name: Optional[str] = None,
     surety_member_id: Optional[int] = None,
@@ -372,14 +370,25 @@ def create_loan_request(
     """
     Inserts a row into loan_requests (NEW schema).
 
-    Accepts BOTH calling styles:
-      A) create_loan_request(..., borrower_id=, surety_id=, amount=)
-      B) create_loan_request(..., member_id=, member_name=, surety_member_id=, requested_amount=)
+    Supports call styles:
+      - borrower_id, surety_id, amount
+      - requester_user_id, requester_member_id, requester_name, surety_member_id, amount
+      - member_id, member_name, surety_member_id, requested_amount
     """
 
-    b_id = borrower_id if borrower_id is not None else member_id
-    s_id = surety_id if surety_id is not None else surety_member_id
+    # Normalize borrower/surety/amount
+    b_id = borrower_id
+    if b_id is None:
+        b_id = requester_member_id if requester_member_id is not None else member_id
+
+    s_id = surety_id
+    if s_id is None:
+        s_id = surety_member_id
+
     amt = amount if amount is not None else requested_amount
+
+    # Names
+    m_name = member_name if member_name else requester_name
 
     if b_id is None or int(b_id) <= 0:
         raise ValueError("Invalid borrower/member id.")
@@ -388,16 +397,27 @@ def create_loan_request(
     if amt is None or float(amt) <= 0:
         raise ValueError("Amount must be > 0.")
 
+    # Put requester_user_id into notes (since table no longer has it)
+    extra_note = ""
+    if requester_user_id:
+        extra_note = f"[requester_user_id={str(requester_user_id).strip()}]"
+
+    merged_notes = (str(notes).strip() if notes else "")
+    if extra_note:
+        merged_notes = (extra_note + ("\n" + merged_notes if merged_notes else "")).strip()
+    if not merged_notes:
+        merged_notes = None
+
     payload = {
         "member_id": int(b_id),
-        "member_name": (str(member_name).strip() if member_name else None),
+        "member_name": (str(m_name).strip() if m_name else None),
         "requested_amount": float(amt),
         "purpose": (str(purpose).strip() if purpose else None),
         "duration_months": int(duration_months) if duration_months is not None else None,
         "interest_rate": float(interest_rate) if interest_rate is not None else MONTHLY_INTEREST_RATE,
         "status": "pending",
         "requested_at": now_iso(),
-        "notes": (str(notes).strip() if notes else None),
+        "notes": merged_notes,
         "surety_member_id": int(s_id),
     }
 
@@ -1049,7 +1069,6 @@ def list_member_loans(sb, schema: str, member_id: int, limit: int = 200) -> List
 
 
 def list_pending_payments(sb, schema: str, limit: int = 500) -> List[Dict[str, Any]]:
-    """All pending table rows (any status)."""
     try:
         return (
             sb.schema(schema).table(PENDING_PAYMENTS_TABLE)
