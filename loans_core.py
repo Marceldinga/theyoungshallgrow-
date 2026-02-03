@@ -1,12 +1,10 @@
 
-# loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED
+# loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED (NEW loan_requests schema + Maker–Checker + Ledger Interest + compute_dpd)
 # -----------------------------------------------------------------------------
-# ✅ FIXED: create_loan_request now accepts BOTH:
-#    - NEW UI style: borrower_id, surety_id, amount
-#    - NEW table style: member_id, member_name, surety_member_id, requested_amount
-# ✅ loan_requests matches YOUR NEW table (member_id, member_name, requested_amount, surety_member_id, ...)
+# ✅ FIXED: create_loan_request accepts borrower_id / surety_id / amount (so your UI won't crash)
+# ✅ ALSO supports new-table params: member_id, member_name, surety_member_id, requested_amount
+# ✅ loan_requests matches your NEW table (member_id, member_name, requested_amount, surety_member_id, ...)
 # ✅ COMPAT: adds OLD alias keys (requester_member_id, requester_name, amount, created_at, requester_user_id)
-#           so older loans_ui.py won't crash.
 # ✅ Maker–Checker: list_unconfirmed_payments() + confirm/reject pending queue
 # ✅ Interest: writes to interest_ledger (idempotent by unique(loan_id, interest_month))
 # ✅ Loans table: uses loans_legacy as your loan book
@@ -348,21 +346,23 @@ def _normalize_request_row(r: dict) -> dict:
 
 
 # ============================================================
-# REQUESTS (✅ NEW TABLE SHAPE) — COMPATIBLE API
+# REQUESTS (✅ NEW TABLE SHAPE) — FIXED FOR borrower_id
 # ============================================================
 def create_loan_request(
     sb,
     schema: str,
     *,
-    # ✅ NEW UI style (your screenshot error)
+    # ✅ UI style (this is what your page calls)
     borrower_id: Optional[int] = None,
     surety_id: Optional[int] = None,
     amount: Optional[float] = None,
+
     # ✅ NEW table style (direct)
     member_id: Optional[int] = None,
     member_name: Optional[str] = None,
     surety_member_id: Optional[int] = None,
     requested_amount: Optional[float] = None,
+
     # optional extras
     purpose: str | None = None,
     duration_months: int | None = None,
@@ -373,11 +373,10 @@ def create_loan_request(
     Inserts a row into loan_requests (NEW schema).
 
     Accepts BOTH calling styles:
-      A) UI style: create_loan_request(..., borrower_id=, surety_id=, amount=)
-      B) Table style: create_loan_request(..., member_id=, member_name=, surety_member_id=, requested_amount=)
+      A) create_loan_request(..., borrower_id=, surety_id=, amount=)
+      B) create_loan_request(..., member_id=, member_name=, surety_member_id=, requested_amount=)
     """
 
-    # Normalize
     b_id = borrower_id if borrower_id is not None else member_id
     s_id = surety_id if surety_id is not None else surety_member_id
     amt = amount if amount is not None else requested_amount
@@ -413,10 +412,6 @@ def create_loan_request(
 
 
 def list_pending_requests(sb, schema: str, limit: int = 300) -> list[dict]:
-    """
-    ✅ Bulletproof: uses select('*') to avoid missing-column crashes.
-    Returns normalized rows (with alias keys) so old UI code can keep working.
-    """
     try:
         rows = (
             sb.schema(schema)
@@ -431,7 +426,6 @@ def list_pending_requests(sb, schema: str, limit: int = 300) -> list[dict]:
         )
     except Exception:
         rows = []
-
     return [_normalize_request_row(r) for r in (rows or [])]
 
 
@@ -469,7 +463,7 @@ def get_request(sb, schema: str, request_id: int) -> dict:
 
 
 # ============================================================
-# ADMIN APPROVAL / DENY (uses NEW request fields)
+# ADMIN APPROVAL / DENY
 # ============================================================
 def approve_loan_request(sb, schema: str, request_id: int, actor_name: str) -> int:
     req = get_request(sb, schema, request_id)
@@ -550,7 +544,6 @@ def deny_loan_request(sb, schema: str, request_id: int, actor_name: str, reason:
 # MAKER–CHECKER READ HELPERS
 # ============================================================
 def list_unconfirmed_payments(sb, schema: str, limit: int = 500) -> List[Dict[str, Any]]:
-    """Maker–checker queue: pending payments waiting for confirmation."""
     try:
         return (
             sb.schema(schema)
