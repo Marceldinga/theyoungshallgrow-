@@ -11,6 +11,13 @@
 # ✅ Uses views when available:
 #   - v_loans_with_member
 #   - v_loan_payments_with_member
+#
+# ✅ FIXES INCLUDED:
+#   1) Record Payment "Loan not found" bug FIXED:
+#      - Selectbox now stores REAL loan_id (int)
+#      - Label is display-only (format_func)
+#   2) UI text aligned with DB constraint:
+#      - Reject action uses wording "REJECT" (DB status is "rejected")
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -49,7 +56,7 @@ REQUESTS_TABLE = "loan_requests"
 SIGNATURES_TABLE = "signatures"
 INTEREST_LEDGER_TABLE = "interest_ledger"
 
-# Views (you have these)
+# Views (optional)
 V_LOANS_WITH_MEMBER = "v_loans_with_member"
 V_PAYMENTS_WITH_MEMBER = "v_loan_payments_with_member"
 
@@ -207,7 +214,6 @@ def _signature_status(sb, schema: str, request_id: int) -> tuple[pd.DataFrame, l
 
 
 def _upsert_signature(sb, schema: str, request_id: int, role: str, signer_member_id: int, signer_name: str):
-    # ✅ requires loans_core.insert_signature to exist (we fixed that in loans_core)
     core.insert_signature(
         sb, schema,
         entity_type=REQ_ENTITY_TYPE,
@@ -301,13 +307,7 @@ def _render_requests(sb, schema: str, actor: Actor):
         surety_pick = st.selectbox("Surety", labels, key="req_surety")
         amount = st.number_input("Amount", min_value=0.0, step=50.0, value=0.0, key="req_amount")
         purpose = st.text_input("Purpose (optional)", value="", key="req_purpose")
-
-        duration_months = st.number_input(
-            "Duration months (optional)",
-            min_value=0, step=1, value=0,
-            key="req_duration_months"
-        )
-
+        duration_months = st.number_input("Duration months (optional)", min_value=0, step=1, value=0, key="req_duration_months")
         notes = st.text_area("Notes (optional)", value="", key="req_notes")
         ok = st.form_submit_button("Submit request", use_container_width=True)
 
@@ -315,8 +315,6 @@ def _render_requests(sb, schema: str, actor: Actor):
         borrower_id = int(label_to_id[borrower_pick])
         borrower_name = str(label_to_name[borrower_pick]).strip() or f"Member {borrower_id}"
         surety_id = int(label_to_id[surety_pick])
-
-        # ✅ YOUR RULE: allow borrower == surety (no blocking validation)
 
         if float(amount) <= 0:
             st.error("Amount must be > 0.")
@@ -398,11 +396,8 @@ def _render_requests(sb, schema: str, actor: Actor):
     with c1:
         if st.button("✅ APPROVE REQUEST", type="primary", use_container_width=True, key="approve_req_btn"):
             try:
-                try:
-                    loan_id = core.approve_loan_request(sb, schema, request_id=int(req_id), actor_name=str(actor.name or "admin"))
-                except TypeError:
-                    loan_id = core.approve_loan_request(sb, schema, request_id=int(req_id), actor_user_id=str(actor.user_id))
-
+                # New core signature expects actor_name
+                loan_id = core.approve_loan_request(sb, schema, request_id=int(req_id), actor_name=str(actor.name or "admin"))
                 audit(sb, "loan_request_approved", "ok",
                       {"request_id": int(req_id), "loan_id": int(loan_id)},
                       actor_user_id=actor.user_id)
@@ -413,21 +408,18 @@ def _render_requests(sb, schema: str, actor: Actor):
                 st.code(_apierror_message(e), language="text")
 
     with c2:
-        reason = st.text_input("Deny reason", value="Denied", key="deny_reason")
-        if st.button("❌ DENY REQUEST", use_container_width=True, key="deny_req_btn"):
+        reason = st.text_input("Reject reason", value="rejected", key="deny_reason")
+        if st.button("❌ REJECT REQUEST", use_container_width=True, key="deny_req_btn"):
             try:
-                try:
-                    core.deny_loan_request(sb, schema, request_id=int(req_id), actor_name=str(actor.name or "admin"), reason=reason)
-                except TypeError:
-                    core.deny_loan_request(sb, schema, request_id=int(req_id), actor_user_id=str(actor.user_id), reason=reason)
-
-                audit(sb, "loan_request_denied", "ok",
+                # Updated core uses status="rejected" (matches DB CHECK)
+                core.deny_loan_request(sb, schema, request_id=int(req_id), actor_name=str(actor.name or "admin"), reason=reason)
+                audit(sb, "loan_request_rejected", "ok",
                       {"request_id": int(req_id), "reason": reason},
                       actor_user_id=actor.user_id)
-                st.warning("Denied.")
+                st.warning("Rejected.")
                 st.rerun()
             except Exception as e:
-                st.error("Deny failed.")
+                st.error("Reject failed.")
                 st.code(_apierror_message(e), language="text")
 
 
@@ -490,7 +482,7 @@ def _render_delinquency(sb, schema: str, actor: Actor):
 
 
 # ============================================================
-# RECORD PAYMENT (loan_payments)
+# RECORD PAYMENT (loan_payments) ✅ FIXED LOAN ID SELECTION
 # ============================================================
 def _render_record_payment(sb, schema: str, actor: Actor):
     require(actor.role, "record_payment")
@@ -524,11 +516,26 @@ def _render_record_payment(sb, schema: str, actor: Actor):
         pc = _num(r.get("principal_current") or r.get("principal"))
         ui = _num(r.get("unpaid_interest") or r.get("accrued_interest"))
         who = r.get("member_display_name") or r.get("member_name") or f"Member {r.get('member_id')}"
-        return f"Loan {int(r['id'])} • {who} • {str(r.get('status') or '')} • Principal {pc:,.0f} • Interest {ui:,.0f} • Due {due:,.0f}"
+        lid = int(_num(r.get("id")))
+        return f"Loan {lid} • {who} • {str(r.get('status') or '')} • Principal {pc:,.0f} • Interest {ui:,.0f} • Due {due:,.0f}"
 
+    # ✅ Critical: store REAL loan_id as integer (prevents "Loan not found")
+    df["loan_id"] = pd.to_numeric(df.get("id"), errors="coerce")
+    df = df[df["loan_id"].notna()].copy()
+    df["loan_id"] = df["loan_id"].astype(int)
     df["label"] = df.apply(_lbl, axis=1)
-    pick = st.selectbox("Select loan", df["label"].tolist(), key="pay_pick_loan")
-    loan_id = int(df[df["label"] == pick].iloc[0]["id"])
+
+    if df.empty:
+        st.warning("No valid loan IDs available.")
+        return
+
+    pick_id = st.selectbox(
+        "Select loan",
+        options=df["loan_id"].tolist(),
+        format_func=lambda x: df.loc[df["loan_id"] == x, "label"].iloc[0],
+        key="pay_pick_loan_id",
+    )
+    loan_id = int(pick_id)
 
     amount = st.number_input("Amount", min_value=0.0, step=50.0, value=0.0, key="pay_amt")
     paid_on = st.date_input("Paid date", value=date.today(), key="pay_date")
@@ -633,10 +640,7 @@ def _render_confirm_payments(sb, schema: str, actor: Actor):
 
     if st.button("✅ Confirm selected payment", type="primary", use_container_width=True, key="confirm_payment_btn"):
         try:
-            try:
-                core.confirm_payment(sb, schema, pending_id=int(pick), confirmer_user_id=str(actor.user_id))
-            except TypeError:
-                core.confirm_payment(sb, schema, payment_id=int(pick), actor_user_id=str(actor.user_id))
+            core.confirm_payment(sb, schema, pending_id=int(pick), confirmer_user_id=str(actor.user_id))
             audit(sb, "loan_payment_confirmed", "ok", {"payment_id": int(pick)}, actor_user_id=actor.user_id)
             st.success("Payment confirmed.")
             st.rerun()
