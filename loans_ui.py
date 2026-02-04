@@ -1,23 +1,20 @@
 
 # loans_ui.py ✅ COMPLETE UPDATED SINGLE FILE — NEW STANDARD (NO LEGACY)
 # -----------------------------------------------------------------------------
-# ✅ NO legacy tables used
-# ✅ MATCHES loan_requests schema:
-#   id, member_id, member_name, requested_amount, purpose, duration_months, interest_rate, status,
-#   requested_at, reviewed_at, approved_at, reviewed_by, notes, surety_member_id, requester_user_id
+# ✅ FIXES INCLUDED (for your current issues):
+#   1) ✅ Record Payment "Loan not found" FIXED PERMANENTLY:
+#      - The payment dropdown is built ONLY from public.loans (real IDs)
+#      - v_loans_with_member is used ONLY for display name enrichment (never for IDs)
 #
-# ✅ DOES NOT REQUIRE phone number anywhere (members can have no phone column)
-# ✅ ALLOWS borrower_id == surety_id (per your rule)
-# ✅ Uses views when available:
-#   - v_loans_with_member
-#   - v_loan_payments_with_member
+#   2) ✅ Reject wording aligned with DB constraint (status allowed: pending/approved/rejected/cancelled)
+#      - Button says REJECT, default reason "rejected"
 #
-# ✅ FIXES INCLUDED:
-#   1) Record Payment "Loan not found" bug FIXED:
-#      - Selectbox now stores REAL loan_id (int)
-#      - Label is display-only (format_func)
-#   2) UI text aligned with DB constraint:
-#      - Reject action uses wording "REJECT" (DB status is "rejected")
+# ✅ DOES NOT REQUIRE phone number anywhere
+# ✅ ALLOWS borrower == surety (your rule)
+# ✅ Uses entity_type="loan_request" for signatures
+# ✅ Uses views when available for display:
+#    - v_loans_with_member
+#    - v_loan_payments_with_member
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -25,12 +22,12 @@ from __future__ import annotations
 from datetime import date, datetime
 from uuid import uuid4, UUID
 
-import streamlit as st
 import pandas as pd
+import streamlit as st
 from postgrest.exceptions import APIError
 
-from rbac import Actor, require, allowed_sections, ROLE_ADMIN, ROLE_TREASURY, ROLE_MEMBER
 import loans_core as core
+from rbac import Actor, require, allowed_sections, ROLE_ADMIN, ROLE_TREASURY, ROLE_MEMBER
 
 # Optional PDFs
 try:
@@ -145,10 +142,7 @@ def _table_exists(sb, schema: str, table_name: str) -> bool:
 
 
 def _read_members(sb, schema: str) -> pd.DataFrame:
-    """
-    ✅ No phone required.
-    members expected columns: id, name, display_name (phone optional/ignored)
-    """
+    """members expected columns: id, name, display_name (phone optional/ignored)"""
     preferred = ["id", "name", "display_name"]
     try:
         rows = (
@@ -396,7 +390,6 @@ def _render_requests(sb, schema: str, actor: Actor):
     with c1:
         if st.button("✅ APPROVE REQUEST", type="primary", use_container_width=True, key="approve_req_btn"):
             try:
-                # New core signature expects actor_name
                 loan_id = core.approve_loan_request(sb, schema, request_id=int(req_id), actor_name=str(actor.name or "admin"))
                 audit(sb, "loan_request_approved", "ok",
                       {"request_id": int(req_id), "loan_id": int(loan_id)},
@@ -411,7 +404,6 @@ def _render_requests(sb, schema: str, actor: Actor):
         reason = st.text_input("Reject reason", value="rejected", key="deny_reason")
         if st.button("❌ REJECT REQUEST", use_container_width=True, key="deny_req_btn"):
             try:
-                # Updated core uses status="rejected" (matches DB CHECK)
                 core.deny_loan_request(sb, schema, request_id=int(req_id), actor_name=str(actor.name or "admin"), reason=reason)
                 audit(sb, "loan_request_rejected", "ok",
                       {"request_id": int(req_id), "reason": reason},
@@ -482,57 +474,73 @@ def _render_delinquency(sb, schema: str, actor: Actor):
 
 
 # ============================================================
-# RECORD PAYMENT (loan_payments) ✅ FIXED LOAN ID SELECTION
+# RECORD PAYMENT (loan_payments) ✅ GUARANTEED REAL LOAN IDs
 # ============================================================
 def _render_record_payment(sb, schema: str, actor: Actor):
     require(actor.role, "record_payment")
     st.subheader("Record Payment")
 
-    table = V_LOANS_WITH_MEMBER if _table_exists(sb, schema, V_LOANS_WITH_MEMBER) else LOANS_TABLE
+    # ✅ Always load from the REAL loans table for IDs
     try:
         loans = (
-            sb.schema(schema).table(table)
-            .select("*")
-            .order("id", desc=True)
-            .limit(2000)
-            .execute().data or []
-        )
-    except Exception:
-        loans = (
             sb.schema(schema).table(LOANS_TABLE)
-            .select("*")
+            .select("id,member_id,status,principal,principal_current,unpaid_interest,accrued_interest,total_due")
             .order("id", desc=True)
-            .limit(2000)
+            .limit(5000)
             .execute().data or []
         )
+    except Exception as e:
+        st.error("Failed to load loans table.")
+        st.code(_apierror_message(e), language="text")
+        return
 
     df = pd.DataFrame(loans)
     if df.empty:
         st.warning("No loans found.")
         return
 
+    # Optional: enrich labels with member name from view (never trust view ids)
+    name_map: dict[int, str] = {}
+    if _table_exists(sb, schema, V_LOANS_WITH_MEMBER):
+        try:
+            vrows = (
+                sb.schema(schema).table(V_LOANS_WITH_MEMBER)
+                .select("*")
+                .limit(5000)
+                .execute().data or []
+            )
+            vdf = pd.DataFrame(vrows)
+            if not vdf.empty and "member_id" in vdf.columns:
+                best_col = None
+                for col in ("member_display_name", "member_name", "display_name", "name"):
+                    if col in vdf.columns:
+                        best_col = col
+                        break
+                if best_col:
+                    vdf["member_id"] = pd.to_numeric(vdf["member_id"], errors="coerce").fillna(0).astype(int)
+                    vdf["best_name"] = vdf[best_col].astype(str).replace({"None": "", "nan": ""})
+                    tmp = vdf[["member_id", "best_name"]].dropna()
+                    name_map = dict(zip(tmp["member_id"].tolist(), tmp["best_name"].tolist()))
+        except Exception:
+            name_map = {}
+
     def _lbl(r):
         due = _num(r.get("total_due"))
         pc = _num(r.get("principal_current") or r.get("principal"))
         ui = _num(r.get("unpaid_interest") or r.get("accrued_interest"))
-        who = r.get("member_display_name") or r.get("member_name") or f"Member {r.get('member_id')}"
-        lid = int(_num(r.get("id")))
-        return f"Loan {lid} • {who} • {str(r.get('status') or '')} • Principal {pc:,.0f} • Interest {ui:,.0f} • Due {due:,.0f}"
+        mid = int(_num(r.get("member_id")))
+        who = (name_map.get(mid) or f"Member {mid}").strip()
+        return f"Loan {int(r['id'])} • {who} • {str(r.get('status') or '')} • Principal {pc:,.0f} • Interest {ui:,.0f} • Due {due:,.0f}"
 
-    # ✅ Critical: store REAL loan_id as integer (prevents "Loan not found")
-    df["loan_id"] = pd.to_numeric(df.get("id"), errors="coerce")
-    df = df[df["loan_id"].notna()].copy()
-    df["loan_id"] = df["loan_id"].astype(int)
+    df["id"] = pd.to_numeric(df.get("id"), errors="coerce")
+    df = df[df["id"].notna()].copy()
+    df["id"] = df["id"].astype(int)
     df["label"] = df.apply(_lbl, axis=1)
-
-    if df.empty:
-        st.warning("No valid loan IDs available.")
-        return
 
     pick_id = st.selectbox(
         "Select loan",
-        options=df["loan_id"].tolist(),
-        format_func=lambda x: df.loc[df["loan_id"] == x, "label"].iloc[0],
+        options=df["id"].tolist(),
+        format_func=lambda x: df.loc[df["id"] == x, "label"].iloc[0],
         key="pay_pick_loan_id",
     )
     loan_id = int(pick_id)
@@ -630,10 +638,6 @@ def _render_confirm_payments(sb, schema: str, actor: Actor):
         return
 
     st.dataframe(df, use_container_width=True, hide_index=True)
-
-    if not hasattr(core, "confirm_payment"):
-        st.info("core.confirm_payment(...) not found.")
-        return
 
     ids = [int(x) for x in df["id"].tolist() if str(x).isdigit()]
     pick = st.selectbox("Select payment ID to confirm", ids, key="confirm_pick_payment_id")
@@ -765,7 +769,7 @@ def _render_statements(sb, schema: str, actor: Actor):
         "member_id": int(member_id),
         "name": str(m.get("name") or ""),
         "display_name": str(m.get("display_name") or ""),
-        "phone": "",  # ✅ ALWAYS BLANK (no phone in DB)
+        "phone": "",
     }
 
     loans = core.list_member_loans(sb, schema, member_id=int(member_id), limit=2000)
