@@ -1,77 +1,119 @@
 
-# loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED — MATCHES YOUR REAL SCHEMA (NO LEGACY)
+# loans_ui.py ✅ COMPLETE UPDATED SINGLE FILE — NEW STANDARD (NO LEGACY)
 # -----------------------------------------------------------------------------
-# ✅ CONFIRMED loans columns (from your screenshots):
-#   id, member_id, session_id, status, principal, principal_current,
-#   unpaid_interest, total_interest_generated, interest_rate_monthly,
-#   total_due (GENERATED), borrow_date, due_cycle_days, last_paid_at,
-#   created_at, updated_at, surety_member_id
-#
-# ✅ IMPORTANT DB RULES (handled here):
-#   - total_due is a GENERATED column → ❌ NEVER insert/update it (Fixes 428C9)
-#   - loan_payments has NO note column → ❌ NEVER insert note (Fixes PGRST204)
-#   - loans has NO accrued_interest → ❌ NEVER reference it (Fixes 42703)
-#
-# ✅ Business Rules:
-#   - loan_requests.status allowed: pending, approved, rejected, cancelled
-#     → deny_loan_request uses "rejected"
-#   - Borrower can be same as surety (self-surety allowed)
-#   - Capacity rule:
-#       cap = contrib_total + 0.70*foundation_total
-#       cap_total = cap_b + cap_s (self-surety counts once)
-#
-# ✅ Required by loans_ui.py:
-#   - create_loan_request, list_pending_requests, approve_loan_request, deny_loan_request
-#   - insert_signature
-#   - record_payment
-#   - list_unconfirmed_payments, confirm_payment, reject_payment
-#   - accrue_monthly_interest
-#   - delinquency_table, list_member_loans
+# ✅ FIXES INCLUDED:
+#   1) ✅ Removes ALL accrued_interest references (your loans table has NO accrued_interest)
+#   2) ✅ Record Payment uses ONLY real loans.id (from public.loans)
+#   3) ✅ v_loans_with_member used only for name enrichment (never for IDs)
+#   4) ✅ Reject wording aligned with DB constraint (pending/approved/rejected/cancelled)
+#   5) ✅ No phone required anywhere
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
-from typing import Optional, List, Dict, Any, Tuple
-import uuid
+from datetime import date, datetime
+from uuid import uuid4, UUID
 
 import pandas as pd
+import streamlit as st
 from postgrest.exceptions import APIError
 
-MONTHLY_INTEREST_RATE = 0.05
-CAP_MULT = 0.70
+import loans_core as core
+from rbac import Actor, require, allowed_sections, ROLE_ADMIN, ROLE_TREASURY, ROLE_MEMBER
 
-# ------------------------------------------------------------
-# Tables (✅ MUST MATCH YOUR DB)
-# ------------------------------------------------------------
+# Optional PDFs
+try:
+    from pdfs import make_member_loan_statement_pdf
+except Exception:
+    make_member_loan_statement_pdf = None
+
+# Optional audit (safe)
+try:
+    from audit import audit
+except Exception:
+    def audit(*args, **kwargs):
+        return None
+
+
+# ============================================================
+# TABLES (✅ NEW STANDARD ONLY)
+# ============================================================
+MEMBERS_TABLE = "members"
 LOANS_TABLE = "loans"
 PAYMENTS_TABLE = "loan_payments"
-PENDING_PAYMENTS_TABLE = "loan_repayments_pending"
 REQUESTS_TABLE = "loan_requests"
-INTEREST_LEDGER_TABLE = "interest_ledger"
 SIGNATURES_TABLE = "signatures"
-MEMBERS_TABLE = "members"
+INTEREST_LEDGER_TABLE = "interest_ledger"
 
-REPAY_LINK_COL = "loan_id"
-REPAY_DATE_COL = "paid_at"
+# Views (optional)
+V_LOANS_WITH_MEMBER = "v_loans_with_member"
+V_PAYMENTS_WITH_MEMBER = "v_loan_payments_with_member"
 
-REQUEST_ENTITY_TYPE = "loan_request"
+# Signatures
+REQ_ENTITY_TYPE = "loan_request"
 REQ_SIG_REQUIRED = ["borrower", "surety", "treasury"]
 
-MEMBER_NAME_TABLES = ["members", "member_registry", "members_legacy"]
-
 
 # ============================================================
-# TIME + DB HELPERS
+# HELPERS
 # ============================================================
-def now_iso() -> str:
-    """UTC ISO string with Z suffix."""
-    return (
-        datetime.now(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
+def _apierror_message(e: Exception) -> str:
+    if isinstance(e, APIError):
+        payload = e.args[0] if getattr(e, "args", None) else {}
+        if isinstance(payload, dict):
+            return str(payload.get("message") or payload.get("details") or payload.get("hint") or "APIError")
+        return str(e)
+    return str(e)
+
+
+def _is_uuid(s: str) -> bool:
+    try:
+        UUID(str(s))
+        return True
+    except Exception:
+        return False
+
+
+def _get_or_make_session_uuid(key: str = "actor_user_uuid") -> str:
+    v = str(st.session_state.get(key) or "").strip()
+    if not v or not _is_uuid(v):
+        st.session_state[key] = str(uuid4())
+    return str(st.session_state[key])
+
+
+def _actor_from_session(default_user_id: str) -> Actor:
+    with st.sidebar.expander("🔐 Role (temporary)", expanded=False):
+        role = st.selectbox("Role", [ROLE_ADMIN, ROLE_TREASURY, ROLE_MEMBER], index=0, key="actor_role")
+        member_id = st.number_input(
+            "Member ID (if member/treasury)",
+            min_value=0, step=1, value=int(st.session_state.get("actor_member_id") or 0),
+            key="actor_member_id",
+        )
+        name = st.text_input(
+            "Name",
+            value=str(st.session_state.get("actor_name") or ("admin" if role != ROLE_MEMBER else "member")),
+            key="actor_name",
+        )
+
+    user_uuid = default_user_id if (default_user_id and _is_uuid(default_user_id)) else _get_or_make_session_uuid()
+
+    return Actor(
+        user_id=user_uuid,
+        role=role,
+        member_id=(int(member_id) if int(member_id) > 0 else None),
+        name=(name.strip() or None),
     )
+
+
+def _to_iso(d: date) -> str:
+    return datetime.combine(d, datetime.min.time()).isoformat()
+
+
+def _num(x) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
 
 
 def _month_key(d: date | None = None) -> str:
@@ -79,776 +121,744 @@ def _month_key(d: date | None = None) -> str:
     return f"{d.year:04d}-{d.month:02d}"
 
 
-def _to_date(x) -> date | None:
+def _safe_df(rows: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame(rows or [])
+
+
+def _table_exists(sb, schema: str, table_name: str) -> bool:
     try:
-        return date.fromisoformat(str(x)[:10])
+        sb.schema(schema).table(table_name).select("*").limit(1).execute()
+        return True
     except Exception:
-        return None
+        return False
 
 
-def fetch_one(query) -> dict | None:
-    try:
-        r = query.limit(1).execute()
-        rows = getattr(r, "data", None) or []
-        return rows[0] if rows else None
-    except Exception:
-        return None
-
-
-# ============================================================
-# SAFE COLUMN FILTERING
-# ============================================================
-def _get_table_columns(sb, schema: str, table: str) -> set[str]:
-    """Infer columns from one row; returns empty set if table is empty/unreadable."""
+def _read_members(sb, schema: str) -> pd.DataFrame:
+    """members expected columns: id, name, display_name (phone optional/ignored)"""
+    preferred = ["id", "name", "display_name"]
     try:
         rows = (
-            sb.schema(schema).table(table)
-            .select("*")
-            .limit(1)
+            sb.schema(schema).table(MEMBERS_TABLE)
+            .select(",".join(preferred))
+            .order("id", desc=False)
+            .limit(5000)
             .execute().data or []
         )
-        if not rows:
-            return set()
-        return set(rows[0].keys())
     except Exception:
-        return set()
+        rows = (
+            sb.schema(schema).table(MEMBERS_TABLE)
+            .select("*")
+            .order("id", desc=False)
+            .limit(5000)
+            .execute().data or []
+        )
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["id", "name", "display_name", "best_name", "label"])
+
+    df["id"] = pd.to_numeric(df.get("id"), errors="coerce").fillna(0).astype(int)
+
+    if "name" not in df.columns:
+        df["name"] = ""
+    if "display_name" not in df.columns:
+        df["display_name"] = ""
+
+    df["name"] = df["name"].astype(str).replace({"None": "", "nan": ""})
+    df["display_name"] = df["display_name"].astype(str).replace({"None": "", "nan": ""})
+
+    df["best_name"] = df.apply(
+        lambda r: (r["display_name"] or r["name"] or f"Member {int(r['id'])}").strip(),
+        axis=1,
+    )
+    df["label"] = df.apply(lambda r: f"{int(r['id']):02d} • {r['best_name']}", axis=1)
+    return df
 
 
-def filter_payload_to_existing_columns(sb, schema: str, table: str, payload: dict) -> dict:
-    cols = _get_table_columns(sb, schema, table)
-    if not cols:
-        return payload
-    return {k: v for k, v in payload.items() if k in cols}
-
-
-# ============================================================
-# SIGNATURES
-# ============================================================
-def sig_df(sb, schema: str, entity_type: str, entity_id: int) -> pd.DataFrame:
+def _signature_status(sb, schema: str, request_id: int) -> tuple[pd.DataFrame, list[str]]:
     try:
         rows = (
             sb.schema(schema).table(SIGNATURES_TABLE)
             .select("entity_type,entity_id,role,signer_member_id,signer_name,signed_at")
-            .eq("entity_type", str(entity_type))
-            .eq("entity_id", int(entity_id))
+            .eq("entity_type", REQ_ENTITY_TYPE)
+            .eq("entity_id", int(request_id))
             .order("signed_at", desc=False)
             .limit(1000)
             .execute().data or []
         )
     except Exception:
         rows = []
-    return pd.DataFrame(rows or [])
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["role", "signer_member_id", "signer_name", "signed_at"]), REQ_SIG_REQUIRED
+
+    roles = df["role"].astype(str).str.lower().str.strip()
+    ok = set(roles[pd.to_numeric(df["signer_member_id"], errors="coerce").notna()].tolist())
+    missing = [r for r in REQ_SIG_REQUIRED if r.lower() not in ok]
+    return df, missing
 
 
-def missing_roles(df: pd.DataFrame, required_roles: List[str]) -> List[str]:
-    if df is None or df.empty or "role" not in df.columns:
-        return list(required_roles)
+def _upsert_signature(sb, schema: str, request_id: int, role: str, signer_member_id: int, signer_name: str):
+    core.insert_signature(
+        sb, schema,
+        entity_type=REQ_ENTITY_TYPE,
+        entity_id=int(request_id),
+        role=str(role).strip().lower(),
+        signer_member_id=int(signer_member_id),
+        signer_name=str(signer_name or "").strip(),
+    )
 
-    role_series = df["role"].astype(str).str.lower().str.strip()
-    signer_ok = pd.to_numeric(df.get("signer_member_id"), errors="coerce").notna()
-    present = set(role_series[signer_ok].tolist())
-    return [r for r in required_roles if str(r).lower().strip() not in present]
+
+# ============================================================
+# SECTION NORMALIZATION
+# ============================================================
+_SECTION_CANON: dict[str, str] = {
+    "Loan Statement": "Statements",
+    "Statements": "Statements",
+    "Statement": "Statements",
+    "Confirm Payment": "Confirm Payments",
+    "Confirm Payments": "Confirm Payments",
+    "Direct Payment": "Direct Payment",
+    "Delinquency": "Delinquency",
+    "Requests": "Requests",
+    "Ledger": "Ledger",
+    "Record Payment": "Record Payment",
+    "Interest": "Interest",
+}
+
+def _canon_section(section: str) -> str:
+    s = (section or "").strip()
+    return _SECTION_CANON.get(s, s)
 
 
-def insert_signature(
-    sb,
-    schema: str,
-    *,
-    entity_type: str,
-    entity_id: int,
-    role: str,
-    signer_member_id: int,
-    signer_name: str,
-) -> bool:
-    et = str(entity_type).strip()
-    eid = int(entity_id)
-    r = str(role).strip().lower()
-    smid = int(signer_member_id)
-    sname = str(signer_name or "").strip()
-
-    if not et:
-        raise ValueError("entity_type is required.")
-    if eid <= 0:
-        raise ValueError("entity_id must be > 0.")
-    if not r:
-        raise ValueError("role is required.")
-    if smid <= 0:
-        raise ValueError("signer_member_id must be > 0.")
-
-    payload = {
-        "entity_type": et,
-        "entity_id": eid,
-        "role": r,
-        "signer_member_id": smid,
-        "signer_name": (sname or f"Member {smid}"),
-        "signed_at": now_iso(),
-    }
-    payload = filter_payload_to_existing_columns(sb, schema, SIGNATURES_TABLE, payload)
-
-    # try upsert
+# ============================================================
+# KPIs
+# ============================================================
+def _render_kpis(sb, schema: str):
     try:
-        sb.schema(schema).table(SIGNATURES_TABLE).upsert(
-            payload,
-            on_conflict="entity_type,entity_id,role"
-        ).execute()
-        return True
+        loans = (
+            sb.schema(schema).table(LOANS_TABLE)
+            .select("id,status,total_due,principal_current,principal,unpaid_interest")
+            .limit(20000).execute().data or []
+        )
     except Exception:
-        pass
+        loans = []
 
-    # fallback delete+insert
-    try:
-        sb.schema(schema).table(SIGNATURES_TABLE).delete() \
-            .eq("entity_type", et).eq("entity_id", eid).eq("role", r).execute()
-    except Exception:
-        pass
+    df = pd.DataFrame(loans)
+    if df.empty:
+        active_count = 0
+        active_due = 0.0
+        active_principal_current = 0.0
+    else:
+        df["status"] = df["status"].astype(str).str.lower().str.strip()
+        df["total_due"] = pd.to_numeric(df.get("total_due"), errors="coerce").fillna(0.0)
+        pc = pd.to_numeric(df.get("principal_current"), errors="coerce")
+        p = pd.to_numeric(df.get("principal"), errors="coerce")
+        df["principal_current_eff"] = pc.fillna(p).fillna(0.0)
 
-    sb.schema(schema).table(SIGNATURES_TABLE).insert(payload).execute()
-    return True
+        active = df[df["status"].isin(["open", "active"])]
+        active_count = len(active)
+        active_due = float(active["total_due"].sum())
+        active_principal_current = float(active["principal_current_eff"].sum())
 
-
-# ============================================================
-# MEMBER NAME LOOKUP
-# ============================================================
-def _pick_first_key(row: dict, keys: List[str]) -> Optional[str]:
-    for k in keys:
-        v = row.get(k)
-        if v is None:
-            continue
-        s = str(v).strip()
-        if s:
-            return s
-    return None
-
-
-def _lookup_member_name(sb, schema: str, member_id: int) -> Optional[str]:
-    mid = int(member_id)
-    if mid <= 0:
-        return None
-
-    name_cols_priority = ["member_name", "full_name", "name", "display_name", "first_name", "last_name"]
-
-    for table in MEMBER_NAME_TABLES:
-        cols = _get_table_columns(sb, schema, table)
-        if not cols:
-            continue
-
-        id_col = "member_id" if "member_id" in cols else ("id" if "id" in cols else None)
-        if not id_col:
-            continue
-
-        select_cols = [c for c in name_cols_priority if c in cols]
-        if not select_cols:
-            continue
-
-        try:
-            row = fetch_one(
-                sb.schema(schema).table(table)
-                .select(",".join([id_col] + select_cols))
-                .eq(id_col, mid)
-            )
-            if not row:
-                continue
-
-            if "first_name" in row and "last_name" in row:
-                fn = str(row.get("first_name") or "").strip()
-                ln = str(row.get("last_name") or "").strip()
-                full = (fn + " " + ln).strip()
-                if full:
-                    return full
-
-            nm = _pick_first_key(row, select_cols)
-            if nm:
-                return nm
-        except Exception:
-            continue
-
-    return None
-
-
-def _ensure_member_name(sb, schema: str, member_id: int, member_name: Optional[str]) -> str:
-    if member_name and str(member_name).strip():
-        return str(member_name).strip()
-    looked = _lookup_member_name(sb, schema, member_id)
-    if looked:
-        return looked
-    return f"Member {int(member_id)}"
-
-
-# ============================================================
-# REQUEST NORMALIZATION
-# ============================================================
-def _normalize_request_row(r: dict) -> dict:
-    out = dict(r)
-    out.setdefault("requester_member_id", out.get("member_id"))
-    out.setdefault("requester_name", out.get("member_name"))
-    out.setdefault("amount", out.get("requested_amount"))
-    out.setdefault("created_at", out.get("requested_at"))
-    rid = out.get("id")
-    out.setdefault("requester_user_id", f"req-{rid}" if rid is not None else str(uuid.uuid4()))
-    out.setdefault("surety_name", None)
-    return out
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Active loans", str(active_count))
+    k2.metric("Principal current (active)", f"{active_principal_current:,.0f}")
+    k3.metric("Total due (active)", f"{active_due:,.0f}")
+    k4.metric("Cycle / Rate", "28 days • 5%")
+    st.divider()
 
 
 # ============================================================
 # REQUESTS
 # ============================================================
-def create_loan_request(
-    sb,
-    schema: str,
-    *,
-    borrower_id: Optional[int] = None,
-    surety_id: Optional[int] = None,
-    amount: Optional[float] = None,
-    requester_user_id: Optional[str] = None,
-    requester_member_id: Optional[int] = None,
-    requester_name: Optional[str] = None,
-    member_id: Optional[int] = None,
-    member_name: Optional[str] = None,
-    surety_member_id: Optional[int] = None,
-    requested_amount: Optional[float] = None,
-    purpose: str | None = None,
-    duration_months: int | None = None,
-    interest_rate: float | None = None,
-    notes: str | None = None,
-) -> int:
-    b_id = borrower_id if borrower_id is not None else (requester_member_id if requester_member_id is not None else member_id)
-    s_id = surety_id if surety_id is not None else surety_member_id
-    amt = amount if amount is not None else requested_amount
+def _render_requests(sb, schema: str, actor: Actor):
+    require(actor.role, "submit_request")
+    st.subheader("Requests")
+    st.caption("Member submits request. Admin approves only after required signatures.")
 
-    if b_id is None or int(b_id) <= 0:
-        raise ValueError("Invalid borrower/member id.")
-    if s_id is None or int(s_id) <= 0:
-        raise ValueError("Invalid surety id.")
-    if amt is None or float(amt) <= 0:
-        raise ValueError("Amount must be > 0.")
+    dfm = _read_members(sb, schema)
+    if dfm.empty:
+        st.warning("No members found in members.")
+        return
 
-    resolved_name = _ensure_member_name(sb, schema, int(b_id), member_name or requester_name)
+    labels = dfm["label"].tolist()
+    label_to_id = dict(zip(dfm["label"], dfm["id"]))
+    label_to_name = dict(zip(dfm["label"], dfm["best_name"]))
 
-    merged_notes = (str(notes).strip() if notes else "")
-    if requester_user_id:
-        tag = f"[requester_user_id={str(requester_user_id).strip()}]"
-        merged_notes = (tag + ("\n" + merged_notes if merged_notes else "")).strip()
-    if not merged_notes:
-        merged_notes = None
+    st.markdown("### Create a loan request")
+    with st.form("loan_request_create", clear_on_submit=True):
+        borrower_pick = st.selectbox("Borrower", labels, key="req_borrower")
+        surety_pick = st.selectbox("Surety", labels, key="req_surety")
+        amount = st.number_input("Amount", min_value=0.0, step=50.0, value=0.0, key="req_amount")
+        purpose = st.text_input("Purpose (optional)", value="", key="req_purpose")
+        duration_months = st.number_input("Duration months (optional)", min_value=0, step=1, value=0, key="req_duration_months")
+        notes = st.text_area("Notes (optional)", value="", key="req_notes")
+        ok = st.form_submit_button("Submit request", use_container_width=True)
 
-    payload = {
-        "member_id": int(b_id),
-        "member_name": resolved_name,
-        "requested_amount": float(amt),
-        "purpose": (str(purpose).strip() if purpose else None),
-        "duration_months": int(duration_months) if duration_months is not None else None,
-        "interest_rate": float(interest_rate) if interest_rate is not None else MONTHLY_INTEREST_RATE,
-        "status": "pending",
-        "requested_at": now_iso(),
-        "notes": merged_notes,
-        "surety_member_id": int(s_id),
-        "requester_user_id": (str(requester_user_id).strip() if requester_user_id else None),
-    }
-    payload = {k: v for k, v in payload.items() if v is not None}
-    payload = filter_payload_to_existing_columns(sb, schema, REQUESTS_TABLE, payload)
+    if ok:
+        borrower_id = int(label_to_id[borrower_pick])
+        borrower_name = str(label_to_name[borrower_pick]).strip() or f"Member {borrower_id}"
+        surety_id = int(label_to_id[surety_pick])
 
-    res = sb.schema(schema).table(REQUESTS_TABLE).insert(payload).execute()
-    row = (res.data or [None])[0]
-    if not row or "id" not in row:
-        raise RuntimeError("Loan request insert failed.")
-    return int(row["id"])
-
-
-def list_pending_requests(sb, schema: str, limit: int = 300) -> list[dict]:
-    try:
-        rows = (
-            sb.schema(schema).table(REQUESTS_TABLE)
-            .select("*")
-            .eq("status", "pending")
-            .order("requested_at", desc=True)
-            .limit(int(limit))
-            .execute().data or []
-        )
-    except Exception:
-        rows = []
-    return [_normalize_request_row(r) for r in (rows or [])]
-
-
-def get_request(sb, schema: str, request_id: int) -> dict:
-    rows = (
-        sb.schema(schema).table(REQUESTS_TABLE)
-        .select("*")
-        .eq("id", int(request_id))
-        .limit(1)
-        .execute().data or []
-    )
-    if not rows:
-        raise RuntimeError("Request not found.")
-    return _normalize_request_row(rows[0])
-
-
-# ============================================================
-# GOVERNANCE + APPROVAL
-# ============================================================
-def _get_totals_row(sb, schema: str, member_id: int) -> dict:
-    rows = (
-        sb.schema(schema)
-        .table("member_contribution_totals")
-        .select("member_id,contrib_total,foundation_total,total_contributed")
-        .eq("member_id", int(member_id))
-        .limit(1)
-        .execute().data or []
-    )
-    if rows:
-        r = rows[0]
-        r.setdefault("member_id", int(member_id))
-        r.setdefault("contrib_total", 0)
-        r.setdefault("foundation_total", 0)
-        if "total_contributed" not in r or r.get("total_contributed") is None:
-            r["total_contributed"] = float(r.get("contrib_total") or 0) + float(r.get("foundation_total") or 0)
-        return r
-    return {"member_id": int(member_id), "contrib_total": 0, "foundation_total": 0, "total_contributed": 0}
-
-
-def _capacity_from_row(r: dict) -> float:
-    contrib = float(r.get("contrib_total") or 0)
-    foundation = float(r.get("foundation_total") or 0)
-    return contrib + CAP_MULT * foundation
-
-
-def check_loan_qualification(sb, schema: str, borrower_id: int, surety_id: int, amount: float) -> dict:
-    borrower = _get_totals_row(sb, schema, borrower_id)
-    cap_b = _capacity_from_row(borrower)
-
-    self_surety = int(borrower_id) == int(surety_id)
-    if self_surety:
-        cap_total = cap_b
-        cap_s = None
-    else:
-        surety = _get_totals_row(sb, schema, surety_id)
-        cap_s = _capacity_from_row(surety)
-        cap_total = cap_b + cap_s
-
-    ok = float(amount) <= float(cap_total)
-
-    return {
-        "ok": ok,
-        "amount": float(amount),
-        "self_surety": self_surety,
-        "cap_borrower": cap_b,
-        "cap_surety": cap_s,
-        "cap_total": cap_total,
-        "rule": "cap = contrib_total + 0.70*foundation_total; cap_total = cap_b + cap_s (self-surety counts once)",
-    }
-
-
-def has_active_loan(sb, schema: str, member_id: int) -> bool:
-    rows = (
-        sb.schema(schema).table(LOANS_TABLE)
-        .select("status,member_id")
-        .eq("member_id", int(member_id))
-        .limit(20000)
-        .execute().data or []
-    )
-    return any(str(r.get("status") or "").lower().strip() in ("active", "open") for r in rows)
-
-
-def approve_loan_request(sb, schema: str, request_id: int, actor_name: str) -> int:
-    req = get_request(sb, schema, request_id)
-    if str(req.get("status") or "").lower().strip() != "pending":
-        raise ValueError("Only pending requests can be approved.")
-
-    df_sig = sig_df(sb, schema, REQUEST_ENTITY_TYPE, int(request_id))
-    miss = missing_roles(df_sig, REQ_SIG_REQUIRED)
-    if miss:
-        raise ValueError("Approval blocked. Missing/invalid signatures: " + ", ".join(miss))
-
-    borrower_id = int(req.get("member_id") or 0)
-    surety_id = int(req.get("surety_member_id") or 0)
-    amount = float(req.get("requested_amount") or 0)
-
-    if borrower_id <= 0 or surety_id <= 0 or amount <= 0:
-        raise ValueError("Invalid request data.")
-
-    if has_active_loan(sb, schema, borrower_id):
-        raise ValueError("Approval blocked: borrower already has an active/open loan.")
-
-    cap = check_loan_qualification(sb, schema, borrower_id, surety_id, amount)
-    if not cap["ok"]:
-        raise ValueError(
-            f"Loan rejected: principal {cap['amount']} exceeds capacity {cap['cap_total']:.2f} "
-            f"(self_surety={cap['self_surety']}, rule={cap['rule']})"
-        )
-
-    ts = now_iso()
-    loan_payload = {
-        "member_id": borrower_id,
-        "surety_member_id": surety_id,
-        "borrow_date": str(date.today()),
-        "due_cycle_days": 28,
-        "principal": float(amount),
-        "principal_current": float(amount),
-        "unpaid_interest": 0.0,
-        "total_interest_generated": 0.0,
-        "interest_rate_monthly": float(req.get("interest_rate") or MONTHLY_INTEREST_RATE),
-        # ❌ DO NOT SET total_due (GENERATED)
-        "status": "open",
-        "updated_at": ts,
-    }
-    loan_payload = filter_payload_to_existing_columns(sb, schema, LOANS_TABLE, loan_payload)
-
-    loan_res = sb.schema(schema).table(LOANS_TABLE).insert(loan_payload).execute()
-    loan_row = (loan_res.data or [None])[0]
-    if not loan_row or "id" not in loan_row:
-        raise RuntimeError("Loan creation failed.")
-    loan_id = int(loan_row["id"])
-
-    upd = {
-        "status": "approved",
-        "reviewed_by": str(actor_name or "").strip() or "admin",
-        "reviewed_at": ts,
-        "approved_at": ts,
-        "notes": (str(req.get("notes") or "").strip() + f"\napproved by {actor_name} | cap_total={cap['cap_total']:.2f}").strip(),
-    }
-    upd = filter_payload_to_existing_columns(sb, schema, REQUESTS_TABLE, upd)
-    sb.schema(schema).table(REQUESTS_TABLE).update(upd).eq("id", int(request_id)).execute()
-
-    return loan_id
-
-
-def deny_loan_request(sb, schema: str, request_id: int, actor_name: str, reason: str):
-    ts = now_iso()
-    upd = {
-        "status": "rejected",
-        "reviewed_by": str(actor_name or "").strip() or "admin",
-        "reviewed_at": ts,
-        "notes": (str(reason or "").strip() or "rejected"),
-    }
-    upd = filter_payload_to_existing_columns(sb, schema, REQUESTS_TABLE, upd)
-    sb.schema(schema).table(REQUESTS_TABLE).update(upd).eq("id", int(request_id)).execute()
-
-
-# ============================================================
-# PAYMENTS — NO note, NO total_due update (GENERATED)
-# ============================================================
-def _apply_payment_to_loan_balances(sb, schema: str, loan: dict, loan_id: int, amount: float, paid_at: str):
-    pay_amt = float(amount)
-
-    unpaid_interest = float(loan.get("unpaid_interest") or 0.0)
-    principal_current = float(loan.get("principal_current") or loan.get("principal") or 0.0)
-
-    # Pay interest first
-    unpaid_interest_new = unpaid_interest
-    if unpaid_interest_new > 0:
-        if pay_amt >= unpaid_interest_new:
-            pay_amt -= unpaid_interest_new
-            unpaid_interest_new = 0.0
+        if float(amount) <= 0:
+            st.error("Amount must be > 0.")
         else:
-            unpaid_interest_new -= pay_amt
-            pay_amt = 0.0
+            try:
+                req_id = core.create_loan_request(
+                    sb, schema,
+                    borrower_id=borrower_id,
+                    surety_id=surety_id,
+                    amount=float(amount),
+                    member_name=borrower_name,
+                    purpose=(purpose.strip() or None),
+                    duration_months=(int(duration_months) if int(duration_months) > 0 else None),
+                    notes=(notes.strip() or None),
+                    requester_user_id=str(actor.user_id),
+                )
+                audit(sb, "loan_request_created", "ok", {"request_id": int(req_id)}, actor_user_id=actor.user_id)
+                st.success(f"Request submitted. ID = {req_id}")
+                st.rerun()
+            except Exception as e:
+                st.error("Failed to create request.")
+                st.code(_apierror_message(e), language="text")
 
-    # Remaining pays principal
-    principal_new = max(principal_current - pay_amt, 0.0)
-    close_now = (principal_new <= 0.0) and (unpaid_interest_new <= 0.0)
+    st.divider()
+    st.markdown("### Pending requests")
 
-    update_payload = {
-        "principal_current": float(principal_new),
-        "unpaid_interest": float(unpaid_interest_new),
-        "updated_at": now_iso(),
-        "last_paid_at": str(paid_at),
-        "status": "closed" if close_now else None,
-    }
-    update_payload = {k: v for k, v in update_payload.items() if v is not None}
-    update_payload = filter_payload_to_existing_columns(sb, schema, LOANS_TABLE, update_payload)
+    pending = core.list_pending_requests(sb, schema, limit=300)
+    dfp = _safe_df(pending)
+    if dfp.empty:
+        st.info("No pending requests.")
+        return
 
-    sb.schema(schema).table(LOANS_TABLE).update(update_payload).eq("id", int(loan_id)).execute()
+    cols_pref = [
+        "id", "member_id", "member_name", "requested_amount", "purpose", "duration_months",
+        "interest_rate", "status", "requested_at", "surety_member_id", "requester_user_id"
+    ]
+    show_cols = [c for c in cols_pref if c in dfp.columns]
+    st.dataframe(dfp[show_cols] if show_cols else dfp, use_container_width=True, hide_index=True)
 
+    if actor.role not in (ROLE_ADMIN, ROLE_TREASURY):
+        st.info("Only Admin/Treasury can manage signatures and approve requests.")
+        return
 
-def record_payment(
-    sb,
-    schema: str,
-    *,
-    loan_id: int,
-    amount: float,
-    paid_at: str,
-    note: str | None = None,  # kept for UI compatibility, not stored
-) -> bool:
-    if float(amount) <= 0:
-        raise ValueError("Amount must be > 0.")
-    if int(loan_id) <= 0:
-        raise ValueError("Invalid loan_id.")
+    st.markdown("### Signatures & Approval")
+    req_id = st.selectbox("Select request ID", dfp["id"].tolist(), key="req_pick_id")
 
-    loan = fetch_one(
-        sb.schema(schema).table(LOANS_TABLE)
-        .select("id,member_id,status,principal,principal_current,unpaid_interest")
-        .eq("id", int(loan_id))
-    )
-    if not loan:
-        raise RuntimeError("Loan not found.")
+    df_sig, missing = _signature_status(sb, schema, int(req_id))
+    if df_sig.empty:
+        st.warning(f"No signatures yet. Required: {', '.join(REQ_SIG_REQUIRED)}")
+    else:
+        st.caption("Signatures on file (entity_type=loan_request):")
+        st.dataframe(df_sig, use_container_width=True, hide_index=True)
+        if missing:
+            st.warning("Missing signatures: " + ", ".join(missing))
+        else:
+            st.success("All required signatures are present.")
 
-    if str(loan.get("status") or "").lower().strip() in ("closed", "paid"):
-        raise ValueError("Loan is already closed.")
+    st.markdown("#### Add/Update a signature (upsert by role)")
+    role = st.selectbox("Role", REQ_SIG_REQUIRED, index=0, key="sig_role")
+    signer_pick = st.selectbox("Signer member", labels, key="sig_signer_pick")
+    signer_id = int(label_to_id[signer_pick])
+    signer_name = str(label_to_name[signer_pick]).strip() or f"Member {signer_id}"
 
-    member_id = int(loan.get("member_id") or 0)
-
-    # ❌ DO NOT INSERT note (column doesn't exist)
-    pay_payload = {
-        "loan_id": int(loan_id),
-        "member_id": (member_id if member_id > 0 else None),
-        "amount": float(amount),
-        "paid_at": str(paid_at),
-        "created_at": now_iso(),
-    }
-    pay_payload = filter_payload_to_existing_columns(sb, schema, PAYMENTS_TABLE, pay_payload)
-
-    sb.schema(schema).table(PAYMENTS_TABLE).insert(pay_payload).execute()
-    _apply_payment_to_loan_balances(sb, schema, loan, int(loan_id), float(amount), str(paid_at))
-    return True
-
-
-# ============================================================
-# MAKER–CHECKER (pending payments)
-# ============================================================
-def list_unconfirmed_payments(sb, schema: str, limit: int = 500) -> List[Dict[str, Any]]:
-    try:
-        return (
-            sb.schema(schema).table(PENDING_PAYMENTS_TABLE)
-            .select("*")
-            .eq("status", "pending")
-            .order("created_at", desc=True)
-            .limit(int(limit))
-            .execute().data or []
-        )
-    except Exception:
-        return []
-
-
-def confirm_payment(sb, schema: str, pending_id: int, confirmer_user_id: str) -> bool:
-    if int(pending_id) <= 0:
-        raise ValueError("Invalid pending_id.")
-
-    pend = fetch_one(
-        sb.schema(schema).table(PENDING_PAYMENTS_TABLE)
-        .select("*")
-        .eq("id", int(pending_id))
-    )
-    if not pend:
-        raise RuntimeError("Pending payment not found.")
-    if str(pend.get("status") or "").lower().strip() != "pending":
-        raise ValueError("Only pending payments can be confirmed.")
-
-    loan_id = int(pend.get("loan_id") or 0)
-    amount = float(pend.get("amount") or 0)
-    paid_at = str(pend.get("paid_at") or "").strip()
-    if loan_id <= 0 or amount <= 0 or not paid_at:
-        raise RuntimeError("Pending payment has invalid data.")
-
-    repay_payload = {
-        "loan_id": int(loan_id),
-        "member_id": int(pend.get("member_id") or 0) or None,
-        "amount": float(amount),
-        "paid_at": str(paid_at),
-        "created_at": now_iso(),
-    }
-    repay_payload = filter_payload_to_existing_columns(sb, schema, PAYMENTS_TABLE, repay_payload)
-    sb.schema(schema).table(PAYMENTS_TABLE).insert(repay_payload).execute()
-
-    loan = fetch_one(
-        sb.schema(schema).table(LOANS_TABLE)
-        .select("id,member_id,status,principal,principal_current,unpaid_interest")
-        .eq("id", int(loan_id))
-    )
-    if loan:
-        _apply_payment_to_loan_balances(sb, schema, loan, loan_id, amount, paid_at)
-
-    upd = {
-        "status": "confirmed",
-        "checker_user_id": str(confirmer_user_id),
-        "checked_at": now_iso(),
-    }
-    upd = filter_payload_to_existing_columns(sb, schema, PENDING_PAYMENTS_TABLE, upd)
-    sb.schema(schema).table(PENDING_PAYMENTS_TABLE).update(upd).eq("id", int(pending_id)).execute()
-    return True
-
-
-def reject_payment(sb, schema: str, pending_id: int, rejecter_user_id: str, reason: str) -> bool:
-    if int(pending_id) <= 0:
-        raise ValueError("Invalid pending_id.")
-
-    pend = fetch_one(
-        sb.schema(schema).table(PENDING_PAYMENTS_TABLE)
-        .select("id,status")
-        .eq("id", int(pending_id))
-    )
-    if not pend:
-        raise RuntimeError("Pending payment not found.")
-    if str(pend.get("status") or "").lower().strip() != "pending":
-        raise ValueError("Only pending payments can be rejected.")
-
-    upd = {
-        "status": "rejected",
-        "checker_user_id": str(rejecter_user_id),
-        "checked_at": now_iso(),
-        "note": (str(reason or "").strip() or None),
-    }
-    upd = {k: v for k, v in upd.items() if v is not None}
-    upd = filter_payload_to_existing_columns(sb, schema, PENDING_PAYMENTS_TABLE, upd)
-
-    sb.schema(schema).table(PENDING_PAYMENTS_TABLE).update(upd).eq("id", int(pending_id)).execute()
-    return True
-
-
-# ============================================================
-# INTEREST (ledger-based) — DO NOT update total_due (GENERATED)
-# ============================================================
-def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> Tuple[int, float]:
-    month = _month_key()
-    ts = now_iso()
-
-    loans = (
-        sb.schema(schema).table(LOANS_TABLE)
-        .select("id,member_id,status,principal,principal_current,unpaid_interest,total_interest_generated,interest_rate_monthly")
-        .limit(20000).execute().data or []
-    )
-
-    updated = 0
-    interest_added_total = 0.0
-
-    for r in loans:
-        if str(r.get("status") or "").lower().strip() not in ("active", "open"):
-            continue
-
-        loan_id = int(r["id"])
-        member_id = int(r.get("member_id") or 0)
-
-        principal_current = float(r.get("principal_current") or r.get("principal") or 0.0)
-        if principal_current <= 0:
-            continue
-
-        rate = float(r.get("interest_rate_monthly") or MONTHLY_INTEREST_RATE)
-        interest = round(principal_current * rate, 2)
-        if interest <= 0:
-            continue
-
-        ledger_payload = {
-            "loan_id": loan_id,
-            "member_id": (member_id if member_id > 0 else None),
-            "amount": float(interest),
-            "interest_month": month,
-            "note": f"monthly interest {month}",
-            "created_at": ts,
-        }
-        ledger_payload = {k: v for k, v in ledger_payload.items() if v is not None}
-        ledger_payload = filter_payload_to_existing_columns(sb, schema, INTEREST_LEDGER_TABLE, ledger_payload)
-
+    if st.button("✍️ Save Signature", use_container_width=True, key="sig_save_btn"):
         try:
-            sb.schema(schema).table(INTEREST_LEDGER_TABLE).insert(ledger_payload).execute()
-        except APIError as e:
-            msg = str(e)
-            if "duplicate key value" in msg or "uq_interest_ledger_loan_month" in msg:
-                continue
-            raise
+            _upsert_signature(sb, schema, int(req_id), role=role, signer_member_id=signer_id, signer_name=signer_name)
+            audit(sb, "loan_request_signature_saved", "ok",
+                  {"request_id": int(req_id), "role": role, "signer_member_id": int(signer_id)},
+                  actor_user_id=actor.user_id)
+            st.success("Signature saved.")
+            st.rerun()
+        except Exception as e:
+            st.error("Failed to save signature.")
+            st.code(_apierror_message(e), language="text")
 
-        unpaid_interest_new = float(r.get("unpaid_interest") or 0) + float(interest)
-        total_interest_generated_new = float(r.get("total_interest_generated") or 0) + float(interest)
+    st.divider()
+    c1, c2 = st.columns(2)
 
-        upd = {
-            "unpaid_interest": unpaid_interest_new,
-            "total_interest_generated": total_interest_generated_new,
-            "updated_at": ts,
-        }
-        upd = filter_payload_to_existing_columns(sb, schema, LOANS_TABLE, upd)
-        sb.schema(schema).table(LOANS_TABLE).update(upd).eq("id", loan_id).execute()
+    with c1:
+        if st.button("✅ APPROVE REQUEST", type="primary", use_container_width=True, key="approve_req_btn"):
+            try:
+                loan_id = core.approve_loan_request(sb, schema, request_id=int(req_id), actor_name=str(actor.name or "admin"))
+                audit(sb, "loan_request_approved", "ok",
+                      {"request_id": int(req_id), "loan_id": int(loan_id)},
+                      actor_user_id=actor.user_id)
+                st.success(f"Approved. Loan ID = {loan_id}")
+                st.rerun()
+            except Exception as e:
+                st.error("Approval blocked.")
+                st.code(_apierror_message(e), language="text")
 
-        updated += 1
-        interest_added_total += float(interest)
-
-    return updated, float(round(interest_added_total, 2))
+    with c2:
+        reason = st.text_input("Reject reason", value="rejected", key="deny_reason")
+        if st.button("❌ REJECT REQUEST", use_container_width=True, key="deny_req_btn"):
+            try:
+                core.deny_loan_request(sb, schema, request_id=int(req_id), actor_name=str(actor.name or "admin"), reason=reason)
+                audit(sb, "loan_request_rejected", "ok",
+                      {"request_id": int(req_id), "reason": reason},
+                      actor_user_id=actor.user_id)
+                st.warning("Rejected.")
+                st.rerun()
+            except Exception as e:
+                st.error("Reject failed.")
+                st.code(_apierror_message(e), language="text")
 
 
 # ============================================================
-# DPD / DELINQUENCY
+# LEDGER
 # ============================================================
-def _parse_due_date(loan_row: dict) -> Optional[date]:
-    for k in ("due_date", "next_due_date", "expected_due_date", "payment_due_date"):
-        d = _to_date(loan_row.get(k))
-        if d:
-            return d
-    return None
+def _render_ledger(sb, schema: str, actor: Actor):
+    require(actor.role, "view_ledger")
+    st.subheader("Ledger (Loans)")
 
-
-def _get_last_paid_on(sb, schema: str, loan_id: int) -> Optional[date]:
+    table = V_LOANS_WITH_MEMBER if _table_exists(sb, schema, V_LOANS_WITH_MEMBER) else LOANS_TABLE
     try:
         rows = (
-            sb.schema(schema).table(PAYMENTS_TABLE)
-            .select(REPAY_DATE_COL)
-            .eq(REPAY_LINK_COL, int(loan_id))
-            .order(REPAY_DATE_COL, desc=True)
-            .limit(1)
+            sb.schema(schema).table(table)
+            .select("*")
+            .order("updated_at", desc=True)
+            .limit(2000)
             .execute().data or []
         )
-        if rows:
-            return _to_date(rows[0].get(REPAY_DATE_COL))
-    except Exception:
-        pass
-    return None
+    except Exception as e:
+        st.error("Failed to load loans.")
+        st.code(_apierror_message(e), language="text")
+        return
 
+    df = pd.DataFrame(rows)
+    if df.empty:
+        st.info("No loans found.")
+        return
 
-def compute_dpd(loan_row: dict, last_paid_on: Optional[date]) -> int:
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("### Delinquency (DPD)")
     try:
-        status = str(loan_row.get("status", "")).lower().strip()
-        if status in ("closed", "paid", "completed", "settled"):
-            return 0
-
-        due_date = _parse_due_date(loan_row)
-        if not due_date:
-            return 0
-
-        ref_date = last_paid_on if last_paid_on is not None else date.today()
-        dpd = (ref_date - due_date).days
-        return int(dpd) if dpd > 0 else 0
-    except Exception:
-        return 0
+        dfd = core.delinquency_table(sb, schema, limit=500)
+        if dfd is None or getattr(dfd, "empty", True):
+            st.info("No delinquent active/open loans.")
+        else:
+            st.dataframe(dfd, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.warning("Could not compute delinquency.")
+        st.code(_apierror_message(e), language="text")
 
 
-def delinquency_table(sb, schema: str, limit: int = 500) -> pd.DataFrame:
+# ============================================================
+# DELINQUENCY
+# ============================================================
+def _render_delinquency(sb, schema: str, actor: Actor):
+    require(actor.role, "view_delinquency")
+    st.subheader("Delinquency")
+    try:
+        dfd = core.delinquency_table(sb, schema, limit=1000)
+        if dfd is None or getattr(dfd, "empty", True):
+            st.info("No delinquent loans.")
+        else:
+            st.dataframe(dfd, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.error("Failed to compute delinquency.")
+        st.code(_apierror_message(e), language="text")
+
+
+# ============================================================
+# RECORD PAYMENT (loan_payments) ✅ GUARANTEED REAL LOAN IDs
+# ============================================================
+def _render_record_payment(sb, schema: str, actor: Actor):
+    require(actor.role, "record_payment")
+    st.subheader("Record Payment")
+
+    # ✅ Always load from the REAL loans table for IDs
     try:
         loans = (
             sb.schema(schema).table(LOANS_TABLE)
-            .select("*")
-            .order("updated_at", desc=True)
-            .limit(int(limit))
+            .select("id,member_id,status,principal,principal_current,unpaid_interest,total_due")
+            .order("id", desc=True)
+            .limit(5000)
             .execute().data or []
         )
-    except Exception:
-        loans = []
+    except Exception as e:
+        st.error("Failed to load loans table.")
+        st.code(_apierror_message(e), language="text")
+        return
 
-    out = []
-    for r in loans:
-        if str(r.get("status") or "").lower().strip() not in ("open", "active"):
-            continue
-        loan_id = int(r.get("id") or 0)
-        if loan_id <= 0:
-            continue
-        last_paid = _get_last_paid_on(sb, schema, loan_id)
-        rr = dict(r)
-        rr["last_paid_on"] = str(last_paid) if last_paid else None
-        rr["dpd"] = compute_dpd(r, last_paid)
-        out.append(rr)
+    df = pd.DataFrame(loans)
+    if df.empty:
+        st.warning("No loans found.")
+        return
 
-    df = pd.DataFrame(out)
-    if not df.empty and "dpd" in df.columns:
-        df = df.sort_values("dpd", ascending=False)
-    return df
+    # Optional: enrich labels with member name from view (never trust view ids)
+    name_map: dict[int, str] = {}
+    if _table_exists(sb, schema, V_LOANS_WITH_MEMBER):
+        try:
+            vrows = (
+                sb.schema(schema).table(V_LOANS_WITH_MEMBER)
+                .select("*")
+                .limit(5000)
+                .execute().data or []
+            )
+            vdf = pd.DataFrame(vrows)
+            if not vdf.empty and "member_id" in vdf.columns:
+                best_col = None
+                for col in ("member_display_name", "member_name", "display_name", "name"):
+                    if col in vdf.columns:
+                        best_col = col
+                        break
+                if best_col:
+                    vdf["member_id"] = pd.to_numeric(vdf["member_id"], errors="coerce").fillna(0).astype(int)
+                    vdf["best_name"] = vdf[best_col].astype(str).replace({"None": "", "nan": ""})
+                    tmp = vdf[["member_id", "best_name"]].dropna()
+                    name_map = dict(zip(tmp["member_id"].tolist(), tmp["best_name"].tolist()))
+        except Exception:
+            name_map = {}
 
+    def _lbl(r):
+        due = _num(r.get("total_due"))
+        pc = _num(r.get("principal_current") or r.get("principal"))
+        ui = _num(r.get("unpaid_interest"))
+        mid = int(_num(r.get("member_id")))
+        who = (name_map.get(mid) or f"Member {mid}").strip()
+        return f"Loan {int(r['id'])} • {who} • {str(r.get('status') or '')} • Principal {pc:,.0f} • Interest {ui:,.0f} • Due {due:,.0f}"
 
-# ============================================================
-# Statements helper (used by loans_ui.py)
-# ============================================================
-def list_member_loans(sb, schema: str, member_id: int, limit: int = 2000) -> List[Dict[str, Any]]:
+    df["id"] = pd.to_numeric(df.get("id"), errors="coerce")
+    df = df[df["id"].notna()].copy()
+    df["id"] = df["id"].astype(int)
+    df["label"] = df.apply(_lbl, axis=1)
+
+    pick_id = st.selectbox(
+        "Select loan",
+        options=df["id"].tolist(),
+        format_func=lambda x: df.loc[df["id"] == x, "label"].iloc[0],
+        key="pay_pick_loan_id",
+    )
+    loan_id = int(pick_id)
+
+    amount = st.number_input("Amount", min_value=0.0, step=50.0, value=0.0, key="pay_amt")
+    paid_on = st.date_input("Paid date", value=date.today(), key="pay_date")
+    note = st.text_input("Note (optional)", value="Loan payment", key="pay_note")
+
+    if st.button("💾 Save payment", type="primary", use_container_width=True, key="pay_save"):
+        if float(amount) <= 0:
+            st.error("Amount must be > 0.")
+            st.stop()
+
+        if not hasattr(core, "record_payment"):
+            st.error("loans_core.record_payment(...) not found.")
+            st.stop()
+
+        try:
+            core.record_payment(
+                sb, schema,
+                loan_id=int(loan_id),
+                amount=float(amount),
+                paid_at=_to_iso(paid_on),
+                note=note,
+            )
+            audit(sb, "loan_payment_recorded", "ok",
+                  {"loan_id": int(loan_id), "amount": float(amount)},
+                  actor_user_id=actor.user_id)
+            st.success("Payment recorded and applied.")
+            st.rerun()
+        except Exception as e:
+            st.error("Failed to record payment.")
+            st.code(_apierror_message(e), language="text")
+
+    st.divider()
+    st.markdown("### Recent payments for selected loan")
+    pay_table = V_PAYMENTS_WITH_MEMBER if _table_exists(sb, schema, V_PAYMENTS_WITH_MEMBER) else PAYMENTS_TABLE
     try:
-        return (
-            sb.schema(schema).table(LOANS_TABLE)
+        rows = (
+            sb.schema(schema).table(pay_table)
             .select("*")
-            .eq("member_id", int(member_id))
-            .order("updated_at", desc=True)
-            .limit(int(limit))
+            .eq("loan_id", int(loan_id))
+            .order("paid_at", desc=True)
+            .limit(200)
             .execute().data or []
         )
-    except Exception:
-        return []
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.warning("Could not load payments.")
+        st.code(_apierror_message(e), language="text")
+
+
+# ============================================================
+# DIRECT PAYMENT
+# ============================================================
+def _render_direct_payment(sb, schema: str, actor: Actor):
+    require(actor.role, "direct_payment")
+    st.subheader("Direct Payment")
+    _render_record_payment(sb, schema, actor)
+
+
+# ============================================================
+# CONFIRM PAYMENTS
+# ============================================================
+def _render_confirm_payments(sb, schema: str, actor: Actor):
+    require(actor.role, "confirm_payment")
+    st.subheader("Confirm Payments")
+
+    if not hasattr(core, "list_unconfirmed_payments"):
+        st.info("Maker-checker not enabled in core. Showing recent payments instead.")
+        pay_table = V_PAYMENTS_WITH_MEMBER if _table_exists(sb, schema, V_PAYMENTS_WITH_MEMBER) else PAYMENTS_TABLE
+        try:
+            rows = (
+                sb.schema(schema).table(pay_table)
+                .select("*")
+                .order("paid_at", desc=True)
+                .limit(200)
+                .execute().data or []
+            )
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        except Exception:
+            pass
+        return
+
+    try:
+        pending_rows = core.list_unconfirmed_payments(sb, schema, limit=500) or []
+    except Exception as e:
+        st.error("Could not load pending confirmations.")
+        st.code(_apierror_message(e), language="text")
+        return
+
+    df = pd.DataFrame(pending_rows)
+    if df.empty:
+        st.success("No pending payments to confirm.")
+        return
+
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    ids = [int(x) for x in df["id"].tolist() if str(x).isdigit()]
+    pick = st.selectbox("Select payment ID to confirm", ids, key="confirm_pick_payment_id")
+
+    if st.button("✅ Confirm selected payment", type="primary", use_container_width=True, key="confirm_payment_btn"):
+        try:
+            core.confirm_payment(sb, schema, pending_id=int(pick), confirmer_user_id=str(actor.user_id))
+            audit(sb, "loan_payment_confirmed", "ok", {"payment_id": int(pick)}, actor_user_id=actor.user_id)
+            st.success("Payment confirmed.")
+            st.rerun()
+        except Exception as e:
+            st.error("Confirmation failed.")
+            st.code(_apierror_message(e), language="text")
+
+
+# ============================================================
+# INTEREST
+# ============================================================
+def _interest_ledger_totals(sb, schema: str) -> dict:
+    out = {"all_time": 0.0, "this_month": 0.0, "last_row": None, "ok": False, "error": None}
+
+    if not _table_exists(sb, schema, INTEREST_LEDGER_TABLE):
+        out["error"] = f"Table {schema}.{INTEREST_LEDGER_TABLE} not found/readable."
+        return out
+
+    try:
+        rows = (
+            sb.schema(schema).table(INTEREST_LEDGER_TABLE)
+            .select("amount,interest_month,created_at,loan_id,member_id,note")
+            .order("created_at", desc=True)
+            .limit(20000)
+            .execute().data or []
+        )
+
+        df = pd.DataFrame(rows)
+        if df.empty:
+            out["ok"] = True
+            return out
+
+        df["amount"] = pd.to_numeric(df.get("amount"), errors="coerce").fillna(0.0)
+        df["interest_month"] = df.get("interest_month").astype(str)
+
+        mk = _month_key()
+        out["all_time"] = float(df["amount"].sum())
+        out["this_month"] = float(df[df["interest_month"].str.startswith(mk)]["amount"].sum())
+        out["last_row"] = rows[0] if rows else None
+        out["ok"] = True
+        return out
+
+    except Exception as e:
+        out["error"] = _apierror_message(e)
+        return out
+
+
+def _render_interest(sb, schema: str, actor: Actor):
+    require(actor.role, "accrue_interest")
+    st.subheader("Interest")
+
+    totals = _interest_ledger_totals(sb, schema)
+    mk = _month_key()
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Interest this month (ledger)", f"{totals['this_month']:,.2f}")
+    c2.metric("Interest all-time (ledger)", f"{totals['all_time']:,.2f}")
+    last = totals.get("last_row") or {}
+    c3.metric("Last cycle key", str(last.get("interest_month") or "—"))
+
+    if totals.get("error"):
+        st.info("Ledger check:")
+        st.write(totals["error"])
+
+    st.divider()
+
+    if st.button("➕ Accrue interest now", use_container_width=True, key="accrue_interest_btn"):
+        try:
+            updated, added = core.accrue_monthly_interest(sb, schema, actor_user_id=str(actor.user_id))
+            audit(sb, "interest_accrued", "ok",
+                  {"updated": int(updated), "added": float(added), "cycle_prefix": mk},
+                  actor_user_id=actor.user_id)
+
+            if float(added) <= 0 and int(updated) <= 0:
+                st.info("No changes made (already accrued or no active loans).")
+            else:
+                st.success(f"Loans updated: {int(updated)} • Interest added: {float(added):,.2f}")
+
+            st.rerun()
+
+        except Exception as e:
+            st.error("Interest accrual failed.")
+            st.code(_apierror_message(e), language="text")
+
+    st.divider()
+    st.markdown("### Recent interest ledger rows")
+    try:
+        rows = (
+            sb.schema(schema).table(INTEREST_LEDGER_TABLE)
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(200)
+            .execute().data or []
+        )
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.warning("Could not load ledger rows.")
+        st.code(_apierror_message(e), language="text")
+
+
+# ============================================================
+# STATEMENTS (NO PHONE REQUIRED)
+# ============================================================
+def _render_statements(sb, schema: str, actor: Actor):
+    require(actor.role, "loan_statement")
+    st.subheader("Statements")
+
+    if make_member_loan_statement_pdf is None:
+        st.info("PDF engine not available (make_member_loan_statement_pdf import failed).")
+        return
+
+    dfm = _read_members(sb, schema)
+    if dfm.empty:
+        st.warning("No members found.")
+        return
+
+    pick = st.selectbox("Select member", dfm["label"].tolist(), key="stmt_pick_member")
+    member_id = int(dfm[dfm["label"] == pick]["id"].iloc[0])
+
+    m = dfm[dfm["id"] == member_id].iloc[0].to_dict()
+    member = {
+        "member_id": int(member_id),
+        "name": str(m.get("name") or ""),
+        "display_name": str(m.get("display_name") or ""),
+        "phone": "",
+    }
+
+    loans = core.list_member_loans(sb, schema, member_id=int(member_id), limit=2000)
+    if not loans:
+        st.info("No loans found for this member.")
+        return
+
+    loan_ids = [int(x.get("id")) for x in loans if str(x.get("id") or "").isdigit()]
+    payments = []
+    if loan_ids:
+        try:
+            pay_rows = (
+                sb.schema(schema).table(PAYMENTS_TABLE)
+                .select("*")
+                .in_("loan_id", loan_ids)
+                .order("paid_at", desc=True)
+                .limit(5000)
+                .execute().data or []
+            )
+            payments = pay_rows
+        except Exception:
+            payments = []
+
+    if st.button("⬇️ Download Member Loan Statement (PDF)", use_container_width=True, key="dl_member_stmt"):
+        try:
+            pdf_bytes = make_member_loan_statement_pdf(
+                brand="theyoungshallgrow",
+                member=member,
+                cycle_info={},
+                loans=loans,
+                payments=payments,
+                currency="$",
+                logo_path=None,
+            )
+            st.download_button(
+                "✅ Click to download",
+                pdf_bytes,
+                file_name=f"loan_statement_member_{member_id}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key="dl_member_stmt_btn",
+            )
+        except Exception as e:
+            st.error("Failed to generate statement PDF.")
+            st.code(_apierror_message(e), language="text")
+
+
+# ============================================================
+# MAIN ENTRY
+# ============================================================
+def render_loans(sb_service, schema: str, actor_user_id: str = ""):
+    required_tables = [MEMBERS_TABLE, LOANS_TABLE, PAYMENTS_TABLE, INTEREST_LEDGER_TABLE, REQUESTS_TABLE, SIGNATURES_TABLE]
+    missing = [t for t in required_tables if not _table_exists(sb_service, schema, t)]
+    if missing:
+        st.error("Missing required table(s) for NEW Loans standard:")
+        st.write(", ".join([f"{schema}.{t}" for t in missing]))
+        st.stop()
+
+    actor_user_uuid = actor_user_id if (actor_user_id and _is_uuid(actor_user_id)) else _get_or_make_session_uuid()
+    actor = _actor_from_session(actor_user_uuid)
+
+    st.header("Loans (Organizational Standard — NEW)")
+    _render_kpis(sb_service, schema)
+
+    raw_sections = allowed_sections(actor.role) or []
+    if not raw_sections:
+        st.warning("No sections available for your role.")
+        return
+
+    sections: list[str] = []
+    seen = set()
+    for s in raw_sections:
+        cs = _canon_section(s)
+        if cs and cs not in seen:
+            sections.append(cs)
+            seen.add(cs)
+
+    if "loans_menu" not in st.session_state or st.session_state["loans_menu"] not in sections:
+        st.session_state["loans_menu"] = sections[0]
+
+    section = _canon_section(st.selectbox("Loans menu", sections, key="loans_menu"))
+
+    if section == "Requests":
+        _render_requests(sb_service, schema, actor); return
+    if section == "Ledger":
+        _render_ledger(sb_service, schema, actor); return
+    if section == "Record Payment":
+        _render_record_payment(sb_service, schema, actor); return
+    if section == "Confirm Payments":
+        _render_confirm_payments(sb_service, schema, actor); return
+    if section == "Interest":
+        _render_interest(sb_service, schema, actor); return
+    if section == "Delinquency":
+        _render_delinquency(sb_service, schema, actor); return
+    if section == "Statements":
+        _render_statements(sb_service, schema, actor); return
+    if section == "Direct Payment":
+        _render_direct_payment(sb_service, schema, actor); return
+
+    st.info(f"Section '{section}' is available but not wired in router.")
