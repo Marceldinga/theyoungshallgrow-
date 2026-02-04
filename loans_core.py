@@ -1,7 +1,7 @@
 
 # loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED — MATCHES YOUR PUBLIC TABLES (NO LEGACY)
 # -----------------------------------------------------------------------------
-# ✅ Tables (from your standard):
+# ✅ Tables (NEW STANDARD):
 #    - loans
 #    - loan_payments
 #    - loan_repayments_pending
@@ -10,16 +10,17 @@
 #    - signatures
 #    - members
 #
-# ✅ Fixes in THIS version:
-#   - ❌ Removes member_contribution_totals.foundation_paid_total / foundation_pending_total (not in your view)
-#   - ✅ Uses your REAL view columns:
-#       member_id, contrib_total, foundation_total, total_contributed
-#   - ✅ Keeps signatures entity_type="loan_request"
-#   - ✅ Keeps record_payment() and insert_signature() required by loans_ui.py
-#   - ✅ Borrower can be same as surety (your rule)
-#   - ✅ Cap rule (NEW STANDARD):
-#       capacity = contrib_total + 0.70 * foundation_total
-#       cap_total = cap_b + cap_s (self-surety counts once)
+# ✅ FIXES INCLUDED (based on your latest errors):
+#   1) ✅ Uses REAL view columns from member_contribution_totals:
+#        member_id, contrib_total, foundation_total, total_contributed
+#      (NO foundation_paid_total / foundation_pending_total)
+#   2) ✅ loan_requests.status CHECK constraint:
+#        allowed = pending, approved, rejected, cancelled
+#      → deny_loan_request now writes status="rejected" (NOT "denied")
+#   3) ✅ Signatures check uses entity_type="loan_request"
+#   4) ✅ Borrower can be same as surety (your rule)
+#   5) ✅ Maker-checker supported via loan_repayments_pending
+#   6) ✅ record_payment() and insert_signature() exist for loans_ui.py
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -352,7 +353,7 @@ def create_loan_request(
         "purpose": (str(purpose).strip() if purpose else None),
         "duration_months": int(duration_months) if duration_months is not None else None,
         "interest_rate": float(interest_rate) if interest_rate is not None else MONTHLY_INTEREST_RATE,
-        "status": "pending",
+        "status": "pending",  # ✅ allowed by CHECK
         "requested_at": now_iso(),
         "notes": merged_notes,
         "surety_member_id": int(s_id),
@@ -397,7 +398,7 @@ def get_request(sb, schema: str, request_id: int) -> dict:
 
 
 # ============================================================
-# GOVERNANCE + APPROVAL ✅ FIXED FOR YOUR VIEW COLUMNS
+# GOVERNANCE + APPROVAL ✅ MATCHES YOUR VIEW + DB CONSTRAINTS
 # ============================================================
 def _get_totals_row(sb, schema: str, member_id: int) -> dict:
     """
@@ -425,17 +426,12 @@ def _get_totals_row(sb, schema: str, member_id: int) -> dict:
             r["total_contributed"] = float(r.get("contrib_total") or 0) + float(r.get("foundation_total") or 0)
         return r
 
-    return {
-        "member_id": int(member_id),
-        "contrib_total": 0,
-        "foundation_total": 0,
-        "total_contributed": 0,
-    }
+    return {"member_id": int(member_id), "contrib_total": 0, "foundation_total": 0, "total_contributed": 0}
 
 
 def _capacity_from_row(r: dict) -> float:
     """
-    NEW STANDARD:
+    NEW STANDARD (your current policy):
       capacity = contrib_total + 0.70 * foundation_total
     """
     contrib = float(r.get("contrib_total") or 0)
@@ -529,7 +525,7 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_name: str) -> i
     loan_id = int(loan_row["id"])
 
     upd = {
-        "status": "approved",
+        "status": "approved",  # ✅ allowed by CHECK
         "reviewed_by": str(actor_name or "").strip() or "admin",
         "reviewed_at": ts,
         "approved_at": ts,
@@ -542,12 +538,16 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_name: str) -> i
 
 
 def deny_loan_request(sb, schema: str, request_id: int, actor_name: str, reason: str):
+    """
+    ✅ IMPORTANT: DB CHECK constraint allows only:
+       pending, approved, rejected, cancelled
+    """
     ts = now_iso()
     upd = {
-        "status": "denied",
+        "status": "rejected",  # ✅ FIXED (NOT "denied")
         "reviewed_by": str(actor_name or "").strip() or "admin",
         "reviewed_at": ts,
-        "notes": (str(reason or "").strip() or "denied"),
+        "notes": (str(reason or "").strip() or "rejected"),
     }
     upd = filter_payload_to_existing_columns(sb, schema, REQUESTS_TABLE, upd)
     sb.schema(schema).table(REQUESTS_TABLE).update(upd).eq("id", int(request_id)).execute()
