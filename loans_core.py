@@ -1,19 +1,32 @@
 
-# loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED — MATCHES YOUR REAL loans COLUMNS (NO LEGACY)
+# loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED — MATCHES YOUR REAL SCHEMA (NO LEGACY)
 # -----------------------------------------------------------------------------
 # ✅ CONFIRMED loans columns (from your screenshots):
 #   id, member_id, session_id, status, principal, principal_current,
 #   unpaid_interest, total_interest_generated, interest_rate_monthly,
-#   total_due, borrow_date, due_cycle_days, last_paid_at, created_at,
-#   updated_at, surety_member_id
+#   total_due (GENERATED), borrow_date, due_cycle_days, last_paid_at,
+#   created_at, updated_at, surety_member_id
 #
-# ✅ THIS VERSION GUARANTEES:
-#   - ❌ NO accrued_interest
-#   - ❌ NO total_paid
-#   - ✅ Payment logic uses unpaid_interest only
-#   - ✅ Interest accrual writes unpaid_interest + total_interest_generated + total_due
-#   - ✅ loan_requests.status uses allowed values (pending/approved/rejected/cancelled)
-#   - ✅ Signatures entity_type="loan_request"
+# ✅ IMPORTANT DB RULES (handled here):
+#   - total_due is a GENERATED column → ❌ NEVER insert/update it (Fixes 428C9)
+#   - loan_payments has NO note column → ❌ NEVER insert note (Fixes PGRST204)
+#   - loans has NO accrued_interest → ❌ NEVER reference it (Fixes 42703)
+#
+# ✅ Business Rules:
+#   - loan_requests.status allowed: pending, approved, rejected, cancelled
+#     → deny_loan_request uses "rejected"
+#   - Borrower can be same as surety (self-surety allowed)
+#   - Capacity rule:
+#       cap = contrib_total + 0.70*foundation_total
+#       cap_total = cap_b + cap_s (self-surety counts once)
+#
+# ✅ Required by loans_ui.py:
+#   - create_loan_request, list_pending_requests, approve_loan_request, deny_loan_request
+#   - insert_signature
+#   - record_payment
+#   - list_unconfirmed_payments, confirm_payment, reject_payment
+#   - accrue_monthly_interest
+#   - delinquency_table, list_member_loans
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -42,7 +55,6 @@ MEMBERS_TABLE = "members"
 REPAY_LINK_COL = "loan_id"
 REPAY_DATE_COL = "paid_at"
 
-# Signatures
 REQUEST_ENTITY_TYPE = "loan_request"
 REQ_SIG_REQUIRED = ["borrower", "surety", "treasury"]
 
@@ -110,7 +122,7 @@ def filter_payload_to_existing_columns(sb, schema: str, table: str, payload: dic
 
 
 # ============================================================
-# SIGNATURES (required by loans_ui.py)
+# SIGNATURES
 # ============================================================
 def sig_df(sb, schema: str, entity_type: str, entity_id: int) -> pd.DataFrame:
     try:
@@ -129,9 +141,7 @@ def sig_df(sb, schema: str, entity_type: str, entity_id: int) -> pd.DataFrame:
 
 
 def missing_roles(df: pd.DataFrame, required_roles: List[str]) -> List[str]:
-    if df is None or df.empty:
-        return list(required_roles)
-    if "role" not in df.columns:
+    if df is None or df.empty or "role" not in df.columns:
         return list(required_roles)
 
     role_series = df["role"].astype(str).str.lower().str.strip()
@@ -150,10 +160,6 @@ def insert_signature(
     signer_member_id: int,
     signer_name: str,
 ) -> bool:
-    """
-    Upsert by (entity_type, entity_id, role) if possible.
-    Fallback: delete existing and insert.
-    """
     et = str(entity_type).strip()
     eid = int(entity_id)
     r = str(role).strip().lower()
@@ -179,6 +185,7 @@ def insert_signature(
     }
     payload = filter_payload_to_existing_columns(sb, schema, SIGNATURES_TABLE, payload)
 
+    # try upsert
     try:
         sb.schema(schema).table(SIGNATURES_TABLE).upsert(
             payload,
@@ -188,6 +195,7 @@ def insert_signature(
     except Exception:
         pass
 
+    # fallback delete+insert
     try:
         sb.schema(schema).table(SIGNATURES_TABLE).delete() \
             .eq("entity_type", et).eq("entity_id", eid).eq("role", r).execute()
@@ -375,7 +383,7 @@ def get_request(sb, schema: str, request_id: int) -> dict:
 
 
 # ============================================================
-# GOVERNANCE + APPROVAL (uses real view columns)
+# GOVERNANCE + APPROVAL
 # ============================================================
 def _get_totals_row(sb, schema: str, member_id: int) -> dict:
     rows = (
@@ -394,7 +402,6 @@ def _get_totals_row(sb, schema: str, member_id: int) -> dict:
         if "total_contributed" not in r or r.get("total_contributed") is None:
             r["total_contributed"] = float(r.get("contrib_total") or 0) + float(r.get("foundation_total") or 0)
         return r
-
     return {"member_id": int(member_id), "contrib_total": 0, "foundation_total": 0, "total_contributed": 0}
 
 
@@ -471,7 +478,6 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_name: str) -> i
     ts = now_iso()
     loan_payload = {
         "member_id": borrower_id,
-        "session_id": None,
         "surety_member_id": surety_id,
         "borrow_date": str(date.today()),
         "due_cycle_days": 28,
@@ -480,13 +486,10 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_name: str) -> i
         "unpaid_interest": 0.0,
         "total_interest_generated": 0.0,
         "interest_rate_monthly": float(req.get("interest_rate") or MONTHLY_INTEREST_RATE),
-        "total_due": float(amount),
+        # ❌ DO NOT SET total_due (GENERATED)
         "status": "open",
-        "last_paid_at": None,
-        "created_at": ts,
         "updated_at": ts,
     }
-    loan_payload = {k: v for k, v in loan_payload.items() if v is not None}
     loan_payload = filter_payload_to_existing_columns(sb, schema, LOANS_TABLE, loan_payload)
 
     loan_res = sb.schema(schema).table(LOANS_TABLE).insert(loan_payload).execute()
@@ -511,7 +514,7 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_name: str) -> i
 def deny_loan_request(sb, schema: str, request_id: int, actor_name: str, reason: str):
     ts = now_iso()
     upd = {
-        "status": "rejected",  # ✅ matches DB CHECK
+        "status": "rejected",
         "reviewed_by": str(actor_name or "").strip() or "admin",
         "reviewed_at": ts,
         "notes": (str(reason or "").strip() or "rejected"),
@@ -521,7 +524,7 @@ def deny_loan_request(sb, schema: str, request_id: int, actor_name: str, reason:
 
 
 # ============================================================
-# PAYMENTS — uses unpaid_interest ONLY
+# PAYMENTS — NO note, NO total_due update (GENERATED)
 # ============================================================
 def _apply_payment_to_loan_balances(sb, schema: str, loan: dict, loan_id: int, amount: float, paid_at: str):
     pay_amt = float(amount)
@@ -536,19 +539,16 @@ def _apply_payment_to_loan_balances(sb, schema: str, loan: dict, loan_id: int, a
             pay_amt -= unpaid_interest_new
             unpaid_interest_new = 0.0
         else:
-            unpaid_interest_new = unpaid_interest_new - pay_amt
+            unpaid_interest_new -= pay_amt
             pay_amt = 0.0
 
     # Remaining pays principal
     principal_new = max(principal_current - pay_amt, 0.0)
-
-    total_due_new = principal_new + unpaid_interest_new
     close_now = (principal_new <= 0.0) and (unpaid_interest_new <= 0.0)
 
     update_payload = {
         "principal_current": float(principal_new),
         "unpaid_interest": float(unpaid_interest_new),
-        "total_due": float(total_due_new),
         "updated_at": now_iso(),
         "last_paid_at": str(paid_at),
         "status": "closed" if close_now else None,
@@ -566,7 +566,7 @@ def record_payment(
     loan_id: int,
     amount: float,
     paid_at: str,
-    note: str | None = None,
+    note: str | None = None,  # kept for UI compatibility, not stored
 ) -> bool:
     if float(amount) <= 0:
         raise ValueError("Amount must be > 0.")
@@ -575,7 +575,7 @@ def record_payment(
 
     loan = fetch_one(
         sb.schema(schema).table(LOANS_TABLE)
-        .select("id,member_id,status,principal,principal_current,unpaid_interest,total_due")
+        .select("id,member_id,status,principal,principal_current,unpaid_interest")
         .eq("id", int(loan_id))
     )
     if not loan:
@@ -586,15 +586,14 @@ def record_payment(
 
     member_id = int(loan.get("member_id") or 0)
 
+    # ❌ DO NOT INSERT note (column doesn't exist)
     pay_payload = {
         "loan_id": int(loan_id),
         "member_id": (member_id if member_id > 0 else None),
         "amount": float(amount),
         "paid_at": str(paid_at),
-        "note": (str(note).strip() if note else None),
         "created_at": now_iso(),
     }
-    pay_payload = {k: v for k, v in pay_payload.items() if v is not None}
     pay_payload = filter_payload_to_existing_columns(sb, schema, PAYMENTS_TABLE, pay_payload)
 
     sb.schema(schema).table(PAYMENTS_TABLE).insert(pay_payload).execute()
@@ -639,22 +638,19 @@ def confirm_payment(sb, schema: str, pending_id: int, confirmer_user_id: str) ->
     if loan_id <= 0 or amount <= 0 or not paid_at:
         raise RuntimeError("Pending payment has invalid data.")
 
-    # insert into confirmed payments
     repay_payload = {
         "loan_id": int(loan_id),
         "member_id": int(pend.get("member_id") or 0) or None,
         "amount": float(amount),
         "paid_at": str(paid_at),
-        "note": (str(pend.get("note") or "").strip() or None),
         "created_at": now_iso(),
     }
-    repay_payload = {k: v for k, v in repay_payload.items() if v is not None}
     repay_payload = filter_payload_to_existing_columns(sb, schema, PAYMENTS_TABLE, repay_payload)
     sb.schema(schema).table(PAYMENTS_TABLE).insert(repay_payload).execute()
 
     loan = fetch_one(
         sb.schema(schema).table(LOANS_TABLE)
-        .select("id,member_id,status,principal,principal_current,unpaid_interest,total_due")
+        .select("id,member_id,status,principal,principal_current,unpaid_interest")
         .eq("id", int(loan_id))
     )
     if loan:
@@ -698,7 +694,7 @@ def reject_payment(sb, schema: str, pending_id: int, rejecter_user_id: str, reas
 
 
 # ============================================================
-# INTEREST (ledger-based) — writes to unpaid_interest + totals
+# INTEREST (ledger-based) — DO NOT update total_due (GENERATED)
 # ============================================================
 def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> Tuple[int, float]:
     month = _month_key()
@@ -706,7 +702,7 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> Tuple[int, f
 
     loans = (
         sb.schema(schema).table(LOANS_TABLE)
-        .select("id,member_id,status,principal,principal_current,unpaid_interest,total_interest_generated,interest_rate_monthly,total_due")
+        .select("id,member_id,status,principal,principal_current,unpaid_interest,total_interest_generated,interest_rate_monthly")
         .limit(20000).execute().data or []
     )
 
@@ -750,13 +746,10 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> Tuple[int, f
 
         unpaid_interest_new = float(r.get("unpaid_interest") or 0) + float(interest)
         total_interest_generated_new = float(r.get("total_interest_generated") or 0) + float(interest)
-        principal_curr = float(r.get("principal_current") or principal_current)
-        total_due_new = principal_curr + unpaid_interest_new
 
         upd = {
             "unpaid_interest": unpaid_interest_new,
             "total_interest_generated": total_interest_generated_new,
-            "total_due": total_due_new,
             "updated_at": ts,
         }
         upd = filter_payload_to_existing_columns(sb, schema, LOANS_TABLE, upd)
@@ -769,7 +762,7 @@ def accrue_monthly_interest(sb, schema: str, actor_user_id: str) -> Tuple[int, f
 
 
 # ============================================================
-# DPD / DELINQUENCY (fallback)
+# DPD / DELINQUENCY
 # ============================================================
 def _parse_due_date(loan_row: dict) -> Optional[date]:
     for k in ("due_date", "next_due_date", "expected_due_date", "payment_due_date"):
