@@ -1,20 +1,12 @@
 
 # loans_ui.py ✅ COMPLETE UPDATED SINGLE FILE — NEW STANDARD (NO LEGACY)
 # -----------------------------------------------------------------------------
-# ✅ FIXES INCLUDED (for your current issues):
-#   1) ✅ Record Payment "Loan not found" FIXED PERMANENTLY:
-#      - The payment dropdown is built ONLY from public.loans (real IDs)
-#      - v_loans_with_member is used ONLY for display name enrichment (never for IDs)
-#
-#   2) ✅ Reject wording aligned with DB constraint (status allowed: pending/approved/rejected/cancelled)
-#      - Button says REJECT, default reason "rejected"
-#
-# ✅ DOES NOT REQUIRE phone number anywhere
-# ✅ ALLOWS borrower == surety (your rule)
-# ✅ Uses entity_type="loan_request" for signatures
-# ✅ Uses views when available for display:
-#    - v_loans_with_member
-#    - v_loan_payments_with_member
+# ✅ FIXES INCLUDED:
+#   1) ✅ Removes ALL accrued_interest references (your loans table has NO accrued_interest)
+#   2) ✅ Record Payment uses ONLY real loans.id (from public.loans)
+#   3) ✅ v_loans_with_member used only for name enrichment (never for IDs)
+#   4) ✅ Reject wording aligned with DB constraint (pending/approved/rejected/cancelled)
+#   5) ✅ No phone required anywhere
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -484,7 +476,7 @@ def _render_record_payment(sb, schema: str, actor: Actor):
     try:
         loans = (
             sb.schema(schema).table(LOANS_TABLE)
-            .select("id,member_id,status,principal,principal_current,unpaid_interest,accrued_interest,total_due")
+            .select("id,member_id,status,principal,principal_current,unpaid_interest,total_due")
             .order("id", desc=True)
             .limit(5000)
             .execute().data or []
@@ -527,7 +519,7 @@ def _render_record_payment(sb, schema: str, actor: Actor):
     def _lbl(r):
         due = _num(r.get("total_due"))
         pc = _num(r.get("principal_current") or r.get("principal"))
-        ui = _num(r.get("unpaid_interest") or r.get("accrued_interest"))
+        ui = _num(r.get("unpaid_interest"))
         mid = int(_num(r.get("member_id")))
         who = (name_map.get(mid) or f"Member {mid}").strip()
         return f"Loan {int(r['id'])} • {who} • {str(r.get('status') or '')} • Principal {pc:,.0f} • Interest {ui:,.0f} • Due {due:,.0f}"
