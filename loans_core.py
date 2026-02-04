@@ -1,7 +1,7 @@
 
-# loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED — MATCHES YOUR PUBLIC TABLES
+# loans_core.py ✅ COMPLETE SINGLE-FILE UPDATED — MATCHES YOUR PUBLIC TABLES (NO LEGACY)
 # -----------------------------------------------------------------------------
-# ✅ Tables (from your screenshot):
+# ✅ Tables (from your standard):
 #    - loans
 #    - loan_payments
 #    - loan_repayments_pending
@@ -10,13 +10,16 @@
 #    - signatures
 #    - members
 #
-# ✅ Fixes:
-#   - Removes loans_legacy references (uses loans)
-#   - Uses loan_payments for confirmed payments
-#   - Uses loan_repayments_pending for maker-checker queue
-#   - Adds insert_signature() required by loans_ui.py
-#   - Adds record_payment() required by loans_ui.py
-#   - Approval signature check uses entity_type="loan_request"
+# ✅ Fixes in THIS version:
+#   - ❌ Removes member_contribution_totals.foundation_paid_total / foundation_pending_total (not in your view)
+#   - ✅ Uses your REAL view columns:
+#       member_id, contrib_total, foundation_total, total_contributed
+#   - ✅ Keeps signatures entity_type="loan_request"
+#   - ✅ Keeps record_payment() and insert_signature() required by loans_ui.py
+#   - ✅ Borrower can be same as surety (your rule)
+#   - ✅ Cap rule (NEW STANDARD):
+#       capacity = contrib_total + 0.70 * foundation_total
+#       cap_total = cap_b + cap_s (self-surety counts once)
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -49,7 +52,7 @@ REPAY_DATE_COL = "paid_at"
 REQUEST_ENTITY_TYPE = "loan_request"
 REQ_SIG_REQUIRED = ["borrower", "surety", "treasury"]
 
-# Member lookup candidates (you have members for sure; the rest are optional)
+# Member lookup candidates (members exists; others optional)
 MEMBER_NAME_TABLES = ["members", "member_registry", "members_legacy"]
 
 
@@ -394,32 +397,50 @@ def get_request(sb, schema: str, request_id: int) -> dict:
 
 
 # ============================================================
-# GOVERNANCE + APPROVAL
+# GOVERNANCE + APPROVAL ✅ FIXED FOR YOUR VIEW COLUMNS
 # ============================================================
 def _get_totals_row(sb, schema: str, member_id: int) -> dict:
+    """
+    Reads from member_contribution_totals (VIEW).
+    ✅ Confirmed view columns:
+      - member_id
+      - contrib_total
+      - foundation_total
+      - total_contributed
+    """
     rows = (
         sb.schema(schema)
         .table("member_contribution_totals")
-        .select("member_id,contrib_total,foundation_paid_total,foundation_pending_total")
+        .select("member_id,contrib_total,foundation_total,total_contributed")
         .eq("member_id", int(member_id))
         .limit(1)
         .execute().data or []
     )
     if rows:
-        return rows[0]
+        r = rows[0]
+        r.setdefault("member_id", int(member_id))
+        r.setdefault("contrib_total", 0)
+        r.setdefault("foundation_total", 0)
+        if "total_contributed" not in r or r.get("total_contributed") is None:
+            r["total_contributed"] = float(r.get("contrib_total") or 0) + float(r.get("foundation_total") or 0)
+        return r
+
     return {
         "member_id": int(member_id),
         "contrib_total": 0,
-        "foundation_paid_total": 0,
-        "foundation_pending_total": 0,
+        "foundation_total": 0,
+        "total_contributed": 0,
     }
 
 
 def _capacity_from_row(r: dict) -> float:
+    """
+    NEW STANDARD:
+      capacity = contrib_total + 0.70 * foundation_total
+    """
     contrib = float(r.get("contrib_total") or 0)
-    f_paid = float(r.get("foundation_paid_total") or 0)
-    f_pending = float(r.get("foundation_pending_total") or 0)
-    return contrib + CAP_MULT * (f_paid + f_pending)
+    foundation = float(r.get("foundation_total") or 0)
+    return contrib + CAP_MULT * foundation
 
 
 def check_loan_qualification(sb, schema: str, borrower_id: int, surety_id: int, amount: float) -> dict:
@@ -430,7 +451,6 @@ def check_loan_qualification(sb, schema: str, borrower_id: int, surety_id: int, 
     if self_surety:
         cap_total = cap_b
         cap_s = None
-        surety = None
     else:
         surety = _get_totals_row(sb, schema, surety_id)
         cap_s = _capacity_from_row(surety)
@@ -445,7 +465,7 @@ def check_loan_qualification(sb, schema: str, borrower_id: int, surety_id: int, 
         "cap_borrower": cap_b,
         "cap_surety": cap_s,
         "cap_total": cap_total,
-        "rule": "cap = contrib_total + 0.70*(foundation_paid_total + foundation_pending_total); cap_total = cap_b + cap_s (self-surety counts once)",
+        "rule": "cap = contrib_total + 0.70*foundation_total; cap_total = cap_b + cap_s (self-surety counts once)",
     }
 
 
