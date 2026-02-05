@@ -1,29 +1,33 @@
 
-# app.py ✅ COMPLETE SINGLE CODE — NJANGI STANDARD (NO legacy)
+# app.py ✅ COMPLETE SINGLE CODE — NJANGI STANDARD (NO legacy) — “SLOW / GENTLE MODE”
+# ------------------------------------------------------------------------------
 # ✅ Built to STOP Streamlit blank-screen crashes:
 #    - ALL optional modules are lazy-imported inside page blocks (no import-time crash)
 #    - Secrets/env validated with visible errors
 #    - Service key optional (writes disabled if missing)
 #    - Safe Mode switch to run Dashboard-only
 #
+# ✅ "SLOW MODE" (to reduce Supabase load / free-tier throttling):
+#    - Adds a global request throttle (min seconds between DB calls)
+#    - Increases cache TTLs (less frequent re-fetch)
+#    - Refresh button only clears st.cache_data (NOT cache_resource) by default
+#    - Attendance UI uses a form (one submit = one write), not continuous triggers
+#    - Limits rows returned from views/tables
+#
 # ✅ Uses NEW tables/views only:
 #   tables: members, sessions, app_state, minutes, attendance, contributions, foundation_contributions,
 #           payouts, loans, loan_payments, fines, interest_ledger, audit_log
 #   views (optional): v_next_beneficiary, v_contributions_with_member, v_attendance_with_member
 #
-# ✅ Dashboard: delegates to dashboard_panel.render_dashboard (no duplicate header)
-# ✅ Minutes & Attendance:
-#    - Attendance save = delete session rows then insert (prevents duplicates)
-#    - Minutes = update if session exists else insert
-#    - Summaries = minutes + attendance + contributions
-#
 # NOTE: This file does NOT reference any "legacy" tables.
+# ------------------------------------------------------------------------------
 
 from __future__ import annotations
 
 import os
-from datetime import date, datetime, timezone
-from typing import Any, Callable, Optional
+import time
+from datetime import datetime, timezone
+from typing import Any, Optional, Tuple, List, Dict
 
 import pandas as pd
 import streamlit as st
@@ -39,7 +43,6 @@ st.set_page_config(
     layout="wide",
     page_icon="🏦",
 )
-
 
 # ============================================================
 # TIME
@@ -197,6 +200,25 @@ sb_service = get_service_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_
 
 
 # ============================================================
+# SLOW MODE (THROTTLE DB CALLS)
+# ============================================================
+# You can tune these from Streamlit Secrets/Env if you want
+SLOW_MODE = str(get_secret("SLOW_MODE", "1")).strip() not in ("0", "false", "False", "no", "NO")
+MIN_SECONDS_BETWEEN_DB_CALLS = float(get_secret("MIN_SECONDS_BETWEEN_DB_CALLS", "0.35") or "0.35")
+
+def throttle_db():
+    """Global throttle to reduce bursts of Supabase calls (free tier friendly)."""
+    if not SLOW_MODE:
+        return
+    last = st.session_state.get("_last_db_call_ts", 0.0)
+    now = time.time()
+    wait = MIN_SECONDS_BETWEEN_DB_CALLS - (now - last)
+    if wait > 0:
+        time.sleep(wait)
+    st.session_state["_last_db_call_ts"] = time.time()
+
+
+# ============================================================
 # SAFE ERROR TEXT
 # ============================================================
 def _api_msg(e: Exception) -> str:
@@ -210,6 +232,7 @@ def _api_msg(e: Exception) -> str:
 
 def table_readable(client, schema: str, table_name: str) -> bool:
     try:
+        throttle_db()
         client.schema(schema).table(table_name).select("*").limit(1).execute()
         return True
     except Exception:
@@ -227,6 +250,7 @@ def safe_select(
     **filters,
 ) -> list[dict]:
     try:
+        throttle_db()
         q = client.schema(schema).table(table_name).select(select_cols)
         for col, val in (filters or {}).items():
             if val is None:
@@ -247,9 +271,7 @@ def safe_select(
 # LAZY IMPORT HELPER (PREVENTS BLACK SCREEN)
 # ============================================================
 def lazy_import(path: str, attr: str | None = None) -> tuple[Any | None, str | None]:
-    """
-    Returns (obj, error_text). Never raises.
-    """
+    """Returns (obj, error_text). Never raises."""
     try:
         mod = __import__(path, fromlist=["*"])
         if attr:
@@ -262,13 +284,15 @@ def lazy_import(path: str, attr: str | None = None) -> tuple[Any | None, str | N
 # ============================================================
 # TOP BAR
 # ============================================================
-left, right = st.columns([1, 0.25])
+left, right = st.columns([1, 0.30])
 with left:
     st.markdown(f"## 🏦 {APP_BRAND} • Bank Dashboard")
+    if SLOW_MODE:
+        st.caption("🐢 Slow Mode ON (reduced DB load)")
 with right:
+    # “slow” refresh: clear cache_data only (keeps clients cached)
     if st.button("🔄 Refresh data", use_container_width=True):
         st.cache_data.clear()
-        st.cache_resource.clear()
         st.rerun()
 
 
@@ -276,19 +300,38 @@ with right:
 # SIDEBAR SAFE MODE
 # ============================================================
 with st.sidebar.expander("🛟 Safe Mode", expanded=False):
-    SAFE_MODE = st.checkbox(
+    SAFE_MODE_UI = st.checkbox(
         "Run Dashboard only (disable optional pages)",
         value=False,
         help="Use this if Streamlit Cloud shows a blank screen; it avoids importing other modules.",
     )
 
+with st.sidebar.expander("🐢 Slow Mode", expanded=False):
+    st.write("Reduce Supabase calls (best for Free plan / outages).")
+    SLOW_MODE_UI = st.checkbox("Enable Slow Mode", value=SLOW_MODE)
+    st.session_state["_slow_mode_override"] = SLOW_MODE_UI
+    if "MIN_SECONDS_BETWEEN_DB_CALLS_UI" not in st.session_state:
+        st.session_state["MIN_SECONDS_BETWEEN_DB_CALLS_UI"] = MIN_SECONDS_BETWEEN_DB_CALLS
+    st.session_state["MIN_SECONDS_BETWEEN_DB_CALLS_UI"] = st.slider(
+        "Min seconds between DB calls",
+        min_value=0.00,
+        max_value=2.00,
+        value=float(st.session_state["MIN_SECONDS_BETWEEN_DB_CALLS_UI"]),
+        step=0.05,
+    )
+
+# apply UI overrides
+SLOW_MODE = bool(st.session_state.get("_slow_mode_override", SLOW_MODE))
+MIN_SECONDS_BETWEEN_DB_CALLS = float(st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", MIN_SECONDS_BETWEEN_DB_CALLS))
+
 
 # ============================================================
-# CACHED LOADERS
+# CACHED LOADERS (LONGER TTL = SLOWER/LESS CALLS)
 # ============================================================
-@st.cache_data(ttl=90)
+@st.cache_data(ttl=300)  # was 90
 def load_members(url: str, anon_key: str, schema: str) -> pd.DataFrame:
     client = create_client(url, anon_key)
+    throttle_db()
     rows = (
         client.schema(schema)
         .table("members")
@@ -312,16 +355,17 @@ def load_members(url: str, anon_key: str, schema: str) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=240)  # was 60
 def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFrame:
     client = create_client(url, anon_key)
     try:
+        throttle_db()
         rows = (
             client.schema(schema)
             .table("v_contributions_with_member")
             .select("id,member_id,member_name,session_id,amount,paid_at,note,created_at")
             .order("created_at", desc=True)
-            .limit(1000)
+            .limit(500)  # reduced from 1000
             .execute()
             .data
             or []
@@ -343,9 +387,7 @@ def get_app_state(sb, schema: str) -> dict:
 
 
 def get_effective_session_id(sb_read, schema: str) -> tuple[int | None, str]:
-    """
-    Returns (session_id, note): from app_state OR fallback to latest session.
-    """
+    """Returns (session_id, note): from app_state OR fallback to latest session."""
     state = get_app_state(sb_read, schema)
     raw = state.get("current_session_id")
     try:
@@ -376,7 +418,7 @@ def get_effective_session_id(sb_read, schema: str) -> tuple[int | None, str]:
 # ============================================================
 # NAVIGATION
 # ============================================================
-if SAFE_MODE:
+if SAFE_MODE_UI:
     PAGES = ["Dashboard"]
 else:
     PAGES = [
@@ -398,7 +440,6 @@ page = st.sidebar.radio("Menu", PAGES, key="main_menu")
 # PAGES
 # ============================================================
 if page == "Dashboard":
-    # Dashboard panel must NOT render big header (app.py owns it)
     render_dashboard(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
 
 
@@ -409,8 +450,15 @@ elif page == "Contributions":
 
     df = load_contributions_view(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
     if df.empty:
-        # fallback: show raw contributions without names
-        rows = safe_select(sb_anon, "contributions", "*", schema=SUPABASE_SCHEMA, order_by="created_at", order_desc=True, limit=500)
+        rows = safe_select(
+            sb_anon,
+            "contributions",
+            "*",
+            schema=SUPABASE_SCHEMA,
+            order_by="created_at",
+            order_desc=True,
+            limit=250,  # reduced
+        )
         df2 = pd.DataFrame(rows)
         if df2.empty:
             st.info("No contributions found.")
@@ -515,17 +563,19 @@ elif page == "Minutes & Attendance":
                 if not title.strip() or not body.strip():
                     st.error("Title and body are required.")
                 else:
-                    existing = (
-                        sb_service.schema(SUPABASE_SCHEMA)
-                        .table("minutes")
-                        .select("id,session_id")
-                        .eq("session_id", int(current_session_id))
-                        .limit(1)
-                        .execute()
-                        .data
-                        or []
-                    )
                     try:
+                        throttle_db()
+                        existing = (
+                            sb_service.schema(SUPABASE_SCHEMA)
+                            .table("minutes")
+                            .select("id,session_id")
+                            .eq("session_id", int(current_session_id))
+                            .limit(1)
+                            .execute()
+                            .data
+                            or []
+                        )
+                        throttle_db()
                         if existing:
                             mid = int(existing[0]["id"])
                             sb_service.schema(SUPABASE_SCHEMA).table("minutes").update(
@@ -544,6 +594,7 @@ elif page == "Minutes & Attendance":
                                 }
                             ).execute()
                             st.success("Minutes saved.")
+                        st.cache_data.clear()
                         st.rerun()
                     except Exception as e:
                         st.error("Failed to save minutes.")
@@ -568,38 +619,59 @@ elif page == "Minutes & Attendance":
         st.markdown(glass_close(), unsafe_allow_html=True)
 
     # -------------------------
-    # Attendance
+    # Attendance (FORM-BASED = ONE WRITE)
     # -------------------------
     with tab2:
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.subheader("Attendance")
         st.caption(f"Linked session_id: {current_session_id}  •  {session_note}")
-        st.caption("Mark each member as Present or Absent. Add a reason/note if needed.")
+        st.caption("Mark each member Present/Absent. Submit once (slow-mode friendly).")
 
-        attendance_rows: list[dict] = []
-        for _, r in df_members.sort_values("id").iterrows():
-            mid = int(r["id"])
-            name = str(r.get("member_name") or r.get("name") or "")
-            label = f"{mid:02d} • {name}"
+        # Show existing attendance (read only)
+        arows_existing = safe_select(
+            sb_anon,
+            "attendance",
+            "member_id,present,note,created_at",
+            schema=SUPABASE_SCHEMA,
+            order_by="member_id",
+            order_desc=False,
+            limit=2000,
+            session_id=int(current_session_id),
+        )
+        existing_map = {int(r["member_id"]): r for r in arows_existing if r.get("member_id") is not None}
 
-            c_status, c_note = st.columns([0.42, 0.58])
-            with c_status:
-                status_key = f"att_status_{mid}_{current_session_id}"
-                status = st.radio(label, options=["present", "absent"], index=0, horizontal=True, key=status_key)
-            with c_note:
-                note_key = f"att_note_{mid}_{current_session_id}"
-                note = st.text_input(
-                    "Reason / Note",
-                    value="",
-                    placeholder="e.g., Sick, Travel, Excused…",
-                    key=note_key,
-                    label_visibility="collapsed",
-                )
+        with st.form("attendance_form"):
+            attendance_rows: list[dict] = []
+            for _, r in df_members.sort_values("id").iterrows():
+                mid = int(r["id"])
+                name = str(r.get("member_name") or r.get("name") or "")
+                label = f"{mid:02d} • {name}"
 
-            attendance_rows.append({"member_id": mid, "present": (status == "present"), "note": note.strip() or None})
+                ex = existing_map.get(mid, {})
+                ex_present = bool(ex.get("present")) if ex else True
+                ex_note = str(ex.get("note") or "") if ex else ""
 
-        st.divider()
-        save = st.button("💾 Save attendance (ALL members)", use_container_width=True)
+                c_status, c_note = st.columns([0.42, 0.58])
+                with c_status:
+                    status = st.radio(
+                        label,
+                        options=["present", "absent"],
+                        index=0 if ex_present else 1,
+                        horizontal=True,
+                        key=f"att_status_{mid}_{current_session_id}",
+                    )
+                with c_note:
+                    note = st.text_input(
+                        "Reason / Note",
+                        value=ex_note,
+                        placeholder="e.g., Sick, Travel, Excused…",
+                        key=f"att_note_{mid}_{current_session_id}",
+                        label_visibility="collapsed",
+                    )
+
+                attendance_rows.append({"member_id": mid, "present": (status == "present"), "note": note.strip() or None})
+
+            save = st.form_submit_button("💾 Save attendance (ALL members)", use_container_width=True)
 
         if save:
             if not can_write:
@@ -618,24 +690,26 @@ elif page == "Minutes & Attendance":
 
                 # delete-then-insert for this session (prevents duplicates)
                 try:
+                    throttle_db()
                     sb_service.schema(SUPABASE_SCHEMA).table("attendance").delete().eq("session_id", int(current_session_id)).execute()
                 except Exception:
                     pass
 
                 try:
+                    throttle_db()
                     sb_service.schema(SUPABASE_SCHEMA).table("attendance").insert(payload_rows).execute()
                     present_count = sum(1 for r in payload_rows if r.get("present") is True)
                     absent_count = len(payload_rows) - present_count
                     st.success(f"Attendance saved ✅ Present: {present_count} • Absent: {absent_count}")
+                    st.cache_data.clear()
                     st.rerun()
                 except Exception as e:
                     st.error("Failed to save attendance.")
                     st.code(_api_msg(e), language="text")
 
         st.divider()
-        st.markdown("### Current session attendance")
-
-        # Try optional view; fallback to join in python
+        st.markdown("### Current session attendance (read)")
+        # Prefer view if readable (but still limited)
         if table_readable(sb_anon, SUPABASE_SCHEMA, "v_attendance_with_member"):
             arows = safe_select(
                 sb_anon,
@@ -653,17 +727,7 @@ elif page == "Minutes & Attendance":
             else:
                 st.dataframe(dfa, use_container_width=True, hide_index=True)
         else:
-            arows = safe_select(
-                sb_anon,
-                "attendance",
-                "id,member_id,session_id,present,note,created_at",
-                schema=SUPABASE_SCHEMA,
-                order_by="member_id",
-                order_desc=False,
-                limit=2000,
-                session_id=int(current_session_id),
-            )
-            dfa = pd.DataFrame(arows)
+            dfa = pd.DataFrame(arows_existing)
             if dfa.empty:
                 st.info("No attendance recorded for this session yet.")
             else:
@@ -705,17 +769,7 @@ elif page == "Minutes & Attendance":
 
         st.divider()
         st.markdown("### ✅ Attendance summary (current session)")
-        a_rows = safe_select(
-            sb_anon,
-            "attendance",
-            "id,member_id,session_id,present,created_at",
-            schema=SUPABASE_SCHEMA,
-            order_by="created_at",
-            order_desc=True,
-            limit=2000,
-            session_id=int(current_session_id),
-        )
-        dfa = pd.DataFrame(a_rows)
+        dfa = pd.DataFrame(arows_existing)
         if dfa.empty:
             st.info("No attendance for current session.")
         else:
@@ -735,33 +789,28 @@ elif page == "Minutes & Attendance":
                 schema=SUPABASE_SCHEMA,
                 order_by="created_at",
                 order_desc=True,
-                limit=2000,
+                limit=1500,
                 session_id=int(current_session_id),
             )
             dfc = pd.DataFrame(c_rows)
-            if dfc.empty:
-                st.info("No contributions for current session.")
-            else:
-                dfc["amount"] = pd.to_numeric(dfc["amount"], errors="coerce").fillna(0)
-                st.metric("Rows", f"{len(dfc):,}")
-                st.metric("Sum", f"{float(dfc['amount'].sum()):,.0f}")
-                st.dataframe(dfc, use_container_width=True, hide_index=True)
+
+        if dfc.empty:
+            st.info("No contributions for current session.")
         else:
-            dfc = dfc[dfc["session_id"].astype(str) == str(current_session_id)].copy()
-            if dfc.empty:
-                st.info("No contributions for current session.")
-            else:
-                dfc["amount"] = pd.to_numeric(dfc["amount"], errors="coerce").fillna(0)
-                st.metric("Rows", f"{len(dfc):,}")
-                st.metric("Sum", f"{float(dfc['amount'].sum()):,.0f}")
-                top = (
-                    dfc.groupby(["member_id", "member_name"], dropna=False)["amount"].sum()
-                    .sort_values(ascending=False)
-                    .head(10)
-                    .reset_index()
-                )
-                st.caption("Top contributors (current session)")
-                st.dataframe(top, use_container_width=True, hide_index=True)
+            if "session_id" in dfc.columns:
+                dfc = dfc[dfc["session_id"].astype(str) == str(current_session_id)].copy()
+            dfc["amount"] = pd.to_numeric(dfc.get("amount"), errors="coerce").fillna(0)
+            st.metric("Rows", f"{len(dfc):,}")
+            st.metric("Sum", f"{float(dfc['amount'].sum()):,.0f}")
+            top = (
+                dfc.groupby([c for c in ["member_id", "member_name"] if c in dfc.columns], dropna=False)["amount"]
+                .sum()
+                .sort_values(ascending=False)
+                .head(10)
+                .reset_index()
+            )
+            st.caption("Top contributors (current session)")
+            st.dataframe(top, use_container_width=True, hide_index=True)
 
         st.markdown(glass_close(), unsafe_allow_html=True)
 
