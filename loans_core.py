@@ -27,6 +27,7 @@
 #   - list_unconfirmed_payments, confirm_payment, reject_payment
 #   - accrue_monthly_interest
 #   - delinquency_table, list_member_loans
+#   - ✅ get_member_for_pdf (NEW) — fixes PDF Name: None
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -58,6 +59,7 @@ REPAY_DATE_COL = "paid_at"
 REQUEST_ENTITY_TYPE = "loan_request"
 REQ_SIG_REQUIRED = ["borrower", "surety", "treasury"]
 
+# where we try to lookup a member name (best-effort)
 MEMBER_NAME_TABLES = ["members", "member_registry", "members_legacy"]
 
 
@@ -225,7 +227,8 @@ def _lookup_member_name(sb, schema: str, member_id: int) -> Optional[str]:
     if mid <= 0:
         return None
 
-    name_cols_priority = ["member_name", "full_name", "name", "display_name", "first_name", "last_name"]
+    # NOTE: your DB confirmed members has "name" (not full_name)
+    name_cols_priority = ["member_name", "name", "display_name", "first_name", "last_name", "full_name"]
 
     for table in MEMBER_NAME_TABLES:
         cols = _get_table_columns(sb, schema, table)
@@ -272,6 +275,56 @@ def _ensure_member_name(sb, schema: str, member_id: int, member_name: Optional[s
     if looked:
         return looked
     return f"Member {int(member_id)}"
+
+
+# ============================================================
+# ✅ NEW: MEMBER DICT FOR PDFs (Fixes "Name: None" in pdfs.py)
+# ============================================================
+def get_member_for_pdf(sb, schema: str, member_id: int) -> dict:
+    """
+    Returns the EXACT shape your pdfs.py expects:
+      { member_id, member_name, position? }
+
+    Your members table is: members.id, members.name
+    pdfs.py prints: member.get('member_id') and member.get('member_name')
+    """
+    mid = int(member_id or 0)
+    if mid <= 0:
+        return {"member_id": None, "member_name": "Unknown"}
+
+    # Resolve name robustly (uses members.name if present)
+    resolved_name = _ensure_member_name(sb, schema, mid, None)
+
+    # Optional position if exists
+    position = None
+    try:
+        cols = _get_table_columns(sb, schema, MEMBERS_TABLE)
+        if cols:
+            id_col = "id" if "id" in cols else ("member_id" if "member_id" in cols else None)
+            if id_col:
+                sel = [id_col]
+                if "name" in cols:
+                    sel.append("name")
+                if "position" in cols:
+                    sel.append("position")
+
+                row = fetch_one(
+                    sb.schema(schema).table(MEMBERS_TABLE)
+                    .select(",".join(sel))
+                    .eq(id_col, mid)
+                )
+                if row:
+                    db_name = str(row.get("name") or "").strip()
+                    if db_name:
+                        resolved_name = db_name
+                    position = row.get("position")
+    except Exception:
+        pass
+
+    out = {"member_id": mid, "member_name": str(resolved_name or f"Member {mid}")}
+    if position is not None:
+        out["position"] = position
+    return out
 
 
 # ============================================================
