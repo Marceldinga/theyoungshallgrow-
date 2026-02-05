@@ -40,6 +40,16 @@ def _utc_now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def _member_id(member: dict) -> Any:
+    """Accept either {member_id, member_name} OR {id, name} shapes."""
+    return member.get("member_id") or member.get("id")
+
+
+def _member_name(member: dict) -> str:
+    """Accept either {member_id, member_name} OR {id, name} shapes."""
+    return str(member.get("member_name") or member.get("name") or "Unknown")
+
+
 # ============================================================
 # LOAN STATEMENT PDF (Member)
 # ============================================================
@@ -89,7 +99,11 @@ def make_member_loan_statement_pdf(
     pdf.drawString(left, y, "Member")
     y -= 0.22 * inch
     pdf.setFont("Helvetica", 10)
-    pdf.drawString(left, y, f"ID: {member.get('member_id')}    Name: {member.get('member_name')}")
+
+    mid = _member_id(member) or "—"
+    mname = _member_name(member)
+    pdf.drawString(left, y, f"ID: {mid}    Name: {mname}")
+
     y -= 0.18 * inch
     if member.get("position") is not None:
         pdf.drawString(left, y, f"Position: {member.get('position')}")
@@ -267,8 +281,9 @@ def make_loan_statements_zip(
     with zipfile.ZipFile(zbuf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for ms in member_statements:
             member = ms.get("member") or {}
-            mid = member.get("member_id")
-            mname = str(member.get("member_name") or "Member").replace("/", "-").replace("\\", "-")
+
+            mid = _member_id(member)
+            mname = _member_name(member).replace("/", "-").replace("\\", "-")
 
             pdf_bytes = make_member_loan_statement_pdf(
                 brand=brand,
