@@ -1,4 +1,3 @@
-
 # dashboard_panel.py ✅ COMPLETE SINGLE CODE (NO SQL) — NJANGI STANDARD (NO "legacy")
 # ✅ Removes the BIG Dashboard header ("🏦 theyoungshallgrow • Bank Dashboard")
 # ✅ Removes the Attendance chart + its header section entirely
@@ -652,7 +651,8 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.markdown("#### 🗓️ Loan Repayment Plan")
         st.caption(f"Due = {DUE_DAYS} days from last payment (or borrow_date if never paid).")
-        st.dataframe(plan_df, use_container_width=True, hide_index=True)
+        # ✅ FIX: Streamlit deprecation — use width instead of use_container_width
+        st.dataframe(plan_df, width="stretch", hide_index=True)
         st.markdown(glass_close(), unsafe_allow_html=True)
 
     # --- Debug ---
