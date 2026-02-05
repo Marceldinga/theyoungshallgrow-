@@ -291,7 +291,7 @@ with left:
         st.caption("🐢 Slow Mode ON (reduced DB load)")
 with right:
     # “slow” refresh: clear cache_data only (keeps clients cached)
-    if st.button("🔄 Refresh data", use_container_width=True):
+    if st.button("🔄 Refresh data", width="stretch"):
         st.cache_data.clear()
         st.rerun()
 
@@ -464,9 +464,9 @@ elif page == "Contributions":
             st.info("No contributions found.")
         else:
             st.warning("View v_contributions_with_member not readable. Showing raw contributions.")
-            st.dataframe(df2, use_container_width=True, hide_index=True)
+            st.dataframe(df2, width="stretch", hide_index=True)
     else:
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width="stretch", hide_index=True)
 
     st.markdown(glass_close(), unsafe_allow_html=True)
 
@@ -557,7 +557,7 @@ elif page == "Minutes & Attendance":
             with st.form("minutes_form", clear_on_submit=False):
                 title = st.text_input("Title", key="minutes_title")
                 body = st.text_area("Minutes / Documentation", height=260, key="minutes_body")
-                ok = st.form_submit_button("💾 Save minutes", use_container_width=True)
+                ok = st.form_submit_button("💾 Save minutes", width="stretch")
 
             if ok:
                 if not title.strip() or not body.strip():
@@ -614,7 +614,7 @@ elif page == "Minutes & Attendance":
         if dfm.empty:
             st.info("No minutes recorded yet.")
         else:
-            st.dataframe(dfm, use_container_width=True, hide_index=True)
+            st.dataframe(dfm, width="stretch", hide_index=True)
 
         st.markdown(glass_close(), unsafe_allow_html=True)
 
@@ -671,7 +671,7 @@ elif page == "Minutes & Attendance":
 
                 attendance_rows.append({"member_id": mid, "present": (status == "present"), "note": note.strip() or None})
 
-            save = st.form_submit_button("💾 Save attendance (ALL members)", use_container_width=True)
+            save = st.form_submit_button("💾 Save attendance (ALL members)", width="stretch")
 
         if save:
             if not can_write:
@@ -725,7 +725,7 @@ elif page == "Minutes & Attendance":
             if dfa.empty:
                 st.info("No attendance recorded for this session yet.")
             else:
-                st.dataframe(dfa, use_container_width=True, hide_index=True)
+                st.dataframe(dfa, width="stretch", hide_index=True)
         else:
             dfa = pd.DataFrame(arows_existing)
             if dfa.empty:
@@ -736,7 +736,7 @@ elif page == "Minutes & Attendance":
                 dfa = dfa.merge(dm, on="member_id", how="left")
                 dfa = dfa[["member_id", "member_name", "present", "note", "created_at"]]
                 st.warning("View v_attendance_with_member not readable. Showing attendance joined in Python.")
-                st.dataframe(dfa, use_container_width=True, hide_index=True)
+                st.dataframe(dfa, width="stretch", hide_index=True)
 
         st.markdown(glass_close(), unsafe_allow_html=True)
 
@@ -810,7 +810,7 @@ elif page == "Minutes & Attendance":
                 .reset_index()
             )
             st.caption("Top contributors (current session)")
-            st.dataframe(top, use_container_width=True, hide_index=True)
+            st.dataframe(top, width="stretch", hide_index=True)
 
         st.markdown(glass_close(), unsafe_allow_html=True)
 
