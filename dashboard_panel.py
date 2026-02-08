@@ -1,3 +1,4 @@
+
 # dashboard_panel.py ✅ COMPLETE SINGLE CODE (NO SQL) — NJANGI STANDARD (NO "legacy")
 # ✅ Removes the BIG Dashboard header ("🏦 theyoungshallgrow • Bank Dashboard")
 # ✅ Removes the Attendance chart + its header section entirely
@@ -7,6 +8,11 @@
 # ✅ Uses sb_service for reads when available (RLS-safe), sb_anon fallback
 # ✅ Dark theme + glass KPI cards
 # ✅ Auto-refresh on app_state stamp change
+#
+# ✅ NEW: Attendance PDF download + summary (NO SQL)
+#    - Uses attendance + members
+#    - Current session only (current_session_id)
+#    - Generates PDF using reportlab
 #
 # ✅ FINANCE MODEL (your rule):
 #    - Payouts are pot redistribution → NOT cash flow (informational only)
@@ -28,16 +34,22 @@
 #   - interest_ledger          (id, loan_id, member_id, interest_month, amount, created_at, ...)
 #   - payouts                  (session_id, member_id, payout_amount, payout_date, payout_index, created_at, updated_at)  # informational only
 #   - fines                    (id, member_id, session_id, amount, reason, issued_by, status, paid_at, created_at, updated_at)
-#   - attendance               (id, member_id, session_id, present, note, created_at)  # still allowed, but NOT shown here
+#   - attendance               (id, member_id, session_id, present, note, created_at)  # allowed; used for PDF export
 #   - v_next_beneficiary       (optional view)
 
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from typing import Any
+from io import BytesIO
 
 import pandas as pd
 import streamlit as st
+
+# PDF
+from reportlab.lib.pagesizes import LETTER
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import inch
 
 DUE_DAYS = 28
 
@@ -455,6 +467,270 @@ def build_repayment_plan(sb, schema: str, last_payment_dates: dict[int, date]) -
 
 
 # ============================================================
+# ATTENDANCE PDF EXPORT (NO SQL)
+# ============================================================
+def _member_name_map(members_rows: list[dict[str, Any]]) -> dict[int, str]:
+    out: dict[int, str] = {}
+    for m in members_rows or []:
+        try:
+            mid = int(m.get("id"))
+        except Exception:
+            continue
+        dn = str(m.get("display_name") or "").strip()
+        nm = str(m.get("name") or "").strip()
+        out[mid] = dn or nm or f"Member {mid:02d}"
+    return out
+
+
+def _dedupe_attendance_latest(att_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Deduplicate by (member_id, session_id): keep the latest record by created_at, then id.
+    """
+    if not att_rows:
+        return []
+    df = pd.DataFrame(att_rows)
+    if df.empty:
+        return []
+
+    # normalize
+    for col in ("member_id", "session_id", "id"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "created_at" in df.columns:
+        df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+    else:
+        df["created_at"] = pd.NaT
+
+    # sort newest first
+    sort_cols = []
+    if "created_at" in df.columns:
+        sort_cols.append("created_at")
+    if "id" in df.columns:
+        sort_cols.append("id")
+    if sort_cols:
+        df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+
+    # keep first per (member_id, session_id)
+    if "member_id" in df.columns and "session_id" in df.columns:
+        df = df.drop_duplicates(subset=["member_id", "session_id"], keep="first")
+
+    return df.to_dict("records")
+
+
+def build_attendance_df(
+    sb,
+    schema: str,
+    session_id: int,
+    members_rows: list[dict[str, Any]],
+) -> pd.DataFrame:
+    if not session_id or not _table_exists(sb, schema, "attendance"):
+        return pd.DataFrame()
+
+    att_rows = safe_table_order_fallback(
+        sb,
+        schema,
+        "attendance",
+        "*",
+        limit=20000,
+        order_candidates=["created_at", "id"],
+        desc=True,
+    )
+
+    if not att_rows:
+        return pd.DataFrame()
+
+    # filter current session
+    filtered = []
+    for r in att_rows:
+        try:
+            sid = int(r.get("session_id")) if r.get("session_id") is not None else None
+        except Exception:
+            sid = None
+        if sid == int(session_id):
+            filtered.append(r)
+
+    filtered = _dedupe_attendance_latest(filtered)
+    if not filtered:
+        return pd.DataFrame()
+
+    name_map = _member_name_map(members_rows)
+
+    out_rows = []
+    for r in filtered:
+        try:
+            mid = int(r.get("member_id"))
+        except Exception:
+            continue
+        present = r.get("present")
+        # present can be True/False or 'true'/'false'
+        p = str(present).lower().strip() in ("true", "1", "yes") if not isinstance(present, bool) else bool(present)
+        note = str(r.get("note") or "").strip()
+        created_at = str(r.get("created_at") or "").strip()
+        out_rows.append(
+            {
+                "member_id": mid,
+                "member_name": name_map.get(mid, f"Member {mid:02d}"),
+                "status": "Present" if p else "Absent",
+                "note": note,
+                "recorded_at": created_at or "—",
+            }
+        )
+
+    df = pd.DataFrame(out_rows)
+    if df.empty:
+        return df
+
+    # stable ordering: by member_id
+    df["member_id"] = pd.to_numeric(df["member_id"], errors="coerce").fillna(0).astype(int)
+    df = df.sort_values("member_id", ascending=True).reset_index(drop=True)
+    return df
+
+
+def _pdf_draw_wrapped(c: canvas.Canvas, text: str, x: float, y: float, max_width: float, line_height: float = 12) -> float:
+    """
+    Draw wrapped text and return new y.
+    """
+    if not text:
+        return y
+    words = text.split()
+    line = ""
+    for w in words:
+        test = (line + " " + w).strip()
+        if c.stringWidth(test, "Helvetica", 10) <= max_width:
+            line = test
+        else:
+            c.setFont("Helvetica", 10)
+            c.drawString(x, y, line)
+            y -= line_height
+            line = w
+    if line:
+        c.setFont("Helvetica", 10)
+        c.drawString(x, y, line)
+        y -= line_height
+    return y
+
+
+def generate_attendance_pdf_bytes(
+    session_id: int,
+    session_window: str,
+    df: pd.DataFrame,
+    total_members: int,
+) -> bytes:
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=LETTER)
+    width, height = LETTER
+
+    margin = 0.75 * inch
+    x = margin
+    y = height - margin
+
+    # Title
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(x, y, "Attendance Report")
+    y -= 18
+
+    c.setFont("Helvetica", 11)
+    c.drawString(x, y, f"Session ID: {session_id}")
+    y -= 14
+    c.drawString(x, y, f"Session Window: {session_window}")
+    y -= 14
+    c.drawString(x, y, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    y -= 18
+
+    if df.empty:
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(x, y, "No attendance records found for this session.")
+        c.showPage()
+        c.save()
+        return buf.getvalue()
+
+    present_count = int((df["status"] == "Present").sum())
+    absent_count = int((df["status"] == "Absent").sum())
+    recorded = int(len(df))
+    denom = total_members if total_members > 0 else recorded
+    rate = (present_count / denom * 100.0) if denom > 0 else 0.0
+
+    # Summary
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(x, y, "Summary")
+    y -= 14
+
+    c.setFont("Helvetica", 11)
+    c.drawString(x, y, f"Total Members (registry): {total_members}")
+    y -= 13
+    c.drawString(x, y, f"Attendance Records (session): {recorded}")
+    y -= 13
+    c.drawString(x, y, f"Present: {present_count}")
+    y -= 13
+    c.drawString(x, y, f"Absent: {absent_count}")
+    y -= 13
+    c.drawString(x, y, f"Attendance Rate: {rate:.1f}% (Present / Total Members)")
+    y -= 18
+
+    # Detail header
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(x, y, "Details")
+    y -= 14
+
+    # columns
+    col1 = x
+    col2 = x + 1.2 * inch
+    col3 = x + 3.4 * inch
+    col4 = x + 4.6 * inch
+    max_note_w = (width - margin) - col4
+
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(col1, y, "ID")
+    c.drawString(col2, y, "Name")
+    c.drawString(col3, y, "Status")
+    c.drawString(col4, y, "Note")
+    y -= 10
+    c.line(x, y, width - margin, y)
+    y -= 12
+
+    c.setFont("Helvetica", 10)
+
+    for _, r in df.iterrows():
+        if y < margin + 80:
+            c.showPage()
+            y = height - margin
+            c.setFont("Helvetica-Bold", 10)
+            c.drawString(col1, y, "ID")
+            c.drawString(col2, y, "Name")
+            c.drawString(col3, y, "Status")
+            c.drawString(col4, y, "Note")
+            y -= 10
+            c.line(x, y, width - margin, y)
+            y -= 12
+            c.setFont("Helvetica", 10)
+
+        mid = str(r.get("member_id") or "")
+        name = str(r.get("member_name") or "")
+        status = str(r.get("status") or "")
+        note = str(r.get("note") or "")
+
+        c.drawString(col1, y, mid)
+        c.drawString(col2, y, name[:28])
+        c.drawString(col3, y, status)
+
+        # wrap note
+        y_note_start = y
+        y_after = _pdf_draw_wrapped(c, note, col4, y_note_start, max_width=max_note_w, line_height=11)
+
+        # row spacing: use the lower of (wrapped lines) vs one line
+        y = min(y_note_start - 14, y_after - 2)
+
+    # Footer
+    y -= 10
+    c.setFont("Helvetica-Oblique", 9)
+    c.drawString(x, max(margin - 10, 20), "theyoungshallgrow • Attendance PDF")
+
+    c.save()
+    return buf.getvalue()
+
+
+# ============================================================
 # DASHBOARD (STANDARD) — HEADER + ATTENDANCE CHART REMOVED
 # ============================================================
 def render_dashboard(sb_anon, sb_service, schema: str = "public"):
@@ -586,6 +862,44 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
 
     st.divider()
 
+    # ============================================================
+    # ✅ Attendance PDF Download (NEW)
+    # ============================================================
+    st.markdown("### 🧾 Attendance PDF")
+    st.caption("Download attendance + summary for the current session (no SQL).")
+
+    if not (isinstance(current_session_id, int) and current_session_id > 0):
+        st.info("No current_session_id available yet.")
+    else:
+        # Build attendance df from attendance table + members
+        att_df = build_attendance_df(read_sb, schema, int(current_session_id), members_rows)
+
+        if att_df.empty:
+            st.warning("No attendance recorded for this session yet.")
+        else:
+            # Preview
+            st.markdown(glass_open(), unsafe_allow_html=True)
+            st.dataframe(att_df, width="stretch", hide_index=True)
+            st.markdown(glass_close(), unsafe_allow_html=True)
+
+            pdf_bytes = generate_attendance_pdf_bytes(
+                session_id=int(current_session_id),
+                session_window=window,
+                df=att_df,
+                total_members=total_members,
+            )
+
+            fname = f"attendance_session_{int(current_session_id)}.pdf"
+            st.download_button(
+                "⬇️ Download Attendance PDF",
+                data=pdf_bytes,
+                file_name=fname,
+                mime="application/pdf",
+                use_container_width=True,
+            )
+
+    st.divider()
+
     # --- Financial Totals ---
     foundation_total = sum_table_amount(finance_sb, schema, "foundation_contributions", ["amount"])
     payouts_total = sum_table_amount(finance_sb, schema, "payouts", ["payout_amount", "amount"])  # informational only
@@ -681,7 +995,6 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
 # ============================================================
 # COMPATIBILITY EXPORTS (prevents import errors)
 # ============================================================
-# Some apps mistakenly import this typo; keep it to avoid crashes.
 def render_dashbaord(sb_anon, sb_service, schema: str = "public"):
     return render_dashboard(sb_anon, sb_service, schema=schema)
 
