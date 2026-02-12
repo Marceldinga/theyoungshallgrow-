@@ -1,13 +1,12 @@
 
-# admin_panels.py ✅ COMPLETE SINGLE CODE (NO LEGACY) — Members(+E164 phone) + Rotation(session-based)
-# + Contributions(ONE/member/session) + Foundation + Fines + Audit (optional)
+# admin_panels.py ✅ COMPLETE SINGLE CODE (NO LEGACY) — UPDATED DESIGN (Fintech Glass + Better Layout)
 # ------------------------------------------------------------------------------
 # ✅ Uses NEW tables only:
 #   - members(id,name,phone,created_at)
 #   - app_state(id=1, current_session_id, next_member_id, updated_at, ...)
 #   - sessions(id OR session_id, start_date, end_date)
 #   - contributions(member_id, session_id, amount, paid_at, note, created_at, updated_at)  ✅ ONE PER MEMBER PER SESSION (UPSERT)
-#   - foundation_contributions(member_id, session_id, amount, paid_at, note, created_at, updated_at) ✅ (UPSERT recommended)
+#   - foundation_contributions(member_id, session_id, amount, paid_at, note, created_at, updated_at) ✅ (UPSERT)
 #   - fines(member_id, amount, reason, status, paid_at, created_at, updated_at)  (optional)
 #   - audit_log (optional; silent if schema differs)
 #
@@ -16,11 +15,13 @@
 #   - Allows NULL phone
 #   - Validates format: optional +, 10–15 digits
 #
-# ✅ Member identity: transactions store member_id only (no member_name stored)
-# ✅ Members tab: add member name + phone; list members including phone; quick phone update
-# ✅ Rotation tab: sets app_state.current_session_id and app_state.next_member_id (session-based, no payout_index)
-# ✅ Contributions tab: saves contribution via UPSERT on (session_id, member_id) to prevent duplicates
-# ✅ No duplicate tabs inside Admin
+# ✅ UI / DESIGN UPDATE:
+#   - Consistent "glass card" sections
+#   - Cleaner headers + small captions
+#   - Two-column layouts where helpful
+#   - KPI-style metrics for state (session/next member)
+#   - Form-based submits for fewer accidental writes
+#   - Clear "Danger/Override" styling hints (text-based)
 # ------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -30,6 +31,26 @@ import re
 import streamlit as st
 import pandas as pd
 from postgrest.exceptions import APIError
+
+
+# ============================================================
+# UI helpers (design)
+# ============================================================
+def glass_open(title: str | None = None, subtitle: str | None = None) -> None:
+    if title:
+        st.markdown(f"### {title}")
+    if subtitle:
+        st.caption(subtitle)
+    st.markdown("<div class='glass'>", unsafe_allow_html=True)
+
+
+def glass_close() -> None:
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def section_divider() -> None:
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    st.divider()
 
 
 # ============================================================
@@ -119,7 +140,6 @@ def is_multiple_of_500(x: int) -> bool:
 
 
 def clean_name(name: str) -> str:
-    # supports multiple names; collapses extra spaces
     return " ".join((name or "").strip().split())
 
 
@@ -140,7 +160,7 @@ def clean_phone(phone: str) -> str | None:
     p = (phone or "").strip()
     if not p:
         return None
-    p = re.sub(r"[^0-9+]", "", p)  # strip spaces/dashes/() etc., keep + and digits
+    p = re.sub(r"[^0-9+]", "", p)
     return p or None
 
 
@@ -222,99 +242,99 @@ def load_members(sb_service, schema: str) -> pd.DataFrame:
 
 
 def panel_members(sb_service, schema: str, actor_email: str):
-    st.subheader("Members (Admin)")
-    st.caption(f"Members table in use: **{schema}.members**")
+    glass_open("Members", f"Table: {schema}.members • Add, list, and update phone numbers (E.164-style).")
 
-    st.markdown("### Add New Member")
-    name = st.text_input("Member name", value="", placeholder="e.g., Marcel Dinga", key="member_add_name")
-    phone = st.text_input("Phone number (optional)", value="", placeholder="e.g., +1 405-845-8002", key="member_add_phone")
+    # --- Add + Quick Edit in two columns
+    col_add, col_edit = st.columns([1, 1], gap="large")
 
-    # Preview normalized phone (nice UX)
-    if phone.strip():
-        st.caption(f"Will save as: `{clean_phone(phone)}`")
+    with col_add:
+        st.markdown("#### Add new member")
+        with st.form("member_add_form", clear_on_submit=True):
+            name = st.text_input("Member name", value="", placeholder="e.g., Marcel Dinga")
+            phone = st.text_input("Phone (optional)", value="", placeholder="e.g., +1 405-845-8002")
+            phone_clean_preview = clean_phone(phone)
+            if phone.strip():
+                st.caption(f"Will save as: `{phone_clean_preview}`")
 
-    if st.button("✅ Add Member", width="stretch", key="member_add_btn"):
-        name_clean = clean_name(name)
-        phone_clean = clean_phone(phone)
+            add = st.form_submit_button("✅ Add Member", use_container_width=True)
 
-        if not name_clean:
-            st.error("Member name is required.")
-            return
+        if add:
+            name_clean = clean_name(name)
+            phone_clean = clean_phone(phone)
 
-        if not is_valid_phone(phone_clean):
-            st.error("Invalid phone format. Use 10–15 digits with optional + (e.g., +14058458002).")
-            return
+            if not name_clean:
+                st.error("Member name is required.")
+            elif not is_valid_phone(phone_clean):
+                st.error("Invalid phone format. Use 10–15 digits with optional + (e.g., +14058458002).")
+            else:
+                payload = {"name": name_clean, "phone": phone_clean, "created_at": now_iso()}
+                ok = safe_insert(sb_service, schema, "members", payload)
+                if ok:
+                    audit_log(
+                        sb_service,
+                        schema,
+                        action="member_inserted",
+                        status="ok",
+                        table_name="members",
+                        entity="member",
+                        details=f"Added member name={name_clean} phone={phone_clean or ''}",
+                        payload=payload,
+                        actor_email=actor_email,
+                        actor_role="admin",
+                    )
+                    st.success("Member added.")
+                    st.cache_data.clear()
+                    st.rerun()
 
-        payload = {
-            "name": name_clean,
-            "phone": phone_clean,  # ✅ None or normalized phone
-            "created_at": now_iso(),
-        }
+    with col_edit:
+        st.markdown("#### Quick phone update")
+        dfm = load_members(sb_service, schema)
+        if dfm.empty:
+            st.info("No members yet. Add your first member on the left.")
+        else:
+            dfm["label"] = dfm.apply(lambda r: f"{int(r['id']):02d} • {r['name']}", axis=1)
+            with st.form("member_phone_form", clear_on_submit=True):
+                pick = st.selectbox("Select member", dfm["label"].tolist())
+                new_phone = st.text_input("New phone (optional)", value="", placeholder="e.g., +1 405-845-8002")
+                if new_phone.strip():
+                    st.caption(f"Will save as: `{clean_phone(new_phone)}`")
+                save = st.form_submit_button("💾 Save Phone", use_container_width=True)
 
-        ok = safe_insert(sb_service, schema, "members", payload)
-        if ok:
-            audit_log(
-                sb_service,
-                schema,
-                action="member_inserted",
-                status="ok",
-                table_name="members",
-                entity="member",
-                details=f"Added member name={name_clean} phone={phone_clean or ''}",
-                payload=payload,
-                actor_email=actor_email,
-                actor_role="admin",
-            )
-            st.success("Member added.")
-            st.cache_data.clear()
-            st.rerun()
+            if save:
+                mid = int(dfm.loc[dfm["label"] == pick, "id"].iloc[0])
+                phone_clean = clean_phone(new_phone)
+                if not is_valid_phone(phone_clean):
+                    st.error("Invalid phone format. Use 10–15 digits with optional + (e.g., +14058458002).")
+                else:
+                    ok = safe_update(sb_service, schema, "members", {"phone": phone_clean}, {"id": mid})
+                    if ok:
+                        audit_log(
+                            sb_service,
+                            schema,
+                            action="member_phone_updated",
+                            status="ok",
+                            table_name="members",
+                            row_pk=str(mid),
+                            entity="member",
+                            entity_id=str(mid),
+                            details=f"Updated phone for member_id={mid} phone={phone_clean or ''}",
+                            payload={"id": mid, "phone": phone_clean},
+                            actor_email=actor_email,
+                            actor_role="admin",
+                        )
+                        st.success("Phone updated.")
+                        st.cache_data.clear()
+                        st.rerun()
 
-    st.divider()
-    st.markdown("### Current Members")
+    section_divider()
+    st.markdown("#### Current members")
     dfm = load_members(sb_service, schema)
     if dfm.empty:
         st.info("No members found.")
-        return
-    st.dataframe(dfm, width="stretch", hide_index=True)
+    else:
+        st.dataframe(dfm, use_container_width=True, hide_index=True)
 
-    # Optional: edit phone quickly
-    st.divider()
-    st.markdown("### Update Member Phone (Quick Edit)")
-    labels = [f"{int(r['id']):02d} • {r['name']}" for _, r in dfm.iterrows()]
-    label_to_id = dict(zip(labels, dfm["id"].tolist()))
-    pick = st.selectbox("Select member", labels, key="member_edit_pick")
-    new_phone = st.text_input("New phone (optional)", value="", placeholder="e.g., +1 405-845-8002", key="member_edit_phone")
-
-    if new_phone.strip():
-        st.caption(f"Will save as: `{clean_phone(new_phone)}`")
-
-    if st.button("💾 Save Phone Update", width="stretch", key="member_edit_save"):
-        mid = int(label_to_id[pick])
-        phone_clean = clean_phone(new_phone)
-
-        if not is_valid_phone(phone_clean):
-            st.error("Invalid phone format. Use 10–15 digits with optional + (e.g., +14058458002).")
-            return
-
-        ok = safe_update(sb_service, schema, "members", {"phone": phone_clean}, {"id": mid})
-        if ok:
-            audit_log(
-                sb_service,
-                schema,
-                action="member_phone_updated",
-                status="ok",
-                table_name="members",
-                row_pk=str(mid),
-                entity="member",
-                entity_id=str(mid),
-                details=f"Updated phone for member_id={mid} phone={phone_clean or ''}",
-                payload={"id": mid, "phone": phone_clean},
-                actor_email=actor_email,
-                actor_role="admin",
-            )
-            st.success("Phone updated.")
-            st.cache_data.clear()
-            st.rerun()
+    glass_close()
 
 
 # ============================================================
@@ -334,151 +354,154 @@ def ensure_app_state(sb_service, schema: str) -> dict:
 # Rotation (session-based)
 # ============================================================
 def panel_rotation_state(sb_service, schema: str, actor_email: str):
-    st.subheader("Rotation State (Session-based)")
+    glass_open("Rotation (Session-based)", "Sets app_state.current_session_id and app_state.next_member_id (no legacy payout_index).")
 
     state = ensure_app_state(sb_service, schema)
     current_session_id = state.get("current_session_id")
     next_member_id = state.get("next_member_id")
     updated_at = state.get("updated_at") or "N/A"
 
-    st.info(
-        f"**current_session_id:** {current_session_id}\n\n"
-        f"**next_member_id:** {next_member_id}\n\n"
-        f"**updated_at:** {updated_at}"
-    )
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Current session_id", f"{current_session_id}" if current_session_id is not None else "—")
+    k2.metric("Next member_id", f"{next_member_id}" if next_member_id is not None else "—")
+    k3.metric("Updated", str(updated_at)[:19])
 
-    st.markdown("### Change Control (Override)")
-    st.caption("Organizational rule: every override requires confirmation + reason and is audit-logged.")
+    section_divider()
+    st.markdown("#### Override (requires reason + confirmation)")
+    st.caption("Every override is audit logged. Use this only for approved corrections.")
 
-    # pick session
     pk = sessions_pk(sb_service, schema)
     dfs = load_sessions(sb_service, schema)
     if dfs.empty:
         st.warning("No sessions found in sessions table.")
+        glass_close()
         return
 
     dfs["label"] = dfs.apply(lambda r: f"{int(r[pk]):04d} • {r.get('start_date','')} → {r.get('end_date','')}", axis=1)
-    sess_pick = st.selectbox("Set current session", dfs["label"].tolist(), key="rot_session_pick")
-    sess_id = int(dfs.loc[dfs["label"] == sess_pick, pk].iloc[0])
 
-    # pick next member
     dfm = load_members(sb_service, schema)
     if dfm.empty:
         st.warning("No members found.")
+        glass_close()
         return
     dfm["label"] = dfm.apply(lambda r: f"{int(r['id']):02d} • {r['name']}", axis=1)
-    mem_pick = st.selectbox("Set next beneficiary (member)", dfm["label"].tolist(), key="rot_member_pick")
-    mem_id = int(dfm.loc[dfm["label"] == mem_pick, "id"].iloc[0])
 
-    reason = st.text_input("Reason for override (required)", value="", placeholder="e.g., new cycle started, correction", key="rot_reason")
-    confirm = st.checkbox("I confirm this override is intentional and approved.", key="rot_confirm")
+    with st.form("rotation_override_form", clear_on_submit=False):
+        colA, colB = st.columns([1, 1], gap="large")
+        with colA:
+            sess_pick = st.selectbox("Set current session", dfs["label"].tolist())
+        with colB:
+            mem_pick = st.selectbox("Set next beneficiary (member)", dfm["label"].tolist())
 
-    if st.button("💾 Save Rotation Override", width="stretch", key="rot_save"):
+        reason = st.text_input("Reason (required)", value="", placeholder="e.g., new cycle started, correction")
+        confirm = st.checkbox("I confirm this override is intentional and approved.")
+
+        save = st.form_submit_button("💾 Save Rotation Override", use_container_width=True)
+
+    if save:
         if not confirm:
             st.error("Confirmation required.")
-            return
-        if not reason.strip():
-            st.error("Reason is required for organizational audit.")
-            return
+        elif not reason.strip():
+            st.error("Reason is required for audit.")
+        else:
+            sess_id = int(dfs.loc[dfs["label"] == sess_pick, pk].iloc[0])
+            mem_id = int(dfm.loc[dfm["label"] == mem_pick, "id"].iloc[0])
 
-        payload = {
-            "id": 1,
-            "current_session_id": int(sess_id),
-            "next_member_id": int(mem_id),
-            "updated_at": now_iso(),
-        }
-        ok = safe_upsert(sb_service, schema, "app_state", payload)
-        if ok:
-            audit_log(
-                sb_service,
-                schema,
-                action="override_rotation_state",
-                status="ok",
-                table_name="app_state",
-                row_pk="1",
-                entity="rotation",
-                entity_id=f"session={sess_id},next_member={mem_id}",
-                details=f"Set current_session_id={sess_id}, next_member_id={mem_id}. Reason: {reason}",
-                payload={"from": {"current_session_id": current_session_id, "next_member_id": next_member_id}, "to": payload, "reason": reason},
-                actor_email=actor_email,
-                actor_role="admin",
-            )
-            st.success("Rotation state updated.")
-            st.cache_data.clear()
-            st.rerun()
+            payload = {"id": 1, "current_session_id": int(sess_id), "next_member_id": int(mem_id), "updated_at": now_iso()}
+            ok = safe_upsert(sb_service, schema, "app_state", payload)
+            if ok:
+                audit_log(
+                    sb_service,
+                    schema,
+                    action="override_rotation_state",
+                    status="ok",
+                    table_name="app_state",
+                    row_pk="1",
+                    entity="rotation",
+                    entity_id=f"session={sess_id},next_member={mem_id}",
+                    details=f"Set current_session_id={sess_id}, next_member_id={mem_id}. Reason: {reason}",
+                    payload={"from": {"current_session_id": current_session_id, "next_member_id": next_member_id}, "to": payload, "reason": reason},
+                    actor_email=actor_email,
+                    actor_role="admin",
+                )
+                st.success("Rotation state updated.")
+                st.cache_data.clear()
+                st.rerun()
+
+    glass_close()
 
 
 # ============================================================
 # Contributions (ONE per member per session) — UPSERT
 # ============================================================
 def panel_contributions(sb_service, schema: str, actor_email: str):
-    st.subheader("Contributions (Admin Entry)")
-    st.caption("Rule: ONE contribution per member per session. Saving again updates the existing row (UPSERT).")
+    glass_open("Contributions", "Rule: ONE contribution per member per session (UPSERT on (session_id, member_id)).")
 
     state = ensure_app_state(sb_service, schema)
     current_session_id = state.get("current_session_id")
 
     if current_session_id is None:
         st.warning("app_state.current_session_id is not set. Set it in Rotation tab first.")
+        glass_close()
         return
 
-    st.caption(f"Current session_id (from app_state.id=1): **{current_session_id}**")
-    st.caption("Rule: amount must be **>= 500** and a **multiple of 500**.")
+    st.caption(f"Current session_id: **{current_session_id}** • Amount must be **>= 500** and a **multiple of 500**.")
 
     dfm = load_members(sb_service, schema)
     if dfm.empty:
         st.warning("No members found.")
+        glass_close()
         return
 
     dfm["label"] = dfm.apply(lambda r: f"{int(r['id']):02d} • {r['name']}", axis=1)
     labels = dfm["label"].tolist()
     label_to_id = dict(zip(dfm["label"], dfm["id"]))
 
-    col1, col2 = st.columns([1, 1])
+    col1, col2 = st.columns([1, 1], gap="large")
 
     with col1:
-        pick = st.selectbox("Member", labels, key="contrib_member")
-        amt = st.number_input("Amount", min_value=0, step=500, value=500, key="contrib_amount")
-        note = st.text_input("Note (optional)", value="", key="contrib_note")
+        st.markdown("#### Single entry")
+        with st.form("contrib_single_form", clear_on_submit=True):
+            pick = st.selectbox("Member", labels)
+            amt = st.number_input("Amount", min_value=0, step=500, value=500)
+            note = st.text_input("Note (optional)", value="")
+            save = st.form_submit_button("✅ Save Contribution", use_container_width=True)
 
-        mid = int(label_to_id[pick])
-
-        if st.button("✅ Save Contribution", width="stretch", key="contrib_save"):
+        if save:
+            mid = int(label_to_id[pick])
             if not is_multiple_of_500(int(amt)):
                 st.error("Amount must be >= 500 and multiple of 500.")
-                return
-
-            payload = {
-                "member_id": mid,
-                "session_id": int(current_session_id),
-                "amount": int(amt),
-                "paid_at": now_iso(),
-                "note": note.strip() or None,
-                "created_at": now_iso(),
-                "updated_at": now_iso(),
-            }
-
-            ok = safe_upsert(sb_service, schema, "contributions", payload)
-            if ok:
-                audit_log(
-                    sb_service,
-                    schema,
-                    action="contribution_upserted",
-                    status="ok",
-                    table_name="contributions",
-                    entity="contribution",
-                    entity_id=str(mid),
-                    details=f"Contribution upserted member_id={mid} session_id={current_session_id} amount={int(amt)}",
-                    payload=payload,
-                    actor_email=actor_email,
-                    actor_role="admin",
-                )
-                st.success("Contribution saved (upsert).")
-                st.cache_data.clear()
-                st.rerun()
+            else:
+                payload = {
+                    "member_id": mid,
+                    "session_id": int(current_session_id),
+                    "amount": int(amt),
+                    "paid_at": now_iso(),
+                    "note": note.strip() or None,
+                    "created_at": now_iso(),
+                    "updated_at": now_iso(),
+                }
+                ok = safe_upsert(sb_service, schema, "contributions", payload)
+                if ok:
+                    audit_log(
+                        sb_service,
+                        schema,
+                        action="contribution_upserted",
+                        status="ok",
+                        table_name="contributions",
+                        entity="contribution",
+                        entity_id=str(mid),
+                        details=f"Contribution upserted member_id={mid} session_id={current_session_id} amount={int(amt)}",
+                        payload=payload,
+                        actor_email=actor_email,
+                        actor_role="admin",
+                    )
+                    st.success("Contribution saved (upsert).")
+                    st.cache_data.clear()
+                    st.rerun()
 
     with col2:
-        st.markdown("### Bulk Entry (optional)")
+        st.markdown("#### Bulk entry (optional)")
         st.caption("Enter amounts for many members. Zero means skip. Saving updates existing rows (UPSERT).")
 
         df_bulk = dfm[["id", "name"]].copy()
@@ -486,12 +509,12 @@ def panel_contributions(sb_service, schema: str, actor_email: str):
         edited = st.data_editor(
             df_bulk,
             hide_index=True,
-            width="stretch",
+            use_container_width=True,
             column_config={"amount": st.column_config.NumberColumn("amount", step=500, min_value=0)},
             key="contrib_bulk_editor",
         )
 
-        if st.button("✅ Save Bulk Contributions", width="stretch", key="contrib_bulk_save"):
+        if st.button("✅ Save Bulk Contributions", use_container_width=True, key="contrib_bulk_save"):
             errors = []
             saved = 0
             for _, r in edited.iterrows():
@@ -534,8 +557,10 @@ def panel_contributions(sb_service, schema: str, actor_email: str):
                 st.cache_data.clear()
                 st.rerun()
 
-    st.divider()
-    st.markdown("### Contributions for current session")
+    section_divider()
+    st.markdown("#### Contributions for current session")
+
+    # Prefer view if exists; otherwise show raw contributions for that session
     rows = safe_select(
         sb_service,
         schema,
@@ -548,137 +573,154 @@ def panel_contributions(sb_service, schema: str, actor_email: str):
     )
     df = pd.DataFrame(rows)
     if df.empty:
-        st.info("No contributions recorded for this session yet.")
+        st.info("No contributions recorded for this session yet (or view not available). Showing raw contributions table instead.")
+        raw = safe_select(
+            sb_service,
+            schema,
+            "contributions",
+            "member_id,session_id,amount,paid_at,created_at,updated_at,note",
+            order_by="member_id",
+            desc=False,
+            limit=5000,
+            session_id=int(current_session_id),
+        )
+        st.dataframe(pd.DataFrame(raw) if raw else pd.DataFrame(), use_container_width=True, hide_index=True)
     else:
-        st.dataframe(df, width="stretch", hide_index=True)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+    glass_close()
 
 
 # ============================================================
 # Fines (optional table: fines)
 # ============================================================
 def panel_fines(sb_service, schema: str, actor_email: str):
-    st.subheader("Fines (Admin)")
-    st.caption("If you don't have public.fines table, this section will show errors until created.")
+    glass_open("Fines", "Optional table: fines. If missing, create it or this panel will error.")
 
     dfm = load_members(sb_service, schema)
     if dfm.empty:
         st.warning("No members found.")
+        glass_close()
         return
 
     dfm["label"] = dfm.apply(lambda r: f"{int(r['id']):02d} • {r['name']}", axis=1)
     pick = st.selectbox("Member", dfm["label"].tolist(), key="fine_member")
     mid = int(dfm[dfm["label"] == pick]["id"].iloc[0])
 
-    amount = st.number_input("Fine amount", min_value=0.0, step=10.0, value=30.0, key="fine_amount")
-    reason = st.text_input("Reason", value="Late payment", key="fine_reason")
-    status = st.selectbox("Status", ["unpaid", "paid", "waived"], index=0, key="fine_status")
+    col1, col2 = st.columns([1, 1], gap="large")
+    with col1:
+        amount = st.number_input("Fine amount", min_value=0.0, step=10.0, value=30.0, key="fine_amount")
+        reason = st.text_input("Reason", value="Late payment", key="fine_reason")
+    with col2:
+        status = st.selectbox("Status", ["unpaid", "paid", "waived"], index=0, key="fine_status")
+        paid_at = None
+        if status == "paid":
+            paid_at = st.date_input("Paid at", value=date.today(), key="fine_paid_at").isoformat()
 
-    paid_at = None
-    if status == "paid":
-        paid_at = st.date_input("Paid at", value=date.today(), key="fine_paid_at").isoformat()
-
-    if st.button("✅ Save Fine", width="stretch", key="fine_save"):
+    if st.button("✅ Save Fine", use_container_width=True, key="fine_save"):
         if amount <= 0:
             st.error("Fine amount must be > 0.")
-            return
+        else:
+            payload = {
+                "member_id": mid,
+                "amount": float(amount),
+                "reason": reason.strip(),
+                "status": status,
+                "paid_at": paid_at,
+                "created_at": now_iso(),
+                "updated_at": now_iso(),
+            }
+            ok = safe_insert(sb_service, schema, "fines", payload)
+            if ok:
+                audit_log(
+                    sb_service,
+                    schema,
+                    action="fine_inserted",
+                    status="ok",
+                    table_name="fines",
+                    entity="fine",
+                    entity_id=str(mid),
+                    details=f"Fine recorded member_id={mid} amount={amount} status={status}",
+                    payload=payload,
+                    actor_email=actor_email,
+                    actor_role="admin",
+                )
+                st.success("Fine saved.")
+                st.cache_data.clear()
+                st.rerun()
 
-        payload = {
-            "member_id": mid,
-            "amount": float(amount),
-            "reason": reason.strip(),
-            "status": status,
-            "paid_at": paid_at,
-            "created_at": now_iso(),
-            "updated_at": now_iso(),
-        }
-
-        ok = safe_insert(sb_service, schema, "fines", payload)
-        if ok:
-            audit_log(
-                sb_service,
-                schema,
-                action="fine_inserted",
-                status="ok",
-                table_name="fines",
-                entity="fine",
-                entity_id=str(mid),
-                details=f"Fine recorded member_id={mid} amount={amount} status={status}",
-                payload=payload,
-                actor_email=actor_email,
-                actor_role="admin",
-            )
-            st.success("Fine saved.")
-            st.cache_data.clear()
-            st.rerun()
-
-    st.divider()
-    st.markdown("### Recent fines")
+    section_divider()
+    st.markdown("#### Recent fines")
     rows = safe_select(sb_service, schema, "fines", "*", order_by="created_at", desc=True, limit=300)
-    st.dataframe(pd.DataFrame(rows) if rows else pd.DataFrame(), width="stretch", hide_index=True)
+    st.dataframe(pd.DataFrame(rows) if rows else pd.DataFrame(), use_container_width=True, hide_index=True)
+
+    glass_close()
 
 
 # ============================================================
-# Foundation contributions (session-based)
+# Foundation contributions (session-based) — UPSERT
 # ============================================================
 def panel_foundation(sb_service, schema: str, actor_email: str):
-    st.subheader("Foundation (Admin)")
-    st.caption("Session-based foundation contributions. Saving again updates existing row (upsert recommended).")
+    glass_open("Foundation", "Session-based foundation contributions (UPSERT).")
 
     state = ensure_app_state(sb_service, schema)
     current_session_id = state.get("current_session_id")
     if current_session_id is None:
         st.warning("app_state.current_session_id is not set. Set it in Rotation tab first.")
+        glass_close()
         return
 
     dfm = load_members(sb_service, schema)
     if dfm.empty:
         st.warning("No members found.")
+        glass_close()
         return
 
     dfm["label"] = dfm.apply(lambda r: f"{int(r['id']):02d} • {r['name']}", axis=1)
     pick = st.selectbox("Member", dfm["label"].tolist(), key="foundation_member")
     mid = int(dfm[dfm["label"] == pick]["id"].iloc[0])
 
-    amount = st.number_input("Amount", min_value=0.0, step=500.0, value=500.0, key="foundation_amount")
-    note = st.text_input("Note (optional)", value="", key="foundation_note")
-    paid_at = st.date_input("Paid at", value=date.today(), key="foundation_paid_at").isoformat()
+    col1, col2 = st.columns([1, 1], gap="large")
+    with col1:
+        amount = st.number_input("Amount", min_value=0.0, step=500.0, value=500.0, key="foundation_amount")
+        note = st.text_input("Note (optional)", value="", key="foundation_note")
+    with col2:
+        paid_at = st.date_input("Paid at", value=date.today(), key="foundation_paid_at").isoformat()
 
-    if st.button("✅ Save Foundation Contribution", width="stretch", key="foundation_save"):
+    if st.button("✅ Save Foundation Contribution", use_container_width=True, key="foundation_save"):
         if amount <= 0:
             st.error("Amount must be > 0.")
-            return
+        else:
+            payload = {
+                "member_id": mid,
+                "session_id": int(current_session_id),
+                "amount": float(amount),
+                "paid_at": paid_at,
+                "note": note.strip() or None,
+                "created_at": now_iso(),
+                "updated_at": now_iso(),
+            }
+            ok = safe_upsert(sb_service, schema, "foundation_contributions", payload)
+            if ok:
+                audit_log(
+                    sb_service,
+                    schema,
+                    action="foundation_contribution_upserted",
+                    status="ok",
+                    table_name="foundation_contributions",
+                    entity="foundation_contribution",
+                    entity_id=str(mid),
+                    details=f"Foundation contribution upserted member_id={mid} session_id={current_session_id} amount={amount}",
+                    payload=payload,
+                    actor_email=actor_email,
+                    actor_role="admin",
+                )
+                st.success("Foundation contribution saved (upsert).")
+                st.cache_data.clear()
+                st.rerun()
 
-        payload = {
-            "member_id": mid,
-            "session_id": int(current_session_id),
-            "amount": float(amount),
-            "paid_at": paid_at,
-            "note": note.strip() or None,
-            "created_at": now_iso(),
-            "updated_at": now_iso(),
-        }
-
-        ok = safe_upsert(sb_service, schema, "foundation_contributions", payload)
-        if ok:
-            audit_log(
-                sb_service,
-                schema,
-                action="foundation_contribution_upserted",
-                status="ok",
-                table_name="foundation_contributions",
-                entity="foundation_contribution",
-                entity_id=str(mid),
-                details=f"Foundation contribution upserted member_id={mid} session_id={current_session_id} amount={amount}",
-                payload=payload,
-                actor_email=actor_email,
-                actor_role="admin",
-            )
-            st.success("Foundation contribution saved (upsert).")
-            st.cache_data.clear()
-            st.rerun()
-
-    st.divider()
-    st.markdown("### Foundation contributions for current session")
+    section_divider()
+    st.markdown("#### Foundation contributions for current session")
     rows = safe_select(
         sb_service,
         schema,
@@ -689,27 +731,25 @@ def panel_foundation(sb_service, schema: str, actor_email: str):
         limit=5000,
         session_id=int(current_session_id),
     )
-    df = pd.DataFrame(rows)
-    if df.empty:
-        st.info("No foundation contributions recorded for this session yet.")
-    else:
-        st.dataframe(df, width="stretch", hide_index=True)
+    st.dataframe(pd.DataFrame(rows) if rows else pd.DataFrame(), use_container_width=True, hide_index=True)
+
+    glass_close()
 
 
 # ============================================================
 # Main entry called from app router
 # ============================================================
 def render_admin(sb_service, schema: str, actor_email: str = ""):
-    st.header("Admin (Service Key)")
-    st.caption("Organizational standard: governed changes, confirmations, and audit logs.")
+    st.markdown("## 🛠️ Admin Console")
+    st.caption("Governed changes • confirmations • audit logging • no legacy tables")
 
     if not sb_service:
         st.warning("Service key not configured.")
         return
 
     # System init (ensure app_state.id=1 exists)
-    st.markdown("### System Initialization")
-    if st.button("✅ Initialize app_state (id=1)", width="stretch", key="init_app_state"):
+    glass_open("System initialization", "Creates app_state(id=1) if it does not exist.")
+    if st.button("✅ Initialize app_state (id=1)", use_container_width=True, key="init_app_state"):
         ok = safe_upsert(sb_service, schema, "app_state", {"id": 1, "updated_at": now_iso()})
         if ok:
             audit_log(
@@ -727,11 +767,14 @@ def render_admin(sb_service, schema: str, actor_email: str = ""):
             st.success("Initialized.")
             st.cache_data.clear()
             st.rerun()
+    glass_close()
 
-    st.divider()
+    section_divider()
 
-    # ✅ Unique tab names = no duplicates inside Admin
-    t_members, t_rot, t_contrib, t_fines, t_found = st.tabs(["Members", "Rotation", "Contributions", "Fines", "Foundation"])
+    # ✅ Unique tab names (no duplicates)
+    t_members, t_rot, t_contrib, t_fines, t_found = st.tabs(
+        ["👥 Members", "🔁 Rotation", "💵 Contributions", "⚠️ Fines", "🏦 Foundation"]
+    )
 
     with t_members:
         panel_members(sb_service, schema, actor_email)
