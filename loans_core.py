@@ -20,6 +20,11 @@
 #       cap = contrib_total + 0.70*foundation_total
 #       cap_total = cap_b + cap_s (self-surety counts once)
 #
+# ✅ UPDATED RULE (YOUR REQUEST):
+#   ✅ Borrower can have MULTIPLE active/open loans as long as they qualify:
+#       projected_outstanding = borrower_outstanding_active + new_amount
+#       allow if projected_outstanding <= cap_total
+#
 # ✅ Required by loans_ui.py:
 #   - create_loan_request, list_pending_requests, approve_loan_request, deny_loan_request
 #   - insert_signature
@@ -292,10 +297,8 @@ def get_member_for_pdf(sb, schema: str, member_id: int) -> dict:
     if mid <= 0:
         return {"member_id": None, "member_name": "Unknown"}
 
-    # Resolve name robustly (uses members.name if present)
     resolved_name = _ensure_member_name(sb, schema, mid, None)
 
-    # Optional position if exists
     position = None
     try:
         cols = _get_table_columns(sb, schema, MEMBERS_TABLE)
@@ -439,6 +442,10 @@ def get_request(sb, schema: str, request_id: int) -> dict:
 # GOVERNANCE + APPROVAL
 # ============================================================
 def _get_totals_row(sb, schema: str, member_id: int) -> dict:
+    """
+    Uses your view/table: member_contribution_totals
+    Must provide: member_id, contrib_total, foundation_total (and maybe total_contributed)
+    """
     rows = (
         sb.schema(schema)
         .table("member_contribution_totals")
@@ -465,6 +472,10 @@ def _capacity_from_row(r: dict) -> float:
 
 
 def check_loan_qualification(sb, schema: str, borrower_id: int, surety_id: int, amount: float) -> dict:
+    """
+    Base cap_total check (does NOT subtract outstanding).
+    We will apply the multi-loan rule in approve_loan_request by using projected outstanding.
+    """
     borrower = _get_totals_row(sb, schema, borrower_id)
     cap_b = _capacity_from_row(borrower)
 
@@ -490,15 +501,35 @@ def check_loan_qualification(sb, schema: str, borrower_id: int, surety_id: int, 
     }
 
 
-def has_active_loan(sb, schema: str, member_id: int) -> bool:
-    rows = (
-        sb.schema(schema).table(LOANS_TABLE)
-        .select("status,member_id")
-        .eq("member_id", int(member_id))
-        .limit(20000)
-        .execute().data or []
-    )
-    return any(str(r.get("status") or "").lower().strip() in ("active", "open") for r in rows)
+def borrower_outstanding_principal(sb, schema: str, borrower_id: int) -> float:
+    """
+    Sum principal_current for all active/open loans for borrower.
+    (Used to allow multiple loans but enforce cap_total on total exposure.)
+    """
+    try:
+        rows = (
+            sb.schema(schema).table(LOANS_TABLE)
+            .select("id,member_id,status,principal_current,principal")
+            .eq("member_id", int(borrower_id))
+            .limit(20000)
+            .execute().data or []
+        )
+    except Exception:
+        rows = []
+
+    outstanding = 0.0
+    for r in rows or []:
+        stt = str(r.get("status") or "").lower().strip()
+        if stt not in ("active", "open"):
+            continue
+        pc = r.get("principal_current")
+        if pc is None:
+            pc = r.get("principal")
+        try:
+            outstanding += float(pc or 0.0)
+        except Exception:
+            pass
+    return float(outstanding)
 
 
 def approve_loan_request(sb, schema: str, request_id: int, actor_name: str) -> int:
@@ -518,13 +549,18 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_name: str) -> i
     if borrower_id <= 0 or surety_id <= 0 or amount <= 0:
         raise ValueError("Invalid request data.")
 
-    if has_active_loan(sb, schema, borrower_id):
-        raise ValueError("Approval blocked: borrower already has an active/open loan.")
-
+    # ✅ MULTI-LOAN RULE: allow multiple loans, but enforce cap_total on total outstanding exposure
     cap = check_loan_qualification(sb, schema, borrower_id, surety_id, amount)
-    if not cap["ok"]:
+    cap_total = float(cap["cap_total"] or 0.0)
+
+    outstanding_now = borrower_outstanding_principal(sb, schema, borrower_id)
+    projected_outstanding = outstanding_now + float(amount)
+
+    if projected_outstanding > cap_total:
         raise ValueError(
-            f"Loan rejected: principal {cap['amount']} exceeds capacity {cap['cap_total']:.2f} "
+            "Loan rejected: borrower total exposure exceeds capacity. "
+            f"outstanding_now={outstanding_now:.2f}, requested={amount:.2f}, "
+            f"projected={projected_outstanding:.2f} > cap_total={cap_total:.2f} "
             f"(self_surety={cap['self_surety']}, rule={cap['rule']})"
         )
 
@@ -556,7 +592,10 @@ def approve_loan_request(sb, schema: str, request_id: int, actor_name: str) -> i
         "reviewed_by": str(actor_name or "").strip() or "admin",
         "reviewed_at": ts,
         "approved_at": ts,
-        "notes": (str(req.get("notes") or "").strip() + f"\napproved by {actor_name} | cap_total={cap['cap_total']:.2f}").strip(),
+        "notes": (
+            (str(req.get("notes") or "").strip() + "\n").strip()
+            + f"approved by {actor_name} | cap_total={cap_total:.2f} | outstanding_now={outstanding_now:.2f} | projected={projected_outstanding:.2f}"
+        ).strip(),
     }
     upd = filter_payload_to_existing_columns(sb, schema, REQUESTS_TABLE, upd)
     sb.schema(schema).table(REQUESTS_TABLE).update(upd).eq("id", int(request_id)).execute()
@@ -905,3 +944,23 @@ def list_member_loans(sb, schema: str, member_id: int, limit: int = 2000) -> Lis
         )
     except Exception:
         return []
+
+
+__all__ = [
+    "create_loan_request",
+    "list_pending_requests",
+    "approve_loan_request",
+    "deny_loan_request",
+    "insert_signature",
+    "record_payment",
+    "list_unconfirmed_payments",
+    "confirm_payment",
+    "reject_payment",
+    "accrue_monthly_interest",
+    "delinquency_table",
+    "list_member_loans",
+    "get_member_for_pdf",
+    "check_loan_qualification",
+    "borrower_outstanding_principal",
+]
+```0
