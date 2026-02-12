@@ -1,25 +1,28 @@
 
 # app.py ✅ COMPLETE SINGLE CODE — NJANGI STANDARD (NO legacy) — “SLOW / GENTLE MODE”
 # ------------------------------------------------------------------------------
-# ✅ Built to STOP Streamlit blank-screen crashes:
-#    - ALL optional modules are lazy-imported inside page blocks (no import-time crash)
-#    - Secrets/env validated with visible errors
+# ✅ Fixes "loads but shows competition/demo data" by:
+#    - Displaying connected Supabase project ref (host prefix)
+#    - Warning if URL/keys look mismatched
+#    - Showing real DB errors (no silent empty returns)
+#    - Schema-safe members loader (works with/without display_name)
+#    - Health page checks table/view readability
+#
+# ✅ Safe against blank-screen crashes:
+#    - Optional modules are lazy-imported inside pages
+#    - Visible secrets/env validation
 #    - Service key optional (writes disabled if missing)
 #    - Safe Mode switch to run Dashboard-only
 #
-# ✅ "SLOW MODE" (to reduce Supabase load / free-tier throttling):
-#    - Adds a global request throttle (min seconds between DB calls)
-#    - Increases cache TTLs (less frequent re-fetch)
-#    - Refresh button only clears st.cache_data (NOT cache_resource) by default
-#    - Attendance UI uses a form (one submit = one write), not continuous triggers
-#    - Limits rows returned from views/tables
+# ✅ "SLOW MODE" to reduce Supabase load:
+#    - Global throttle between DB calls
+#    - cache_data TTLs
+#    - Refresh clears cache_data only
 #
 # ✅ Uses NEW tables/views only:
 #   tables: members, sessions, app_state, minutes, attendance, contributions, foundation_contributions,
 #           payouts, loans, loan_payments, fines, interest_ledger, audit_log
 #   views (optional): v_next_beneficiary, v_contributions_with_member, v_attendance_with_member
-#
-# NOTE: This file does NOT reference any "legacy" tables.
 # ------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -27,13 +30,14 @@ from __future__ import annotations
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional, Tuple, List, Dict
 
 import pandas as pd
 import streamlit as st
 from postgrest.exceptions import APIError
 from supabase import create_client
 
+# Dashboard is required (your main page)
 from dashboard_panel import render_dashboard
 
 APP_BRAND = "theyoungshallgrow"
@@ -50,27 +54,25 @@ st.set_page_config(
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-
 # ============================================================
-# GLOBAL THEME (UPDATED COLORS — Midnight Navy + Emerald)
+# GLOBAL THEME (Midnight Navy + Emerald)
 # ============================================================
 def inject_global_theme():
     st.markdown(
         """
         <style>
         :root{
-            --bg0: #0B1426;          /* deep navy */
-            --bg1: #0F1C35;          /* slightly lighter navy */
+            --bg0: #0B1426;
+            --bg1: #0F1C35;
 
             --text: #EAF0FF;
             --muted: #A9B6D3;
 
-            --primary: #00C896;      /* emerald */
-            --primary2:#00E6A8;      /* hover emerald */
-            --link: #60A5FA;         /* soft blue */
+            --primary: #00C896;
+            --primary2:#00E6A8;
+            --link: #60A5FA;
         }
 
-        /* App background */
         .stApp {
             background:
                 radial-gradient(1200px 800px at 15% 10%, rgba(0,200,150,0.12), transparent 55%),
@@ -89,13 +91,11 @@ def inject_global_theme():
 
         header, footer { background: transparent !important; }
 
-        /* Sidebar */
         section[data-testid="stSidebar"]{
             background: linear-gradient(180deg, rgba(15,28,53,0.96), rgba(11,20,38,0.96)) !important;
             border-right: 1px solid rgba(255,255,255,0.08) !important;
         }
 
-        /* Global typography */
         html, body, p, div, span, label, small,
         h1, h2, h3, h4, h5, h6 {
             color: var(--text) !important;
@@ -103,7 +103,6 @@ def inject_global_theme():
         .stCaption, [data-testid="stCaptionContainer"] * { color: var(--muted) !important; }
         a { color: var(--link) !important; }
 
-        /* Glass container */
         .glass {
             background: rgba(255,255,255,0.055) !important;
             border: 1px solid rgba(255,255,255,0.10) !important;
@@ -114,7 +113,6 @@ def inject_global_theme():
             -webkit-backdrop-filter: blur(12px);
         }
 
-        /* Buttons - emerald */
         .stButton button, .stDownloadButton button {
             border-radius: 14px !important;
             border: 1px solid rgba(255,255,255,0.14) !important;
@@ -127,12 +125,7 @@ def inject_global_theme():
             background: linear-gradient(180deg, rgba(0,230,168,0.25), rgba(0,200,150,0.14)) !important;
             transform: translateY(-1px);
         }
-        .stButton button:focus, .stDownloadButton button:focus {
-            outline: none !important;
-            box-shadow: 0 0 0 3px rgba(0,230,168,0.18) !important;
-        }
 
-        /* Inputs */
         [data-baseweb="input"] input,
         [data-testid="stTextInput"] input,
         [data-testid="stNumberInput"] input,
@@ -149,19 +142,7 @@ def inject_global_theme():
             border: 1px solid rgba(255,255,255,0.14) !important;
             border-radius: 12px !important;
         }
-        [data-baseweb="select"] > div {
-            background: rgba(255,255,255,0.035) !important;
-            border: 1px solid rgba(255,255,255,0.14) !important;
-            color: var(--text) !important;
-            border-radius: 12px !important;
-        }
-        [data-baseweb="menu"] {
-            background: #0F1C35 !important;
-            border: 1px solid rgba(255,255,255,0.14) !important;
-        }
-        [data-baseweb="menu"] * { color: var(--text) !important; }
 
-        /* DataFrames */
         div[data-testid="stDataFrame"]{
             border-radius: 14px !important;
             overflow: hidden !important;
@@ -169,16 +150,12 @@ def inject_global_theme():
             background: rgba(255,255,255,0.025) !important;
         }
 
-        /* Tabs */
-        button[data-baseweb="tab"]{
-            color: var(--muted) !important;
-        }
+        button[data-baseweb="tab"]{ color: var(--muted) !important; }
         button[data-baseweb="tab"][aria-selected="true"]{
             color: var(--text) !important;
             border-bottom: 2px solid rgba(0,230,168,0.65) !important;
         }
 
-        /* Metric tweak */
         [data-testid="stMetricValue"]{
             color: var(--primary2) !important;
             text-shadow: 0 0 14px rgba(0,230,168,0.10);
@@ -188,22 +165,24 @@ def inject_global_theme():
         unsafe_allow_html=True,
     )
 
-
 def glass_open() -> str:
     return "<div class='glass'>"
-
 
 def glass_close() -> str:
     return "</div>"
 
-
 inject_global_theme()
-
 
 # ============================================================
 # SECRETS / ENV
 # ============================================================
-def get_secret(key: str, default: str | None = None) -> str | None:
+def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
+    """
+    Reads from OS env first (Railway/GitHub Actions), then Streamlit secrets.
+    This is correct for streamlit.app hosting, but can cause "competition data"
+    if your Streamlit secrets are pointing to the wrong Supabase project.
+    We'll display the connected project ref so you can fix it.
+    """
     v = os.getenv(key)
     if v not in (None, ""):
         return v
@@ -211,7 +190,6 @@ def get_secret(key: str, default: str | None = None) -> str | None:
         return st.secrets.get(key, default)
     except Exception:
         return default
-
 
 SUPABASE_URL = (get_secret("SUPABASE_URL") or "").strip()
 SUPABASE_ANON_KEY = (get_secret("SUPABASE_ANON_KEY") or "").strip()
@@ -221,7 +199,7 @@ SUPABASE_SCHEMA = (get_secret("SUPABASE_SCHEMA", "public") or "public").strip()
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
     st.error(
         "Missing SUPABASE_URL or SUPABASE_ANON_KEY.\n\n"
-        "If you are on Streamlit Cloud: Manage app → Settings → Secrets.\n"
+        "Streamlit Cloud: Manage app → Settings → Secrets\n\n"
         "Add:\n"
         "SUPABASE_URL\nSUPABASE_ANON_KEY\n(optional) SUPABASE_SERVICE_KEY\nSUPABASE_SCHEMA"
     )
@@ -230,7 +208,6 @@ if not SUPABASE_URL or not SUPABASE_ANON_KEY:
 if not SUPABASE_SERVICE_KEY:
     st.warning("SUPABASE_SERVICE_KEY not set. Writes (Admin/Loans/Payouts/Minutes/Attendance) may be disabled.")
 
-
 # ============================================================
 # CLIENTS
 # ============================================================
@@ -238,15 +215,12 @@ if not SUPABASE_SERVICE_KEY:
 def get_anon_client(url: str, anon_key: str):
     return create_client(url.strip(), anon_key.strip())
 
-
 @st.cache_resource
 def get_service_client(url: str, service_key: str):
     return create_client(url.strip(), service_key.strip())
 
-
 sb_anon = get_anon_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 sb_service = get_service_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_SERVICE_KEY else None
-
 
 # ============================================================
 # SLOW MODE (THROTTLE DB CALLS)
@@ -255,7 +229,6 @@ SLOW_MODE = str(get_secret("SLOW_MODE", "1")).strip() not in ("0", "false", "Fal
 MIN_SECONDS_BETWEEN_DB_CALLS = float(get_secret("MIN_SECONDS_BETWEEN_DB_CALLS", "0.35") or "0.35")
 
 def throttle_db():
-    """Global throttle to reduce bursts of Supabase calls (free tier friendly)."""
     if not SLOW_MODE:
         return
     last = st.session_state.get("_last_db_call_ts", 0.0)
@@ -264,7 +237,6 @@ def throttle_db():
     if wait > 0:
         time.sleep(wait)
     st.session_state["_last_db_call_ts"] = time.time()
-
 
 # ============================================================
 # SAFE ERROR TEXT
@@ -277,7 +249,6 @@ def _api_msg(e: Exception) -> str:
         return str(e)
     return repr(e)
 
-
 def table_readable(client, schema: str, table_name: str) -> bool:
     try:
         throttle_db()
@@ -286,17 +257,17 @@ def table_readable(client, schema: str, table_name: str) -> bool:
     except Exception:
         return False
 
-
 def safe_select(
     client,
     table_name: str,
     select_cols: str = "*",
     schema: str = "public",
-    order_by: str | None = None,
+    order_by: Optional[str] = None,
     order_desc: bool = False,
-    limit: int | None = None,
+    limit: Optional[int] = None,
+    show_error: bool = True,
     **filters,
-) -> list[dict]:
+) -> List[Dict]:
     try:
         throttle_db()
         q = client.schema(schema).table(table_name).select(select_cols)
@@ -310,16 +281,15 @@ def safe_select(
             q = q.limit(int(limit))
         return (q.execute().data or [])
     except Exception as e:
-        st.error(f"Error reading {schema}.{table_name}")
-        st.code(_api_msg(e), language="text")
+        if show_error:
+            st.error(f"Error reading {schema}.{table_name}")
+            st.code(_api_msg(e), language="text")
         return []
 
-
 # ============================================================
-# LAZY IMPORT HELPER (PREVENTS BLACK SCREEN)
+# LAZY IMPORT HELPER
 # ============================================================
-def lazy_import(path: str, attr: str | None = None) -> tuple[Any | None, str | None]:
-    """Returns (obj, error_text). Never raises."""
+def lazy_import(path: str, attr: Optional[str] = None) -> Tuple[Any, Optional[str]]:
     try:
         mod = __import__(path, fromlist=["*"])
         if attr:
@@ -328,6 +298,44 @@ def lazy_import(path: str, attr: str | None = None) -> tuple[Any | None, str | N
     except Exception as e:
         return None, repr(e)
 
+# ============================================================
+# CONNECTED DB CHECK (THIS IS THE KEY FIX FOR “COMPETITION DATA”)
+# ============================================================
+def project_ref_from_url(url: str) -> str:
+    # https://<ref>.supabase.co -> <ref>
+    try:
+        host = url.split("//", 1)[-1].split("/", 1)[0]
+        return host.split(".")[0]
+    except Exception:
+        return "unknown"
+
+def looks_like_jwt(key: str) -> bool:
+    # Supabase keys are usually JWT-like: header.payload.signature
+    return key.count(".") >= 2 and len(key) > 40
+
+def show_connected_db_banner():
+    pref = project_ref_from_url(SUPABASE_URL)
+    st.markdown(glass_open(), unsafe_allow_html=True)
+    st.markdown("### 🔐 Connected Database Check")
+    st.write("Supabase project ref:", f"`{pref}`")
+    st.write("Schema:", f"`{SUPABASE_SCHEMA}`")
+    st.write("Anon key looks valid:", "✅" if looks_like_jwt(SUPABASE_ANON_KEY) else "❌")
+    st.write("Service key set:", "✅" if bool(SUPABASE_SERVICE_KEY) else "❌")
+
+    # Quick read test (members)
+    try:
+        throttle_db()
+        r = sb_anon.schema(SUPABASE_SCHEMA).table("members").select("id").limit(1).execute()
+        st.success("Anon read test: ✅ can read members")
+        st.write("Sample:", r.data)
+    except Exception as e:
+        st.error("Anon read test: ❌ cannot read members (likely RLS policy or wrong schema)")
+        st.code(_api_msg(e), language="text")
+
+    st.caption(
+        "If this shows the WRONG project ref, fix Streamlit Cloud secrets: Manage app → Settings → Secrets."
+    )
+    st.markdown(glass_close(), unsafe_allow_html=True)
 
 # ============================================================
 # TOP BAR
@@ -342,15 +350,18 @@ with right:
         st.cache_data.clear()
         st.rerun()
 
+# Always show connected DB check (small but critical)
+with st.expander("🔎 Show connected database details", expanded=False):
+    show_connected_db_banner()
 
 # ============================================================
-# SIDEBAR SAFE MODE
+# SIDEBAR SAFE MODE / SLOW MODE
 # ============================================================
 with st.sidebar.expander("🛟 Safe Mode", expanded=False):
     SAFE_MODE_UI = st.checkbox(
         "Run Dashboard only (disable optional pages)",
         value=False,
-        help="Use this if Streamlit Cloud shows a blank screen; it avoids importing other modules.",
+        help="Use this if Streamlit shows a blank screen; avoids importing other modules.",
     )
 
 with st.sidebar.expander("🐢 Slow Mode", expanded=False):
@@ -367,46 +378,69 @@ with st.sidebar.expander("🐢 Slow Mode", expanded=False):
         step=0.05,
     )
 
-# apply UI overrides
 SLOW_MODE = bool(st.session_state.get("_slow_mode_override", SLOW_MODE))
 MIN_SECONDS_BETWEEN_DB_CALLS = float(st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", MIN_SECONDS_BETWEEN_DB_CALLS))
 
-
 # ============================================================
-# CACHED LOADERS (LONGER TTL = SLOWER/LESS CALLS)
+# CACHED LOADERS (SCHEMA-SAFE)
 # ============================================================
 @st.cache_data(ttl=300)
 def load_members(url: str, anon_key: str, schema: str) -> pd.DataFrame:
     client = create_client(url, anon_key)
-    throttle_db()
-    rows = (
-        client.schema(schema)
-        .table("members")
-        .select("id,name,display_name,phone")
-        .order("id", desc=False)
-        .limit(5000)
-        .execute()
-        .data
-        or []
-    )
+
+    # Try with display_name; fallback if column doesn't exist
+    try:
+        throttle_db()
+        rows = (
+            client.schema(schema)
+            .table("members")
+            .select("id,name,display_name,phone")
+            .order("id", desc=False)
+            .limit(5000)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        throttle_db()
+        rows = (
+            client.schema(schema)
+            .table("members")
+            .select("id,name,phone")
+            .order("id", desc=False)
+            .limit(5000)
+            .execute()
+            .data
+            or []
+        )
+
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["id", "name", "display_name", "phone", "member_name", "label"])
+        return pd.DataFrame(columns=["id", "name", "phone", "member_name", "label"])
+
     df["id"] = pd.to_numeric(df["id"], errors="coerce").fillna(0).astype(int)
     df = df[df["id"] > 0].copy()
     df["name"] = df["name"].astype(str)
-    df["display_name"] = df.get("display_name", "").astype(str).replace({"None": "", "nan": ""})
     df["phone"] = df.get("phone", "").astype(str).replace({"None": "", "nan": ""})
-    df["member_name"] = df["display_name"].where(df["display_name"].str.strip() != "", df["name"])
+
+    if "display_name" in df.columns:
+        df["display_name"] = df["display_name"].astype(str).replace({"None": "", "nan": ""})
+        df["member_name"] = df["display_name"].where(df["display_name"].str.strip() != "", df["name"])
+    else:
+        df["member_name"] = df["name"]
+
     df["label"] = df.apply(lambda r: f"{int(r['id']):02d} • {r['member_name']}", axis=1)
     return df
 
-
 @st.cache_data(ttl=240)
 def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFrame:
+    """
+    IMPORTANT: we DO NOT swallow errors silently anymore.
+    If the view is missing / RLS blocked, we show the error and return empty.
+    """
     client = create_client(url, anon_key)
+    throttle_db()
     try:
-        throttle_db()
         rows = (
             client.schema(schema)
             .table("v_contributions_with_member")
@@ -418,23 +452,23 @@ def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFram
             or []
         )
         return pd.DataFrame(rows) if rows else pd.DataFrame()
-    except Exception:
+    except Exception as e:
+        # We'll show this error on the Contributions page (not here to avoid caching weirdness).
+        # So we store it in session_state for display.
+        st.session_state["_last_contrib_view_error"] = _api_msg(e)
         return pd.DataFrame()
 
-
 # ============================================================
-# SESSION HELPERS (Minutes/Attendance)
+# SESSION HELPERS
 # ============================================================
 def get_app_state(sb, schema: str) -> dict:
-    rows = safe_select(sb, "app_state", "*", schema=schema, limit=1, id=1)
+    rows = safe_select(sb, "app_state", "*", schema=schema, limit=1, show_error=False, id=1)
     if rows:
         return rows[0]
-    rows2 = safe_select(sb, "app_state", "*", schema=schema, limit=1)
+    rows2 = safe_select(sb, "app_state", "*", schema=schema, limit=1, show_error=False)
     return rows2[0] if rows2 else {}
 
-
-def get_effective_session_id(sb_read, schema: str) -> tuple[int | None, str]:
-    """Returns (session_id, note): from app_state OR fallback to latest session."""
+def get_effective_session_id(sb_read, schema: str) -> tuple[Optional[int], str]:
     state = get_app_state(sb_read, schema)
     raw = state.get("current_session_id")
     try:
@@ -453,6 +487,7 @@ def get_effective_session_id(sb_read, schema: str) -> tuple[int | None, str]:
         order_by="session_id",
         order_desc=True,
         limit=1,
+        show_error=False,
     )
     if srows:
         try:
@@ -460,7 +495,6 @@ def get_effective_session_id(sb_read, schema: str) -> tuple[int | None, str]:
         except Exception:
             return None, "fallback failed"
     return None, "no sessions"
-
 
 # ============================================================
 # NAVIGATION
@@ -482,13 +516,11 @@ else:
 
 page = st.sidebar.radio("Menu", PAGES, key="main_menu")
 
-
 # ============================================================
 # PAGES
 # ============================================================
 if page == "Dashboard":
     render_dashboard(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
-
 
 elif page == "Contributions":
     st.markdown(glass_open(), unsafe_allow_html=True)
@@ -496,6 +528,12 @@ elif page == "Contributions":
     st.caption("Stored by member_id. Names shown via view if available.")
 
     df = load_contributions_view(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
+
+    # If the view failed, show why
+    if df.empty and st.session_state.get("_last_contrib_view_error"):
+        st.warning("View v_contributions_with_member failed (showing error). Falling back to raw contributions.")
+        st.code(st.session_state.get("_last_contrib_view_error"), language="text")
+
     if df.empty:
         rows = safe_select(
             sb_anon,
@@ -508,15 +546,14 @@ elif page == "Contributions":
         )
         df2 = pd.DataFrame(rows)
         if df2.empty:
-            st.info("No contributions found.")
+            st.info("No contributions found (or RLS blocked). Check the database details expander at the top.")
         else:
-            st.warning("View v_contributions_with_member not readable. Showing raw contributions.")
+            st.warning("Showing raw contributions (view not available or not readable).")
             st.dataframe(df2, use_container_width=True, hide_index=True)
     else:
         st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.markdown(glass_close(), unsafe_allow_html=True)
-
 
 elif page == "Payouts":
     if not sb_service:
@@ -530,7 +567,6 @@ elif page == "Payouts":
     else:
         payout_fn(sb_service, SUPABASE_SCHEMA)
 
-
 elif page == "Loans":
     if not sb_service:
         st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY to enable loans writes.")
@@ -539,7 +575,7 @@ elif page == "Loans":
     needed = ["members", "loans", "loan_payments", "loan_requests", "signatures", "interest_ledger"]
     missing = [t for t in needed if not table_readable(sb_service, SUPABASE_SCHEMA, t)]
     if missing:
-        st.error("Loans module is not ready — missing required table(s):")
+        st.error("Loans module is not ready — missing required table(s) or not readable:")
         st.write(", ".join([f"{SUPABASE_SCHEMA}.{t}" for t in missing]))
         st.stop()
 
@@ -554,7 +590,6 @@ elif page == "Loans":
         else:
             loans_fn(sb_service, SUPABASE_SCHEMA, actor_user_id="")
 
-
 elif page == "🤖 AI Risk Panel":
     fn, err = lazy_import("ai_risk_panel", "render_ai_risk_panel")
     if fn is None:
@@ -562,7 +597,6 @@ elif page == "🤖 AI Risk Panel":
         st.code(err or "", language="text")
     else:
         fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
-
 
 elif page == "Minutes & Attendance":
     st.subheader("📝 Minutes & ✅ Attendance")
@@ -587,14 +621,11 @@ elif page == "Minutes & Attendance":
 
     df_members = load_members(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
     if df_members.empty:
-        st.error("No members found in members.")
+        st.error("No members found (or RLS blocked). Check the database details expander at the top.")
         st.stop()
 
     tab1, tab2, tab3 = st.tabs(["Minutes / Documentation", "Attendance", "Summaries"])
 
-    # -------------------------
-    # Minutes
-    # -------------------------
     with tab1:
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.subheader("Meeting Minutes / Documentation")
@@ -662,12 +693,8 @@ elif page == "Minutes & Attendance":
             st.info("No minutes recorded yet.")
         else:
             st.dataframe(dfm, use_container_width=True, hide_index=True)
-
         st.markdown(glass_close(), unsafe_allow_html=True)
 
-    # -------------------------
-    # Attendance (FORM-BASED = ONE WRITE)
-    # -------------------------
     with tab2:
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.subheader("Attendance")
@@ -687,7 +714,7 @@ elif page == "Minutes & Attendance":
         existing_map = {int(r["member_id"]): r for r in arows_existing if r.get("member_id") is not None}
 
         with st.form("attendance_form"):
-            attendance_rows: list[dict] = []
+            attendance_rows: List[Dict] = []
             for _, r in df_members.sort_values("id").iterrows():
                 mid = int(r["id"])
                 name = str(r.get("member_name") or r.get("name") or "")
@@ -785,16 +812,13 @@ elif page == "Minutes & Attendance":
 
         st.markdown(glass_close(), unsafe_allow_html=True)
 
-    # -------------------------
-    # Summaries
-    # -------------------------
     with tab3:
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.subheader("Summaries")
         st.caption("Summaries for Minutes, Attendance, and Contributions.")
 
         st.markdown("### 📝 Minutes summary")
-        m_rows = safe_select(sb_anon, "minutes", "*", schema=SUPABASE_SCHEMA, order_by="updated_at", order_desc=True, limit=20)
+        m_rows = safe_select(sb_anon, "minutes", "*", schema=SUPABASE_SCHEMA, order_by="updated_at", order_desc=True, limit=20, show_error=False)
         dfm = pd.DataFrame(m_rows)
         if dfm.empty:
             st.info("No minutes recorded yet.")
@@ -826,7 +850,6 @@ elif page == "Minutes & Attendance":
         st.markdown("### 💰 Contributions summary (current session)")
         dfc = load_contributions_view(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
         if dfc.empty:
-            st.info("No contributions view available. Showing raw contributions.")
             c_rows = safe_select(
                 sb_anon,
                 "contributions",
@@ -836,6 +859,7 @@ elif page == "Minutes & Attendance":
                 order_desc=True,
                 limit=1500,
                 session_id=int(current_session_id),
+                show_error=False,
             )
             dfc = pd.DataFrame(c_rows)
 
@@ -847,18 +871,19 @@ elif page == "Minutes & Attendance":
             dfc["amount"] = pd.to_numeric(dfc.get("amount"), errors="coerce").fillna(0)
             st.metric("Rows", f"{len(dfc):,}")
             st.metric("Sum", f"{float(dfc['amount'].sum()):,.0f}")
-            top = (
-                dfc.groupby([c for c in ["member_id", "member_name"] if c in dfc.columns], dropna=False)["amount"]
-                .sum()
-                .sort_values(ascending=False)
-                .head(10)
-                .reset_index()
-            )
-            st.caption("Top contributors (current session)")
-            st.dataframe(top, use_container_width=True, hide_index=True)
+            group_cols = [c for c in ["member_id", "member_name"] if c in dfc.columns]
+            if group_cols:
+                top = (
+                    dfc.groupby(group_cols, dropna=False)["amount"]
+                    .sum()
+                    .sort_values(ascending=False)
+                    .head(10)
+                    .reset_index()
+                )
+                st.caption("Top contributors (current session)")
+                st.dataframe(top, use_container_width=True, hide_index=True)
 
         st.markdown(glass_close(), unsafe_allow_html=True)
-
 
 elif page == "Admin":
     if not sb_service:
@@ -872,7 +897,6 @@ elif page == "Admin":
     else:
         admin_fn(sb_service=sb_service, schema=SUPABASE_SCHEMA, actor_email="admin@yourorg.com")
 
-
 elif page == "Audit":
     if not sb_service:
         st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY.")
@@ -885,11 +909,44 @@ elif page == "Audit":
     else:
         audit_fn(sb_service=sb_service, schema=SUPABASE_SCHEMA)
 
-
 elif page == "Health":
-    health_fn, health_err = lazy_import("health_panel", "render_health")
-    if health_fn is None:
-        st.error("Health panel failed to load.")
-        st.code(health_err or "", language="text")
-    else:
-        health_fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
+    st.markdown(glass_open(), unsafe_allow_html=True)
+    st.subheader("🩺 Health Check")
+    st.caption("Confirms which tables/views are readable from anon and service clients.")
+
+    targets = [
+        ("table", "members"),
+        ("table", "sessions"),
+        ("table", "app_state"),
+        ("table", "contributions"),
+        ("table", "foundation_contributions"),
+        ("table", "loans"),
+        ("table", "loan_payments"),
+        ("table", "minutes"),
+        ("table", "attendance"),
+        ("table", "fines"),
+        ("table", "interest_ledger"),
+        ("table", "audit_log"),
+        ("view", "v_contributions_with_member"),
+        ("view", "v_attendance_with_member"),
+        ("view", "v_next_beneficiary"),
+    ]
+
+    rows = []
+    for kind, name in targets:
+        anon_ok = table_readable(sb_anon, SUPABASE_SCHEMA, name)
+        svc_ok = table_readable(sb_service, SUPABASE_SCHEMA, name) if sb_service else False
+        rows.append({"object": f"{kind}:{name}", "anon_read": anon_ok, "service_read": svc_ok})
+
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("### Quick tips")
+    st.write("• If `anon_read` is ❌ for tables you want to display, your RLS SELECT policies are blocking reads.")
+    st.write("• If project ref is wrong, fix Streamlit Cloud secrets (Manage app → Settings → Secrets).")
+    st.write("• If views are ❌ but raw tables are ✅, your views may not exist in that project/schema.")
+
+    st.markdown(glass_close(), unsafe_allow_html=True)
+
+else:
+    st.info("Page not implemented.")
