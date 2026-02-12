@@ -27,7 +27,7 @@ from __future__ import annotations
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Optional, Tuple, List, Dict
+from typing import Any
 
 import pandas as pd
 import streamlit as st
@@ -52,51 +52,84 @@ def now_iso() -> str:
 
 
 # ============================================================
-# GLOBAL THEME
+# GLOBAL THEME (UPDATED COLORS — Midnight Navy + Emerald)
 # ============================================================
 def inject_global_theme():
     st.markdown(
         """
         <style>
-        .stApp {
-            background-color: #0b0f1a !important;
-            background-image:
-                radial-gradient(circle at 1px 1px, rgba(255,255,255,0.06) 1px, transparent 0) !important;
-            background-size: 24px 24px !important;
-            color: #e5e7eb !important;
+        :root{
+            --bg0: #0B1426;          /* deep navy */
+            --bg1: #0F1C35;          /* slightly lighter navy */
+
+            --text: #EAF0FF;
+            --muted: #A9B6D3;
+
+            --primary: #00C896;      /* emerald */
+            --primary2:#00E6A8;      /* hover emerald */
+            --link: #60A5FA;         /* soft blue */
         }
+
+        /* App background */
+        .stApp {
+            background:
+                radial-gradient(1200px 800px at 15% 10%, rgba(0,200,150,0.12), transparent 55%),
+                radial-gradient(900px 650px at 85% 15%, rgba(96,165,250,0.10), transparent 60%),
+                linear-gradient(180deg, var(--bg1) 0%, var(--bg0) 60%) !important;
+
+            background-image:
+                radial-gradient(circle at 1px 1px, rgba(255,255,255,0.055) 1px, transparent 0),
+                radial-gradient(1200px 800px at 15% 10%, rgba(0,200,150,0.12), transparent 55%),
+                radial-gradient(900px 650px at 85% 15%, rgba(96,165,250,0.10), transparent 60%),
+                linear-gradient(180deg, var(--bg1) 0%, var(--bg0) 60%) !important;
+
+            background-size: 24px 24px, auto, auto, auto !important;
+            color: var(--text) !important;
+        }
+
         header, footer { background: transparent !important; }
 
+        /* Sidebar */
         section[data-testid="stSidebar"]{
-            background: #0b0f1a !important;
-            border-right: 1px solid rgba(255,255,255,0.06) !important;
+            background: linear-gradient(180deg, rgba(15,28,53,0.96), rgba(11,20,38,0.96)) !important;
+            border-right: 1px solid rgba(255,255,255,0.08) !important;
         }
 
+        /* Global typography */
         html, body, p, div, span, label, small,
         h1, h2, h3, h4, h5, h6 {
-            color: #e5e7eb !important;
+            color: var(--text) !important;
         }
-        a { color: #60a5fa !important; }
+        .stCaption, [data-testid="stCaptionContainer"] * { color: var(--muted) !important; }
+        a { color: var(--link) !important; }
 
+        /* Glass container */
         .glass {
-            background: rgba(255,255,255,0.04) !important;
-            border: 1px solid rgba(255,255,255,0.06) !important;
+            background: rgba(255,255,255,0.055) !important;
+            border: 1px solid rgba(255,255,255,0.10) !important;
             border-radius: 18px !important;
             padding: 18px 18px !important;
-            box-shadow: 0 14px 45px rgba(0,0,0,0.45) !important;
-            backdrop-filter: blur(10px);
-            -webkit-backdrop-filter: blur(10px);
+            box-shadow: 0 16px 50px rgba(0,0,0,0.52) !important;
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
         }
 
+        /* Buttons - emerald */
         .stButton button, .stDownloadButton button {
             border-radius: 14px !important;
-            border: 1px solid rgba(255,255,255,0.12) !important;
-            background: rgba(255,255,255,0.04) !important;
-            color: #e5e7eb !important;
+            border: 1px solid rgba(255,255,255,0.14) !important;
+            background: linear-gradient(180deg, rgba(0,200,150,0.20), rgba(0,200,150,0.12)) !important;
+            color: var(--text) !important;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.35) !important;
         }
         .stButton button:hover, .stDownloadButton button:hover {
-            border: 1px solid rgba(255,255,255,0.22) !important;
-            background: rgba(255,255,255,0.06) !important;
+            border: 1px solid rgba(0,230,168,0.45) !important;
+            background: linear-gradient(180deg, rgba(0,230,168,0.25), rgba(0,200,150,0.14)) !important;
+            transform: translateY(-1px);
+        }
+        .stButton button:focus, .stDownloadButton button:focus {
+            outline: none !important;
+            box-shadow: 0 0 0 3px rgba(0,230,168,0.18) !important;
         }
 
         /* Inputs */
@@ -104,35 +137,51 @@ def inject_global_theme():
         [data-testid="stTextInput"] input,
         [data-testid="stNumberInput"] input,
         [data-testid="stDateInput"] input {
-            background: rgba(255,255,255,0.03) !important;
-            color: #e5e7eb !important;
-            border: 1px solid rgba(255,255,255,0.12) !important;
+            background: rgba(255,255,255,0.035) !important;
+            color: var(--text) !important;
+            border: 1px solid rgba(255,255,255,0.14) !important;
             border-radius: 12px !important;
         }
         [data-baseweb="textarea"] textarea,
         [data-testid="stTextArea"] textarea {
-            background: rgba(255,255,255,0.03) !important;
-            color: #e5e7eb !important;
-            border: 1px solid rgba(255,255,255,0.12) !important;
+            background: rgba(255,255,255,0.035) !important;
+            color: var(--text) !important;
+            border: 1px solid rgba(255,255,255,0.14) !important;
             border-radius: 12px !important;
         }
         [data-baseweb="select"] > div {
-            background: rgba(255,255,255,0.03) !important;
-            border: 1px solid rgba(255,255,255,0.12) !important;
-            color: #e5e7eb !important;
+            background: rgba(255,255,255,0.035) !important;
+            border: 1px solid rgba(255,255,255,0.14) !important;
+            color: var(--text) !important;
             border-radius: 12px !important;
         }
         [data-baseweb="menu"] {
-            background: #0f172a !important;
-            border: 1px solid rgba(255,255,255,0.12) !important;
+            background: #0F1C35 !important;
+            border: 1px solid rgba(255,255,255,0.14) !important;
         }
-        [data-baseweb="menu"] * { color: #e5e7eb !important; }
+        [data-baseweb="menu"] * { color: var(--text) !important; }
 
+        /* DataFrames */
         div[data-testid="stDataFrame"]{
             border-radius: 14px !important;
             overflow: hidden !important;
-            border: 1px solid rgba(255,255,255,0.08) !important;
-            background: rgba(255,255,255,0.02) !important;
+            border: 1px solid rgba(255,255,255,0.10) !important;
+            background: rgba(255,255,255,0.025) !important;
+        }
+
+        /* Tabs */
+        button[data-baseweb="tab"]{
+            color: var(--muted) !important;
+        }
+        button[data-baseweb="tab"][aria-selected="true"]{
+            color: var(--text) !important;
+            border-bottom: 2px solid rgba(0,230,168,0.65) !important;
+        }
+
+        /* Metric tweak */
+        [data-testid="stMetricValue"]{
+            color: var(--primary2) !important;
+            text-shadow: 0 0 14px rgba(0,230,168,0.10);
         }
         </style>
         """,
@@ -202,7 +251,6 @@ sb_service = get_service_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_
 # ============================================================
 # SLOW MODE (THROTTLE DB CALLS)
 # ============================================================
-# You can tune these from Streamlit Secrets/Env if you want
 SLOW_MODE = str(get_secret("SLOW_MODE", "1")).strip() not in ("0", "false", "False", "no", "NO")
 MIN_SECONDS_BETWEEN_DB_CALLS = float(get_secret("MIN_SECONDS_BETWEEN_DB_CALLS", "0.35") or "0.35")
 
@@ -290,8 +338,7 @@ with left:
     if SLOW_MODE:
         st.caption("🐢 Slow Mode ON (reduced DB load)")
 with right:
-    # “slow” refresh: clear cache_data only (keeps clients cached)
-    if st.button("🔄 Refresh data", width="stretch"):
+    if st.button("🔄 Refresh data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
@@ -328,7 +375,7 @@ MIN_SECONDS_BETWEEN_DB_CALLS = float(st.session_state.get("MIN_SECONDS_BETWEEN_D
 # ============================================================
 # CACHED LOADERS (LONGER TTL = SLOWER/LESS CALLS)
 # ============================================================
-@st.cache_data(ttl=300)  # was 90
+@st.cache_data(ttl=300)
 def load_members(url: str, anon_key: str, schema: str) -> pd.DataFrame:
     client = create_client(url, anon_key)
     throttle_db()
@@ -355,7 +402,7 @@ def load_members(url: str, anon_key: str, schema: str) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=240)  # was 60
+@st.cache_data(ttl=240)
 def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFrame:
     client = create_client(url, anon_key)
     try:
@@ -365,7 +412,7 @@ def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFram
             .table("v_contributions_with_member")
             .select("id,member_id,member_name,session_id,amount,paid_at,note,created_at")
             .order("created_at", desc=True)
-            .limit(500)  # reduced from 1000
+            .limit(500)
             .execute()
             .data
             or []
@@ -457,16 +504,16 @@ elif page == "Contributions":
             schema=SUPABASE_SCHEMA,
             order_by="created_at",
             order_desc=True,
-            limit=250,  # reduced
+            limit=250,
         )
         df2 = pd.DataFrame(rows)
         if df2.empty:
             st.info("No contributions found.")
         else:
             st.warning("View v_contributions_with_member not readable. Showing raw contributions.")
-            st.dataframe(df2, width="stretch", hide_index=True)
+            st.dataframe(df2, use_container_width=True, hide_index=True)
     else:
-        st.dataframe(df, width="stretch", hide_index=True)
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.markdown(glass_close(), unsafe_allow_html=True)
 
@@ -496,7 +543,7 @@ elif page == "Loans":
         st.write(", ".join([f"{SUPABASE_SCHEMA}.{t}" for t in missing]))
         st.stop()
 
-    loans_mod, loans_err = lazy_import("loans", None)  # expects show_loans or render_loans
+    loans_mod, loans_err = lazy_import("loans", None)
     if loans_mod is None:
         st.error("Loans module failed to import.")
         st.code(loans_err or "", language="text")
@@ -557,7 +604,7 @@ elif page == "Minutes & Attendance":
             with st.form("minutes_form", clear_on_submit=False):
                 title = st.text_input("Title", key="minutes_title")
                 body = st.text_area("Minutes / Documentation", height=260, key="minutes_body")
-                ok = st.form_submit_button("💾 Save minutes", width="stretch")
+                ok = st.form_submit_button("💾 Save minutes", use_container_width=True)
 
             if ok:
                 if not title.strip() or not body.strip():
@@ -614,7 +661,7 @@ elif page == "Minutes & Attendance":
         if dfm.empty:
             st.info("No minutes recorded yet.")
         else:
-            st.dataframe(dfm, width="stretch", hide_index=True)
+            st.dataframe(dfm, use_container_width=True, hide_index=True)
 
         st.markdown(glass_close(), unsafe_allow_html=True)
 
@@ -627,7 +674,6 @@ elif page == "Minutes & Attendance":
         st.caption(f"Linked session_id: {current_session_id}  •  {session_note}")
         st.caption("Mark each member Present/Absent. Submit once (slow-mode friendly).")
 
-        # Show existing attendance (read only)
         arows_existing = safe_select(
             sb_anon,
             "attendance",
@@ -671,7 +717,7 @@ elif page == "Minutes & Attendance":
 
                 attendance_rows.append({"member_id": mid, "present": (status == "present"), "note": note.strip() or None})
 
-            save = st.form_submit_button("💾 Save attendance (ALL members)", width="stretch")
+            save = st.form_submit_button("💾 Save attendance (ALL members)", use_container_width=True)
 
         if save:
             if not can_write:
@@ -688,7 +734,6 @@ elif page == "Minutes & Attendance":
                     for row in attendance_rows
                 ]
 
-                # delete-then-insert for this session (prevents duplicates)
                 try:
                     throttle_db()
                     sb_service.schema(SUPABASE_SCHEMA).table("attendance").delete().eq("session_id", int(current_session_id)).execute()
@@ -709,7 +754,7 @@ elif page == "Minutes & Attendance":
 
         st.divider()
         st.markdown("### Current session attendance (read)")
-        # Prefer view if readable (but still limited)
+
         if table_readable(sb_anon, SUPABASE_SCHEMA, "v_attendance_with_member"):
             arows = safe_select(
                 sb_anon,
@@ -725,7 +770,7 @@ elif page == "Minutes & Attendance":
             if dfa.empty:
                 st.info("No attendance recorded for this session yet.")
             else:
-                st.dataframe(dfa, width="stretch", hide_index=True)
+                st.dataframe(dfa, use_container_width=True, hide_index=True)
         else:
             dfa = pd.DataFrame(arows_existing)
             if dfa.empty:
@@ -736,7 +781,7 @@ elif page == "Minutes & Attendance":
                 dfa = dfa.merge(dm, on="member_id", how="left")
                 dfa = dfa[["member_id", "member_name", "present", "note", "created_at"]]
                 st.warning("View v_attendance_with_member not readable. Showing attendance joined in Python.")
-                st.dataframe(dfa, width="stretch", hide_index=True)
+                st.dataframe(dfa, use_container_width=True, hide_index=True)
 
         st.markdown(glass_close(), unsafe_allow_html=True)
 
@@ -810,7 +855,7 @@ elif page == "Minutes & Attendance":
                 .reset_index()
             )
             st.caption("Top contributors (current session)")
-            st.dataframe(top, width="stretch", hide_index=True)
+            st.dataframe(top, use_container_width=True, hide_index=True)
 
         st.markdown(glass_close(), unsafe_allow_html=True)
 
