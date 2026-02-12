@@ -1,23 +1,32 @@
 
-# admin_panels.py ✅ UPDATED (NO LEGACY) — Members(+phone) + Rotation(session-based) + Contributions(ONE/member/session) + Foundation + Fines
+# admin_panels.py ✅ COMPLETE SINGLE CODE (NO LEGACY) — Members(+E164 phone) + Rotation(session-based)
+# + Contributions(ONE/member/session) + Foundation + Fines + Audit (optional)
+# ------------------------------------------------------------------------------
 # ✅ Uses NEW tables only:
 #   - members(id,name,phone,created_at)
 #   - app_state(id=1, current_session_id, next_member_id, updated_at, ...)
 #   - sessions(id OR session_id, start_date, end_date)
 #   - contributions(member_id, session_id, amount, paid_at, note, created_at, updated_at)  ✅ ONE PER MEMBER PER SESSION (UPSERT)
 #   - foundation_contributions(member_id, session_id, amount, paid_at, note, created_at, updated_at) ✅ (UPSERT recommended)
-#   - fines(member_id, amount, reason, status, paid_at, created_at, updated_at)  (if you have this table; otherwise it will show errors)
+#   - fines(member_id, amount, reason, status, paid_at, created_at, updated_at)  (optional)
 #   - audit_log (optional; silent if schema differs)
 #
+# ✅ FIXED PHONE ISSUE:
+#   - Normalizes phone before saving: "+1 405-845-8002" -> "+14058458002"
+#   - Allows NULL phone
+#   - Validates format: optional +, 10–15 digits
+#
 # ✅ Member identity: transactions store member_id only (no member_name stored)
-# ✅ Members tab: add member name + phone; list members including phone
+# ✅ Members tab: add member name + phone; list members including phone; quick phone update
 # ✅ Rotation tab: sets app_state.current_session_id and app_state.next_member_id (session-based, no payout_index)
 # ✅ Contributions tab: saves contribution via UPSERT on (session_id, member_id) to prevent duplicates
 # ✅ No duplicate tabs inside Admin
+# ------------------------------------------------------------------------------
 
 from __future__ import annotations
 
 from datetime import datetime, timezone, date
+import re
 import streamlit as st
 import pandas as pd
 from postgrest.exceptions import APIError
@@ -44,7 +53,16 @@ def show_api_error(e: Exception, title: str = "Supabase error"):
     st.code(str(_api_error_payload(e)), language="text")
 
 
-def safe_select(sb_service, schema: str, table: str, cols: str = "*", order_by: str | None = None, desc: bool = False, limit: int | None = None, **eq_filters):
+def safe_select(
+    sb_service,
+    schema: str,
+    table: str,
+    cols: str = "*",
+    order_by: str | None = None,
+    desc: bool = False,
+    limit: int | None = None,
+    **eq_filters,
+):
     try:
         q = sb_service.schema(schema).table(table).select(cols)
         for k, v in eq_filters.items():
@@ -105,9 +123,29 @@ def clean_name(name: str) -> str:
     return " ".join((name or "").strip().split())
 
 
+# -----------------------------
+# ✅ Phone normalization/validation
+# -----------------------------
+_PHONE_RE = re.compile(r"^\+?[0-9]{10,15}$")
+
+
 def clean_phone(phone: str) -> str | None:
+    """
+    Normalize to digits/+ only (E.164-ish) or None.
+    Examples:
+      "+1 405-845-8002" -> "+14058458002"
+      "(405) 845-8002"  -> "4058458002"
+      "" -> None
+    """
     p = (phone or "").strip()
-    return p if p else None
+    if not p:
+        return None
+    p = re.sub(r"[^0-9+]", "", p)  # strip spaces/dashes/() etc., keep + and digits
+    return p or None
+
+
+def is_valid_phone(phone: str | None) -> bool:
+    return phone is None or bool(_PHONE_RE.match(phone))
 
 
 # ============================================================
@@ -189,7 +227,11 @@ def panel_members(sb_service, schema: str, actor_email: str):
 
     st.markdown("### Add New Member")
     name = st.text_input("Member name", value="", placeholder="e.g., Marcel Dinga", key="member_add_name")
-    phone = st.text_input("Phone number", value="", placeholder="e.g., +1 405-845-8002", key="member_add_phone")
+    phone = st.text_input("Phone number (optional)", value="", placeholder="e.g., +1 405-845-8002", key="member_add_phone")
+
+    # Preview normalized phone (nice UX)
+    if phone.strip():
+        st.caption(f"Will save as: `{clean_phone(phone)}`")
 
     if st.button("✅ Add Member", width="stretch", key="member_add_btn"):
         name_clean = clean_name(name)
@@ -199,16 +241,21 @@ def panel_members(sb_service, schema: str, actor_email: str):
             st.error("Member name is required.")
             return
 
+        if not is_valid_phone(phone_clean):
+            st.error("Invalid phone format. Use 10–15 digits with optional + (e.g., +14058458002).")
+            return
+
         payload = {
             "name": name_clean,
-            "phone": phone_clean,
+            "phone": phone_clean,  # ✅ None or normalized phone
             "created_at": now_iso(),
         }
 
         ok = safe_insert(sb_service, schema, "members", payload)
         if ok:
             audit_log(
-                sb_service, schema,
+                sb_service,
+                schema,
                 action="member_inserted",
                 status="ok",
                 table_name="members",
@@ -236,16 +283,24 @@ def panel_members(sb_service, schema: str, actor_email: str):
     labels = [f"{int(r['id']):02d} • {r['name']}" for _, r in dfm.iterrows()]
     label_to_id = dict(zip(labels, dfm["id"].tolist()))
     pick = st.selectbox("Select member", labels, key="member_edit_pick")
-    new_phone = st.text_input("New phone", value="", placeholder="e.g., +1 405-845-8002", key="member_edit_phone")
+    new_phone = st.text_input("New phone (optional)", value="", placeholder="e.g., +1 405-845-8002", key="member_edit_phone")
+
+    if new_phone.strip():
+        st.caption(f"Will save as: `{clean_phone(new_phone)}`")
 
     if st.button("💾 Save Phone Update", width="stretch", key="member_edit_save"):
         mid = int(label_to_id[pick])
         phone_clean = clean_phone(new_phone)
 
+        if not is_valid_phone(phone_clean):
+            st.error("Invalid phone format. Use 10–15 digits with optional + (e.g., +14058458002).")
+            return
+
         ok = safe_update(sb_service, schema, "members", {"phone": phone_clean}, {"id": mid})
         if ok:
             audit_log(
-                sb_service, schema,
+                sb_service,
+                schema,
                 action="member_phone_updated",
                 status="ok",
                 table_name="members",
@@ -335,7 +390,8 @@ def panel_rotation_state(sb_service, schema: str, actor_email: str):
         ok = safe_upsert(sb_service, schema, "app_state", payload)
         if ok:
             audit_log(
-                sb_service, schema,
+                sb_service,
+                schema,
                 action="override_rotation_state",
                 status="ok",
                 table_name="app_state",
@@ -405,7 +461,8 @@ def panel_contributions(sb_service, schema: str, actor_email: str):
             ok = safe_upsert(sb_service, schema, "contributions", payload)
             if ok:
                 audit_log(
-                    sb_service, schema,
+                    sb_service,
+                    schema,
                     action="contribution_upserted",
                     status="ok",
                     table_name="contributions",
@@ -463,7 +520,8 @@ def panel_contributions(sb_service, schema: str, actor_email: str):
                 st.error("Some rows failed:\n- " + "\n- ".join(errors))
             if saved:
                 audit_log(
-                    sb_service, schema,
+                    sb_service,
+                    schema,
                     action="bulk_contributions_upserted",
                     status="ok",
                     table_name="contributions",
@@ -479,9 +537,13 @@ def panel_contributions(sb_service, schema: str, actor_email: str):
     st.divider()
     st.markdown("### Contributions for current session")
     rows = safe_select(
-        sb_service, schema, "v_contributions_with_member",
+        sb_service,
+        schema,
+        "v_contributions_with_member",
         "member_id,member_name,session_id,amount,paid_at,created_at,note",
-        order_by="member_id", desc=False, limit=5000,
+        order_by="member_id",
+        desc=False,
+        limit=5000,
         session_id=int(current_session_id),
     )
     df = pd.DataFrame(rows)
@@ -533,7 +595,8 @@ def panel_fines(sb_service, schema: str, actor_email: str):
         ok = safe_insert(sb_service, schema, "fines", payload)
         if ok:
             audit_log(
-                sb_service, schema,
+                sb_service,
+                schema,
                 action="fine_inserted",
                 status="ok",
                 table_name="fines",
@@ -598,7 +661,8 @@ def panel_foundation(sb_service, schema: str, actor_email: str):
         ok = safe_upsert(sb_service, schema, "foundation_contributions", payload)
         if ok:
             audit_log(
-                sb_service, schema,
+                sb_service,
+                schema,
                 action="foundation_contribution_upserted",
                 status="ok",
                 table_name="foundation_contributions",
@@ -616,9 +680,13 @@ def panel_foundation(sb_service, schema: str, actor_email: str):
     st.divider()
     st.markdown("### Foundation contributions for current session")
     rows = safe_select(
-        sb_service, schema, "foundation_contributions",
+        sb_service,
+        schema,
+        "foundation_contributions",
         "member_id,session_id,amount,paid_at,created_at,note",
-        order_by="member_id", desc=False, limit=5000,
+        order_by="member_id",
+        desc=False,
+        limit=5000,
         session_id=int(current_session_id),
     )
     df = pd.DataFrame(rows)
@@ -645,7 +713,8 @@ def render_admin(sb_service, schema: str, actor_email: str = ""):
         ok = safe_upsert(sb_service, schema, "app_state", {"id": 1, "updated_at": now_iso()})
         if ok:
             audit_log(
-                sb_service, schema,
+                sb_service,
+                schema,
                 action="init_app_state",
                 status="ok",
                 table_name="app_state",
