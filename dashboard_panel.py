@@ -895,7 +895,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
                 data=pdf_bytes,
                 file_name=fname,
                 mime="application/pdf",
-                use_container_width=True,
+                width="stretch",  # ✅ replaces use_container_width=True
             )
 
     st.divider()
@@ -965,7 +965,6 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.markdown("#### 🗓️ Loan Repayment Plan")
         st.caption(f"Due = {DUE_DAYS} days from last payment (or borrow_date if never paid).")
-        # ✅ FIX: Streamlit deprecation — use width instead of use_container_width
         st.dataframe(plan_df, width="stretch", hide_index=True)
         st.markdown(glass_close(), unsafe_allow_html=True)
 
