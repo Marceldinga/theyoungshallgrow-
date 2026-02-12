@@ -1,47 +1,28 @@
 
 # dashboard_panel.py ✅ COMPLETE SINGLE CODE (NO SQL) — NJANGI STANDARD (NO "legacy")
-# ✅ Removes the BIG Dashboard header ("🏦 theyoungshallgrow • Bank Dashboard")
-# ✅ Removes the Attendance chart + its header section entirely
-# ✅ Keeps everything else (KPIs, Financial Summary, Loans, Repayment Plan, Debug)
-# ✅ Fixes ImportError: render_dashboard exists at module import time
-# ✅ Adds backward alias render_dashbaord (typo safety)
+# ------------------------------------------------------------------------------
+# ✅ Mobile-speed update (Railway / Supabase friendly)
 # ✅ Uses sb_service for reads when available (RLS-safe), sb_anon fallback
-# ✅ Dark theme + glass KPI cards
-# ✅ Auto-refresh on app_state stamp change
-#
-# ✅ NEW: Attendance PDF download + summary (NO SQL)
-#    - Uses attendance + members
-#    - Current session only (current_session_id)
-#    - Generates PDF using reportlab
-#
-# ✅ FINANCE MODEL (your rule):
-#    - Payouts are pot redistribution → NOT cash flow (informational only)
-#    - Adds FINES PAID as cash flow (fines.status='paid')
-#    - Interest is LEDGER-based (interest_ledger):
-#         - Interest this month = sum(amount) where interest_month startswith YYYY-MM
-#         - Interest all-time  = sum(amount) all rows
-#    - Cash Available = foundation + loan_payments + interest(ledger) + fines_paid − outstanding_principal
-#
-# NEW TABLES ONLY:
-#   - app_state                (id=1, current_session_id, next_member_id, optional next_payout_date, updated_at)
-#   - sessions                 (session_id, start_date, end_date, created_at)
-#   - members                  (id, name, phone, display_name optional)
-#   - contributions            (member_id, session_id, amount, paid_at, created_at)
-#   - foundation_contributions (member_id, session_id, amount, paid_at, created_at)
-#   - loans                    (id, member_id, status, principal_current, principal, unpaid_interest, total_interest_generated,
-#                               interest_rate_monthly, total_due (generated), borrow_date, due_cycle_days, last_paid_at, created_at, updated_at)
-#   - loan_payments            (loan_id, member_id, amount, paid_at, created_at)
-#   - interest_ledger          (id, loan_id, member_id, interest_month, amount, created_at, ...)
-#   - payouts                  (session_id, member_id, payout_amount, payout_date, payout_index, created_at, updated_at)  # informational only
-#   - fines                    (id, member_id, session_id, amount, reason, issued_by, status, paid_at, created_at, updated_at)
-#   - attendance               (id, member_id, session_id, present, note, created_at)  # allowed; used for PDF export
-#   - v_next_beneficiary       (optional view)
+# ✅ Auto-refresh on app_state stamp change (includes updated_at)
+# ✅ Filters by session_id at the API level (NO "download all then filter")
+# ✅ Lower row limits (fast)
+# ✅ Attendance PDF generated ON DEMAND (button) to avoid heavy reruns
+# ✅ Supports members.display_name OPTIONAL (fallback to id,name,phone)
+# ✅ Supports sessions.session_id OR sessions.id (fallback)
+# ✅ Removes Attendance chart entirely; keeps PDF + preview
+# ✅ Fixes Streamlit params: use_container_width=True (no width="stretch")
+# ------------------------------------------------------------------------------
+# TABLES (NEW ONLY):
+#   app_state, sessions, members, contributions, foundation_contributions,
+#   loans, loan_payments, interest_ledger, payouts, fines, attendance
+#   v_next_beneficiary (optional)
+# ------------------------------------------------------------------------------
 
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
-from typing import Any
 from io import BytesIO
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -151,19 +132,28 @@ def glass_close() -> str:
 
 
 # ============================================================
-# SAFE HELPERS (NO RAW SQL)
+# SAFE HELPERS (NO RAW SQL) — FAST + FILTERED
 # ============================================================
 def safe_table(
     sb,
     schema: str,
     table: str,
     cols: str = "*",
-    limit: int | None = 20000,
+    limit: int | None = 2000,
     order_by: str | None = None,
     desc: bool = True,
-):
+    **eq_filters,
+) -> list[dict]:
+    """
+    Safe select with optional equality filters (PostgREST .eq()).
+    Keeps limits low for mobile speed.
+    """
     try:
         q = sb.schema(schema).table(table).select(cols)
+        for k, v in (eq_filters or {}).items():
+            if v is None:
+                continue
+            q = q.eq(k, v)
         if order_by:
             q = q.order(order_by, desc=desc)
         if limit is not None:
@@ -179,25 +169,34 @@ def safe_table_order_fallback(
     schema: str,
     table: str,
     cols: str = "*",
-    limit: int | None = 20000,
+    limit: int | None = 2000,
     order_candidates: list[str] | None = None,
     desc: bool = True,
-):
+    **eq_filters,
+) -> list[dict]:
     order_candidates = order_candidates or []
     for c in order_candidates:
-        try:
-            rows = safe_table(sb, schema, table, cols=cols, limit=limit, order_by=c, desc=desc)
-            if rows is not None:
-                return rows or []
-        except Exception:
-            continue
-    return safe_table(sb, schema, table, cols=cols, limit=limit, order_by=None, desc=desc)
+        rows = safe_table(
+            sb,
+            schema,
+            table,
+            cols=cols,
+            limit=limit,
+            order_by=c,
+            desc=desc,
+            **eq_filters,
+        )
+        # If the order_by column doesn't exist, safe_table returns []
+        # so we keep trying candidates.
+        if rows != []:
+            return rows
+    return safe_table(sb, schema, table, cols=cols, limit=limit, order_by=None, desc=desc, **eq_filters)
 
 
 def safe_single(sb, schema: str, table: str, cols: str = "*", **eq_filters) -> dict:
     try:
         q = sb.schema(schema).table(table).select(cols)
-        for k, v in eq_filters.items():
+        for k, v in (eq_filters or {}).items():
             q = q.eq(k, v)
         q = q.limit(1)
         rows = q.execute().data or []
@@ -252,10 +251,10 @@ def _table_exists(sb, schema: str, table: str) -> bool:
 
 
 # ============================================================
-# AUTO-REFRESH ON app_state CHANGE
+# AUTO-REFRESH ON app_state CHANGE (includes updated_at)
 # ============================================================
 def _read_state_stamp(sb, schema: str) -> str:
-    r = safe_single(sb, schema, "app_state", "*", id=1)
+    r = safe_single(sb, schema, "app_state", "*", id=1) or {}
     return "|".join(
         [
             str(r.get("current_session_id") or ""),
@@ -282,9 +281,9 @@ def _auto_refresh_if_state_changed(sb, schema: str):
 
 
 # ============================================================
-# KPI COMPUTATIONS
+# KPI COMPUTATIONS (LIMITED READS)
 # ============================================================
-def compute_interest_ledger(sb, schema: str) -> tuple[float, float]:
+def compute_interest_ledger(sb, schema: str, limit: int = 2000) -> tuple[float, float]:
     if not _table_exists(sb, schema, "interest_ledger"):
         return 0.0, 0.0
 
@@ -292,12 +291,11 @@ def compute_interest_ledger(sb, schema: str) -> tuple[float, float]:
         sb,
         schema,
         "interest_ledger",
-        "*",
-        limit=20000,
+        "interest_month,amount,interest_amount,created_at,id",
+        limit=limit,
         order_candidates=["interest_month", "created_at", "id"],
         desc=True,
     )
-
     if not rows:
         return 0.0, 0.0
 
@@ -309,7 +307,6 @@ def compute_interest_ledger(sb, schema: str) -> tuple[float, float]:
         amt = r.get("amount") if "amount" in r else r.get("interest_amount")
         v = _num(amt, 0.0)
         all_time += v
-
         im = str(r.get("interest_month") or "").strip()
         if im.startswith(month_prefix):
             this_month += v
@@ -317,7 +314,7 @@ def compute_interest_ledger(sb, schema: str) -> tuple[float, float]:
     return float(this_month), float(all_time)
 
 
-def compute_loan_payments(sb, schema: str) -> tuple[float, dict[int, date]]:
+def compute_loan_payments(sb, schema: str, limit: int = 2000) -> tuple[float, dict[int, date]]:
     if not _table_exists(sb, schema, "loan_payments"):
         return 0.0, {}
 
@@ -325,8 +322,8 @@ def compute_loan_payments(sb, schema: str) -> tuple[float, dict[int, date]]:
         sb,
         schema,
         "loan_payments",
-        "*",
-        limit=20000,
+        "loan_id,amount,paid_at,created_at,id",
+        limit=limit,
         order_candidates=["paid_at", "created_at", "id"],
         desc=True,
     )
@@ -345,11 +342,11 @@ def compute_loan_payments(sb, schema: str) -> tuple[float, dict[int, date]]:
     return float(total), last_by_loan
 
 
-def compute_loans_kpis(sb, schema: str) -> dict[str, Any]:
+def compute_loans_kpis(sb, schema: str, limit: int = 2000) -> dict[str, Any]:
     if not _table_exists(sb, schema, "loans"):
         return {"active_loans": 0, "principal_active": 0.0, "total_due_active": 0.0}
 
-    rows = safe_table(sb, schema, "loans", "*", limit=20000)
+    rows = safe_table(sb, schema, "loans", "*", limit=limit)
     active = 0
     principal_sum = 0.0
     total_due_sum = 0.0
@@ -373,10 +370,17 @@ def compute_loans_kpis(sb, schema: str) -> dict[str, Any]:
     }
 
 
-def sum_table_amount(sb, schema: str, table: str, amount_cols: list[str]) -> float:
+def sum_table_amount(
+    sb,
+    schema: str,
+    table: str,
+    amount_cols: list[str],
+    limit: int = 2000,
+    **eq_filters,
+) -> float:
     if not _table_exists(sb, schema, table):
         return 0.0
-    rows = safe_table(sb, schema, table, "*", limit=20000)
+    rows = safe_table(sb, schema, table, "*", limit=limit, **eq_filters)
     total = 0.0
     for r in rows or []:
         val = None
@@ -388,7 +392,7 @@ def sum_table_amount(sb, schema: str, table: str, amount_cols: list[str]) -> flo
     return float(total)
 
 
-def compute_fines_paid_total(sb, schema: str) -> float:
+def compute_fines_paid_total(sb, schema: str, limit: int = 2000) -> float:
     if not _table_exists(sb, schema, "fines"):
         return 0.0
 
@@ -396,8 +400,8 @@ def compute_fines_paid_total(sb, schema: str) -> float:
         sb,
         schema,
         "fines",
-        "*",
-        limit=20000,
+        "amount,status,paid_at,created_at,id",
+        limit=limit,
         order_candidates=["paid_at", "created_at", "id"],
         desc=True,
     )
@@ -413,7 +417,10 @@ def compute_fines_paid_total(sb, schema: str) -> float:
 def get_session_window(sb, schema: str, session_id: int) -> str:
     if not session_id:
         return "—"
+    # Support sessions.session_id OR sessions.id
     srow = safe_single(sb, schema, "sessions", "*", session_id=int(session_id))
+    if not srow:
+        srow = safe_single(sb, schema, "sessions", "*", id=int(session_id))
     sd = srow.get("start_date")
     ed = srow.get("end_date")
     if sd and ed:
@@ -421,8 +428,8 @@ def get_session_window(sb, schema: str, session_id: int) -> str:
     return "—"
 
 
-def build_repayment_plan(sb, schema: str, last_payment_dates: dict[int, date]) -> pd.DataFrame:
-    loans = safe_table(sb, schema, "loans", "*", limit=20000)
+def build_repayment_plan(sb, schema: str, last_payment_dates: dict[int, date], limit: int = 2000) -> pd.DataFrame:
+    loans = safe_table(sb, schema, "loans", "*", limit=limit)
     out: list[dict[str, Any]] = []
 
     for r in loans or []:
@@ -438,7 +445,6 @@ def build_repayment_plan(sb, schema: str, last_payment_dates: dict[int, date]) -
         principal = _num(r.get("principal_current") or r.get("principal"), 0.0)
         unpaid_interest = _num(r.get("unpaid_interest"), 0.0)
         total_due = _num(r.get("total_due"), principal + unpaid_interest)
-
         borrow_date = _to_date(r.get("borrow_date")) or _to_date(r.get("created_at")) or date.today()
 
         if lid in last_payment_dates:
@@ -467,7 +473,7 @@ def build_repayment_plan(sb, schema: str, last_payment_dates: dict[int, date]) -
 
 
 # ============================================================
-# ATTENDANCE PDF EXPORT (NO SQL)
+# ATTENDANCE PDF EXPORT (NO SQL) — ON DEMAND
 # ============================================================
 def _member_name_map(members_rows: list[dict[str, Any]]) -> dict[int, str]:
     out: dict[int, str] = {}
@@ -483,16 +489,12 @@ def _member_name_map(members_rows: list[dict[str, Any]]) -> dict[int, str]:
 
 
 def _dedupe_attendance_latest(att_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Deduplicate by (member_id, session_id): keep the latest record by created_at, then id.
-    """
     if not att_rows:
         return []
     df = pd.DataFrame(att_rows)
     if df.empty:
         return []
 
-    # normalize
     for col in ("member_id", "session_id", "id"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -502,7 +504,6 @@ def _dedupe_attendance_latest(att_rows: list[dict[str, Any]]) -> list[dict[str, 
     else:
         df["created_at"] = pd.NaT
 
-    # sort newest first
     sort_cols = []
     if "created_at" in df.columns:
         sort_cols.append("created_at")
@@ -511,7 +512,6 @@ def _dedupe_attendance_latest(att_rows: list[dict[str, Any]]) -> list[dict[str, 
     if sort_cols:
         df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
 
-    # keep first per (member_id, session_id)
     if "member_id" in df.columns and "session_id" in df.columns:
         df = df.drop_duplicates(subset=["member_id", "session_id"], keep="first")
 
@@ -523,34 +523,26 @@ def build_attendance_df(
     schema: str,
     session_id: int,
     members_rows: list[dict[str, Any]],
+    limit: int = 2000,
 ) -> pd.DataFrame:
     if not session_id or not _table_exists(sb, schema, "attendance"):
         return pd.DataFrame()
 
+    # ✅ Filter current session at the API level
     att_rows = safe_table_order_fallback(
         sb,
         schema,
         "attendance",
         "*",
-        limit=20000,
+        limit=limit,
         order_candidates=["created_at", "id"],
         desc=True,
+        session_id=int(session_id),
     )
-
     if not att_rows:
         return pd.DataFrame()
 
-    # filter current session
-    filtered = []
-    for r in att_rows:
-        try:
-            sid = int(r.get("session_id")) if r.get("session_id") is not None else None
-        except Exception:
-            sid = None
-        if sid == int(session_id):
-            filtered.append(r)
-
-    filtered = _dedupe_attendance_latest(filtered)
+    filtered = _dedupe_attendance_latest(att_rows)
     if not filtered:
         return pd.DataFrame()
 
@@ -563,7 +555,6 @@ def build_attendance_df(
         except Exception:
             continue
         present = r.get("present")
-        # present can be True/False or 'true'/'false'
         p = str(present).lower().strip() in ("true", "1", "yes") if not isinstance(present, bool) else bool(present)
         note = str(r.get("note") or "").strip()
         created_at = str(r.get("created_at") or "").strip()
@@ -581,16 +572,12 @@ def build_attendance_df(
     if df.empty:
         return df
 
-    # stable ordering: by member_id
     df["member_id"] = pd.to_numeric(df["member_id"], errors="coerce").fillna(0).astype(int)
     df = df.sort_values("member_id", ascending=True).reset_index(drop=True)
     return df
 
 
 def _pdf_draw_wrapped(c: canvas.Canvas, text: str, x: float, y: float, max_width: float, line_height: float = 12) -> float:
-    """
-    Draw wrapped text and return new y.
-    """
     if not text:
         return y
     words = text.split()
@@ -625,7 +612,6 @@ def generate_attendance_pdf_bytes(
     x = margin
     y = height - margin
 
-    # Title
     c.setFont("Helvetica-Bold", 16)
     c.drawString(x, y, "Attendance Report")
     y -= 18
@@ -651,7 +637,6 @@ def generate_attendance_pdf_bytes(
     denom = total_members if total_members > 0 else recorded
     rate = (present_count / denom * 100.0) if denom > 0 else 0.0
 
-    # Summary
     c.setFont("Helvetica-Bold", 12)
     c.drawString(x, y, "Summary")
     y -= 14
@@ -668,12 +653,10 @@ def generate_attendance_pdf_bytes(
     c.drawString(x, y, f"Attendance Rate: {rate:.1f}% (Present / Total Members)")
     y -= 18
 
-    # Detail header
     c.setFont("Helvetica-Bold", 12)
     c.drawString(x, y, "Details")
     y -= 14
 
-    # columns
     col1 = x
     col2 = x + 1.2 * inch
     col3 = x + 3.4 * inch
@@ -714,14 +697,10 @@ def generate_attendance_pdf_bytes(
         c.drawString(col2, y, name[:28])
         c.drawString(col3, y, status)
 
-        # wrap note
         y_note_start = y
         y_after = _pdf_draw_wrapped(c, note, col4, y_note_start, max_width=max_note_w, line_height=11)
-
-        # row spacing: use the lower of (wrapped lines) vs one line
         y = min(y_note_start - 14, y_after - 2)
 
-    # Footer
     y -= 10
     c.setFont("Helvetica-Oblique", 9)
     c.drawString(x, max(margin - 10, 20), "theyoungshallgrow • Attendance PDF")
@@ -731,7 +710,7 @@ def generate_attendance_pdf_bytes(
 
 
 # ============================================================
-# DASHBOARD (STANDARD) — HEADER + ATTENDANCE CHART REMOVED
+# DASHBOARD
 # ============================================================
 def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     inject_dashboard_theme()
@@ -754,27 +733,33 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     except Exception:
         current_session_id = None
 
+    # Fallback: latest session (supports session_id OR id)
     if current_session_id is None:
         srows = safe_table_order_fallback(
             read_sb,
             schema,
             "sessions",
-            "session_id,start_date,end_date,created_at",
+            "id,session_id,start_date,end_date,created_at",
             limit=1,
-            order_candidates=["session_id", "start_date", "created_at"],
+            order_candidates=["session_id", "id", "start_date", "created_at"],
             desc=True,
         )
         if srows:
+            sid = srows[0].get("session_id", None)
+            if sid is None:
+                sid = srows[0].get("id", None)
             try:
-                current_session_id = int(srows[0].get("session_id"))
+                current_session_id = int(sid) if sid is not None else None
             except Exception:
                 current_session_id = None
 
     session_note = "from app_state" if state.get("current_session_id") else "fallback: latest session"
     next_member_id = state.get("next_member_id")
 
-    # --- Members ---
-    members_rows = safe_table(read_sb, schema, "members", "id,name,display_name", limit=5000, order_by="id", desc=False)
+    # --- Members (display_name optional) ---
+    members_rows = safe_table(read_sb, schema, "members", "id,name,display_name,phone", limit=5000, order_by="id", desc=False)
+    if not members_rows:
+        members_rows = safe_table(read_sb, schema, "members", "id,name,phone", limit=5000, order_by="id", desc=False)
 
     # safety dedupe
     seen_ids = set()
@@ -813,20 +798,27 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     if isinstance(current_session_id, int) and current_session_id > 0:
         window = get_session_window(read_sb, schema, int(current_session_id))
 
-    # --- Current pot ---
+    # --- Current pot (✅ filtered by session at API level) ---
     pot = 0.0
     members_paid = 0
     if isinstance(current_session_id, int) and current_session_id > 0:
-        crows = safe_table(finance_sb, schema, "contributions", "member_id,session_id,amount", limit=20000)
-        dfc = pd.DataFrame(crows or [])
-        if not dfc.empty and "session_id" in dfc.columns:
-            dfc["session_id"] = pd.to_numeric(dfc["session_id"], errors="coerce").fillna(-1).astype(int)
-            dfc = dfc[dfc["session_id"] == int(current_session_id)].copy()
+        crows = safe_table(
+            finance_sb,
+            schema,
+            "contributions",
+            "member_id,session_id,amount,paid_at,created_at",
+            limit=2000,
+            order_by="paid_at",
+            desc=True,
+            session_id=int(current_session_id),
+        )
+        if crows:
+            dfc = pd.DataFrame(crows)
             dfc["amount"] = pd.to_numeric(dfc.get("amount"), errors="coerce").fillna(0.0)
             pot = float(dfc["amount"].sum())
             members_paid = int(dfc["member_id"].nunique()) if "member_id" in dfc.columns else 0
 
-    # --- Top KPIs (kept, but NO big header text above) ---
+    # --- Top KPIs ---
     st.markdown(glass_open(), unsafe_allow_html=True)
     a1, a2, a3, a4 = st.columns(4)
     with a1:
@@ -863,51 +855,51 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     st.divider()
 
     # ============================================================
-    # ✅ Attendance PDF Download (NEW)
+    # ✅ Attendance PDF Download (ON DEMAND)
     # ============================================================
     st.markdown("### 🧾 Attendance PDF")
-    st.caption("Download attendance + summary for the current session (no SQL).")
+    st.caption("Preview current session attendance and generate PDF on demand (fast).")
 
     if not (isinstance(current_session_id, int) and current_session_id > 0):
         st.info("No current_session_id available yet.")
+        att_df = pd.DataFrame()
     else:
-        # Build attendance df from attendance table + members
-        att_df = build_attendance_df(read_sb, schema, int(current_session_id), members_rows)
+        att_df = build_attendance_df(read_sb, schema, int(current_session_id), members_rows, limit=2000)
 
         if att_df.empty:
             st.warning("No attendance recorded for this session yet.")
         else:
-            # Preview
             st.markdown(glass_open(), unsafe_allow_html=True)
-            st.dataframe(att_df, width="stretch", hide_index=True)
+            st.dataframe(att_df, use_container_width=True, hide_index=True)
             st.markdown(glass_close(), unsafe_allow_html=True)
 
-            pdf_bytes = generate_attendance_pdf_bytes(
-                session_id=int(current_session_id),
-                session_window=window,
-                df=att_df,
-                total_members=total_members,
-            )
-
-            fname = f"attendance_session_{int(current_session_id)}.pdf"
-            st.download_button(
-                "⬇️ Download Attendance PDF",
-                data=pdf_bytes,
-                file_name=fname,
-                mime="application/pdf",
-                width="stretch",  # ✅ replaces use_container_width=True
-            )
+            if st.button("🧾 Generate Attendance PDF", use_container_width=True):
+                pdf_bytes = generate_attendance_pdf_bytes(
+                    session_id=int(current_session_id),
+                    session_window=window,
+                    df=att_df,
+                    total_members=total_members,
+                )
+                fname = f"attendance_session_{int(current_session_id)}.pdf"
+                st.download_button(
+                    "⬇️ Download Attendance PDF",
+                    data=pdf_bytes,
+                    file_name=fname,
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
 
     st.divider()
 
-    # --- Financial Totals ---
-    foundation_total = sum_table_amount(finance_sb, schema, "foundation_contributions", ["amount"])
-    payouts_total = sum_table_amount(finance_sb, schema, "payouts", ["payout_amount", "amount"])  # informational only
-    interest_this_month, interest_all_time = compute_interest_ledger(finance_sb, schema)
-    repayments_total, last_payment_dates = compute_loan_payments(finance_sb, schema)
-    fines_paid_total = compute_fines_paid_total(finance_sb, schema)
-    loan_kpis = compute_loans_kpis(finance_sb, schema)
-    loans_outstanding = float(loan_kpis["principal_active"])
+    # --- Financial Totals (fast limits; session filtered where possible) ---
+    # Foundation: all-time (limit safe), or current session if you prefer: add session_id=current_session_id
+    foundation_total = sum_table_amount(finance_sb, schema, "foundation_contributions", ["amount"], limit=2000)
+    payouts_total = sum_table_amount(finance_sb, schema, "payouts", ["payout_amount", "amount"], limit=2000)  # informational only
+    interest_this_month, interest_all_time = compute_interest_ledger(finance_sb, schema, limit=2000)
+    repayments_total, last_payment_dates = compute_loan_payments(finance_sb, schema, limit=2000)
+    fines_paid_total = compute_fines_paid_total(finance_sb, schema, limit=2000)
+    loan_kpis = compute_loans_kpis(finance_sb, schema, limit=2000)
+    loans_outstanding = float(loan_kpis.get("principal_active", 0.0))
 
     cash_available_raw = foundation_total + repayments_total + interest_all_time + fines_paid_total - loans_outstanding
     cash_available = max(cash_available_raw, 0.0)
@@ -924,9 +916,9 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     with f3:
         st.markdown(kpi_card("Interest This Month", _fmt_money(interest_this_month, 2), "green", sub="interest_ledger (YYYY-MM)"), unsafe_allow_html=True)
     with f4:
-        st.markdown(kpi_card("Interest All-time", _fmt_money(interest_all_time, 2), "green", sub="interest_ledger (all)"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Interest All-time", _fmt_money(interest_all_time, 2), "green", sub="interest_ledger (recent window)"), unsafe_allow_html=True)
     with f5:
-        st.markdown(kpi_card("Loan Payments", _fmt_money(repayments_total, 0), "green", sub="loan_payments"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Loan Payments", _fmt_money(repayments_total, 0), "green", sub="loan_payments (recent window)"), unsafe_allow_html=True)
     with f6:
         st.markdown(kpi_card("Total Fines Paid", _fmt_money(fines_paid_total, 0), "purple", sub="fines.status='paid'"), unsafe_allow_html=True)
     with f7:
@@ -951,21 +943,21 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     st.markdown(glass_open(), unsafe_allow_html=True)
     l1, l2, l3 = st.columns(3)
     with l1:
-        st.markdown(kpi_card("Active Loans", str(int(loan_kpis["active_loans"])), "purple"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Active Loans", str(int(loan_kpis.get("active_loans", 0))), "purple"), unsafe_allow_html=True)
     with l2:
-        st.markdown(kpi_card("Principal Current", _fmt_money(loan_kpis["principal_active"], 0), "orange"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Principal Current", _fmt_money(loan_kpis.get("principal_active", 0.0), 0), "orange"), unsafe_allow_html=True)
     with l3:
-        st.markdown(kpi_card("Total Due", _fmt_money(loan_kpis["total_due_active"], 0), "red"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Total Due", _fmt_money(loan_kpis.get("total_due_active", 0.0), 0), "red"), unsafe_allow_html=True)
     st.markdown(glass_close(), unsafe_allow_html=True)
 
-    plan_df = build_repayment_plan(finance_sb, schema, last_payment_dates)
+    plan_df = build_repayment_plan(finance_sb, schema, last_payment_dates, limit=2000)
     if plan_df.empty:
         st.info("No active/open loans found.")
     else:
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.markdown("#### 🗓️ Loan Repayment Plan")
         st.caption(f"Due = {DUE_DAYS} days from last payment (or borrow_date if never paid).")
-        st.dataframe(plan_df, width="stretch", hide_index=True)
+        st.dataframe(plan_df, use_container_width=True, hide_index=True)
         st.markdown(glass_close(), unsafe_allow_html=True)
 
     # --- Debug ---
@@ -979,6 +971,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         st.write("beneficiary_name", beneficiary_name)
         st.write("current_pot", pot)
         st.write("members_paid", members_paid)
+        st.write("total_members", total_members)
         st.write("foundation_total", foundation_total)
         st.write("payouts_total (informational)", payouts_total)
         st.write("interest_this_month (ledger)", interest_this_month)
