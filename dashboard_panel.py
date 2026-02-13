@@ -1,6 +1,8 @@
 
 # dashboard_panel.py ✅ COMPLETE SINGLE CODE (NO SQL) — NJANGI STANDARD (NO "legacy")
 # ------------------------------------------------------------------------------
+# ✅ CLEAN + FUTURE-PROOF (Streamlit 2025+):
+#    - Replaces use_container_width=True  ✅ with width="stretch"
 # ✅ Mobile-speed update (Railway / Supabase friendly)
 # ✅ Uses sb_service for reads when available (RLS-safe), sb_anon fallback
 # ✅ Auto-refresh on app_state stamp change (includes updated_at)
@@ -10,7 +12,6 @@
 # ✅ Supports members.display_name OPTIONAL (fallback to id,name,phone)
 # ✅ Supports sessions.session_id OR sessions.id (fallback)
 # ✅ Removes Attendance chart entirely; keeps PDF + preview
-# ✅ Fixes Streamlit params: use_container_width=True (no width="stretch")
 # ✅ FIXED interest_ledger: works with (amount only) OR (interest_month) OR (created_at)
 # ------------------------------------------------------------------------------
 # TABLES (NEW ONLY):
@@ -34,6 +35,11 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.units import inch
 
 DUE_DAYS = 28
+
+# =========================
+# UI CONSTANTS
+# =========================
+W_STRETCH = "stretch"  # Streamlit replacement for use_container_width=True
 
 
 # ============================================================
@@ -172,21 +178,26 @@ def safe_table_order_fallback(
     desc: bool = True,
     **eq_filters,
 ) -> list[dict]:
-    """Try ordering by several candidate columns; if a column doesn't exist, keep trying."""
+    """
+    Try ordering by candidate columns. If ordering fails for a column, move to next.
+    NOTE: An empty result can be valid; we still return it if the query succeeds.
+    """
     order_candidates = order_candidates or []
     for c in order_candidates:
-        rows = safe_table(
-            sb,
-            schema,
-            table,
-            cols=cols,
-            limit=limit,
-            order_by=c,
-            desc=desc,
-            **eq_filters,
-        )
-        if rows != []:
-            return rows
+        try:
+            q = sb.schema(schema).table(table).select(cols)
+            for k, v in (eq_filters or {}).items():
+                if v is None:
+                    continue
+                q = q.eq(k, v)
+            if limit is not None:
+                q = q.limit(int(limit))
+            q = q.order(c, desc=desc)
+            res = q.execute()
+            return res.data or []
+        except Exception:
+            continue
+
     return safe_table(sb, schema, table, cols=cols, limit=limit, order_by=None, desc=desc, **eq_filters)
 
 
@@ -290,7 +301,7 @@ def compute_interest_ledger(sb, schema: str, limit: int = 2000) -> tuple[float, 
 
     ✅ If your table ONLY has (amount) and no dates:
        - All-time will still work
-       - This-month will be 0 (because there is no way to know the month)
+       - This-month will be 0 (no month info)
     """
     if not _table_exists(sb, schema, "interest_ledger"):
         return 0.0, 0.0
@@ -312,11 +323,7 @@ def compute_interest_ledger(sb, schema: str, limit: int = 2000) -> tuple[float, 
     all_time = 0.0
 
     for r in rows:
-        if "amount" in r and r.get("amount") is not None:
-            v = _num(r.get("amount"), 0.0)
-        else:
-            v = _num(r.get("interest_amount"), 0.0)
-
+        v = _num(r.get("amount") if r.get("amount") is not None else r.get("interest_amount"), 0.0)
         all_time += v
 
         im = str(r.get("interest_month") or "").strip()
@@ -347,6 +354,7 @@ def compute_loan_payments(sb, schema: str, limit: int = 2000) -> tuple[float, di
     )
     total = 0.0
     last_by_loan: dict[int, date] = {}
+
     for r in rows or []:
         total += _num(r.get("amount"), 0.0)
         try:
@@ -354,9 +362,9 @@ def compute_loan_payments(sb, schema: str, limit: int = 2000) -> tuple[float, di
         except Exception:
             continue
         d = _to_date(r.get("paid_at") or r.get("created_at"))
-        if d is not None:
-            if lid not in last_by_loan or d > last_by_loan[lid]:
-                last_by_loan[lid] = d
+        if d is not None and (lid not in last_by_loan or d > last_by_loan[lid]):
+            last_by_loan[lid] = d
+
     return float(total), last_by_loan
 
 
@@ -425,10 +433,8 @@ def compute_fines_paid_total(sb, schema: str, limit: int = 2000) -> float:
     )
     total = 0.0
     for r in rows or []:
-        status = str(r.get("status") or "").lower().strip()
-        if status != "paid":
-            continue
-        total += _num(r.get("amount"), 0.0)
+        if str(r.get("status") or "").lower().strip() == "paid":
+            total += _num(r.get("amount"), 0.0)
     return float(total)
 
 
@@ -521,11 +527,7 @@ def _dedupe_attendance_latest(att_rows: list[dict[str, Any]]) -> list[dict[str, 
     else:
         df["created_at"] = pd.NaT
 
-    sort_cols = []
-    if "created_at" in df.columns:
-        sort_cols.append("created_at")
-    if "id" in df.columns:
-        sort_cols.append("id")
+    sort_cols = [c for c in ("created_at", "id") if c in df.columns]
     if sort_cols:
         df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
 
@@ -570,15 +572,17 @@ def build_attendance_df(
             mid = int(r.get("member_id"))
         except Exception:
             continue
+
         present = r.get("present")
-        p = str(present).lower().strip() in ("true", "1", "yes") if not isinstance(present, bool) else bool(present)
+        is_present = bool(present) if isinstance(present, bool) else str(present).lower().strip() in ("true", "1", "yes")
         note = str(r.get("note") or "").strip()
         created_at = str(r.get("created_at") or "").strip()
+
         out_rows.append(
             {
                 "member_id": mid,
                 "member_name": name_map.get(mid, f"Member {mid:02d}"),
-                "status": "Present" if p else "Absent",
+                "status": "Present" if is_present else "Absent",
                 "note": note,
                 "recorded_at": created_at or "—",
             }
@@ -614,19 +618,14 @@ def _pdf_draw_wrapped(c: canvas.Canvas, text: str, x: float, y: float, max_width
     return y
 
 
-def generate_attendance_pdf_bytes(
-    session_id: int,
-    session_window: str,
-    df: pd.DataFrame,
-    total_members: int,
-) -> bytes:
+def generate_attendance_pdf_bytes(session_id: int, session_window: str, df: pd.DataFrame, total_members: int) -> bytes:
     buf = BytesIO()
     c = canvas.Canvas(buf, pagesize=LETTER)
-    width, height = LETTER
+    page_w, page_h = LETTER
 
     margin = 0.75 * inch
     x = margin
-    y = height - margin
+    y = page_h - margin
 
     c.setFont("Helvetica-Bold", 16)
     c.drawString(x, y, "Attendance Report")
@@ -677,32 +676,27 @@ def generate_attendance_pdf_bytes(
     col2 = x + 1.2 * inch
     col3 = x + 3.4 * inch
     col4 = x + 4.6 * inch
-    max_note_w = (width - margin) - col4
+    max_note_w = (page_w - margin) - col4
 
-    c.setFont("Helvetica-Bold", 10)
-    c.drawString(col1, y, "ID")
-    c.drawString(col2, y, "Name")
-    c.drawString(col3, y, "Status")
-    c.drawString(col4, y, "Note")
-    y -= 10
-    c.line(x, y, width - margin, y)
-    y -= 12
+    def draw_header(y0: float) -> float:
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(col1, y0, "ID")
+        c.drawString(col2, y0, "Name")
+        c.drawString(col3, y0, "Status")
+        c.drawString(col4, y0, "Note")
+        y0 -= 10
+        c.line(x, y0, page_w - margin, y0)
+        y0 -= 12
+        c.setFont("Helvetica", 10)
+        return y0
 
-    c.setFont("Helvetica", 10)
+    y = draw_header(y)
 
     for _, r in df.iterrows():
         if y < margin + 80:
             c.showPage()
-            y = height - margin
-            c.setFont("Helvetica-Bold", 10)
-            c.drawString(col1, y, "ID")
-            c.drawString(col2, y, "Name")
-            c.drawString(col3, y, "Status")
-            c.drawString(col4, y, "Note")
-            y -= 10
-            c.line(x, y, width - margin, y)
-            y -= 12
-            c.setFont("Helvetica", 10)
+            y = page_h - margin
+            y = draw_header(y)
 
         mid = str(r.get("member_id") or "")
         name = str(r.get("member_name") or "")
@@ -717,7 +711,6 @@ def generate_attendance_pdf_bytes(
         y_after = _pdf_draw_wrapped(c, note, col4, y_note_start, max_width=max_note_w, line_height=11)
         y = min(y_note_start - 14, y_after - 2)
 
-    y -= 10
     c.setFont("Helvetica-Oblique", 9)
     c.drawString(x, max(margin - 10, 20), "theyoungshallgrow • Attendance PDF")
 
@@ -785,6 +778,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     if not members_rows:
         members_rows = safe_table(read_sb, schema, "members", "id,name,phone", limit=5000, order_by="id", desc=False)
 
+    # Dedup by id (safe)
     seen_ids = set()
     dedup_members = []
     for m in members_rows or []:
@@ -796,7 +790,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     members_rows = dedup_members
     total_members = int(len(members_rows or []))
 
-    # --- Beneficiary ---
+    # --- Beneficiary (v_next_beneficiary optional) ---
     beneficiary_name = "—"
     beneficiary_id = next_member_id
 
@@ -837,8 +831,9 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         )
         if crows:
             dfc = pd.DataFrame(crows)
-            dfc["amount"] = pd.to_numeric(dfc.get("amount"), errors="coerce").fillna(0.0)
-            pot = float(dfc["amount"].sum())
+            if "amount" in dfc.columns:
+                dfc["amount"] = pd.to_numeric(dfc["amount"], errors="coerce").fillna(0.0)
+                pot = float(dfc["amount"].sum())
             members_paid = int(dfc["member_id"].nunique()) if "member_id" in dfc.columns else 0
 
     # --- Top KPIs ---
@@ -893,10 +888,10 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
             st.warning("No attendance recorded for this session yet.")
         else:
             st.markdown(glass_open(), unsafe_allow_html=True)
-            st.dataframe(att_df, use_container_width=True, hide_index=True)
+            st.dataframe(att_df, width=W_STRETCH, hide_index=True)
             st.markdown(glass_close(), unsafe_allow_html=True)
 
-            if st.button("🧾 Generate Attendance PDF", use_container_width=True):
+            if st.button("🧾 Generate Attendance PDF", width=W_STRETCH):
                 pdf_bytes = generate_attendance_pdf_bytes(
                     session_id=int(current_session_id),
                     session_window=window,
@@ -909,7 +904,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
                     data=pdf_bytes,
                     file_name=fname,
                     mime="application/pdf",
-                    use_container_width=True,
+                    width=W_STRETCH,
                 )
 
     st.divider()
@@ -979,7 +974,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.markdown("#### 🗓️ Loan Repayment Plan")
         st.caption(f"Due = {DUE_DAYS} days from last payment (or borrow_date if never paid).")
-        st.dataframe(plan_df, use_container_width=True, hide_index=True)
+        st.dataframe(plan_df, width=W_STRETCH, hide_index=True)
         st.markdown(glass_close(), unsafe_allow_html=True)
 
     # --- Debug ---
