@@ -11,6 +11,7 @@
 # ✅ Supports sessions.session_id OR sessions.id (fallback)
 # ✅ Removes Attendance chart entirely; keeps PDF + preview
 # ✅ Fixes Streamlit params: use_container_width=True (no width="stretch")
+# ✅ FIXED interest_ledger: works with (amount only) OR (interest_month) OR (created_at)
 # ------------------------------------------------------------------------------
 # TABLES (NEW ONLY):
 #   app_state, sessions, members, contributions, foundation_contributions,
@@ -22,7 +23,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import pandas as pd
 import streamlit as st
@@ -144,10 +145,7 @@ def safe_table(
     desc: bool = True,
     **eq_filters,
 ) -> list[dict]:
-    """
-    Safe select with optional equality filters (PostgREST .eq()).
-    Keeps limits low for mobile speed.
-    """
+    """Safe select with optional equality filters (PostgREST .eq())."""
     try:
         q = sb.schema(schema).table(table).select(cols)
         for k, v in (eq_filters or {}).items():
@@ -174,6 +172,7 @@ def safe_table_order_fallback(
     desc: bool = True,
     **eq_filters,
 ) -> list[dict]:
+    """Try ordering by several candidate columns; if a column doesn't exist, keep trying."""
     order_candidates = order_candidates or []
     for c in order_candidates:
         rows = safe_table(
@@ -186,8 +185,6 @@ def safe_table_order_fallback(
             desc=desc,
             **eq_filters,
         )
-        # If the order_by column doesn't exist, safe_table returns []
-        # so we keep trying candidates.
         if rows != []:
             return rows
     return safe_table(sb, schema, table, cols=cols, limit=limit, order_by=None, desc=desc, **eq_filters)
@@ -284,6 +281,17 @@ def _auto_refresh_if_state_changed(sb, schema: str):
 # KPI COMPUTATIONS (LIMITED READS)
 # ============================================================
 def compute_interest_ledger(sb, schema: str, limit: int = 2000) -> tuple[float, float]:
+    """
+    ✅ Works for any of these schemas:
+      - interest_ledger(amount, created_at)
+      - interest_ledger(amount, interest_month='YYYY-MM')
+      - interest_ledger(interest_amount, created_at)
+      - interest_ledger(interest_amount, interest_month)
+
+    ✅ If your table ONLY has (amount) and no dates:
+       - All-time will still work
+       - This-month will be 0 (because there is no way to know the month)
+    """
     if not _table_exists(sb, schema, "interest_ledger"):
         return 0.0, 0.0
 
@@ -291,9 +299,9 @@ def compute_interest_ledger(sb, schema: str, limit: int = 2000) -> tuple[float, 
         sb,
         schema,
         "interest_ledger",
-        "interest_month,amount,interest_amount,created_at,id",
+        "amount,interest_amount,interest_month,created_at,id",
         limit=limit,
-        order_candidates=["interest_month", "created_at", "id"],
+        order_candidates=["created_at", "interest_month", "id"],
         desc=True,
     )
     if not rows:
@@ -304,11 +312,21 @@ def compute_interest_ledger(sb, schema: str, limit: int = 2000) -> tuple[float, 
     all_time = 0.0
 
     for r in rows:
-        amt = r.get("amount") if "amount" in r else r.get("interest_amount")
-        v = _num(amt, 0.0)
+        if "amount" in r and r.get("amount") is not None:
+            v = _num(r.get("amount"), 0.0)
+        else:
+            v = _num(r.get("interest_amount"), 0.0)
+
         all_time += v
+
         im = str(r.get("interest_month") or "").strip()
-        if im.startswith(month_prefix):
+        if im:
+            if im.startswith(month_prefix):
+                this_month += v
+            continue
+
+        d = _to_date(r.get("created_at"))
+        if d and d.strftime("%Y-%m") == month_prefix:
             this_month += v
 
     return float(this_month), float(all_time)
@@ -417,7 +435,6 @@ def compute_fines_paid_total(sb, schema: str, limit: int = 2000) -> float:
 def get_session_window(sb, schema: str, session_id: int) -> str:
     if not session_id:
         return "—"
-    # Support sessions.session_id OR sessions.id
     srow = safe_single(sb, schema, "sessions", "*", session_id=int(session_id))
     if not srow:
         srow = safe_single(sb, schema, "sessions", "*", id=int(session_id))
@@ -528,7 +545,6 @@ def build_attendance_df(
     if not session_id or not _table_exists(sb, schema, "attendance"):
         return pd.DataFrame()
 
-    # ✅ Filter current session at the API level
     att_rows = safe_table_order_fallback(
         sb,
         schema,
@@ -757,11 +773,18 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     next_member_id = state.get("next_member_id")
 
     # --- Members (display_name optional) ---
-    members_rows = safe_table(read_sb, schema, "members", "id,name,display_name,phone", limit=5000, order_by="id", desc=False)
+    members_rows = safe_table(
+        read_sb,
+        schema,
+        "members",
+        "id,name,display_name,phone",
+        limit=5000,
+        order_by="id",
+        desc=False,
+    )
     if not members_rows:
         members_rows = safe_table(read_sb, schema, "members", "id,name,phone", limit=5000, order_by="id", desc=False)
 
-    # safety dedupe
     seen_ids = set()
     dedup_members = []
     for m in members_rows or []:
@@ -798,7 +821,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     if isinstance(current_session_id, int) and current_session_id > 0:
         window = get_session_window(read_sb, schema, int(current_session_id))
 
-    # --- Current pot (✅ filtered by session at API level) ---
+    # --- Current pot (filtered by session) ---
     pot = 0.0
     members_paid = 0
     if isinstance(current_session_id, int) and current_session_id > 0:
@@ -855,7 +878,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     st.divider()
 
     # ============================================================
-    # ✅ Attendance PDF Download (ON DEMAND)
+    # Attendance PDF Download (ON DEMAND)
     # ============================================================
     st.markdown("### 🧾 Attendance PDF")
     st.caption("Preview current session attendance and generate PDF on demand (fast).")
@@ -891,8 +914,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
 
     st.divider()
 
-    # --- Financial Totals (fast limits; session filtered where possible) ---
-    # Foundation: all-time (limit safe), or current session if you prefer: add session_id=current_session_id
+    # --- Financial Totals ---
     foundation_total = sum_table_amount(finance_sb, schema, "foundation_contributions", ["amount"], limit=2000)
     payouts_total = sum_table_amount(finance_sb, schema, "payouts", ["payout_amount", "amount"], limit=2000)  # informational only
     interest_this_month, interest_all_time = compute_interest_ledger(finance_sb, schema, limit=2000)
@@ -914,15 +936,15 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     with f2:
         st.markdown(kpi_card("Payouts Total", _fmt_money(payouts_total, 0), "orange", sub="pot redistribution (info)"), unsafe_allow_html=True)
     with f3:
-        st.markdown(kpi_card("Interest This Month", _fmt_money(interest_this_month, 2), "green", sub="interest_ledger (YYYY-MM)"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Interest This Month", _fmt_money(interest_this_month, 2), "green", sub="interest_ledger (this month)"), unsafe_allow_html=True)
     with f4:
-        st.markdown(kpi_card("Interest All-time", _fmt_money(interest_all_time, 2), "green", sub="interest_ledger (recent window)"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Interest All-time", _fmt_money(interest_all_time, 2), "green", sub="interest_ledger (all rows)"), unsafe_allow_html=True)
     with f5:
-        st.markdown(kpi_card("Loan Payments", _fmt_money(repayments_total, 0), "green", sub="loan_payments (recent window)"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Loan Payments", _fmt_money(repayments_total, 0), "green", sub="loan_payments"), unsafe_allow_html=True)
     with f6:
         st.markdown(kpi_card("Total Fines Paid", _fmt_money(fines_paid_total, 0), "purple", sub="fines.status='paid'"), unsafe_allow_html=True)
     with f7:
-        st.markdown(kpi_card("Outstanding Principal", _fmt_money(loans_outstanding, 0), "red", sub="loans.principal_current"), unsafe_allow_html=True)
+        st.markdown(kpi_card("Outstanding Principal", _fmt_money(loans_outstanding, 0), "red", sub="loans principal_current"), unsafe_allow_html=True)
     with f8:
         st.markdown(kpi_card("Cash Available", _fmt_money(cash_available, 0), "green", sub="foundation + payments + interest + fines − principal"), unsafe_allow_html=True)
     with f9:
@@ -932,7 +954,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     if cash_available_raw < 0:
         st.warning(
             f"⚠️ Cash Available RAW is negative ({cash_available_raw:,.0f}) before flooring to 0. "
-            "This means outstanding loans exceed foundation cash-in (payments/interest/fines)."
+            "Outstanding loans exceed foundation cash-in."
         )
 
     st.divider()
@@ -974,8 +996,8 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         st.write("total_members", total_members)
         st.write("foundation_total", foundation_total)
         st.write("payouts_total (informational)", payouts_total)
-        st.write("interest_this_month (ledger)", interest_this_month)
-        st.write("interest_all_time (ledger)", interest_all_time)
+        st.write("interest_this_month", interest_this_month)
+        st.write("interest_all_time", interest_all_time)
         st.write("loan_payments_total", repayments_total)
         st.write("fines_paid_total", fines_paid_total)
         st.write("loan_kpis", loan_kpis)
