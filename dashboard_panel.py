@@ -2,7 +2,7 @@
 # dashboard_panel.py ✅ COMPLETE SINGLE CODE (NO SQL) — NJANGI STANDARD (NO "legacy")
 # ------------------------------------------------------------------------------
 # ✅ CLEAN + FUTURE-PROOF (Streamlit 2025+):
-#    - Replaces use_container_width=True  ✅ with width="stretch"
+#    - Replaces use_container_width=True ✅ with width="stretch"
 # ✅ Mobile-speed update (Railway / Supabase friendly)
 # ✅ Uses sb_service for reads when available (RLS-safe), sb_anon fallback
 # ✅ Auto-refresh on app_state stamp change (includes updated_at)
@@ -12,7 +12,11 @@
 # ✅ Supports members.display_name OPTIONAL (fallback to id,name,phone)
 # ✅ Supports sessions.session_id OR sessions.id (fallback)
 # ✅ Removes Attendance chart entirely; keeps PDF + preview
-# ✅ FIXED interest_ledger: works with (amount only) OR (interest_month) OR (created_at)
+# ✅ FIXED interest_ledger (NO silent zeros):
+#     - Uses server-side SUM() for all-time + this-month (fast + accurate)
+#     - Tries amount then interest_amount
+#     - This-month prefers interest_month LIKE 'YYYY-MM%' else uses created_at month range
+#     - Stores any error in Debug (st.session_state['_interest_ledger_error'])
 # ------------------------------------------------------------------------------
 # TABLES (NEW ONLY):
 #   app_state, sessions, members, contributions, foundation_contributions,
@@ -179,8 +183,8 @@ def safe_table_order_fallback(
     **eq_filters,
 ) -> list[dict]:
     """
-    Try ordering by candidate columns. If ordering fails for a column, move to next.
-    NOTE: An empty result can be valid; we still return it if the query succeeds.
+    Try ordering by candidate columns; if ordering fails, try the next.
+    NOTE: returning [] can be valid if table is empty; errors are swallowed here for speed.
     """
     order_candidates = order_candidates or []
     for c in order_candidates:
@@ -289,56 +293,123 @@ def _auto_refresh_if_state_changed(sb, schema: str):
 
 
 # ============================================================
-# KPI COMPUTATIONS (LIMITED READS)
+# INTEREST LEDGER (SERVER-SIDE SUM) — NO SILENT ZEROS
 # ============================================================
+def _month_range() -> tuple[str, str, str]:
+    month_prefix = date.today().strftime("%Y-%m")
+    start = date.today().replace(day=1)
+    if start.month == 12:
+        end = date(start.year + 1, 1, 1)
+    else:
+        end = date(start.year, start.month + 1, 1)
+    return month_prefix, start.isoformat(), end.isoformat()
+
+
+def _safe_sum(sb, schema: str, table: str, sum_expr: str, *, like: tuple[str, str] | None = None, gte=None, lt=None) -> tuple[float, str | None]:
+    """
+    PostgREST aggregate call:
+      sum_expr example: "amount.sum()"
+    Returns (value, error)
+    """
+    try:
+        q = sb.schema(schema).table(table).select(sum_expr).limit(1)
+        if like is not None:
+            col, pattern = like
+            q = q.like(col, pattern)
+        if gte is not None:
+            col, v = gte
+            q = q.gte(col, v)
+        if lt is not None:
+            col, v = lt
+            q = q.lt(col, v)
+        res = q.execute()
+        data = res.data or []
+        if not data:
+            return 0.0, None
+        return _num(data[0].get("sum"), 0.0), None
+    except Exception as e:
+        return 0.0, repr(e)
+
+
 def compute_interest_ledger(sb, schema: str, limit: int = 2000) -> tuple[float, float]:
     """
-    ✅ Works for any of these schemas:
-      - interest_ledger(amount, created_at)
-      - interest_ledger(amount, interest_month='YYYY-MM')
-      - interest_ledger(interest_amount, created_at)
-      - interest_ledger(interest_amount, interest_month)
-
-    ✅ If your table ONLY has (amount) and no dates:
-       - All-time will still work
-       - This-month will be 0 (no month info)
+    ✅ FIXED:
+      - All-time: SUM(amount) or SUM(interest_amount)
+      - This-month: SUM(...) where interest_month LIKE 'YYYY-MM%' if possible
+                   else fallback to created_at month range
+      - Stores readable cause in st.session_state['_interest_ledger_error']
     """
+    st.session_state.pop("_interest_ledger_error", None)
+
     if not _table_exists(sb, schema, "interest_ledger"):
+        st.session_state["_interest_ledger_error"] = "interest_ledger not readable (missing table or RLS blocks read)."
         return 0.0, 0.0
 
-    rows = safe_table_order_fallback(
-        sb,
-        schema,
-        "interest_ledger",
-        "amount,interest_amount,interest_month,created_at,id",
-        limit=limit,
-        order_candidates=["created_at", "interest_month", "id"],
-        desc=True,
+    month_prefix, start_iso, end_iso = _month_range()
+
+    # ---- Try column: amount ----
+    all_time, e_all = _safe_sum(sb, schema, "interest_ledger", "amount.sum()")
+
+    # this-month: interest_month LIKE first
+    this_month, e_m_like = _safe_sum(
+        sb, schema, "interest_ledger", "amount.sum()", like=("interest_month", f"{month_prefix}%")
     )
-    if not rows:
+
+    # if interest_month doesn't exist, fallback to created_at range
+    if this_month == 0.0 and e_m_like is not None:
+        this_month, e_m_date = _safe_sum(
+            sb, schema, "interest_ledger", "amount.sum()",
+            gte=("created_at", start_iso),
+            lt=("created_at", end_iso),
+        )
+    else:
+        e_m_date = None
+
+    # If amount looks broken, try interest_amount
+    if (all_time == 0.0 and this_month == 0.0) and (e_all is not None or e_m_like is not None or e_m_date is not None):
+        all_time2, e_all2 = _safe_sum(sb, schema, "interest_ledger", "interest_amount.sum()")
+        this_month2, e2_like = _safe_sum(
+            sb, schema, "interest_ledger", "interest_amount.sum()", like=("interest_month", f"{month_prefix}%")
+        )
+        if this_month2 == 0.0 and e2_like is not None:
+            this_month2, e2_date = _safe_sum(
+                sb, schema, "interest_ledger", "interest_amount.sum()",
+                gte=("created_at", start_iso),
+                lt=("created_at", end_iso),
+            )
+        else:
+            e2_date = None
+
+        if (e_all2 is None or e2_like is None or e2_date is None):
+            # We got something without hard failure
+            return float(this_month2), float(all_time2)
+
+        st.session_state["_interest_ledger_error"] = (
+            "interest_ledger SUM failed.\n"
+            f"amount.sum all-time error: {e_all}\n"
+            f"amount.sum month-like error: {e_m_like}\n"
+            f"amount.sum month-date error: {e_m_date}\n"
+            f"interest_amount.sum all-time error: {e_all2}\n"
+            f"interest_amount.sum month-like error: {e2_like}\n"
+            f"interest_amount.sum month-date error: {e2_date}\n"
+        )
         return 0.0, 0.0
 
-    month_prefix = date.today().strftime("%Y-%m")
-    this_month = 0.0
-    all_time = 0.0
-
-    for r in rows:
-        v = _num(r.get("amount") if r.get("amount") is not None else r.get("interest_amount"), 0.0)
-        all_time += v
-
-        im = str(r.get("interest_month") or "").strip()
-        if im:
-            if im.startswith(month_prefix):
-                this_month += v
-            continue
-
-        d = _to_date(r.get("created_at"))
-        if d and d.strftime("%Y-%m") == month_prefix:
-            this_month += v
+    # Store non-fatal hint if any
+    if e_all or e_m_like or e_m_date:
+        st.session_state["_interest_ledger_error"] = (
+            "interest_ledger partial warning:\n"
+            f"amount.sum all-time error: {e_all}\n"
+            f"amount.sum month-like error: {e_m_like}\n"
+            f"amount.sum month-date error: {e_m_date}\n"
+        )
 
     return float(this_month), float(all_time)
 
 
+# ============================================================
+# KPI COMPUTATIONS (LIMITED READS)
+# ============================================================
 def compute_loan_payments(sb, schema: str, limit: int = 2000) -> tuple[float, dict[int, date]]:
     if not _table_exists(sb, schema, "loan_payments"):
         return 0.0, {}
@@ -778,7 +849,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     if not members_rows:
         members_rows = safe_table(read_sb, schema, "members", "id,name,phone", limit=5000, order_by="id", desc=False)
 
-    # Dedup by id (safe)
+    # Dedup by id
     seen_ids = set()
     dedup_members = []
     for m in members_rows or []:
@@ -790,7 +861,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     members_rows = dedup_members
     total_members = int(len(members_rows or []))
 
-    # --- Beneficiary (v_next_beneficiary optional) ---
+    # --- Beneficiary ---
     beneficiary_name = "—"
     beneficiary_id = next_member_id
 
@@ -912,7 +983,13 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     # --- Financial Totals ---
     foundation_total = sum_table_amount(finance_sb, schema, "foundation_contributions", ["amount"], limit=2000)
     payouts_total = sum_table_amount(finance_sb, schema, "payouts", ["payout_amount", "amount"], limit=2000)  # informational only
+
     interest_this_month, interest_all_time = compute_interest_ledger(finance_sb, schema, limit=2000)
+    _interest_err = st.session_state.get("_interest_ledger_error")
+    if _interest_err:
+        st.warning("Interest might be 0 because the dashboard cannot read interest_ledger properly.")
+        st.code(_interest_err, language="text")
+
     repayments_total, last_payment_dates = compute_loan_payments(finance_sb, schema, limit=2000)
     fines_paid_total = compute_fines_paid_total(finance_sb, schema, limit=2000)
     loan_kpis = compute_loans_kpis(finance_sb, schema, limit=2000)
@@ -925,24 +1002,28 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     st.markdown("### 🏦 Financial Summary")
 
     st.markdown(glass_open(), unsafe_allow_html=True)
-    f1, f2, f3, f4, f5, f6, f7, f8, f9 = st.columns(9)
+    f1, f2, f3 = st.columns(3)
     with f1:
         st.markdown(kpi_card("Foundation Total", _fmt_money(foundation_total, 0), "blue", sub="foundation_contributions"), unsafe_allow_html=True)
     with f2:
         st.markdown(kpi_card("Payouts Total", _fmt_money(payouts_total, 0), "orange", sub="pot redistribution (info)"), unsafe_allow_html=True)
     with f3:
-        st.markdown(kpi_card("Interest This Month", _fmt_money(interest_this_month, 2), "green", sub="interest_ledger (this month)"), unsafe_allow_html=True)
-    with f4:
-        st.markdown(kpi_card("Interest All-time", _fmt_money(interest_all_time, 2), "green", sub="interest_ledger (all rows)"), unsafe_allow_html=True)
-    with f5:
-        st.markdown(kpi_card("Loan Payments", _fmt_money(repayments_total, 0), "green", sub="loan_payments"), unsafe_allow_html=True)
-    with f6:
         st.markdown(kpi_card("Total Fines Paid", _fmt_money(fines_paid_total, 0), "purple", sub="fines.status='paid'"), unsafe_allow_html=True)
-    with f7:
+    st.divider()
+    g1, g2, g3 = st.columns(3)
+    with g1:
+        st.markdown(kpi_card("Interest This Month", _fmt_money(interest_this_month, 2), "green", sub="interest_ledger"), unsafe_allow_html=True)
+    with g2:
+        st.markdown(kpi_card("Interest All-time", _fmt_money(interest_all_time, 2), "green", sub="interest_ledger"), unsafe_allow_html=True)
+    with g3:
+        st.markdown(kpi_card("Loan Payments", _fmt_money(repayments_total, 0), "green", sub="loan_payments"), unsafe_allow_html=True)
+    st.divider()
+    h1, h2, h3 = st.columns(3)
+    with h1:
         st.markdown(kpi_card("Outstanding Principal", _fmt_money(loans_outstanding, 0), "red", sub="loans principal_current"), unsafe_allow_html=True)
-    with f8:
+    with h2:
         st.markdown(kpi_card("Cash Available", _fmt_money(cash_available, 0), "green", sub="foundation + payments + interest + fines − principal"), unsafe_allow_html=True)
-    with f9:
+    with h3:
         st.markdown(kpi_card("Net Available", _fmt_money(net_available, 0), "blue", sub="Cash Available + Current Pot"), unsafe_allow_html=True)
     st.markdown(glass_close(), unsafe_allow_html=True)
 
@@ -980,6 +1061,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     # --- Debug ---
     with st.expander("🔎 Debug", expanded=False):
         st.write("Using read client:", "service" if sb_service is not None else "anon")
+        st.write("interest_ledger_error", st.session_state.get("_interest_ledger_error"))
         st.write("app_state", state)
         st.write("session_note", session_note)
         st.write("current_session_id", current_session_id)
