@@ -1,6 +1,10 @@
 
 # app.py ✅ COMPLETE SINGLE CODE — NJANGI STANDARD (NO legacy) — “SLOW / GENTLE MODE”
 # ------------------------------------------------------------------------------
+# ✅ CLEAN + FUTURE-PROOF (Streamlit 2025+):
+#    - Replaces use_container_width=True ✅ with width="stretch"
+#    - Uses a single constant W_STRETCH
+#
 # ✅ Fixes "loads but shows competition/demo data" by:
 #    - Displaying connected Supabase project ref (host prefix)
 #    - Warning if URL/keys look mismatched
@@ -47,6 +51,11 @@ st.set_page_config(
     layout="wide",
     page_icon="🏦",
 )
+
+# =========================
+# UI CONSTANTS
+# =========================
+W_STRETCH = "stretch"  # Streamlit replacement for use_container_width=True
 
 # ============================================================
 # TIME
@@ -177,12 +186,6 @@ inject_global_theme()
 # SECRETS / ENV
 # ============================================================
 def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
-    """
-    Reads from OS env first (Railway/GitHub Actions), then Streamlit secrets.
-    This is correct for streamlit.app hosting, but can cause "competition data"
-    if your Streamlit secrets are pointing to the wrong Supabase project.
-    We'll display the connected project ref so you can fix it.
-    """
     v = os.getenv(key)
     if v not in (None, ""):
         return v
@@ -299,10 +302,9 @@ def lazy_import(path: str, attr: Optional[str] = None) -> Tuple[Any, Optional[st
         return None, repr(e)
 
 # ============================================================
-# CONNECTED DB CHECK (THIS IS THE KEY FIX FOR “COMPETITION DATA”)
+# CONNECTED DB CHECK (KEY FIX FOR “COMPETITION DATA”)
 # ============================================================
 def project_ref_from_url(url: str) -> str:
-    # https://<ref>.supabase.co -> <ref>
     try:
         host = url.split("//", 1)[-1].split("/", 1)[0]
         return host.split(".")[0]
@@ -310,11 +312,11 @@ def project_ref_from_url(url: str) -> str:
         return "unknown"
 
 def looks_like_jwt(key: str) -> bool:
-    # Supabase keys are usually JWT-like: header.payload.signature
     return key.count(".") >= 2 and len(key) > 40
 
 def show_connected_db_banner():
     pref = project_ref_from_url(SUPABASE_URL)
+
     st.markdown(glass_open(), unsafe_allow_html=True)
     st.markdown("### 🔐 Connected Database Check")
     st.write("Supabase project ref:", f"`{pref}`")
@@ -322,7 +324,6 @@ def show_connected_db_banner():
     st.write("Anon key looks valid:", "✅" if looks_like_jwt(SUPABASE_ANON_KEY) else "❌")
     st.write("Service key set:", "✅" if bool(SUPABASE_SERVICE_KEY) else "❌")
 
-    # Quick read test (members)
     try:
         throttle_db()
         r = sb_anon.schema(SUPABASE_SCHEMA).table("members").select("id").limit(1).execute()
@@ -332,9 +333,7 @@ def show_connected_db_banner():
         st.error("Anon read test: ❌ cannot read members (likely RLS policy or wrong schema)")
         st.code(_api_msg(e), language="text")
 
-    st.caption(
-        "If this shows the WRONG project ref, fix Streamlit Cloud secrets: Manage app → Settings → Secrets."
-    )
+    st.caption("If this shows the WRONG project ref, fix Streamlit Cloud secrets: Manage app → Settings → Secrets.")
     st.markdown(glass_close(), unsafe_allow_html=True)
 
 # ============================================================
@@ -346,7 +345,7 @@ with left:
     if SLOW_MODE:
         st.caption("🐢 Slow Mode ON (reduced DB load)")
 with right:
-    if st.button("🔄 Refresh data", use_container_width=True):
+    if st.button("🔄 Refresh data", width=W_STRETCH):
         st.cache_data.clear()
         st.rerun()
 
@@ -379,7 +378,9 @@ with st.sidebar.expander("🐢 Slow Mode", expanded=False):
     )
 
 SLOW_MODE = bool(st.session_state.get("_slow_mode_override", SLOW_MODE))
-MIN_SECONDS_BETWEEN_DB_CALLS = float(st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", MIN_SECONDS_BETWEEN_DB_CALLS))
+MIN_SECONDS_BETWEEN_DB_CALLS = float(
+    st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", MIN_SECONDS_BETWEEN_DB_CALLS)
+)
 
 # ============================================================
 # CACHED LOADERS (SCHEMA-SAFE)
@@ -388,7 +389,6 @@ MIN_SECONDS_BETWEEN_DB_CALLS = float(st.session_state.get("MIN_SECONDS_BETWEEN_D
 def load_members(url: str, anon_key: str, schema: str) -> pd.DataFrame:
     client = create_client(url, anon_key)
 
-    # Try with display_name; fallback if column doesn't exist
     try:
         throttle_db()
         rows = (
@@ -435,8 +435,9 @@ def load_members(url: str, anon_key: str, schema: str) -> pd.DataFrame:
 @st.cache_data(ttl=240)
 def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFrame:
     """
-    IMPORTANT: we DO NOT swallow errors silently anymore.
-    If the view is missing / RLS blocked, we show the error and return empty.
+    IMPORTANT:
+    - We don't swallow errors silently
+    - We store the error string in session_state for display (outside cache side-effects)
     """
     client = create_client(url, anon_key)
     throttle_db()
@@ -451,10 +452,10 @@ def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFram
             .data
             or []
         )
+        # Clear old error if success
+        st.session_state.pop("_last_contrib_view_error", None)
         return pd.DataFrame(rows) if rows else pd.DataFrame()
     except Exception as e:
-        # We'll show this error on the Contributions page (not here to avoid caching weirdness).
-        # So we store it in session_state for display.
         st.session_state["_last_contrib_view_error"] = _api_msg(e)
         return pd.DataFrame()
 
@@ -479,10 +480,11 @@ def get_effective_session_id(sb_read, schema: str) -> tuple[Optional[int], str]:
     if cs is not None:
         return cs, "from app_state"
 
+    # Try sessions.session_id first, then sessions.id
     srows = safe_select(
         sb_read,
         "sessions",
-        "session_id,start_date,end_date,created_at",
+        "id,session_id,start_date,end_date,created_at",
         schema=schema,
         order_by="session_id",
         order_desc=True,
@@ -490,8 +492,9 @@ def get_effective_session_id(sb_read, schema: str) -> tuple[Optional[int], str]:
         show_error=False,
     )
     if srows:
+        sid = srows[0].get("session_id") or srows[0].get("id")
         try:
-            return int(srows[0].get("session_id")), "fallback: latest session"
+            return int(sid), "fallback: latest session"
         except Exception:
             return None, "fallback failed"
     return None, "no sessions"
@@ -529,7 +532,6 @@ elif page == "Contributions":
 
     df = load_contributions_view(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
 
-    # If the view failed, show why
     if df.empty and st.session_state.get("_last_contrib_view_error"):
         st.warning("View v_contributions_with_member failed (showing error). Falling back to raw contributions.")
         st.code(st.session_state.get("_last_contrib_view_error"), language="text")
@@ -549,9 +551,9 @@ elif page == "Contributions":
             st.info("No contributions found (or RLS blocked). Check the database details expander at the top.")
         else:
             st.warning("Showing raw contributions (view not available or not readable).")
-            st.dataframe(df2, use_container_width=True, hide_index=True)
+            st.dataframe(df2, width=W_STRETCH, hide_index=True)
     else:
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        st.dataframe(df, width=W_STRETCH, hide_index=True)
 
     st.markdown(glass_close(), unsafe_allow_html=True)
 
@@ -635,7 +637,7 @@ elif page == "Minutes & Attendance":
             with st.form("minutes_form", clear_on_submit=False):
                 title = st.text_input("Title", key="minutes_title")
                 body = st.text_area("Minutes / Documentation", height=260, key="minutes_body")
-                ok = st.form_submit_button("💾 Save minutes", use_container_width=True)
+                ok = st.form_submit_button("💾 Save minutes", width=W_STRETCH)
 
             if ok:
                 if not title.strip() or not body.strip():
@@ -681,7 +683,9 @@ elif page == "Minutes & Attendance":
         st.divider()
         st.markdown("### Current session minutes")
         rows = safe_select(
-            sb_service, "minutes", "*",
+            sb_service,
+            "minutes",
+            "*",
             schema=SUPABASE_SCHEMA,
             order_by="updated_at",
             order_desc=True,
@@ -692,7 +696,7 @@ elif page == "Minutes & Attendance":
         if dfm.empty:
             st.info("No minutes recorded yet.")
         else:
-            st.dataframe(dfm, use_container_width=True, hide_index=True)
+            st.dataframe(dfm, width=W_STRETCH, hide_index=True)
         st.markdown(glass_close(), unsafe_allow_html=True)
 
     with tab2:
@@ -744,7 +748,7 @@ elif page == "Minutes & Attendance":
 
                 attendance_rows.append({"member_id": mid, "present": (status == "present"), "note": note.strip() or None})
 
-            save = st.form_submit_button("💾 Save attendance (ALL members)", use_container_width=True)
+            save = st.form_submit_button("💾 Save attendance (ALL members)", width=W_STRETCH)
 
         if save:
             if not can_write:
@@ -797,7 +801,7 @@ elif page == "Minutes & Attendance":
             if dfa.empty:
                 st.info("No attendance recorded for this session yet.")
             else:
-                st.dataframe(dfa, use_container_width=True, hide_index=True)
+                st.dataframe(dfa, width=W_STRETCH, hide_index=True)
         else:
             dfa = pd.DataFrame(arows_existing)
             if dfa.empty:
@@ -808,7 +812,7 @@ elif page == "Minutes & Attendance":
                 dfa = dfa.merge(dm, on="member_id", how="left")
                 dfa = dfa[["member_id", "member_name", "present", "note", "created_at"]]
                 st.warning("View v_attendance_with_member not readable. Showing attendance joined in Python.")
-                st.dataframe(dfa, use_container_width=True, hide_index=True)
+                st.dataframe(dfa, width=W_STRETCH, hide_index=True)
 
         st.markdown(glass_close(), unsafe_allow_html=True)
 
@@ -868,7 +872,8 @@ elif page == "Minutes & Attendance":
         else:
             if "session_id" in dfc.columns:
                 dfc = dfc[dfc["session_id"].astype(str) == str(current_session_id)].copy()
-            dfc["amount"] = pd.to_numeric(dfc.get("amount"), errors="coerce").fillna(0)
+            if "amount" in dfc.columns:
+                dfc["amount"] = pd.to_numeric(dfc["amount"], errors="coerce").fillna(0)
             st.metric("Rows", f"{len(dfc):,}")
             st.metric("Sum", f"{float(dfc['amount'].sum()):,.0f}")
             group_cols = [c for c in ["member_id", "member_name"] if c in dfc.columns]
@@ -881,7 +886,7 @@ elif page == "Minutes & Attendance":
                     .reset_index()
                 )
                 st.caption("Top contributors (current session)")
-                st.dataframe(top, use_container_width=True, hide_index=True)
+                st.dataframe(top, width=W_STRETCH, hide_index=True)
 
         st.markdown(glass_close(), unsafe_allow_html=True)
 
@@ -938,7 +943,7 @@ elif page == "Health":
         svc_ok = table_readable(sb_service, SUPABASE_SCHEMA, name) if sb_service else False
         rows.append({"object": f"{kind}:{name}", "anon_read": anon_ok, "service_read": svc_ok})
 
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width=W_STRETCH, hide_index=True)
 
     st.divider()
     st.markdown("### Quick tips")
