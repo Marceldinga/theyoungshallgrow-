@@ -1,4 +1,3 @@
-
 # app.py ✅ COMPLETE SINGLE CODE — NJANGI STANDARD (NO legacy) — “SLOW / GENTLE MODE”
 # ------------------------------------------------------------------------------
 # ✅ CLEAN + FUTURE-PROOF (Streamlit 2025+):
