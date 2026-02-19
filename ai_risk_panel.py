@@ -11,6 +11,7 @@
 # ✅ Safe Supabase reads (won’t crash if order_by column missing)
 # ✅ Streamlit cache FIXED (no unhashable Supabase clients in st.cache_data)
 # ✅ Timezone FIX: all datetime math uses tz-aware UTC
+# ✅ Label FIX: if only one class from status, fallback behavior-based labels so ML can train
 
 from __future__ import annotations
 
@@ -97,7 +98,6 @@ def _utc_now() -> pd.Timestamp:
 
 
 def _to_dt_utc(s: pd.Series) -> pd.Series:
-    # Parse to tz-aware UTC consistently
     return pd.to_datetime(s, errors="coerce", utc=True)
 
 
@@ -140,7 +140,7 @@ def _load_table_cached(
 
     rows = _safe_select_autosort(client, schema, table, cols=cols, limit=limit, desc=True)
 
-    # If anon is empty and service exists, retry with service automatically
+    # If anon empty and service exists, retry automatically
     if not rows and not use_service:
         sb_service = st.session_state.get("__sb_service__")
         if sb_service is not None:
@@ -254,7 +254,7 @@ def _build_member_features(
         p["member_id"] = _to_int(p["member_id"])
         p["amount"] = _to_num(p.get("amount", 0))
 
-        # prefer paid_at, fallback to created_at
+        # prefer paid_at, fallback created_at
         if "paid_at" in p.columns:
             p["paid_at"] = _to_dt_utc(p.get("paid_at", pd.NaT))
         else:
@@ -333,19 +333,57 @@ def _build_member_features(
     return X
 
 
-def _make_label_from_loans(loans: pd.DataFrame, members: pd.DataFrame) -> pd.Series:
+def _make_label_from_loans(loans: pd.DataFrame, members: pd.DataFrame, X: pd.DataFrame | None = None) -> pd.Series:
+    """
+    Primary label:
+        y=1 if member has ANY loan with a 'bad' status (mapped).
+    Fallback label (if only one class found):
+        y=1 if:
+            (loan_balance_sum > 0 AND days_since_last_payment >= 30)
+            OR (days_since_last_contrib >= 45)
+    """
     members_ids = _to_int(members["id"])
     y = pd.Series(0, index=members_ids, dtype=int)
 
-    if loans.empty or "member_id" not in loans.columns:
-        return y.reset_index(drop=True)
+    # PRIMARY from status
+    if not loans.empty and "member_id" in loans.columns:
+        l = loans.copy()
+        l["member_id"] = _to_int(l["member_id"])
+        l["status_raw"] = l.get("status", "").astype(str).str.strip().str.lower()
 
-    l = loans.copy()
-    l["member_id"] = _to_int(l["member_id"])
-    l["status"] = l.get("status", "").astype(str).str.lower()
+        def _norm_status(s: str) -> str:
+            if s in ("", "none", "nan"):
+                return "unknown"
 
-    bad_members = l.loc[l["status"].isin(["delinquent", "default", "overdue"]), "member_id"].unique()
-    y.loc[y.index.isin(bad_members)] = 1
+            bad_tokens = ["overdue", "past due", "past_due", "delinquent", "default", "late", "arrears", "unpaid"]
+            if any(tok in s for tok in bad_tokens):
+                return "bad"
+
+            good_tokens = ["paid", "cleared", "closed", "settled", "complete", "completed", "repaid"]
+            if any(tok in s for tok in good_tokens):
+                return "good"
+
+            active_tokens = ["active", "open", "running", "current", "approved", "disbursed"]
+            if any(tok in s for tok in active_tokens):
+                return "active"
+
+            return "unknown"
+
+        l["status_norm"] = l["status_raw"].apply(_norm_status)
+        bad_members = l.loc[l["status_norm"] == "bad", "member_id"].unique()
+        y.loc[y.index.isin(bad_members)] = 1
+
+    # FALLBACK if single-class
+    if len(pd.unique(y)) < 2 and X is not None and not X.empty:
+        tmp = X.set_index("member_id", drop=False)
+
+        bal = pd.to_numeric(tmp.get("loan_balance_sum", 0), errors="coerce").fillna(0)
+        dsp = pd.to_numeric(tmp.get("days_since_last_payment", 0), errors="coerce").fillna(0)
+        dsc = pd.to_numeric(tmp.get("days_since_last_contrib", 0), errors="coerce").fillna(0)
+
+        fallback_flag = ((bal > 0) & (dsp >= 30)) | (dsc >= 45)
+        y.loc[y.index.isin(tmp.index)] = fallback_flag.astype(int)
+
     return y.reset_index(drop=True)
 
 
@@ -455,8 +493,21 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
         else pd.DataFrame()
     )
 
+    # Debug: loan status distribution (helps see why single class)
+    if not loans.empty and "status" in loans.columns:
+        st.caption("Loan status distribution:")
+        st.dataframe(
+            loans["status"]
+            .astype(str)
+            .str.lower()
+            .value_counts()
+            .reset_index()
+            .rename(columns={"index": "status", "status": "count"}),
+            use_container_width=True,
+        )
+
     X = _build_member_features(members, contrib, loans, payments, fines, foundation)
-    y = _make_label_from_loans(loans, members)
+    y = _make_label_from_loans(loans, members, X=X)
 
     model, feature_cols, auc = _train_model(X, y)
 
@@ -480,8 +531,8 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
 
     st.subheader("Risk prediction")
     if model is None:
-        st.warning("Not enough labeled data to train supervised ML (only one class found or too few examples).")
-        st.caption("Fix: Ensure loans.status has both good and bad examples (e.g., 'overdue' vs 'active/paid').")
+        st.warning("Not enough labeled data to train supervised ML (still single-class after fallback).")
+        st.caption("If you want, I can add anomaly detection so you always get a risk score.")
     else:
         proba = float(model.predict_proba(row[feature_cols])[0, 1])
         st.metric("Predicted Risk (probability)", f"{proba * 100:.1f}%")
