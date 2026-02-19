@@ -10,6 +10,7 @@
 # ✅ Machine Learning risk probability (Logistic Regression)
 # ✅ Safe Supabase reads (won’t crash if order_by column missing)
 # ✅ Streamlit cache FIXED (no unhashable Supabase clients in st.cache_data)
+# ✅ Timezone FIX: all datetime math uses tz-aware UTC
 
 from __future__ import annotations
 
@@ -43,7 +44,6 @@ def _safe_select(
             try:
                 q = q.order(order_by, desc=desc)
             except Exception:
-                # retry without ordering
                 q = client.schema(schema).table(table).select(cols)
 
         if limit:
@@ -66,7 +66,6 @@ def _safe_select_autosort(
     limit: int = 2000,
     desc: bool = True,
 ):
-    # try typical timestamp / id columns
     for c in ["created_at", "updated_at", "paid_at", "payout_date", "borrow_date", "start_date", "id"]:
         rows = _safe_select(client, schema, table, cols=cols, limit=limit, order_by=c, desc=desc, silent=True)
         if rows:
@@ -93,8 +92,18 @@ def _to_num(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce").fillna(0.0)
 
 
-def _to_dt(s: pd.Series) -> pd.Series:
-    return pd.to_datetime(s, errors="coerce")
+def _utc_now() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC")
+
+
+def _to_dt_utc(s: pd.Series) -> pd.Series:
+    # Parse to tz-aware UTC consistently
+    return pd.to_datetime(s, errors="coerce", utc=True)
+
+
+def _days_since(now_utc: pd.Timestamp, dt_series) -> pd.Series:
+    dt_utc = pd.to_datetime(dt_series, errors="coerce", utc=True)
+    return (now_utc - dt_utc).dt.days
 
 
 # ============================================================
@@ -105,7 +114,6 @@ def _pick_client(sb_anon, sb_service):
 
 
 def _ensure_clients_in_state(sb_anon, sb_service):
-    # store clients in session_state so cached functions don't receive them as args
     st.session_state["__sb_anon__"] = sb_anon
     st.session_state["__sb_service__"] = sb_service
 
@@ -126,17 +134,13 @@ def _load_table_cached(
     limit: int = 5000,
     use_service: bool = False,
 ) -> pd.DataFrame:
-    """
-    Cached read keyed ONLY by hashable params.
-    Supabase clients are read from st.session_state to avoid UnhashableParamError.
-    """
     client = _get_client_from_state(use_service=use_service)
     if client is None:
         return pd.DataFrame()
 
     rows = _safe_select_autosort(client, schema, table, cols=cols, limit=limit, desc=True)
 
-    # If anon returned empty and service exists, optionally retry with service
+    # If anon is empty and service exists, retry with service automatically
     if not rows and not use_service:
         sb_service = st.session_state.get("__sb_service__")
         if sb_service is not None:
@@ -146,17 +150,11 @@ def _load_table_cached(
 
 
 def _load_table(sb_anon, sb_service, schema: str, table: str, cols: str = "*", limit: int = 5000) -> pd.DataFrame:
-    """
-    Wrapper keeping your original call style but cache-safe.
-    """
     _ensure_clients_in_state(sb_anon, sb_service)
     return _load_table_cached(schema=schema, table=table, cols=cols, limit=limit, use_service=False)
 
 
 def _load_table_service(sb_anon, sb_service, schema: str, table: str, cols: str = "*", limit: int = 5000) -> pd.DataFrame:
-    """
-    Forces service client inside cached loader when available.
-    """
     _ensure_clients_in_state(sb_anon, sb_service)
     return _load_table_cached(schema=schema, table=table, cols=cols, limit=limit, use_service=True)
 
@@ -172,12 +170,11 @@ def _build_member_features(
     fines: pd.DataFrame,
     foundation: pd.DataFrame,
 ) -> pd.DataFrame:
-    # normalize member ids
     members = members.copy()
     members["id"] = _to_int(members["id"])
     members = members[members["id"] > 0].copy()
 
-    now = pd.Timestamp.utcnow()
+    now = _utc_now()
 
     # ----------------------------
     # contributions features
@@ -187,7 +184,7 @@ def _build_member_features(
         c = contrib.copy()
         c["member_id"] = _to_int(c["member_id"])
         c["amount"] = _to_num(c.get("amount", 0))
-        c["created_at"] = _to_dt(c.get("created_at", pd.NaT))
+        c["created_at"] = _to_dt_utc(c.get("created_at", pd.NaT))
 
         grp = c.groupby("member_id", dropna=False)
         c_sum = grp["amount"].sum()
@@ -211,7 +208,7 @@ def _build_member_features(
         cfeat["contrib_last_dt"] = pd.NaT
         cfeat["contrib_sessions_n"] = np.nan
 
-    cfeat["days_since_last_contrib"] = (now - pd.to_datetime(cfeat["contrib_last_dt"], errors="coerce")).dt.days
+    cfeat["days_since_last_contrib"] = _days_since(now, cfeat["contrib_last_dt"])
 
     # ----------------------------
     # loans features
@@ -256,7 +253,13 @@ def _build_member_features(
         p = payments.copy()
         p["member_id"] = _to_int(p["member_id"])
         p["amount"] = _to_num(p.get("amount", 0))
-        p["paid_at"] = _to_dt(p.get("paid_at", pd.NaT))
+
+        # prefer paid_at, fallback to created_at
+        if "paid_at" in p.columns:
+            p["paid_at"] = _to_dt_utc(p.get("paid_at", pd.NaT))
+        else:
+            p["paid_at"] = _to_dt_utc(p.get("created_at", pd.NaT))
+
         grp = p.groupby("member_id", dropna=False)
         p_cnt = grp["amount"].count()
         p_sum = grp["amount"].sum()
@@ -270,7 +273,7 @@ def _build_member_features(
         pfeat["pay_total"] = np.nan
         pfeat["pay_last_dt"] = pd.NaT
 
-    pfeat["days_since_last_payment"] = (now - pd.to_datetime(pfeat["pay_last_dt"], errors="coerce")).dt.days
+    pfeat["days_since_last_payment"] = _days_since(now, pfeat["pay_last_dt"])
 
     # ----------------------------
     # fines features
@@ -297,7 +300,8 @@ def _build_member_features(
         fd = foundation.copy()
         fd["member_id"] = _to_int(fd["member_id"])
         fd["amount"] = _to_num(fd.get("amount", 0))
-        fd["created_at"] = _to_dt(fd.get("created_at", pd.NaT))
+        fd["created_at"] = _to_dt_utc(fd.get("created_at", pd.NaT))
+
         grp = fd.groupby("member_id", dropna=False)
         fd_sum = grp["amount"].sum()
         fd_cnt = grp["amount"].count()
@@ -311,7 +315,7 @@ def _build_member_features(
         fdfeat["foundation_count"] = np.nan
         fdfeat["foundation_last_dt"] = pd.NaT
 
-    fdfeat["days_since_last_foundation"] = (now - pd.to_datetime(fdfeat["foundation_last_dt"], errors="coerce")).dt.days
+    fdfeat["days_since_last_foundation"] = _days_since(now, fdfeat["foundation_last_dt"])
 
     # merge all
     X = (
@@ -346,7 +350,7 @@ def _make_label_from_loans(loans: pd.DataFrame, members: pd.DataFrame) -> pd.Ser
 
 
 # ============================================================
-# Model training (cached safely)
+# Model training (cached)
 # ============================================================
 @st.cache_resource(show_spinner=False)
 def _train_model_cached(X: pd.DataFrame, y: pd.Series):
@@ -361,11 +365,9 @@ def _train_model_cached(X: pd.DataFrame, y: pd.Series):
         ]
     )
 
-    # If only one class exists, can't train supervised
     if len(pd.unique(y)) < 2:
         return None, feature_cols, None
 
-    # Guard for tiny class counts
     min_class = int(y.value_counts().min())
     n_splits = min(5, max(2, min_class))
     if n_splits < 2:
@@ -379,7 +381,6 @@ def _train_model_cached(X: pd.DataFrame, y: pd.Series):
 
 
 def _train_model(X: pd.DataFrame, y: pd.Series):
-    # wrapper to keep future flexibility
     return _train_model_cached(X, y)
 
 
@@ -390,50 +391,60 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     st.header("🤖 AI Risk Panel (Machine Learning)")
     st.caption("ML risk probability using NJANGI STANDARD tables only (no legacy).")
 
-    # Ensure clients are available for cached reads
     _ensure_clients_in_state(sb_anon, sb_service)
 
-    # Minimal required table
     if not _table_exists(sb_anon, schema, "members"):
         st.error("Missing table: members")
         return
 
-    # Load data (cached, hash-safe)
     members = _load_table(sb_anon, sb_service, schema, "members", cols="id,name", limit=1000)
     if members.empty or "id" not in members.columns:
         st.error("members not readable.")
         return
 
-    # Optional tables (use anon existence check; if RLS blocks anon, we will still try service reads when loading)
     contrib = (
         _load_table(sb_anon, sb_service, schema, "contributions", cols="member_id,session_id,amount,created_at", limit=10000)
         if _table_exists(sb_anon, schema, "contributions")
         else pd.DataFrame()
     )
 
-    # For tables often protected by RLS, prefer service if available
     client_for_secure = _pick_client(sb_anon, sb_service)
 
     loans = (
-        _load_table_service(sb_anon, sb_service, schema, "loans",
-                            cols="member_id,status,principal,principal_current,balance,total_due,unpaid_interest,created_at",
-                            limit=10000)
+        _load_table_service(
+            sb_anon,
+            sb_service,
+            schema,
+            "loans",
+            cols="member_id,status,principal,principal_current,balance,total_due,unpaid_interest,created_at",
+            limit=10000,
+        )
         if _table_exists(client_for_secure, schema, "loans")
         else pd.DataFrame()
     )
 
     payments = (
-        _load_table_service(sb_anon, sb_service, schema, "loan_payments",
-                            cols="member_id,amount,paid_at,created_at",
-                            limit=20000)
+        _load_table_service(
+            sb_anon,
+            sb_service,
+            schema,
+            "loan_payments",
+            cols="member_id,amount,paid_at,created_at",
+            limit=20000,
+        )
         if _table_exists(client_for_secure, schema, "loan_payments")
         else pd.DataFrame()
     )
 
     fines = (
-        _load_table_service(sb_anon, sb_service, schema, "fines",
-                            cols="member_id,amount,created_at",
-                            limit=10000)
+        _load_table_service(
+            sb_anon,
+            sb_service,
+            schema,
+            "fines",
+            cols="member_id,amount,created_at",
+            limit=10000,
+        )
         if _table_exists(client_for_secure, schema, "fines")
         else pd.DataFrame()
     )
@@ -444,13 +455,11 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
         else pd.DataFrame()
     )
 
-    # Build features + label
     X = _build_member_features(members, contrib, loans, payments, fines, foundation)
     y = _make_label_from_loans(loans, members)
 
     model, feature_cols, auc = _train_model(X, y)
 
-    # UI select member
     members = members.copy()
     members["id"] = _to_int(members["id"])
     members["name"] = members.get("name", "").astype(str)
@@ -481,7 +490,6 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
         if auc is not None:
             st.caption(f"Model CV ROC-AUC (rough): {auc:.3f} (small-data estimate)")
 
-        # explain drivers (simple coefficient view)
         try:
             clf = model.named_steps["clf"]
             coefs = pd.Series(clf.coef_[0], index=feature_cols).sort_values(key=np.abs, ascending=False)
