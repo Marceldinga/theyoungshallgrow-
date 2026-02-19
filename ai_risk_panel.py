@@ -1,4 +1,16 @@
 # ai_risk_panel.py ✅ NJANGI STANDARD (ML VERSION, NO legacy)
+# ✅ Uses ONLY new tables:
+#   - members
+#   - contributions
+#   - loans
+#   - loan_payments (optional)
+#   - foundation_contributions
+#   - fines (optional)
+#
+# ✅ Machine Learning risk probability (Logistic Regression)
+# ✅ Safe Supabase reads (won’t crash if order_by column missing)
+# ✅ Streamlit cache FIXED (no unhashable Supabase clients in st.cache_data)
+
 from __future__ import annotations
 
 import streamlit as st
@@ -15,17 +27,28 @@ from sklearn.linear_model import LogisticRegression
 # ============================================================
 # Safe Supabase reads
 # ============================================================
-def _safe_select(client, schema: str, table: str, cols: str = "*", limit: int = 2000,
-                 order_by: str | None = None, desc: bool = True, silent: bool = False):
+def _safe_select(
+    client,
+    schema: str,
+    table: str,
+    cols: str = "*",
+    limit: int = 2000,
+    order_by: str | None = None,
+    desc: bool = True,
+    silent: bool = False,
+):
     try:
         q = client.schema(schema).table(table).select(cols)
         if order_by:
             try:
                 q = q.order(order_by, desc=desc)
             except Exception:
+                # retry without ordering
                 q = client.schema(schema).table(table).select(cols)
+
         if limit:
             q = q.limit(limit)
+
         resp = q.execute()
         return resp.data or []
     except Exception as e:
@@ -35,7 +58,15 @@ def _safe_select(client, schema: str, table: str, cols: str = "*", limit: int = 
         return []
 
 
-def _safe_select_autosort(client, schema: str, table: str, cols: str = "*", limit: int = 2000, desc: bool = True):
+def _safe_select_autosort(
+    client,
+    schema: str,
+    table: str,
+    cols: str = "*",
+    limit: int = 2000,
+    desc: bool = True,
+):
+    # try typical timestamp / id columns
     for c in ["created_at", "updated_at", "paid_at", "payout_date", "borrow_date", "start_date", "id"]:
         rows = _safe_select(client, schema, table, cols=cols, limit=limit, order_by=c, desc=desc, silent=True)
         if rows:
@@ -57,37 +88,90 @@ def _table_exists(client, schema: str, table: str) -> bool:
 def _to_int(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce").fillna(-1).astype(int)
 
+
 def _to_num(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce").fillna(0.0)
+
 
 def _to_dt(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce")
 
 
 # ============================================================
-# Loaders
+# Cache-safe loaders (NO unhashable clients in cache args)
 # ============================================================
-@st.cache_data(ttl=60)
-def _load_table(sb_anon, sb_service, schema: str, table: str, cols: str = "*", limit: int = 5000) -> pd.DataFrame:
-    rows = _safe_select_autosort(sb_anon, schema, table, cols=cols, limit=limit, desc=True)
-    if (not rows) and (sb_service is not None):
-        rows = _safe_select_autosort(sb_service, schema, table, cols=cols, limit=limit, desc=True)
+def _pick_client(sb_anon, sb_service):
+    return sb_service if sb_service is not None else sb_anon
+
+
+def _ensure_clients_in_state(sb_anon, sb_service):
+    # store clients in session_state so cached functions don't receive them as args
+    st.session_state["__sb_anon__"] = sb_anon
+    st.session_state["__sb_service__"] = sb_service
+
+
+def _get_client_from_state(use_service: bool = False):
+    sb_anon = st.session_state.get("__sb_anon__")
+    sb_service = st.session_state.get("__sb_service__")
+    if use_service and sb_service is not None:
+        return sb_service
+    return sb_anon
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _load_table_cached(
+    schema: str,
+    table: str,
+    cols: str = "*",
+    limit: int = 5000,
+    use_service: bool = False,
+) -> pd.DataFrame:
+    """
+    Cached read keyed ONLY by hashable params.
+    Supabase clients are read from st.session_state to avoid UnhashableParamError.
+    """
+    client = _get_client_from_state(use_service=use_service)
+    if client is None:
+        return pd.DataFrame()
+
+    rows = _safe_select_autosort(client, schema, table, cols=cols, limit=limit, desc=True)
+
+    # If anon returned empty and service exists, optionally retry with service
+    if not rows and not use_service:
+        sb_service = st.session_state.get("__sb_service__")
+        if sb_service is not None:
+            rows = _safe_select_autosort(sb_service, schema, table, cols=cols, limit=limit, desc=True)
+
     return pd.DataFrame(rows)
 
 
-def _pick_client(sb_anon, sb_service):
-    return sb_service if sb_service is not None else sb_anon
+def _load_table(sb_anon, sb_service, schema: str, table: str, cols: str = "*", limit: int = 5000) -> pd.DataFrame:
+    """
+    Wrapper keeping your original call style but cache-safe.
+    """
+    _ensure_clients_in_state(sb_anon, sb_service)
+    return _load_table_cached(schema=schema, table=table, cols=cols, limit=limit, use_service=False)
+
+
+def _load_table_service(sb_anon, sb_service, schema: str, table: str, cols: str = "*", limit: int = 5000) -> pd.DataFrame:
+    """
+    Forces service client inside cached loader when available.
+    """
+    _ensure_clients_in_state(sb_anon, sb_service)
+    return _load_table_cached(schema=schema, table=table, cols=cols, limit=limit, use_service=True)
 
 
 # ============================================================
 # Feature engineering per member
 # ============================================================
-def _build_member_features(members: pd.DataFrame,
-                           contrib: pd.DataFrame,
-                           loans: pd.DataFrame,
-                           payments: pd.DataFrame,
-                           fines: pd.DataFrame,
-                           foundation: pd.DataFrame) -> pd.DataFrame:
+def _build_member_features(
+    members: pd.DataFrame,
+    contrib: pd.DataFrame,
+    loans: pd.DataFrame,
+    payments: pd.DataFrame,
+    fines: pd.DataFrame,
+    foundation: pd.DataFrame,
+) -> pd.DataFrame:
     # normalize member ids
     members = members.copy()
     members["id"] = _to_int(members["id"])
@@ -95,7 +179,9 @@ def _build_member_features(members: pd.DataFrame,
 
     now = pd.Timestamp.utcnow()
 
+    # ----------------------------
     # contributions features
+    # ----------------------------
     cfeat = pd.DataFrame({"member_id": members["id"]})
     if not contrib.empty and "member_id" in contrib.columns:
         c = contrib.copy()
@@ -127,15 +213,17 @@ def _build_member_features(members: pd.DataFrame,
 
     cfeat["days_since_last_contrib"] = (now - pd.to_datetime(cfeat["contrib_last_dt"], errors="coerce")).dt.days
 
+    # ----------------------------
     # loans features
+    # ----------------------------
     lfeat = pd.DataFrame({"member_id": members["id"]})
     if not loans.empty and "member_id" in loans.columns:
         l = loans.copy()
         l["member_id"] = _to_int(l["member_id"])
-        # numeric columns (safe)
         for col in ["principal", "principal_current", "balance", "total_due", "unpaid_interest"]:
             if col in l.columns:
                 l[col] = _to_num(l[col])
+
         l["status"] = l.get("status", "").astype(str).str.lower()
 
         grp = l.groupby("member_id", dropna=False)
@@ -146,9 +234,12 @@ def _build_member_features(members: pd.DataFrame,
         bad = grp["status"].apply(lambda s: s.isin(["delinquent", "default", "overdue"]).sum())
 
         lfeat = lfeat.merge(l_cnt.rename("loan_count"), left_on="member_id", right_index=True, how="left")
-        if not bal.empty: lfeat = lfeat.merge(bal.rename("loan_balance_sum"), left_on="member_id", right_index=True, how="left")
-        if not pc.empty:  lfeat = lfeat.merge(pc.rename("loan_principal_current_sum"), left_on="member_id", right_index=True, how="left")
-        if not td.empty:  lfeat = lfeat.merge(td.rename("loan_total_due_sum"), left_on="member_id", right_index=True, how="left")
+        if not bal.empty:
+            lfeat = lfeat.merge(bal.rename("loan_balance_sum"), left_on="member_id", right_index=True, how="left")
+        if not pc.empty:
+            lfeat = lfeat.merge(pc.rename("loan_principal_current_sum"), left_on="member_id", right_index=True, how="left")
+        if not td.empty:
+            lfeat = lfeat.merge(td.rename("loan_total_due_sum"), left_on="member_id", right_index=True, how="left")
         lfeat = lfeat.merge(bad.rename("loan_bad_status_count"), left_on="member_id", right_index=True, how="left")
     else:
         lfeat["loan_count"] = np.nan
@@ -157,7 +248,9 @@ def _build_member_features(members: pd.DataFrame,
         lfeat["loan_total_due_sum"] = np.nan
         lfeat["loan_bad_status_count"] = np.nan
 
+    # ----------------------------
     # payments features
+    # ----------------------------
     pfeat = pd.DataFrame({"member_id": members["id"]})
     if not payments.empty and "member_id" in payments.columns:
         p = payments.copy()
@@ -168,6 +261,7 @@ def _build_member_features(members: pd.DataFrame,
         p_cnt = grp["amount"].count()
         p_sum = grp["amount"].sum()
         p_last = grp["paid_at"].max()
+
         pfeat = pfeat.merge(p_cnt.rename("pay_count"), left_on="member_id", right_index=True, how="left")
         pfeat = pfeat.merge(p_sum.rename("pay_total"), left_on="member_id", right_index=True, how="left")
         pfeat = pfeat.merge(p_last.rename("pay_last_dt"), left_on="member_id", right_index=True, how="left")
@@ -178,7 +272,9 @@ def _build_member_features(members: pd.DataFrame,
 
     pfeat["days_since_last_payment"] = (now - pd.to_datetime(pfeat["pay_last_dt"], errors="coerce")).dt.days
 
+    # ----------------------------
     # fines features
+    # ----------------------------
     ffeat = pd.DataFrame({"member_id": members["id"]})
     if not fines.empty and "member_id" in fines.columns:
         f = fines.copy()
@@ -193,7 +289,9 @@ def _build_member_features(members: pd.DataFrame,
         ffeat["fine_total"] = np.nan
         ffeat["fine_count"] = np.nan
 
+    # ----------------------------
     # foundation features
+    # ----------------------------
     fdfeat = pd.DataFrame({"member_id": members["id"]})
     if not foundation.empty and "member_id" in foundation.columns:
         fd = foundation.copy()
@@ -204,6 +302,7 @@ def _build_member_features(members: pd.DataFrame,
         fd_sum = grp["amount"].sum()
         fd_cnt = grp["amount"].count()
         fd_last = grp["created_at"].max()
+
         fdfeat = fdfeat.merge(fd_sum.rename("foundation_total"), left_on="member_id", right_index=True, how="left")
         fdfeat = fdfeat.merge(fd_cnt.rename("foundation_count"), left_on="member_id", right_index=True, how="left")
         fdfeat = fdfeat.merge(fd_last.rename("foundation_last_dt"), left_on="member_id", right_index=True, how="left")
@@ -215,10 +314,12 @@ def _build_member_features(members: pd.DataFrame,
     fdfeat["days_since_last_foundation"] = (now - pd.to_datetime(fdfeat["foundation_last_dt"], errors="coerce")).dt.days
 
     # merge all
-    X = cfeat.merge(lfeat, on="member_id", how="left") \
-             .merge(pfeat, on="member_id", how="left") \
-             .merge(ffeat, on="member_id", how="left") \
-             .merge(fdfeat, on="member_id", how="left")
+    X = (
+        cfeat.merge(lfeat, on="member_id", how="left")
+        .merge(pfeat, on="member_id", how="left")
+        .merge(ffeat, on="member_id", how="left")
+        .merge(fdfeat, on="member_id", how="left")
+    )
 
     # drop raw datetime columns from model input
     for dtcol in ["contrib_last_dt", "pay_last_dt", "foundation_last_dt"]:
@@ -229,7 +330,6 @@ def _build_member_features(members: pd.DataFrame,
 
 
 def _make_label_from_loans(loans: pd.DataFrame, members: pd.DataFrame) -> pd.Series:
-    # y per member_id
     members_ids = _to_int(members["id"])
     y = pd.Series(0, index=members_ids, dtype=int)
 
@@ -245,27 +345,42 @@ def _make_label_from_loans(loans: pd.DataFrame, members: pd.DataFrame) -> pd.Ser
     return y.reset_index(drop=True)
 
 
-@st.cache_resource
-def _train_model(X: pd.DataFrame, y: pd.Series):
-    # Use a simple, stable model (works with small data)
+# ============================================================
+# Model training (cached safely)
+# ============================================================
+@st.cache_resource(show_spinner=False)
+def _train_model_cached(X: pd.DataFrame, y: pd.Series):
     feature_cols = [c for c in X.columns if c != "member_id"]
     Xmat = X[feature_cols]
 
-    model = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler()),
-        ("clf", LogisticRegression(max_iter=200, class_weight="balanced"))
-    ])
+    model = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(max_iter=400, class_weight="balanced")),
+        ]
+    )
 
     # If only one class exists, can't train supervised
     if len(pd.unique(y)) < 2:
         return None, feature_cols, None
 
-    # small-data CV check
-    cv = StratifiedKFold(n_splits=min(5, max(2, y.value_counts().min())), shuffle=True, random_state=42)
+    # Guard for tiny class counts
+    min_class = int(y.value_counts().min())
+    n_splits = min(5, max(2, min_class))
+    if n_splits < 2:
+        return None, feature_cols, None
+
+    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     scores = cross_val_score(model, Xmat, y, cv=cv, scoring="roc_auc")
+
     model.fit(Xmat, y)
     return model, feature_cols, float(np.mean(scores))
+
+
+def _train_model(X: pd.DataFrame, y: pd.Series):
+    # wrapper to keep future flexibility
+    return _train_model_cached(X, y)
 
 
 # ============================================================
@@ -273,47 +388,78 @@ def _train_model(X: pd.DataFrame, y: pd.Series):
 # ============================================================
 def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     st.header("🤖 AI Risk Panel (Machine Learning)")
-    st.caption("ML risk probability using new tables only.")
+    st.caption("ML risk probability using NJANGI STANDARD tables only (no legacy).")
 
-    # minimal table checks
+    # Ensure clients are available for cached reads
+    _ensure_clients_in_state(sb_anon, sb_service)
+
+    # Minimal required table
     if not _table_exists(sb_anon, schema, "members"):
         st.error("Missing table: members")
         return
 
-    # load data (cached)
+    # Load data (cached, hash-safe)
     members = _load_table(sb_anon, sb_service, schema, "members", cols="id,name", limit=1000)
     if members.empty or "id" not in members.columns:
         st.error("members not readable.")
         return
 
-    contrib = _load_table(sb_anon, sb_service, schema, "contributions", cols="member_id,session_id,amount,created_at", limit=10000) \
-        if _table_exists(sb_anon, schema, "contributions") else pd.DataFrame()
+    # Optional tables (use anon existence check; if RLS blocks anon, we will still try service reads when loading)
+    contrib = (
+        _load_table(sb_anon, sb_service, schema, "contributions", cols="member_id,session_id,amount,created_at", limit=10000)
+        if _table_exists(sb_anon, schema, "contributions")
+        else pd.DataFrame()
+    )
 
+    # For tables often protected by RLS, prefer service if available
     client_for_secure = _pick_client(sb_anon, sb_service)
 
-    loans = _load_table(sb_anon, sb_service, schema, "loans", cols="member_id,status,principal,principal_current,balance,total_due,unpaid_interest,created_at", limit=10000) \
-        if _table_exists(client_for_secure, schema, "loans") else pd.DataFrame()
+    loans = (
+        _load_table_service(sb_anon, sb_service, schema, "loans",
+                            cols="member_id,status,principal,principal_current,balance,total_due,unpaid_interest,created_at",
+                            limit=10000)
+        if _table_exists(client_for_secure, schema, "loans")
+        else pd.DataFrame()
+    )
 
-    payments = _load_table(sb_anon, sb_service, schema, "loan_payments", cols="member_id,amount,paid_at,created_at", limit=20000) \
-        if _table_exists(client_for_secure, schema, "loan_payments") else pd.DataFrame()
+    payments = (
+        _load_table_service(sb_anon, sb_service, schema, "loan_payments",
+                            cols="member_id,amount,paid_at,created_at",
+                            limit=20000)
+        if _table_exists(client_for_secure, schema, "loan_payments")
+        else pd.DataFrame()
+    )
 
-    fines = _load_table(sb_anon, sb_service, schema, "fines", cols="member_id,amount,created_at", limit=10000) \
-        if _table_exists(client_for_secure, schema, "fines") else pd.DataFrame()
+    fines = (
+        _load_table_service(sb_anon, sb_service, schema, "fines",
+                            cols="member_id,amount,created_at",
+                            limit=10000)
+        if _table_exists(client_for_secure, schema, "fines")
+        else pd.DataFrame()
+    )
 
-    foundation = _load_table(sb_anon, sb_service, schema, "foundation_contributions", cols="member_id,amount,created_at", limit=20000) \
-        if _table_exists(client_for_secure, schema, "foundation_contributions") else pd.DataFrame()
+    foundation = (
+        _load_table(sb_anon, sb_service, schema, "foundation_contributions", cols="member_id,amount,created_at", limit=20000)
+        if _table_exists(sb_anon, schema, "foundation_contributions")
+        else pd.DataFrame()
+    )
 
-    # build features + label
+    # Build features + label
     X = _build_member_features(members, contrib, loans, payments, fines, foundation)
     y = _make_label_from_loans(loans, members)
 
     model, feature_cols, auc = _train_model(X, y)
 
     # UI select member
+    members = members.copy()
     members["id"] = _to_int(members["id"])
     members["name"] = members.get("name", "").astype(str)
     members = members[members["id"] > 0].copy()
     members["label"] = members.apply(lambda r: f'{int(r["id"]):02d} • {r["name"]}', axis=1)
+
+    if members.empty:
+        st.warning("No members found.")
+        return
 
     pick = st.selectbox("Select member", members["label"].tolist())
     mid = int(members.loc[members["label"] == pick, "id"].iloc[0])
@@ -325,12 +471,13 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
 
     st.subheader("Risk prediction")
     if model is None:
-        st.warning("Not enough labeled data to train supervised ML (only one class found).")
-        st.caption("Fix: Ensure loans.status contains both good and bad examples, or switch to anomaly detection.")
+        st.warning("Not enough labeled data to train supervised ML (only one class found or too few examples).")
+        st.caption("Fix: Ensure loans.status has both good and bad examples (e.g., 'overdue' vs 'active/paid').")
     else:
         proba = float(model.predict_proba(row[feature_cols])[0, 1])
-        st.metric("Predicted Risk (probability)", f"{proba*100:.1f}%")
-        st.progress(min(max(proba, 0.0), 1.0))
+        st.metric("Predicted Risk (probability)", f"{proba * 100:.1f}%")
+        st.progress(float(np.clip(proba, 0.0, 1.0)))
+
         if auc is not None:
             st.caption(f"Model CV ROC-AUC (rough): {auc:.3f} (small-data estimate)")
 
@@ -345,4 +492,6 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
 
     st.divider()
     st.subheader("Member feature snapshot")
-    st.dataframe(row[["member_id"] + feature_cols].T.rename(columns={row.index[0]: "value"}), use_container_width=True)
+    snap = row[["member_id"] + feature_cols].T
+    snap.columns = ["value"]
+    st.dataframe(snap, use_container_width=True)
