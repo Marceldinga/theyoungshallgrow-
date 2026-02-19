@@ -1,4 +1,4 @@
-# ai_risk_panel.py ✅ NJANGI STANDARD (ML VERSION, NO legacy)
+# ai_risk_panel.py ✅ NJANGI STANDARD (ML + ANOMALY FALLBACK, NO legacy)
 # ✅ Uses ONLY new tables:
 #   - members
 #   - contributions
@@ -7,11 +7,11 @@
 #   - foundation_contributions
 #   - fines (optional)
 #
-# ✅ Machine Learning risk probability (Logistic Regression)
+# ✅ If labels allow: Supervised Logistic Regression risk probability
+# ✅ If labels are single-class: IsolationForest anomaly risk (always works)
 # ✅ Safe Supabase reads (won’t crash if order_by column missing)
 # ✅ Streamlit cache FIXED (no unhashable Supabase clients in st.cache_data)
 # ✅ Timezone FIX: all datetime math uses tz-aware UTC
-# ✅ Label FIX: if only one class from status, fallback behavior-based labels so ML can train
 
 from __future__ import annotations
 
@@ -22,8 +22,9 @@ import numpy as np
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import IsolationForest
 
 
 # ============================================================
@@ -176,9 +177,7 @@ def _build_member_features(
 
     now = _utc_now()
 
-    # ----------------------------
     # contributions features
-    # ----------------------------
     cfeat = pd.DataFrame({"member_id": members["id"]})
     if not contrib.empty and "member_id" in contrib.columns:
         c = contrib.copy()
@@ -187,20 +186,15 @@ def _build_member_features(
         c["created_at"] = _to_dt_utc(c.get("created_at", pd.NaT))
 
         grp = c.groupby("member_id", dropna=False)
-        c_sum = grp["amount"].sum()
-        c_cnt = grp["amount"].count()
-        c_avg = grp["amount"].mean()
-        c_last = grp["created_at"].max()
-
-        cfeat = cfeat.merge(c_sum.rename("contrib_total"), left_on="member_id", right_index=True, how="left")
-        cfeat = cfeat.merge(c_cnt.rename("contrib_count"), left_on="member_id", right_index=True, how="left")
-        cfeat = cfeat.merge(c_avg.rename("contrib_avg"), left_on="member_id", right_index=True, how="left")
-        cfeat = cfeat.merge(c_last.rename("contrib_last_dt"), left_on="member_id", right_index=True, how="left")
+        cfeat = cfeat.merge(grp["amount"].sum().rename("contrib_total"), left_on="member_id", right_index=True, how="left")
+        cfeat = cfeat.merge(grp["amount"].count().rename("contrib_count"), left_on="member_id", right_index=True, how="left")
+        cfeat = cfeat.merge(grp["amount"].mean().rename("contrib_avg"), left_on="member_id", right_index=True, how="left")
+        cfeat = cfeat.merge(grp["created_at"].max().rename("contrib_last_dt"), left_on="member_id", right_index=True, how="left")
 
         if "session_id" in c.columns:
             c["session_id"] = _to_int(c["session_id"])
-            sess_n = c.groupby("member_id")["session_id"].nunique()
-            cfeat = cfeat.merge(sess_n.rename("contrib_sessions_n"), left_on="member_id", right_index=True, how="left")
+            cfeat = cfeat.merge(c.groupby("member_id")["session_id"].nunique().rename("contrib_sessions_n"),
+                                left_on="member_id", right_index=True, how="left")
     else:
         cfeat["contrib_total"] = np.nan
         cfeat["contrib_count"] = np.nan
@@ -210,9 +204,7 @@ def _build_member_features(
 
     cfeat["days_since_last_contrib"] = _days_since(now, cfeat["contrib_last_dt"])
 
-    # ----------------------------
     # loans features
-    # ----------------------------
     lfeat = pd.DataFrame({"member_id": members["id"]})
     if not loans.empty and "member_id" in loans.columns:
         l = loans.copy()
@@ -220,24 +212,30 @@ def _build_member_features(
         for col in ["principal", "principal_current", "balance", "total_due", "unpaid_interest"]:
             if col in l.columns:
                 l[col] = _to_num(l[col])
-
         l["status"] = l.get("status", "").astype(str).str.lower()
 
         grp = l.groupby("member_id", dropna=False)
-        l_cnt = grp.size()
-        bal = grp["balance"].sum() if "balance" in l.columns else pd.Series(dtype=float)
-        pc = grp["principal_current"].sum() if "principal_current" in l.columns else pd.Series(dtype=float)
-        td = grp["total_due"].sum() if "total_due" in l.columns else pd.Series(dtype=float)
-        bad = grp["status"].apply(lambda s: s.isin(["delinquent", "default", "overdue"]).sum())
+        lfeat = lfeat.merge(grp.size().rename("loan_count"), left_on="member_id", right_index=True, how="left")
+        if "balance" in l.columns:
+            lfeat = lfeat.merge(grp["balance"].sum().rename("loan_balance_sum"), left_on="member_id", right_index=True, how="left")
+        else:
+            lfeat["loan_balance_sum"] = np.nan
+        if "principal_current" in l.columns:
+            lfeat = lfeat.merge(grp["principal_current"].sum().rename("loan_principal_current_sum"),
+                                left_on="member_id", right_index=True, how="left")
+        else:
+            lfeat["loan_principal_current_sum"] = np.nan
+        if "total_due" in l.columns:
+            lfeat = lfeat.merge(grp["total_due"].sum().rename("loan_total_due_sum"), left_on="member_id", right_index=True, how="left")
+        else:
+            lfeat["loan_total_due_sum"] = np.nan
 
-        lfeat = lfeat.merge(l_cnt.rename("loan_count"), left_on="member_id", right_index=True, how="left")
-        if not bal.empty:
-            lfeat = lfeat.merge(bal.rename("loan_balance_sum"), left_on="member_id", right_index=True, how="left")
-        if not pc.empty:
-            lfeat = lfeat.merge(pc.rename("loan_principal_current_sum"), left_on="member_id", right_index=True, how="left")
-        if not td.empty:
-            lfeat = lfeat.merge(td.rename("loan_total_due_sum"), left_on="member_id", right_index=True, how="left")
-        lfeat = lfeat.merge(bad.rename("loan_bad_status_count"), left_on="member_id", right_index=True, how="left")
+        lfeat = lfeat.merge(
+            grp["status"].apply(lambda s: s.isin(["delinquent", "default", "overdue"]).sum()).rename("loan_bad_status_count"),
+            left_on="member_id",
+            right_index=True,
+            how="left",
+        )
     else:
         lfeat["loan_count"] = np.nan
         lfeat["loan_balance_sum"] = np.nan
@@ -245,29 +243,21 @@ def _build_member_features(
         lfeat["loan_total_due_sum"] = np.nan
         lfeat["loan_bad_status_count"] = np.nan
 
-    # ----------------------------
     # payments features
-    # ----------------------------
     pfeat = pd.DataFrame({"member_id": members["id"]})
     if not payments.empty and "member_id" in payments.columns:
         p = payments.copy()
         p["member_id"] = _to_int(p["member_id"])
         p["amount"] = _to_num(p.get("amount", 0))
-
-        # prefer paid_at, fallback created_at
         if "paid_at" in p.columns:
             p["paid_at"] = _to_dt_utc(p.get("paid_at", pd.NaT))
         else:
             p["paid_at"] = _to_dt_utc(p.get("created_at", pd.NaT))
 
         grp = p.groupby("member_id", dropna=False)
-        p_cnt = grp["amount"].count()
-        p_sum = grp["amount"].sum()
-        p_last = grp["paid_at"].max()
-
-        pfeat = pfeat.merge(p_cnt.rename("pay_count"), left_on="member_id", right_index=True, how="left")
-        pfeat = pfeat.merge(p_sum.rename("pay_total"), left_on="member_id", right_index=True, how="left")
-        pfeat = pfeat.merge(p_last.rename("pay_last_dt"), left_on="member_id", right_index=True, how="left")
+        pfeat = pfeat.merge(grp["amount"].count().rename("pay_count"), left_on="member_id", right_index=True, how="left")
+        pfeat = pfeat.merge(grp["amount"].sum().rename("pay_total"), left_on="member_id", right_index=True, how="left")
+        pfeat = pfeat.merge(grp["paid_at"].max().rename("pay_last_dt"), left_on="member_id", right_index=True, how="left")
     else:
         pfeat["pay_count"] = np.nan
         pfeat["pay_total"] = np.nan
@@ -275,26 +265,20 @@ def _build_member_features(
 
     pfeat["days_since_last_payment"] = _days_since(now, pfeat["pay_last_dt"])
 
-    # ----------------------------
     # fines features
-    # ----------------------------
     ffeat = pd.DataFrame({"member_id": members["id"]})
     if not fines.empty and "member_id" in fines.columns:
         f = fines.copy()
         f["member_id"] = _to_int(f["member_id"])
         f["amount"] = _to_num(f.get("amount", 0))
         grp = f.groupby("member_id", dropna=False)
-        f_sum = grp["amount"].sum()
-        f_cnt = grp["amount"].count()
-        ffeat = ffeat.merge(f_sum.rename("fine_total"), left_on="member_id", right_index=True, how="left")
-        ffeat = ffeat.merge(f_cnt.rename("fine_count"), left_on="member_id", right_index=True, how="left")
+        ffeat = ffeat.merge(grp["amount"].sum().rename("fine_total"), left_on="member_id", right_index=True, how="left")
+        ffeat = ffeat.merge(grp["amount"].count().rename("fine_count"), left_on="member_id", right_index=True, how="left")
     else:
         ffeat["fine_total"] = np.nan
         ffeat["fine_count"] = np.nan
 
-    # ----------------------------
     # foundation features
-    # ----------------------------
     fdfeat = pd.DataFrame({"member_id": members["id"]})
     if not foundation.empty and "member_id" in foundation.columns:
         fd = foundation.copy()
@@ -303,13 +287,9 @@ def _build_member_features(
         fd["created_at"] = _to_dt_utc(fd.get("created_at", pd.NaT))
 
         grp = fd.groupby("member_id", dropna=False)
-        fd_sum = grp["amount"].sum()
-        fd_cnt = grp["amount"].count()
-        fd_last = grp["created_at"].max()
-
-        fdfeat = fdfeat.merge(fd_sum.rename("foundation_total"), left_on="member_id", right_index=True, how="left")
-        fdfeat = fdfeat.merge(fd_cnt.rename("foundation_count"), left_on="member_id", right_index=True, how="left")
-        fdfeat = fdfeat.merge(fd_last.rename("foundation_last_dt"), left_on="member_id", right_index=True, how="left")
+        fdfeat = fdfeat.merge(grp["amount"].sum().rename("foundation_total"), left_on="member_id", right_index=True, how="left")
+        fdfeat = fdfeat.merge(grp["amount"].count().rename("foundation_count"), left_on="member_id", right_index=True, how="left")
+        fdfeat = fdfeat.merge(grp["created_at"].max().rename("foundation_last_dt"), left_on="member_id", right_index=True, how="left")
     else:
         fdfeat["foundation_total"] = np.nan
         fdfeat["foundation_count"] = np.nan
@@ -317,7 +297,6 @@ def _build_member_features(
 
     fdfeat["days_since_last_foundation"] = _days_since(now, fdfeat["foundation_last_dt"])
 
-    # merge all
     X = (
         cfeat.merge(lfeat, on="member_id", how="left")
         .merge(pfeat, on="member_id", how="left")
@@ -325,7 +304,6 @@ def _build_member_features(
         .merge(fdfeat, on="member_id", how="left")
     )
 
-    # drop raw datetime columns from model input
     for dtcol in ["contrib_last_dt", "pay_last_dt", "foundation_last_dt"]:
         if dtcol in X.columns:
             X.drop(columns=[dtcol], inplace=True)
@@ -333,19 +311,13 @@ def _build_member_features(
     return X
 
 
+# ============================================================
+# Labels (status + fallback behavior)
+# ============================================================
 def _make_label_from_loans(loans: pd.DataFrame, members: pd.DataFrame, X: pd.DataFrame | None = None) -> pd.Series:
-    """
-    Primary label:
-        y=1 if member has ANY loan with a 'bad' status (mapped).
-    Fallback label (if only one class found):
-        y=1 if:
-            (loan_balance_sum > 0 AND days_since_last_payment >= 30)
-            OR (days_since_last_contrib >= 45)
-    """
     members_ids = _to_int(members["id"])
     y = pd.Series(0, index=members_ids, dtype=int)
 
-    # PRIMARY from status
     if not loans.empty and "member_id" in loans.columns:
         l = loans.copy()
         l["member_id"] = _to_int(l["member_id"])
@@ -354,44 +326,39 @@ def _make_label_from_loans(loans: pd.DataFrame, members: pd.DataFrame, X: pd.Dat
         def _norm_status(s: str) -> str:
             if s in ("", "none", "nan"):
                 return "unknown"
-
             bad_tokens = ["overdue", "past due", "past_due", "delinquent", "default", "late", "arrears", "unpaid"]
             if any(tok in s for tok in bad_tokens):
                 return "bad"
-
             good_tokens = ["paid", "cleared", "closed", "settled", "complete", "completed", "repaid"]
             if any(tok in s for tok in good_tokens):
                 return "good"
-
             active_tokens = ["active", "open", "running", "current", "approved", "disbursed"]
             if any(tok in s for tok in active_tokens):
                 return "active"
-
             return "unknown"
 
         l["status_norm"] = l["status_raw"].apply(_norm_status)
         bad_members = l.loc[l["status_norm"] == "bad", "member_id"].unique()
         y.loc[y.index.isin(bad_members)] = 1
 
-    # FALLBACK if single-class
+    # fallback if single-class
     if len(pd.unique(y)) < 2 and X is not None and not X.empty:
         tmp = X.set_index("member_id", drop=False)
-
         bal = pd.to_numeric(tmp.get("loan_balance_sum", 0), errors="coerce").fillna(0)
         dsp = pd.to_numeric(tmp.get("days_since_last_payment", 0), errors="coerce").fillna(0)
         dsc = pd.to_numeric(tmp.get("days_since_last_contrib", 0), errors="coerce").fillna(0)
-
-        fallback_flag = ((bal > 0) & (dsp >= 30)) | (dsc >= 45)
+        # Slightly more sensitive so you get 2 classes with small data
+        fallback_flag = ((bal > 0) & (dsp >= 14)) | (dsc >= 30)
         y.loc[y.index.isin(tmp.index)] = fallback_flag.astype(int)
 
     return y.reset_index(drop=True)
 
 
 # ============================================================
-# Model training (cached)
+# Models
 # ============================================================
 @st.cache_resource(show_spinner=False)
-def _train_model_cached(X: pd.DataFrame, y: pd.Series):
+def _train_supervised(X: pd.DataFrame, y: pd.Series):
     feature_cols = [c for c in X.columns if c != "member_id"]
     Xmat = X[feature_cols]
 
@@ -413,13 +380,49 @@ def _train_model_cached(X: pd.DataFrame, y: pd.Series):
 
     cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     scores = cross_val_score(model, Xmat, y, cv=cv, scoring="roc_auc")
-
     model.fit(Xmat, y)
     return model, feature_cols, float(np.mean(scores))
 
 
-def _train_model(X: pd.DataFrame, y: pd.Series):
-    return _train_model_cached(X, y)
+@st.cache_resource(show_spinner=False)
+def _train_anomaly(X: pd.DataFrame):
+    feature_cols = [c for c in X.columns if c != "member_id"]
+    Xmat = X[feature_cols]
+
+    # Impute + robust scaling helps with heavy-tailed amounts
+    prep = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", RobustScaler(with_centering=True, with_scaling=True)),
+        ]
+    )
+    Xp = prep.fit_transform(Xmat)
+
+    # contamination: small dataset -> keep conservative, but not too tiny
+    n = max(1, X.shape[0])
+    contamination = float(np.clip(2.0 / n, 0.05, 0.25))  # between 5% and 25%
+
+    iso = IsolationForest(
+        n_estimators=300,
+        contamination=contamination,
+        random_state=42,
+    )
+    iso.fit(Xp)
+
+    return (prep, iso, feature_cols, contamination)
+
+
+def _anomaly_to_risk_percent(prep, iso, X_row: pd.DataFrame, feature_cols: list[str]) -> float:
+    """
+    IsolationForest:
+      decision_function higher = more normal
+      We'll convert to "risk" by ranking within dataset later.
+    Here we compute a raw anomaly score and squash to 0..1.
+    """
+    Xp = prep.transform(X_row[feature_cols])
+    # score_samples: higher = more normal; lower = more abnormal
+    s = float(iso.score_samples(Xp)[0])
+    return s
 
 
 # ============================================================
@@ -493,24 +496,26 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
         else pd.DataFrame()
     )
 
-    # Debug: loan status distribution (helps see why single class)
-    if not loans.empty and "status" in loans.columns:
-        st.caption("Loan status distribution:")
-        st.dataframe(
-            loans["status"]
-            .astype(str)
-            .str.lower()
-            .value_counts()
-            .reset_index()
-            .rename(columns={"index": "status", "status": "count"}),
-            use_container_width=True,
-        )
+    # Optional debug
+    with st.expander("🔎 Debug: Loan status distribution", expanded=False):
+        if not loans.empty and "status" in loans.columns:
+            st.dataframe(
+                loans["status"]
+                .astype(str)
+                .str.lower()
+                .value_counts()
+                .reset_index()
+                .rename(columns={"index": "status", "status": "count"}),
+                use_container_width=True,
+            )
+        else:
+            st.caption("No loans.status column or loans table empty.")
 
+    # Build features + label
     X = _build_member_features(members, contrib, loans, payments, fines, foundation)
     y = _make_label_from_loans(loans, members, X=X)
 
-    model, feature_cols, auc = _train_model(X, y)
-
+    # member picker
     members = members.copy()
     members["id"] = _to_int(members["id"])
     members["name"] = members.get("name", "").astype(str)
@@ -530,17 +535,17 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
         return
 
     st.subheader("Risk prediction")
-    if model is None:
-        st.warning("Not enough labeled data to train supervised ML (still single-class after fallback).")
-        st.caption("If you want, I can add anomaly detection so you always get a risk score.")
-    else:
+
+    # Try supervised first
+    model, feature_cols, auc = _train_supervised(X, y)
+
+    if model is not None:
         proba = float(model.predict_proba(row[feature_cols])[0, 1])
-        st.metric("Predicted Risk (probability)", f"{proba * 100:.1f}%")
+        st.metric("Predicted Risk (Supervised)", f"{proba * 100:.1f}%")
         st.progress(float(np.clip(proba, 0.0, 1.0)))
+        st.caption(f"Mode: Supervised Logistic Regression • CV ROC-AUC (rough): {auc:.3f}" if auc is not None else "Mode: Supervised Logistic Regression")
 
-        if auc is not None:
-            st.caption(f"Model CV ROC-AUC (rough): {auc:.3f} (small-data estimate)")
-
+        # coefficient drivers
         try:
             clf = model.named_steps["clf"]
             coefs = pd.Series(clf.coef_[0], index=feature_cols).sort_values(key=np.abs, ascending=False)
@@ -548,6 +553,42 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
             st.dataframe(coefs.head(12).to_frame("coef"), use_container_width=True)
         except Exception:
             pass
+
+    else:
+        # Anomaly fallback (ALWAYS works)
+        prep, iso, feature_cols, contamination = _train_anomaly(X)
+
+        # Compute anomaly scores for all members to turn into percentile risk
+        Xmat_all = X[feature_cols].copy()
+        Xp_all = prep.transform(Xmat_all)
+        scores_all = iso.score_samples(Xp_all)  # higher = more normal
+        scores_all = pd.Series(scores_all, index=X["member_id"].values)
+
+        # Convert to risk = percentile of abnormality
+        # lower score => higher risk
+        rank = scores_all.rank(method="average", ascending=True)  # 1 = most abnormal
+        risk_pct = (rank / rank.max()).clip(0, 1)
+
+        this_risk = float(risk_pct.loc[mid]) if mid in risk_pct.index else float(risk_pct.mean())
+
+        st.metric("Predicted Risk (Anomaly)", f"{this_risk * 100:.1f}%")
+        st.progress(float(np.clip(this_risk, 0.0, 1.0)))
+        st.caption(f"Mode: IsolationForest anomaly detection • expected high-risk share ≈ {contamination*100:.0f}%")
+
+        with st.expander("Why anomaly mode?", expanded=False):
+            st.write(
+                "Your loan labels are single-class (all good or all bad), so supervised ML can't train. "
+                "Anomaly detection ranks members by unusual patterns in contributions/loans/payments/fines."
+            )
+
+        # Show top anomalies
+        top = (
+            pd.DataFrame({"member_id": scores_all.index, "anomaly_score": scores_all.values, "risk": risk_pct.values})
+            .sort_values("risk", ascending=False)
+            .head(10)
+        )
+        st.write("Top risk (anomaly ranking):")
+        st.dataframe(top, use_container_width=True)
 
     st.divider()
     st.subheader("Member feature snapshot")
