@@ -1,5 +1,6 @@
-# ai_suite_panel.py ✅ EXTRA AI SUITE (NO API KEY)
-# ------------------------------------------------------------
+
+# ai_suite_panel.py ✅ EXTRA AI SUITE (NO API KEY) + ✅ MINUTES GENERATOR
+# ---------------------------------------------------------------------
 # Adds:
 # - Reliability score (0–100)
 # - Dropout risk (0–1)
@@ -8,9 +9,10 @@
 # - Smart loan recommendation
 # - Alerts center
 # - Local chatbox (answers from computed context)
+# - Meeting minutes generator (auto-build minutes text + optional DB save)
 #
-# Designed to be imported into ai_risk_panel.py
-# ------------------------------------------------------------
+# Designed to be imported into ai_risk_panel.py (or used standalone in any page).
+# ---------------------------------------------------------------------
 
 from __future__ import annotations
 
@@ -19,6 +21,9 @@ import pandas as pd
 import streamlit as st
 
 
+# ============================================================
+# Helpers
+# ============================================================
 def _clip01(x: float) -> float:
     try:
         return float(np.clip(float(x), 0.0, 1.0))
@@ -46,6 +51,37 @@ def _days_since(now_utc: pd.Timestamp, dt_series) -> pd.Series:
     dt_utc = pd.to_datetime(dt_series, errors="coerce", utc=True)
     out = (now_utc - dt_utc).dt.days
     return out.fillna(999).astype(int)
+
+
+def _fmt_money(x) -> str:
+    try:
+        return f"{float(x):,.0f}"
+    except Exception:
+        return str(x)
+
+
+def _safe_insert(client, schema: str, table: str, row: dict) -> tuple[bool, str]:
+    """
+    Optional helper if you pass supabase client(s) into render.
+    Returns (ok, msg). If no client or insert fails, ok=False.
+    """
+    if client is None:
+        return False, "No client provided."
+    try:
+        client.schema(schema).table(table).insert(row).execute()
+        return True, "OK"
+    except Exception as e:
+        return False, repr(e)
+
+
+def _table_exists(client, schema: str, table: str) -> bool:
+    if client is None:
+        return False
+    try:
+        client.schema(schema).table(table).select("*").limit(1).execute()
+        return True
+    except Exception:
+        return False
 
 
 # ============================================================
@@ -151,7 +187,7 @@ def compute_fraud_anomaly_score(
     reasons = []
     score = 0.05
 
-    if not contrib.empty and "member_id" in contrib.columns and "amount" in contrib.columns:
+    if contrib is not None and not contrib.empty and "member_id" in contrib.columns and "amount" in contrib.columns:
         c = contrib.copy()
         c["member_id"] = _to_int(c["member_id"])
         c["amount"] = _to_num(c["amount"])
@@ -164,7 +200,7 @@ def compute_fraud_anomaly_score(
                 score += 0.35
                 reasons.append("Contribution amount is a strong outlier vs member history (3σ)")
 
-    if not loans.empty and "member_id" in loans.columns:
+    if loans is not None and not loans.empty and "member_id" in loans.columns:
         l = loans.copy()
         l["member_id"] = _to_int(l["member_id"])
         l["borrow_date"] = _to_dt_utc(l.get("borrow_date", l.get("created_at", pd.NaT)))
@@ -176,7 +212,7 @@ def compute_fraud_anomaly_score(
                 score += 0.25
                 reasons.append("Multiple loans created within last 14 days")
 
-    if not payments.empty and "member_id" in payments.columns:
+    if payments is not None and not payments.empty and "member_id" in payments.columns:
         p = payments.copy()
         p["member_id"] = _to_int(p["member_id"])
         p["amount"] = _to_num(p.get("amount", 0))
@@ -214,23 +250,23 @@ def foundation_liquidity_forecast_simple(
         return d.groupby(dt_col)[amt_col].sum() * float(sign)
 
     inflow = pd.Series(dtype=float)
-    if not contrib.empty and "created_at" in contrib.columns:
+    if contrib is not None and not contrib.empty and "created_at" in contrib.columns:
         inflow = inflow.add(daily_sum(contrib, "created_at", "amount", +1.0), fill_value=0.0)
-    if not foundation.empty and "created_at" in foundation.columns:
+    if foundation is not None and not foundation.empty and "created_at" in foundation.columns:
         inflow = inflow.add(daily_sum(foundation, "created_at", "amount", +1.0), fill_value=0.0)
-    if not payments.empty:
+    if payments is not None and not payments.empty:
         dtc = "paid_at" if "paid_at" in payments.columns else ("created_at" if "created_at" in payments.columns else None)
         if dtc:
             inflow = inflow.add(daily_sum(payments, dtc, "amount", +1.0), fill_value=0.0)
 
     outflow = pd.Series(dtype=float)
-    if not loans.empty:
+    if loans is not None and not loans.empty:
         dtc = "borrow_date" if "borrow_date" in loans.columns else ("created_at" if "created_at" in loans.columns else None)
         principal_col = "principal" if "principal" in loans.columns else ("principal_current" if "principal_current" in loans.columns else None)
         if dtc and principal_col:
             outflow = outflow.add(daily_sum(loans, dtc, principal_col, +1.0), fill_value=0.0)
 
-    if not payouts.empty:
+    if payouts is not None and not payouts.empty:
         dtc = "payout_date" if "payout_date" in payouts.columns else ("created_at" if "created_at" in payouts.columns else None)
         amt_col = "payout_amount" if "payout_amount" in payouts.columns else ("amount" if "amount" in payouts.columns else None)
         if dtc and amt_col:
@@ -332,11 +368,140 @@ def generate_ai_alerts(
 
 
 # ============================================================
+# Minutes Generator
+# ============================================================
+def build_minutes_text(
+    *,
+    meeting_title: str,
+    meeting_date: pd.Timestamp,
+    location: str,
+    chairperson: str,
+    secretary: str,
+    agenda: str,
+    members: pd.DataFrame,
+    contrib: pd.DataFrame,
+    foundation: pd.DataFrame,
+    loans: pd.DataFrame,
+    payments: pd.DataFrame,
+    payouts: pd.DataFrame,
+    fines: pd.DataFrame,
+    top_risky: list[dict],
+    alerts: list[dict],
+) -> str:
+    contrib_total = float(_to_num(contrib.get("amount", 0)).sum()) if (contrib is not None and not contrib.empty and "amount" in contrib.columns) else 0.0
+    foundation_total = float(_to_num(foundation.get("amount", 0)).sum()) if (foundation is not None and not foundation.empty and "amount" in foundation.columns) else 0.0
+    fines_total = float(_to_num(fines.get("amount", 0)).sum()) if (fines is not None and not fines.empty and "amount" in fines.columns) else 0.0
+    payments_total = float(_to_num(payments.get("amount", 0)).sum()) if (payments is not None and not payments.empty and "amount" in payments.columns) else 0.0
+
+    payout_amt_col = (
+        "payout_amount" if (payouts is not None and not payouts.empty and "payout_amount" in payouts.columns)
+        else ("amount" if (payouts is not None and not payouts.empty and "amount" in payouts.columns) else None)
+    )
+    payouts_total = float(_to_num(payouts.get(payout_amt_col, 0)).sum()) if payout_amt_col else 0.0
+
+    loan_count = int(len(loans)) if loans is not None else 0
+    active_loans = 0
+    closed_loans = 0
+    loan_balance_sum = 0.0
+    if loans is not None and not loans.empty:
+        if "status" in loans.columns:
+            s = loans["status"].astype(str).str.lower()
+            active_loans = int((s == "active").sum())
+            closed_loans = int((s == "closed").sum())
+        bal_col = "principal_current" if "principal_current" in loans.columns else ("principal" if "principal" in loans.columns else None)
+        if bal_col:
+            loan_balance_sum = float(_to_num(loans[bal_col]).sum())
+
+    member_count = int(len(members)) if members is not None and not members.empty else 0
+
+    high_alerts = [a for a in (alerts or []) if a.get("severity") == "high"]
+    med_alerts = [a for a in (alerts or []) if a.get("severity") == "med"]
+
+    if top_risky:
+        risk_lines = "\n".join([f"- {r.get('name','Member')} ({r.get('member_id','?')}): {float(r.get('risk',0))*100:.1f}%" for r in top_risky])
+    else:
+        risk_lines = "- Not available"
+
+    date_str = meeting_date.strftime("%Y-%m-%d")
+
+    lines = []
+    lines.append(f"{meeting_title}")
+    lines.append(f"Date: {date_str}")
+    if location:
+        lines.append(f"Location: {location}")
+    if chairperson:
+        lines.append(f"Chairperson: {chairperson}")
+    if secretary:
+        lines.append(f"Secretary: {secretary}")
+    lines.append("")
+    lines.append("1. Opening")
+    lines.append(f"The meeting was called to order on {date_str}.")
+    lines.append("")
+    lines.append("2. Attendance")
+    lines.append(f"Total registered members in system: {member_count}.")
+    lines.append("")
+    lines.append("3. Agenda")
+    lines.append(agenda.strip() if agenda.strip() else "Treasury update, contributions, loans, payouts, fines, risk review, and resolutions.")
+    lines.append("")
+    lines.append("4. Treasury Summary (System Totals)")
+    lines.append(f"- Contributions (total): {_fmt_money(contrib_total)}")
+    lines.append(f"- Foundation contributions (total): {_fmt_money(foundation_total)}")
+    lines.append(f"- Loan payments (total): {_fmt_money(payments_total)}")
+    lines.append(f"- Payouts (total): {_fmt_money(payouts_total)}")
+    lines.append(f"- Fines (total): {_fmt_money(fines_total)}")
+    lines.append("")
+    lines.append("5. Loans Summary")
+    lines.append(f"- Total loans recorded: {loan_count}")
+    lines.append(f"- Active loans: {active_loans}")
+    lines.append(f"- Closed loans: {closed_loans}")
+    lines.append(f"- Total outstanding principal (sum): {_fmt_money(loan_balance_sum)}")
+    lines.append("")
+    lines.append("6. Risk & Compliance Review")
+    lines.append("Top risk members (heuristic):")
+    lines.append(risk_lines)
+    lines.append("")
+    lines.append("Alerts raised:")
+    if not alerts:
+        lines.append("- None")
+    else:
+        if high_alerts:
+            lines.append("High severity:")
+            for a in high_alerts[:10]:
+                lines.append(f"- {a.get('message','')}")
+        if med_alerts:
+            lines.append("Medium severity:")
+            for a in med_alerts[:10]:
+                lines.append(f"- {a.get('message','')}")
+    lines.append("")
+    lines.append("7. Resolutions / Action Items")
+    lines.append("- Treasury to review any high-risk members and enforce loan conditions where necessary.")
+    lines.append("- Members with overdue payment patterns should be contacted for repayment plan.")
+    lines.append("- Continue monitoring liquidity trend before approving large loans.")
+    lines.append("")
+    lines.append("8. Closing")
+    lines.append("The meeting was adjourned after completing all agenda items.")
+    lines.append("")
+    lines.append("Signatures:")
+    lines.append(f"- Chairperson: ____________________   Date: {date_str}")
+    lines.append(f"- Secretary:   ____________________   Date: {date_str}")
+
+    return "\n".join(lines)
+
+
+# ============================================================
 # Local Chat Answer
 # ============================================================
 def local_chat_answer(question: str, context: dict) -> str:
     q = (question or "").lower().strip()
-
+    if q in ("help", "?", "commands"):
+        return (
+            "### ✅ What I can do\n"
+            "- **Alerts**: any alerts?\n"
+            "- **Liquidity**: is liquidity safe?\n"
+            "- **Top risky members**: top risky members\n"
+            "- **Loan recommendation**: loan recommendation\n"
+            "- **Minutes**: open the Minutes tab\n"
+        )
     if "top" in q and ("risk" in q or "risky" in q):
         top = context.get("top_risky", [])
         if not top:
@@ -375,14 +540,11 @@ def local_chat_answer(question: str, context: dict) -> str:
             out += f"- {r}\n"
         return out
 
-    return (
-        "I can help with: **top risky members**, **liquidity/foundation outlook**, **alerts**, and **loan recommendation**.\n\n"
-        "Try: *'Top risky members'* or *'Is liquidity safe?'* or *'Any alerts?'*"
-    )
+    return "Ask about: alerts, liquidity, top risky members, loan recommendation, or open the Minutes tab."
 
 
 # ============================================================
-# Main panel renderer to embed in ai_risk_panel.py
+# Main panel renderer (Extra AI Suite + Minutes) to embed anywhere
 # ============================================================
 def render_ai_suite_panel(
     *,
@@ -396,9 +558,19 @@ def render_ai_suite_panel(
     loans: pd.DataFrame,
     payments: pd.DataFrame,
     payouts: pd.DataFrame,
-    foundation: pd.DataFrame,
+    fines: pd.DataFrame | None = None,
+    foundation: pd.DataFrame | None = None,
+    sessions: pd.DataFrame | None = None,
+    # Optional DB save for minutes:
+    sb_anon=None,
+    sb_service=None,
+    schema: str = "public",
 ):
-    st.subheader("🧠 Extra AI Suite (Reliability • Dropout • Fraud • Liquidity • Loan Decision • Alerts • Chat)")
+    st.subheader("🧠 Extra AI Suite (Reliability • Dropout • Fraud • Liquidity • Loan Decision • Alerts • Chat • Minutes)")
+
+    foundation = foundation if foundation is not None else pd.DataFrame()
+    fines = fines if fines is not None else pd.DataFrame()
+    sessions = sessions if sessions is not None else pd.DataFrame()
 
     reliability, rel_reasons = compute_reliability_score(row_features)
     dropout, drop_reasons = compute_dropout_risk(row_features)
@@ -431,13 +603,11 @@ def render_ai_suite_panel(
         liquidity_forecast=liquidity,
     )
 
-    # top risky (heuristic approximation: uses final_risk inputs elsewhere; here we just rank by your computed risk feature if present)
+    # Top risky (rank by heuristic-like rank_score)
     top_risky = []
     try:
         if X_all_members is not None and not X_all_members.empty:
             tmp = X_all_members.copy()
-            # if ai_risk_panel already computed heuristic risk per row, pass that instead.
-            # fallback: rank by loan_balance_sum + inactivity
             tmp["rank_score"] = (
                 pd.to_numeric(tmp.get("loan_balance_sum", 0), errors="coerce").fillna(0)
                 + 0.5 * pd.to_numeric(tmp.get("days_since_last_payment", 0), errors="coerce").fillna(0)
@@ -455,13 +625,14 @@ def render_ai_suite_panel(
     except Exception:
         top_risky = []
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "✅ Reliability & Dropout",
         "🕵🏽 Fraud/Anomaly",
         "💰 Liquidity Forecast",
         "🧾 Loan Recommendation",
         "🚨 Alerts Center",
         "💬 Local Chatbox",
+        "📝 Minutes",
     ])
 
     with tab1:
@@ -469,11 +640,9 @@ def render_ai_suite_panel(
         cA.metric("Reliability (0–100)", f"{reliability}")
         cB.metric("Dropout Risk", f"{dropout*100:.0f}%")
         cC.metric("Fraud/Anomaly", f"{fraud*100:.0f}%")
-
         st.write("**Reliability reasons**")
         for r in rel_reasons:
             st.write(f"• {r}")
-
         st.write("**Dropout risk reasons**")
         for r in drop_reasons:
             st.write(f"• {r}")
@@ -487,7 +656,6 @@ def render_ai_suite_panel(
                 st.write(f"• {r}")
         else:
             st.info("No anomaly signals detected from current data.")
-
         st.caption("Note: lightweight anomaly detection (fast).")
 
     with tab3:
@@ -496,7 +664,6 @@ def render_ai_suite_panel(
         else:
             st.metric("Estimated Net Balance (approx)", f"{liquidity.get('balance_est', 0.0):,.0f}")
             st.metric("Avg Daily Net Flow (last ~30d)", f"{liquidity.get('avg_daily_net', 0.0):,.1f}")
-
             df_fc = pd.DataFrame({"date": liquidity["dates"], "forecast_balance": liquidity["forecast_balance"]})
             st.line_chart(df_fc.set_index("date"))
 
@@ -504,6 +671,7 @@ def render_ai_suite_panel(
         st.write(f"**Decision:** `{decision}`")
         for r in dec_reasons:
             st.write(f"• {r}")
+        st.caption("Policy engine uses Risk + Reliability + Liquidity trend.")
 
     with tab5:
         if not alerts:
@@ -518,13 +686,12 @@ def render_ai_suite_panel(
                     st.warning(msg)
                 else:
                     st.info(msg)
-
         if top_risky:
             st.write("**Top (approx) risky members**")
             st.dataframe(pd.DataFrame(top_risky), use_container_width=True)
 
     with tab6:
-        st.caption("Local AI Chat (no API key).")
+        st.caption("Local AI Chat (no API key). Type `help` for examples.")
         if "local_ai_msgs" not in st.session_state:
             st.session_state.local_ai_msgs = []
 
@@ -545,7 +712,7 @@ def render_ai_suite_panel(
             with st.chat_message(role):
                 st.markdown(msg)
 
-        q = st.chat_input("Ask: 'Any alerts?'  'Is liquidity safe?'  'Loan recommendation'")
+        q = st.chat_input("Ask: alerts / liquidity / top risky / loan recommendation (or help)")
         if q:
             st.session_state.local_ai_msgs.append(("user", q))
             ans = local_chat_answer(q, context)
@@ -555,3 +722,83 @@ def render_ai_suite_panel(
 
         with st.expander("🔎 Context (debug)", expanded=False):
             st.json(context)
+
+    with tab7:
+        st.caption("Generate meeting minutes from your real Njangi tables (no API key).")
+
+        # Optional session filter (only if session_id exists in contributions/payouts)
+        session_id = None
+        if sessions is not None and not sessions.empty and "id" in sessions.columns:
+            s = sessions.copy()
+            s["id"] = _to_int(s["id"])
+            date_col = "session_date" if "session_date" in s.columns else ("created_at" if "created_at" in s.columns else None)
+            if date_col:
+                s[date_col] = _to_dt_utc(s[date_col])
+                s["label"] = s.apply(lambda r: f"Session {int(r['id'])} • {r[date_col].date() if pd.notna(r[date_col]) else ''}", axis=1)
+                opts = ["All data (no session filter)"] + s["label"].tolist()
+                sel = st.selectbox("Filter minutes by session (optional)", opts, index=0)
+                if sel != "All data (no session filter)":
+                    session_id = int(s.loc[s["label"] == sel, "id"].iloc[0])
+
+        def filt(df: pd.DataFrame) -> pd.DataFrame:
+            if session_id is None:
+                return df
+            if df is None or df.empty or "session_id" not in df.columns:
+                return df
+            d = df.copy()
+            d["session_id"] = _to_int(d["session_id"])
+            return d[d["session_id"] == int(session_id)].copy()
+
+        contrib_f = filt(contrib)
+        payouts_f = filt(payouts)
+
+        meeting_title = st.text_input("Meeting title", value="THE YOUNG SHALL GROW (NJANGI) — Meeting Minutes")
+        meeting_date = st.date_input("Meeting date", value=pd.Timestamp.utcnow().date())
+        location = st.text_input("Location (optional)", value="")
+        chairperson = st.text_input("Chairperson (optional)", value="")
+        secretary = st.text_input("Secretary (optional)", value="")
+        agenda = st.text_area("Agenda (optional)", value="Treasury update, contributions, loans, payouts, fines, risk review, and resolutions.")
+
+        minutes_text = build_minutes_text(
+            meeting_title=meeting_title,
+            meeting_date=pd.Timestamp(meeting_date),
+            location=location,
+            chairperson=chairperson,
+            secretary=secretary,
+            agenda=agenda,
+            members=members_df if members_df is not None else pd.DataFrame(),
+            contrib=contrib_f,
+            foundation=foundation,
+            loans=loans,
+            payments=payments,
+            payouts=payouts_f,
+            fines=fines,
+            top_risky=top_risky,
+            alerts=alerts,
+        )
+
+        st.text_area("Generated Minutes (copy/paste)", value=minutes_text, height=420)
+
+        # Optional save to DB if minutes table exists and client passed
+        can_save = False
+        client = sb_service if sb_service is not None else sb_anon
+        if client is not None:
+            can_save = _table_exists(client, schema, "minutes")
+
+        if can_save:
+            st.info("A `minutes` table exists. You can save this minutes text to the database.")
+            if st.button("💾 Save Minutes to DB"):
+                row = {
+                    "meeting_date": str(meeting_date),
+                    "title": meeting_title,
+                    "content": minutes_text,
+                    "session_id": int(session_id) if session_id is not None else None,
+                }
+                ok, msg = _safe_insert(client, schema, "minutes", row)
+                if ok:
+                    st.success("Minutes saved.")
+                else:
+                    st.error("Failed to save minutes.")
+                    st.code(msg, language="text")
+        else:
+     st.caption("No `minutes` table found (or no DB client passed). Copy/paste the minutes text, or create a minutes table later.")
