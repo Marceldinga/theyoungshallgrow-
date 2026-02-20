@@ -1,21 +1,25 @@
 
-# ai_suite_panel.py ✅ EXTRA AI SUITE (NO API KEY) + ✅ MINUTES GENERATOR
+# ai_suite_panel.py ✅ COMPLETE FREE AI SUITE (NO API KEY) — ALL FEATURES
 # ---------------------------------------------------------------------
-# Adds:
-# - Reliability score (0–100)
-# - Dropout risk (0–1)
-# - Fraud/Anomaly score (0–1)
-# - Simple liquidity forecast
-# - Smart loan recommendation
-# - Alerts center
-# - Local chatbox (answers from computed context)
-# - Meeting minutes generator (auto-build minutes text + optional DB save)
+# ✅ Includes EVERYTHING you requested:
+# ✅ Risk scoring (Heuristic + XGBoost if installed)
+# ✅ Reliability score (0–100) Njangi “credit score”
+# ✅ Dropout risk (disengagement prediction)
+# ✅ Fraud/Anomaly detection (outliers & suspicious patterns)
+# ✅ Liquidity forecast (simple cashflow projection)
+# ✅ Smart loan decision engine (Approve / Conditions / Reject)
+# ✅ Alerts center (risk/liquidity/fraud flags)
+# ✅ System Chat Assistant (free) — answers questions about your system using real tables
+# ✅ Minutes generator (free) — auto writes meeting minutes using your data
+# ✅ Optional Save minutes to DB if you create `minutes` table
 #
-# Designed to be imported into ai_risk_panel.py (or used standalone in any page).
+# Designed to be imported into any Streamlit page (including ai_risk_panel.py).
+# You pass your loaded DataFrames into `render_full_ai_suite_panel(...)`.
 # ---------------------------------------------------------------------
 
 from __future__ import annotations
 
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -61,10 +65,6 @@ def _fmt_money(x) -> str:
 
 
 def _safe_insert(client, schema: str, table: str, row: dict) -> tuple[bool, str]:
-    """
-    Optional helper if you pass supabase client(s) into render.
-    Returns (ok, msg). If no client or insert fails, ok=False.
-    """
     if client is None:
         return False, "No client provided."
     try:
@@ -84,11 +84,453 @@ def _table_exists(client, schema: str, table: str) -> bool:
         return False
 
 
+def _infer_member_name_col(members: pd.DataFrame) -> str | None:
+    for c in ["name", "full_name", "member_name"]:
+        if members is not None and not members.empty and c in members.columns:
+            return c
+    return None
+
+
+def _member_map(members: pd.DataFrame) -> dict[int, str]:
+    if members is None or members.empty or "id" not in members.columns:
+        return {}
+    name_col = _infer_member_name_col(members)
+    if not name_col:
+        return {}
+    out: dict[int, str] = {}
+    for _, r in members.iterrows():
+        try:
+            out[int(r["id"])] = str(r.get(name_col) or f"Member {int(r['id'])}")
+        except Exception:
+            pass
+    return out
+
+
+def _fill_feature_defaults(X: pd.DataFrame) -> pd.DataFrame:
+    X = X.copy()
+    for col in X.columns:
+        if col == "member_id":
+            continue
+        if col.endswith("_count") or col.endswith("_n"):
+            X[col] = pd.to_numeric(X[col], errors="coerce").fillna(0).astype(int)
+        elif col.startswith("days_since_") or col.endswith("_days"):
+            X[col] = pd.to_numeric(X[col], errors="coerce").fillna(999).astype(int)
+        else:
+            X[col] = pd.to_numeric(X[col], errors="coerce").fillna(0.0)
+    return X
+
+
 # ============================================================
-# Scores
+# Feature engineering (member-level)
 # ============================================================
+def build_member_features(
+    members: pd.DataFrame,
+    contrib: pd.DataFrame,
+    loans: pd.DataFrame,
+    payments: pd.DataFrame,
+    payouts: pd.DataFrame,
+    fines: pd.DataFrame,
+    foundation: pd.DataFrame,
+) -> pd.DataFrame:
+    if members is None or members.empty or "id" not in members.columns:
+        return pd.DataFrame()
+
+    members2 = members.copy()
+    members2["id"] = _to_int(members2["id"])
+    members2 = members2[members2["id"] > 0].copy()
+    now = _utc_now()
+
+    base = pd.DataFrame({"member_id": members2["id"].astype(int)})
+
+    # Contributions
+    cfeat = base.copy()
+    if contrib is not None and not contrib.empty and "member_id" in contrib.columns:
+        c = contrib.copy()
+        c["member_id"] = _to_int(c["member_id"])
+        c["amount"] = _to_num(c.get("amount", 0))
+        c["created_at"] = _to_dt_utc(c.get("created_at", pd.NaT))
+
+        grp = c.groupby("member_id", dropna=False)
+        cfeat = cfeat.merge(grp["amount"].sum().rename("contrib_total"), left_on="member_id", right_index=True, how="left")
+        cfeat = cfeat.merge(grp["amount"].count().rename("contrib_count"), left_on="member_id", right_index=True, how="left")
+        cfeat = cfeat.merge(grp["amount"].mean().rename("contrib_avg"), left_on="member_id", right_index=True, how="left")
+        cfeat = cfeat.merge(grp["created_at"].max().rename("contrib_last_dt"), left_on="member_id", right_index=True, how="left")
+
+        if "session_id" in c.columns:
+            c["session_id"] = _to_int(c["session_id"])
+            cfeat = cfeat.merge(
+                c.groupby("member_id")["session_id"].nunique().rename("contrib_sessions_n"),
+                left_on="member_id",
+                right_index=True,
+                how="left",
+            )
+    else:
+        cfeat["contrib_total"] = 0.0
+        cfeat["contrib_count"] = 0
+        cfeat["contrib_avg"] = 0.0
+        cfeat["contrib_sessions_n"] = 0
+        cfeat["contrib_last_dt"] = pd.NaT
+
+    cfeat["days_since_last_contrib"] = _days_since(now, cfeat["contrib_last_dt"])
+
+    # Loans
+    lfeat = base.copy()
+    if loans is not None and not loans.empty and "member_id" in loans.columns:
+        l = loans.copy()
+        l["member_id"] = _to_int(l["member_id"])
+
+        for col in ["principal", "principal_current", "total_due", "unpaid_interest"]:
+            if col in l.columns:
+                l[col] = _to_num(l[col])
+
+        if "principal_current" in l.columns:
+            l["balance_calc"] = l["principal_current"]
+        elif "principal" in l.columns:
+            l["balance_calc"] = l["principal"]
+        else:
+            l["balance_calc"] = 0.0
+
+        l["status"] = l.get("status", "").astype(str).str.lower().fillna("")
+        l["last_paid_at"] = _to_dt_utc(l.get("last_paid_at", pd.NaT))
+        l["created_at"] = _to_dt_utc(l.get("created_at", pd.NaT))
+
+        grp = l.groupby("member_id", dropna=False)
+        lfeat = lfeat.merge(grp.size().rename("loan_count"), left_on="member_id", right_index=True, how="left")
+        lfeat = lfeat.merge(grp["balance_calc"].sum().rename("loan_balance_sum"), left_on="member_id", right_index=True, how="left")
+
+        if "principal_current" in l.columns:
+            lfeat = lfeat.merge(grp["principal_current"].sum().rename("loan_principal_current_sum"), left_on="member_id", right_index=True, how="left")
+        else:
+            lfeat["loan_principal_current_sum"] = 0.0
+
+        if "total_due" in l.columns:
+            lfeat = lfeat.merge(grp["total_due"].sum().rename("loan_total_due_sum"), left_on="member_id", right_index=True, how="left")
+        else:
+            lfeat["loan_total_due_sum"] = 0.0
+
+        bad_tokens = ["delinquent", "default", "overdue", "late", "arrears", "past due", "past_due", "unpaid"]
+        lfeat = lfeat.merge(
+            grp["status"].apply(lambda s: sum(any(tok in str(v) for tok in bad_tokens) for v in s)).rename("loan_bad_status_count"),
+            left_on="member_id",
+            right_index=True,
+            how="left",
+        )
+        lfeat = lfeat.merge(grp["last_paid_at"].max().rename("loan_last_paid_dt"), left_on="member_id", right_index=True, how="left")
+    else:
+        lfeat["loan_count"] = 0
+        lfeat["loan_balance_sum"] = 0.0
+        lfeat["loan_principal_current_sum"] = 0.0
+        lfeat["loan_total_due_sum"] = 0.0
+        lfeat["loan_bad_status_count"] = 0
+        lfeat["loan_last_paid_dt"] = pd.NaT
+
+    # Payments
+    pfeat = base.copy()
+    if payments is not None and not payments.empty and "member_id" in payments.columns:
+        p = payments.copy()
+        p["member_id"] = _to_int(p["member_id"])
+        p["amount"] = _to_num(p.get("amount", 0))
+        if "paid_at" in p.columns:
+            p["paid_at"] = _to_dt_utc(p.get("paid_at", pd.NaT))
+        else:
+            p["paid_at"] = _to_dt_utc(p.get("created_at", pd.NaT))
+
+        grp = p.groupby("member_id", dropna=False)
+        pfeat = pfeat.merge(grp["amount"].count().rename("pay_count"), left_on="member_id", right_index=True, how="left")
+        pfeat = pfeat.merge(grp["amount"].sum().rename("pay_total"), left_on="member_id", right_index=True, how="left")
+        pfeat = pfeat.merge(grp["paid_at"].max().rename("pay_last_dt"), left_on="member_id", right_index=True, how="left")
+    else:
+        pfeat["pay_count"] = 0
+        pfeat["pay_total"] = 0.0
+        pfeat["pay_last_dt"] = pd.NaT
+
+    pfeat["days_since_last_payment"] = _days_since(now, pfeat["pay_last_dt"])
+
+    # Payouts (supports payout_amount/payout_date or amount/created_at)
+    poutfeat = base.copy()
+    if payouts is not None and not payouts.empty and "member_id" in payouts.columns:
+        po = payouts.copy()
+        po["member_id"] = _to_int(po["member_id"])
+
+        amt_col = "payout_amount" if "payout_amount" in po.columns else ("amount" if "amount" in po.columns else None)
+        po["payout_amount_calc"] = _to_num(po[amt_col]) if amt_col else 0.0
+
+        dt_col = "payout_date" if "payout_date" in po.columns else ("created_at" if "created_at" in po.columns else None)
+        po["payout_dt_calc"] = _to_dt_utc(po[dt_col]) if dt_col else pd.NaT
+
+        grp = po.groupby("member_id", dropna=False)
+        poutfeat = poutfeat.merge(grp["payout_amount_calc"].count().rename("payout_count"), left_on="member_id", right_index=True, how="left")
+        poutfeat = poutfeat.merge(grp["payout_amount_calc"].sum().rename("payout_total"), left_on="member_id", right_index=True, how="left")
+        poutfeat = poutfeat.merge(grp["payout_dt_calc"].max().rename("payout_last_dt"), left_on="member_id", right_index=True, how="left")
+    else:
+        poutfeat["payout_count"] = 0
+        poutfeat["payout_total"] = 0.0
+        poutfeat["payout_last_dt"] = pd.NaT
+
+    poutfeat["days_since_last_payout"] = _days_since(now, poutfeat["payout_last_dt"])
+
+    # Fines
+    ffeat = base.copy()
+    if fines is not None and not fines.empty and "member_id" in fines.columns:
+        f = fines.copy()
+        f["member_id"] = _to_int(f["member_id"])
+        f["amount"] = _to_num(f.get("amount", 0))
+        grp = f.groupby("member_id", dropna=False)
+        ffeat = ffeat.merge(grp["amount"].sum().rename("fine_total"), left_on="member_id", right_index=True, how="left")
+        ffeat = ffeat.merge(grp["amount"].count().rename("fine_count"), left_on="member_id", right_index=True, how="left")
+    else:
+        ffeat["fine_total"] = 0.0
+        ffeat["fine_count"] = 0
+
+    # Foundation contributions
+    fdfeat = base.copy()
+    if foundation is not None and not foundation.empty and "member_id" in foundation.columns:
+        fd = foundation.copy()
+        fd["member_id"] = _to_int(fd["member_id"])
+        fd["amount"] = _to_num(fd.get("amount", 0))
+        fd["created_at"] = _to_dt_utc(fd.get("created_at", pd.NaT))
+        grp = fd.groupby("member_id", dropna=False)
+        fdfeat = fdfeat.merge(grp["amount"].sum().rename("foundation_total"), left_on="member_id", right_index=True, how="left")
+        fdfeat = fdfeat.merge(grp["amount"].count().rename("foundation_count"), left_on="member_id", right_index=True, how="left")
+        fdfeat = fdfeat.merge(grp["created_at"].max().rename("foundation_last_dt"), left_on="member_id", right_index=True, how="left")
+    else:
+        fdfeat["foundation_total"] = 0.0
+        fdfeat["foundation_count"] = 0
+        fdfeat["foundation_last_dt"] = pd.NaT
+
+    fdfeat["days_since_last_foundation"] = _days_since(now, fdfeat["foundation_last_dt"])
+
+    X = (
+        cfeat.merge(lfeat, on="member_id", how="left")
+        .merge(pfeat, on="member_id", how="left")
+        .merge(poutfeat, on="member_id", how="left")
+        .merge(ffeat, on="member_id", how="left")
+        .merge(fdfeat, on="member_id", how="left")
+    )
+
+    for dtcol in ["contrib_last_dt", "pay_last_dt", "foundation_last_dt", "loan_last_paid_dt", "payout_last_dt"]:
+        if dtcol in X.columns:
+            X.drop(columns=[dtcol], inplace=True)
+
+    return _fill_feature_defaults(X)
+
+
+# ============================================================
+# Risk scoring (Heuristic)
+# ============================================================
+def compute_heuristic_risk(row: pd.Series) -> tuple[float, list[str]]:
+    reasons: list[str] = []
+
+    loan_balance = float(row.get("loan_balance_sum", 0.0))
+    total_due = float(row.get("loan_total_due_sum", 0.0))
+    bad_status = int(row.get("loan_bad_status_count", 0))
+    days_pay = int(row.get("days_since_last_payment", 999))
+    days_contrib = int(row.get("days_since_last_contrib", 999))
+    fine_total = float(row.get("fine_total", 0.0))
+    contrib_total = float(row.get("contrib_total", 0.0))
+    contrib_count = int(row.get("contrib_count", 0))
+
+    score = 0.0
+
+    if loan_balance > 0:
+        score += 0.20
+        reasons.append("Has outstanding loan balance")
+
+    if total_due > 0 and total_due >= max(loan_balance, 1.0) * 1.02:
+        score += 0.10
+        reasons.append("Total due indicates interest/arrears")
+
+    if bad_status > 0:
+        score += min(0.30, 0.10 * bad_status)
+        reasons.append("Loan status flagged as overdue/delinquent/etc.")
+
+    if days_pay >= 30 and loan_balance > 0:
+        score += 0.25
+        reasons.append("No recent loan payment (≥30 days) while loan balance > 0")
+    elif days_pay >= 14 and loan_balance > 0:
+        score += 0.15
+        reasons.append("No recent loan payment (≥14 days) while loan balance > 0")
+
+    if days_contrib >= 30:
+        score += 0.15
+        reasons.append("No recent contribution (≥30 days)")
+    elif days_contrib >= 14:
+        score += 0.08
+        reasons.append("No recent contribution (≥14 days)")
+
+    if fine_total > 0:
+        score += min(0.15, fine_total / 2000.0)
+        reasons.append("Has fines")
+
+    if contrib_total >= 2000:
+        score -= 0.05
+        reasons.append("Strong contributions reduce risk")
+    if contrib_count >= 6:
+        score -= 0.05
+        reasons.append("Consistent contribution frequency reduces risk")
+
+    return float(np.clip(score, 0.0, 1.0)), reasons[:6]
+
+
+# ============================================================
+# Risk scoring (XGBoost if installed)
+#   target: closed=0, active=1
+# ============================================================
+def _make_loan_ml_frame(loans: pd.DataFrame) -> pd.DataFrame:
+    if loans is None or loans.empty or "member_id" not in loans.columns or "status" not in loans.columns:
+        return pd.DataFrame()
+
+    l = loans.copy()
+    now = _utc_now()
+
+    l["member_id"] = _to_int(l["member_id"])
+    l["status"] = l["status"].astype(str).str.lower().fillna("")
+
+    l["principal"] = _to_num(l.get("principal", 0))
+    l["principal_current"] = _to_num(l.get("principal_current", l["principal"]))
+    l["total_due"] = _to_num(l.get("total_due", 0))
+    l["unpaid_interest"] = _to_num(l.get("unpaid_interest", 0))
+    l["interest_rate_monthly"] = _to_num(l.get("interest_rate_monthly", 0))
+    l["due_cycle_days"] = _to_num(l.get("due_cycle_days", 0))
+
+    l["borrow_date"] = _to_dt_utc(l.get("borrow_date", l.get("created_at", pd.NaT)))
+    l["last_paid_at"] = _to_dt_utc(l.get("last_paid_at", pd.NaT))
+
+    l["loan_age_days"] = _days_since(now, l["borrow_date"])
+    l["days_since_last_payment"] = _days_since(now, l["last_paid_at"].fillna(l["borrow_date"]))
+
+    l["target"] = np.where(l["status"] == "closed", 0, 1).astype(int)
+
+    cols = [
+        "member_id",
+        "status",
+        "principal",
+        "principal_current",
+        "interest_rate_monthly",
+        "total_due",
+        "unpaid_interest",
+        "due_cycle_days",
+        "loan_age_days",
+        "days_since_last_payment",
+        "target",
+    ]
+    out = l[cols].copy()
+    out = out.replace([np.inf, -np.inf], np.nan).fillna(0)
+    out = out[out["member_id"] > 0].copy()
+    return out
+
+
+def _df_fingerprint(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return "empty"
+    try:
+        cols = df.columns.tolist()
+        h = pd.util.hash_pandas_object(df[cols], index=True).sum()
+        return str(int(h))
+    except Exception:
+        return str(len(df))
+
+
+def _xgb_get_or_train(loans_ml: pd.DataFrame):
+    try:
+        from xgboost import XGBClassifier
+    except Exception as e:
+        return None, f"xgboost not installed or failed to import: {repr(e)}"
+
+    feature_cols = [
+        "principal",
+        "principal_current",
+        "interest_rate_monthly",
+        "total_due",
+        "unpaid_interest",
+        "due_cycle_days",
+        "loan_age_days",
+        "days_since_last_payment",
+    ]
+
+    fp = _df_fingerprint(loans_ml[feature_cols + ["target"]].copy())
+    cache = st.session_state.get("__ai_suite_xgb_cache__", {})
+
+    if cache.get("fp") == fp and cache.get("model") is not None:
+        return cache["model"], "OK (cached)"
+
+    X = loans_ml[feature_cols].to_numpy(dtype=float)
+    y = loans_ml["target"].to_numpy(dtype=int)
+
+    vc = loans_ml["target"].value_counts().to_dict()
+    if len(vc) < 2:
+        return None, "ML needs both classes: closed and active."
+
+    n_pos = int((y == 1).sum())
+    n_neg = int((y == 0).sum())
+    scale_pos_weight = (n_neg / max(n_pos, 1))
+
+    model = XGBClassifier(
+        n_estimators=250,
+        max_depth=3,
+        learning_rate=0.08,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        reg_lambda=1.0,
+        random_state=42,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        scale_pos_weight=scale_pos_weight,
+    )
+    model.fit(X, y)
+
+    st.session_state["__ai_suite_xgb_cache__"] = {"fp": fp, "model": model}
+    return model, "OK (trained)"
+
+
+def xgb_risk_for_member(loans: pd.DataFrame, member_id: int, min_rows: int = 20) -> tuple[float | None, str]:
+    loans_ml = _make_loan_ml_frame(loans)
+    if loans_ml.empty:
+        return None, "No loans for ML."
+
+    if len(loans_ml) < int(min_rows):
+        return None, f"Need at least {min_rows} loans for ML (currently {len(loans_ml)})."
+
+    model, msg = _xgb_get_or_train(loans_ml)
+    if model is None:
+        return None, msg
+
+    feature_cols = [
+        "principal",
+        "principal_current",
+        "interest_rate_monthly",
+        "total_due",
+        "unpaid_interest",
+        "due_cycle_days",
+        "loan_age_days",
+        "days_since_last_payment",
+    ]
+
+    mdf = loans_ml[loans_ml["member_id"] == int(member_id)].copy()
+    if mdf.empty:
+        return None, "Member has no loans."
+
+    active = mdf[mdf["status"] == "active"]
+    if not active.empty:
+        mdf = active
+
+    Xm = mdf[feature_cols].to_numpy(dtype=float)
+    proba = model.predict_proba(Xm)[:, 1]
+    risk = float(np.max(proba)) if len(proba) else None
+    if risk is None:
+        return None, "Unable to compute ML risk."
+    return float(np.clip(risk, 0.0, 1.0)), msg
+
+
+# ============================================================
+# Reliability / Dropout / Fraud
+# ============================================================
+def reliability_score(row: pd.Series) -> tuple[int, list[str]]:
+    return compute_reliability_score(row)
+
+
 def compute_reliability_score(row: pd.Series) -> tuple[int, list[str]]:
-    reasons = []
+    reasons: list[str] = []
     score = 70.0
 
     contrib_count = int(row.get("contrib_count", 0))
@@ -149,8 +591,8 @@ def compute_reliability_score(row: pd.Series) -> tuple[int, list[str]]:
     return score, reasons[:6]
 
 
-def compute_dropout_risk(row: pd.Series) -> tuple[float, list[str]]:
-    reasons = []
+def dropout_risk(row: pd.Series) -> tuple[float, list[str]]:
+    reasons: list[str] = []
     days_contrib = int(row.get("days_since_last_contrib", 999))
     contrib_count = int(row.get("contrib_count", 0))
     fine_count = int(row.get("fine_count", 0))
@@ -178,15 +620,11 @@ def compute_dropout_risk(row: pd.Series) -> tuple[float, list[str]]:
     return _clip01(risk), reasons[:6]
 
 
-def compute_fraud_anomaly_score(
-    member_id: int,
-    contrib: pd.DataFrame,
-    loans: pd.DataFrame,
-    payments: pd.DataFrame,
-) -> tuple[float, list[str]]:
-    reasons = []
+def fraud_anomaly_score(member_id: int, contrib: pd.DataFrame, loans: pd.DataFrame, payments: pd.DataFrame) -> tuple[float, list[str]]:
+    reasons: list[str] = []
     score = 0.05
 
+    # Contribution outlier
     if contrib is not None and not contrib.empty and "member_id" in contrib.columns and "amount" in contrib.columns:
         c = contrib.copy()
         c["member_id"] = _to_int(c["member_id"])
@@ -200,6 +638,7 @@ def compute_fraud_anomaly_score(
                 score += 0.35
                 reasons.append("Contribution amount is a strong outlier vs member history (3σ)")
 
+    # Multiple recent loans
     if loans is not None and not loans.empty and "member_id" in loans.columns:
         l = loans.copy()
         l["member_id"] = _to_int(l["member_id"])
@@ -212,7 +651,8 @@ def compute_fraud_anomaly_score(
                 score += 0.25
                 reasons.append("Multiple loans created within last 14 days")
 
-    if payments is not None and not payments.empty and "member_id" in payments.columns:
+    # Payment outlier
+    if payments is not None and not payments.empty and "member_id" in payments.columns and "amount" in payments.columns:
         p = payments.copy()
         p["member_id"] = _to_int(p["member_id"])
         p["amount"] = _to_num(p.get("amount", 0))
@@ -229,9 +669,9 @@ def compute_fraud_anomaly_score(
 
 
 # ============================================================
-# Liquidity Forecast (simple)
+# Liquidity forecast (simple)
 # ============================================================
-def foundation_liquidity_forecast_simple(
+def liquidity_forecast_simple(
     contrib: pd.DataFrame,
     foundation: pd.DataFrame,
     loans: pd.DataFrame,
@@ -298,10 +738,10 @@ def foundation_liquidity_forecast_simple(
 
 
 # ============================================================
-# Loan Recommendation + Alerts
+# Loan decision engine + Alerts
 # ============================================================
-def smart_loan_recommendation(risk: float, reliability: int, liquidity_ok: bool, requested_amount: float) -> tuple[str, list[str]]:
-    reasons = []
+def smart_loan_decision(risk: float, reliability: int, liquidity_ok: bool, requested_amount: float) -> tuple[str, list[str]]:
+    reasons: list[str] = []
     decision = "APPROVE"
 
     if not liquidity_ok:
@@ -330,15 +770,8 @@ def smart_loan_recommendation(risk: float, reliability: int, liquidity_ok: bool,
     return decision, reasons[:6]
 
 
-def generate_ai_alerts(
-    member_name: str,
-    final_risk: float,
-    reliability: int,
-    dropout: float,
-    fraud: float,
-    liquidity_forecast: dict,
-) -> list[dict]:
-    alerts = []
+def generate_alerts(member_name: str, final_risk: float, reliability: int, dropout: float, fraud: float, liquidity: dict) -> list[dict]:
+    alerts: list[dict] = []
 
     if final_risk >= 0.70:
         alerts.append({"severity": "high", "type": "default_risk", "message": f"{member_name}: High risk ({final_risk*100:.1f}%)."})
@@ -358,8 +791,8 @@ def generate_ai_alerts(
     elif fraud >= 0.35:
         alerts.append({"severity": "med", "type": "fraud", "message": f"{member_name}: Mild anomaly signals ({fraud*100:.0f}%)."})
 
-    if liquidity_forecast.get("ok"):
-        if float(liquidity_forecast.get("avg_daily_net", 0.0)) < 0:
+    if liquidity.get("ok"):
+        if float(liquidity.get("avg_daily_net", 0.0)) < 0:
             alerts.append({"severity": "med", "type": "liquidity", "message": "System liquidity trend is negative (avg daily net outflow)."})
     else:
         alerts.append({"severity": "low", "type": "liquidity", "message": "Liquidity forecast unavailable (missing history)."})
@@ -368,7 +801,7 @@ def generate_ai_alerts(
 
 
 # ============================================================
-# Minutes Generator
+# Minutes generator
 # ============================================================
 def build_minutes_text(
     *,
@@ -413,18 +846,17 @@ def build_minutes_text(
             loan_balance_sum = float(_to_num(loans[bal_col]).sum())
 
     member_count = int(len(members)) if members is not None and not members.empty else 0
-
     high_alerts = [a for a in (alerts or []) if a.get("severity") == "high"]
     med_alerts = [a for a in (alerts or []) if a.get("severity") == "med"]
 
-    if top_risky:
-        risk_lines = "\n".join([f"- {r.get('name','Member')} ({r.get('member_id','?')}): {float(r.get('risk',0))*100:.1f}%" for r in top_risky])
-    else:
-        risk_lines = "- Not available"
+    risk_lines = "\n".join(
+        [f"- {r.get('name','Member')} ({r.get('member_id','?')}): {float(r.get('risk',0))*100:.1f}%"
+         for r in (top_risky or [])]
+    ) if top_risky else "- Not available"
 
     date_str = meeting_date.strftime("%Y-%m-%d")
 
-    lines = []
+    lines: list[str] = []
     lines.append(f"{meeting_title}")
     lines.append(f"Date: {date_str}")
     if location:
@@ -489,157 +921,304 @@ def build_minutes_text(
 
 
 # ============================================================
-# Local Chat Answer
+# System Chat Assistant (FREE)
 # ============================================================
-def local_chat_answer(question: str, context: dict) -> str:
-    q = (question or "").lower().strip()
-    if q in ("help", "?", "commands"):
+def system_chat_answer(question: str, ctx: dict) -> str:
+    q0 = (question or "").strip()
+    ql = q0.lower()
+
+    members = ctx.get("members", pd.DataFrame())
+    contrib = ctx.get("contrib", pd.DataFrame())
+    loans = ctx.get("loans", pd.DataFrame())
+    payments = ctx.get("payments", pd.DataFrame())
+    payouts = ctx.get("payouts", pd.DataFrame())
+    fines = ctx.get("fines", pd.DataFrame())
+    foundation = ctx.get("foundation", pd.DataFrame())
+    top_risky = ctx.get("top_risky", [])
+    alerts = ctx.get("alerts", [])
+    minutes_text = ctx.get("minutes_text", "")
+
+    id2name = _member_map(members)
+
+    def _find_member_id(text: str) -> int | None:
+        m = re.search(r"(member\s*|#)(\d+)", text.lower())
+        if m:
+            try:
+                return int(m.group(2))
+            except Exception:
+                pass
+        # try name contains
+        name_col = _infer_member_name_col(members)
+        if name_col and not members.empty:
+            hits = members[members[name_col].astype(str).str.lower().str.contains(text.lower(), na=False)]
+            if len(hits) == 1:
+                return int(_to_int(hits["id"]).iloc[0])
+        return None
+
+    if ql in ("help", "?", "commands", "what can you do"):
         return (
-            "### ✅ What I can do\n"
-            "- **Alerts**: any alerts?\n"
-            "- **Liquidity**: is liquidity safe?\n"
-            "- **Top risky members**: top risky members\n"
-            "- **Loan recommendation**: loan recommendation\n"
-            "- **Minutes**: open the Minutes tab\n"
+            "### ✅ System Chat (Free)\n"
+            "- `top risky`\n"
+            "- `loan status`\n"
+            "- `total contributions` / `total payouts` / `total fines` / `total payments` / `foundation total`\n"
+            "- `summary member 5` or `summary Marcel`\n"
+            "- `minutes` (shows latest generated minutes if available)\n"
         )
-    if "top" in q and ("risk" in q or "risky" in q):
-        top = context.get("top_risky", [])
-        if not top:
-            return "I don’t have enough risk data to compute top risky members."
+
+    if "minutes" in ql:
+        if minutes_text:
+            return "### 📝 Latest Generated Minutes\n" + minutes_text
+        return "Minutes not generated yet. Open the **Minutes** tab and generate minutes first."
+
+    if ("top" in ql and "risk" in ql) or "top risky" in ql or "highest risk" in ql:
+        if not top_risky:
+            return "Top risky list not available yet."
         out = "### 🔴 Top risky members\n"
-        for item in top:
-            out += f"- {item['name']} → {item['risk']*100:.1f}%\n"
+        for r in top_risky:
+            out += f"- {r.get('name','Member')} → {float(r.get('risk',0))*100:.1f}%\n"
         return out
 
-    if "liquid" in q or "foundation" in q or "cash" in q:
-        lf = context.get("liquidity", {})
-        if not lf.get("ok"):
-            return f"Liquidity forecast not available: {lf.get('msg','missing data')}."
-        return (
-            "### 💰 Liquidity outlook (simple)\n"
-            f"- Estimated net balance (approx): **{lf.get('balance_est', 0.0):,.0f}**\n"
-            f"- Avg daily net flow (last ~30 days): **{lf.get('avg_daily_net', 0.0):,.1f}**\n"
-            f"- Horizon: **{lf.get('horizon_days', 30)} days**\n"
-        )
+    if "loan status" in ql or ("loans" in ql and "status" in ql):
+        if loans is None or loans.empty or "status" not in loans.columns:
+            return "Loans status not available."
+        vc = loans["status"].astype(str).str.lower().value_counts()
+        out = "### 📌 Loan status counts\n"
+        for k, v in vc.items():
+            out += f"- **{k}**: {int(v)}\n"
+        return out
 
-    if "alert" in q:
-        alerts = context.get("alerts", [])
+    # totals
+    if "total contributions" in ql:
+        if contrib is None or contrib.empty or "amount" not in contrib.columns:
+            return "Contributions data not available."
+        return f"### 💵 Total contributions\n**{_fmt_money(_to_num(contrib['amount']).sum())}**"
+
+    if "total payouts" in ql:
+        if payouts is None or payouts.empty:
+            return "Payouts data not available."
+        amt_col = "payout_amount" if "payout_amount" in payouts.columns else ("amount" if "amount" in payouts.columns else None)
+        if not amt_col:
+            return "Payout amount column not found."
+        return f"### 🧾 Total payouts\n**{_fmt_money(_to_num(payouts[amt_col]).sum())}**"
+
+    if "total fines" in ql:
+        if fines is None or fines.empty or "amount" not in fines.columns:
+            return "Fines data not available."
+        return f"### 💸 Total fines\n**{_fmt_money(_to_num(fines['amount']).sum())}**"
+
+    if "total payments" in ql:
+        if payments is None or payments.empty or "amount" not in payments.columns:
+            return "Payments data not available."
+        return f"### ✅ Total loan payments\n**{_fmt_money(_to_num(payments['amount']).sum())}**"
+
+    if "foundation total" in ql or ("total" in ql and "foundation" in ql):
+        if foundation is None or foundation.empty or "amount" not in foundation.columns:
+            return "Foundation contributions data not available."
+        return f"### 🏦 Foundation total contributions\n**{_fmt_money(_to_num(foundation['amount']).sum())}**"
+
+    # alerts
+    if "alert" in ql:
         if not alerts:
             return "No alerts generated right now."
         out = "### 🚨 Alerts\n"
-        for a in alerts:
-            out += f"- **{a['severity'].upper()}** [{a['type']}] — {a['message']}\n"
+        for a in alerts[:25]:
+            out += f"- **{a.get('severity','').upper()}** [{a.get('type','')}] — {a.get('message','')}\n"
         return out
 
-    if "recommend" in q or "approve" in q or "loan" in q:
-        rec = context.get("loan_reco", None)
-        if not rec:
-            return "Loan recommendation is not available yet."
-        out = f"### 🧾 Loan decision recommendation\n**Decision:** `{rec['decision']}`\n"
-        for r in rec["reasons"]:
-            out += f"- {r}\n"
-        return out
+    # member summary
+    if "summary" in ql or "profile" in ql or "member" in ql:
+        mid = _find_member_id(q0)
+        if mid is None:
+            return "I couldn’t identify the member. Try `summary member 5` or `summary <exact name>`."
+        name = id2name.get(mid, f"Member {mid}")
 
-    return "Ask about: alerts, liquidity, top risky members, loan recommendation, or open the Minutes tab."
+        def _sum(df: pd.DataFrame, amt_col: str, mid_col: str = "member_id") -> float:
+            if df is None or df.empty or amt_col not in df.columns or mid_col not in df.columns:
+                return 0.0
+            d = df.copy()
+            d[mid_col] = _to_int(d[mid_col])
+            return float(_to_num(d[d[mid_col] == int(mid)][amt_col]).sum())
+
+        c_total = _sum(contrib, "amount")
+        fd_total = _sum(foundation, "amount")
+        f_total = _sum(fines, "amount")
+        p_total = _sum(payments, "amount")
+        po_amt_col = "payout_amount" if payouts is not None and "payout_amount" in payouts.columns else ("amount" if payouts is not None and "amount" in payouts.columns else None)
+        po_total = _sum(payouts, po_amt_col) if po_amt_col else 0.0
+
+        active_loans = 0
+        bal_sum = 0.0
+        if loans is not None and not loans.empty and "member_id" in loans.columns:
+            l = loans.copy()
+            l["member_id"] = _to_int(l["member_id"])
+            lm = l[l["member_id"] == int(mid)].copy()
+            if not lm.empty and "status" in lm.columns:
+                active_loans = int((lm["status"].astype(str).str.lower() == "active").sum())
+            bal_col = "principal_current" if "principal_current" in lm.columns else ("principal" if "principal" in lm.columns else None)
+            if bal_col:
+                bal_sum = float(_to_num(lm[bal_col]).sum())
+
+        return (
+            f"### 👤 Member Summary — {name} (ID {mid})\n"
+            f"- Contributions: **{_fmt_money(c_total)}**\n"
+            f"- Foundation: **{_fmt_money(fd_total)}**\n"
+            f"- Loan payments: **{_fmt_money(p_total)}**\n"
+            f"- Payouts: **{_fmt_money(po_total)}**\n"
+            f"- Fines: **{_fmt_money(f_total)}**\n"
+            f"- Active loans: **{active_loans}**\n"
+            f"- Loan balance (sum): **{_fmt_money(bal_sum)}**\n"
+        )
+
+    return "Try `help`. I can answer totals, loan status, member summaries, alerts, top risky, and minutes."
 
 
 # ============================================================
-# Main panel renderer (Extra AI Suite + Minutes) to embed anywhere
+# UI: Render EVERYTHING
 # ============================================================
-def render_ai_suite_panel(
+def render_full_ai_suite_panel(
     *,
-    member_id: int,
-    member_name: str,
-    final_risk: float,
-    row_features: pd.Series,
-    X_all_members: pd.DataFrame,
-    members_df: pd.DataFrame,
-    contrib: pd.DataFrame,
+    members: pd.DataFrame,
+    contributions: pd.DataFrame,
     loans: pd.DataFrame,
-    payments: pd.DataFrame,
+    loan_payments: pd.DataFrame,
     payouts: pd.DataFrame,
-    fines: pd.DataFrame | None = None,
-    foundation: pd.DataFrame | None = None,
+    fines: pd.DataFrame,
+    foundation_contributions: pd.DataFrame,
     sessions: pd.DataFrame | None = None,
-    # Optional DB save for minutes:
+    schema: str = "public",
     sb_anon=None,
     sb_service=None,
-    schema: str = "public",
+    min_loans_for_ml: int = 20,
 ):
-    st.subheader("🧠 Extra AI Suite (Reliability • Dropout • Fraud • Liquidity • Loan Decision • Alerts • Chat • Minutes)")
-
-    foundation = foundation if foundation is not None else pd.DataFrame()
-    fines = fines if fines is not None else pd.DataFrame()
+    """
+    Call this from any Streamlit page after you load your tables into DataFrames.
+    - No OpenAI required.
+    - If xgboost is installed, ML risk becomes available automatically.
+    """
     sessions = sessions if sessions is not None else pd.DataFrame()
 
-    reliability, rel_reasons = compute_reliability_score(row_features)
-    dropout, drop_reasons = compute_dropout_risk(row_features)
-    fraud, fraud_reasons = compute_fraud_anomaly_score(member_id, contrib, loans, payments)
-
-    liquidity = foundation_liquidity_forecast_simple(
-        contrib=contrib,
-        foundation=foundation,
+    # Build features
+    X = build_member_features(
+        members=members,
+        contrib=contributions,
         loans=loans,
-        payments=payments,
+        payments=loan_payments,
         payouts=payouts,
-        horizon_days=30,
-    )
-    liquidity_ok = bool(liquidity.get("ok")) and float(liquidity.get("avg_daily_net", 0.0)) >= 0
-
-    amt = st.number_input("Test Loan Amount (for recommendation)", min_value=0.0, value=3000.0, step=500.0)
-    decision, dec_reasons = smart_loan_recommendation(
-        risk=float(final_risk),
-        reliability=int(reliability),
-        liquidity_ok=bool(liquidity_ok),
-        requested_amount=float(amt),
+        fines=fines,
+        foundation=foundation_contributions,
     )
 
-    alerts = generate_ai_alerts(
-        member_name=member_name,
-        final_risk=float(final_risk),
-        reliability=int(reliability),
-        dropout=float(dropout),
-        fraud=float(fraud),
-        liquidity_forecast=liquidity,
-    )
+    if X.empty:
+        st.error("AI Suite: could not build features (check members table / IDs).")
+        return
 
-    # Top risky (rank by heuristic-like rank_score)
-    top_risky = []
+    name_col = _infer_member_name_col(members)
+    members2 = members.copy()
+    members2["id"] = _to_int(members2["id"])
+    if name_col:
+        members2[name_col] = members2[name_col].astype(str)
+    else:
+        members2["name"] = members2.get("name", "").astype(str)
+        name_col = "name"
+
+    members2 = members2[members2["id"] > 0].copy()
+    members2["label"] = members2.apply(lambda r: f"{int(r['id']):02d} • {r.get(name_col,'')}", axis=1)
+
+    st.header("🧠 Free AI Suite (NJANGI)")
+    st.caption("Risk • Reliability • Dropout • Fraud • Liquidity • Loan Decisions • Alerts • System Chat • Minutes (no API key)")
+
+    pick = st.selectbox("Select member", members2["label"].tolist())
+    member_id = int(members2.loc[members2["label"] == pick, "id"].iloc[0])
+    member_name = str(members2.loc[members2["id"] == member_id, name_col].iloc[0]) if name_col else f"Member {member_id}"
+
+    row = X[X["member_id"] == int(member_id)]
+    if row.empty:
+        st.warning("No feature row for selected member.")
+        return
+    row1 = row.iloc[0]
+
+    # Risk mode
+    mode = st.radio("Risk mode", ["Heuristic", "ML (XGBoost)", "Hybrid"], horizontal=True)
+
+    h_risk, h_reasons = compute_heuristic_risk(row1)
+    ml_risk, ml_msg = xgb_risk_for_member(loans, member_id=member_id, min_rows=min_loans_for_ml)
+
+    if mode == "Heuristic":
+        final_risk = h_risk
+    elif mode == "ML (XGBoost)":
+        final_risk = ml_risk if ml_risk is not None else h_risk
+    else:
+        final_risk = h_risk if ml_risk is None else float(np.clip((h_risk + ml_risk) / 2.0, 0.0, 1.0))
+
+    # Other scores
+    rel, rel_reasons = reliability_score(row1)
+    drop, drop_reasons = dropout_risk(row1)
+    fraud, fraud_reasons = fraud_anomaly_score(member_id, contributions, loans, loan_payments)
+
+    liq = liquidity_forecast_simple(contributions, foundation_contributions, loans, loan_payments, payouts, horizon_days=30)
+    liquidity_ok = bool(liq.get("ok")) and float(liq.get("avg_daily_net", 0.0)) >= 0
+
+    # loan decision
+    req_amt = st.number_input("Test loan amount (for recommendation)", min_value=0.0, value=3000.0, step=500.0)
+    decision, dec_reasons = smart_loan_decision(final_risk, rel, liquidity_ok, float(req_amt))
+
+    # alerts
+    alerts = generate_alerts(member_name, final_risk, rel, drop, fraud, liq)
+
+    # top risky (heuristic across all)
+    top_risky: list[dict] = []
     try:
-        if X_all_members is not None and not X_all_members.empty:
-            tmp = X_all_members.copy()
-            tmp["rank_score"] = (
-                pd.to_numeric(tmp.get("loan_balance_sum", 0), errors="coerce").fillna(0)
-                + 0.5 * pd.to_numeric(tmp.get("days_since_last_payment", 0), errors="coerce").fillna(0)
-                + 0.3 * pd.to_numeric(tmp.get("days_since_last_contrib", 0), errors="coerce").fillna(0)
-            )
-            tmp = tmp.sort_values("rank_score", ascending=False).head(5)
-            for _, rr in tmp.iterrows():
-                mid2 = int(rr["member_id"])
-                nm2 = None
-                if members_df is not None and not members_df.empty and "id" in members_df.columns:
-                    mrow = members_df[members_df["id"].astype(int) == mid2]
-                    if not mrow.empty:
-                        nm2 = str(mrow.iloc[0].get("name") or mrow.iloc[0].get("full_name") or f"Member {mid2}")
-                top_risky.append({"member_id": mid2, "name": nm2 or f"Member {mid2}", "risk": 0.0})
+        tmp = []
+        id2name = _member_map(members2)
+        for _, rr in X.iterrows():
+            r, _ = compute_heuristic_risk(rr)
+            mid2 = int(rr["member_id"])
+            tmp.append({"member_id": mid2, "name": id2name.get(mid2, f"Member {mid2}"), "risk": float(r)})
+        tmp.sort(key=lambda z: z["risk"], reverse=True)
+        top_risky = tmp[:5]
     except Exception:
         top_risky = []
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    # Minutes (defaults)
+    meeting_title_default = "THE YOUNG SHALL GROW (NJANGI) — Meeting Minutes"
+    agenda_default = "Treasury update, contributions, loans, payouts, fines, risk review, and resolutions."
+
+    # Tabs
+    tab_risk, tab_scores, tab_fraud, tab_liq, tab_loan, tab_alerts, tab_chat, tab_minutes = st.tabs([
+        "📈 Risk",
         "✅ Reliability & Dropout",
         "🕵🏽 Fraud/Anomaly",
         "💰 Liquidity Forecast",
-        "🧾 Loan Recommendation",
+        "🧾 Loan Decision",
         "🚨 Alerts Center",
-        "💬 Local Chatbox",
+        "💬 System Chat",
         "📝 Minutes",
     ])
 
-    with tab1:
-        cA, cB, cC = st.columns(3)
-        cA.metric("Reliability (0–100)", f"{reliability}")
-        cB.metric("Dropout Risk", f"{dropout*100:.0f}%")
-        cC.metric("Fraud/Anomaly", f"{fraud*100:.0f}%")
+    with tab_risk:
+        st.subheader("Risk prediction")
+        st.metric("Final Risk", f"{final_risk*100:.1f}%")
+        st.progress(float(np.clip(final_risk, 0.0, 1.0)))
+        st.caption("Heuristic signals:")
+        for r in h_reasons:
+            st.write(f"• {r}")
+
+        if mode in ["ML (XGBoost)", "Hybrid"]:
+            if ml_risk is None:
+                st.info(f"ML not ready: {ml_msg}")
+            else:
+                st.success(f"ML active: {ml_msg} • Member ML risk: {ml_risk*100:.1f}%")
+
+        with st.expander("Member feature snapshot (no blanks)", expanded=False):
+            snap = row.T
+            snap.columns = ["value"]
+            st.dataframe(snap, use_container_width=True)
+
+    with tab_scores:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Reliability (0–100)", f"{rel}")
+        c2.metric("Dropout Risk", f"{drop*100:.0f}%")
+        c3.metric("Fraud/Anomaly", f"{fraud*100:.0f}%")
         st.write("**Reliability reasons**")
         for r in rel_reasons:
             st.write(f"• {r}")
@@ -647,7 +1226,7 @@ def render_ai_suite_panel(
         for r in drop_reasons:
             st.write(f"• {r}")
 
-    with tab2:
+    with tab_fraud:
         st.metric("Fraud/Anomaly Score", f"{fraud*100:.0f}%")
         st.progress(float(np.clip(fraud, 0.0, 1.0)))
         if fraud_reasons:
@@ -656,77 +1235,84 @@ def render_ai_suite_panel(
                 st.write(f"• {r}")
         else:
             st.info("No anomaly signals detected from current data.")
-        st.caption("Note: lightweight anomaly detection (fast).")
 
-    with tab3:
-        if not liquidity.get("ok"):
-            st.warning(liquidity.get("msg", "Liquidity forecast unavailable."))
+    with tab_liq:
+        if not liq.get("ok"):
+            st.warning(liq.get("msg", "Liquidity forecast unavailable."))
         else:
-            st.metric("Estimated Net Balance (approx)", f"{liquidity.get('balance_est', 0.0):,.0f}")
-            st.metric("Avg Daily Net Flow (last ~30d)", f"{liquidity.get('avg_daily_net', 0.0):,.1f}")
-            df_fc = pd.DataFrame({"date": liquidity["dates"], "forecast_balance": liquidity["forecast_balance"]})
+            st.metric("Estimated Net Balance (approx)", f"{liq.get('balance_est', 0.0):,.0f}")
+            st.metric("Avg Daily Net Flow (last ~30d)", f"{liq.get('avg_daily_net', 0.0):,.1f}")
+            df_fc = pd.DataFrame({"date": liq["dates"], "forecast_balance": liq["forecast_balance"]})
             st.line_chart(df_fc.set_index("date"))
 
-    with tab4:
+    with tab_loan:
         st.write(f"**Decision:** `{decision}`")
         for r in dec_reasons:
             st.write(f"• {r}")
-        st.caption("Policy engine uses Risk + Reliability + Liquidity trend.")
 
-    with tab5:
+    with tab_alerts:
         if not alerts:
             st.success("No alerts generated.")
         else:
             for a in alerts:
-                sev = a["severity"]
-                msg = a["message"]
+                sev = a.get("severity")
+                msg = a.get("message", "")
                 if sev == "high":
                     st.error(msg)
                 elif sev == "med":
                     st.warning(msg)
                 else:
                     st.info(msg)
+
+        st.write("**Top 5 risky members (heuristic)**")
         if top_risky:
-            st.write("**Top (approx) risky members**")
             st.dataframe(pd.DataFrame(top_risky), use_container_width=True)
+        else:
+            st.info("Not enough data to compute top risky members.")
 
-    with tab6:
-        st.caption("Local AI Chat (no API key). Type `help` for examples.")
-        if "local_ai_msgs" not in st.session_state:
-            st.session_state.local_ai_msgs = []
+    with tab_chat:
+        st.caption("System Chat Assistant (free). Type `help` to see commands.")
+        if "system_ai_msgs" not in st.session_state:
+            st.session_state.system_ai_msgs = []
 
-        context = {
-            "member_id": member_id,
-            "member_name": member_name,
-            "final_risk": float(final_risk),
-            "reliability": int(reliability),
-            "dropout": float(dropout),
-            "fraud": float(fraud),
-            "liquidity": liquidity,
-            "alerts": alerts,
-            "loan_reco": {"decision": decision, "reasons": dec_reasons},
+        # minutes text in context will be updated in Minutes tab (stored in session state)
+        minutes_text = st.session_state.get("__latest_minutes_text__", "")
+
+        chat_ctx = {
+            "members": members2,
+            "contrib": contributions,
+            "loans": loans,
+            "payments": loan_payments,
+            "payouts": payouts,
+            "fines": fines,
+            "foundation": foundation_contributions,
             "top_risky": top_risky,
+            "alerts": alerts,
+            "minutes_text": minutes_text,
         }
 
-        for role, msg in st.session_state.local_ai_msgs[-20:]:
+        for role, msg in st.session_state.system_ai_msgs[-20:]:
             with st.chat_message(role):
                 st.markdown(msg)
 
-        q = st.chat_input("Ask: alerts / liquidity / top risky / loan recommendation (or help)")
+        q = st.chat_input("Ask about your system: totals, loan status, member summary, top risky, alerts, minutes…")
         if q:
-            st.session_state.local_ai_msgs.append(("user", q))
-            ans = local_chat_answer(q, context)
+            st.session_state.system_ai_msgs.append(("user", q))
+            ans = system_chat_answer(q, chat_ctx)
             with st.chat_message("assistant"):
                 st.markdown(ans)
-            st.session_state.local_ai_msgs.append(("assistant", ans))
+            st.session_state.system_ai_msgs.append(("assistant", ans))
 
-        with st.expander("🔎 Context (debug)", expanded=False):
-            st.json(context)
+        with st.expander("🔎 Chat context (debug)", expanded=False):
+            st.write(
+                f"members={len(members2)} contrib={len(contributions)} loans={len(loans)} "
+                f"payments={len(loan_payments)} payouts={len(payouts)} fines={len(fines)} foundation={len(foundation_contributions)}"
+            )
 
-    with tab7:
-        st.caption("Generate meeting minutes from your real Njangi tables (no API key).")
+    with tab_minutes:
+        st.caption("Minutes generator (free). Produces copy/paste minutes from your real tables. Optional DB save if `minutes` table exists.")
 
-        # Optional session filter (only if session_id exists in contributions/payouts)
+        # Optional session filter (only affects tables that have session_id, like contributions/payouts)
         session_id = None
         if sessions is not None and not sessions.empty and "id" in sessions.columns:
             s = sessions.copy()
@@ -740,7 +1326,7 @@ def render_ai_suite_panel(
                 if sel != "All data (no session filter)":
                     session_id = int(s.loc[s["label"] == sel, "id"].iloc[0])
 
-        def filt(df: pd.DataFrame) -> pd.DataFrame:
+        def filt_by_session(df: pd.DataFrame) -> pd.DataFrame:
             if session_id is None:
                 return df
             if df is None or df.empty or "session_id" not in df.columns:
@@ -749,15 +1335,15 @@ def render_ai_suite_panel(
             d["session_id"] = _to_int(d["session_id"])
             return d[d["session_id"] == int(session_id)].copy()
 
-        contrib_f = filt(contrib)
-        payouts_f = filt(payouts)
+        contrib_f = filt_by_session(contributions)
+        payouts_f = filt_by_session(payouts)
 
-        meeting_title = st.text_input("Meeting title", value="THE YOUNG SHALL GROW (NJANGI) — Meeting Minutes")
+        meeting_title = st.text_input("Meeting title", value=meeting_title_default)
         meeting_date = st.date_input("Meeting date", value=pd.Timestamp.utcnow().date())
         location = st.text_input("Location (optional)", value="")
         chairperson = st.text_input("Chairperson (optional)", value="")
         secretary = st.text_input("Secretary (optional)", value="")
-        agenda = st.text_area("Agenda (optional)", value="Treasury update, contributions, loans, payouts, fines, risk review, and resolutions.")
+        agenda = st.text_area("Agenda (optional)", value=agenda_default)
 
         minutes_text = build_minutes_text(
             meeting_title=meeting_title,
@@ -766,24 +1352,23 @@ def render_ai_suite_panel(
             chairperson=chairperson,
             secretary=secretary,
             agenda=agenda,
-            members=members_df if members_df is not None else pd.DataFrame(),
+            members=members2,
             contrib=contrib_f,
-            foundation=foundation,
+            foundation=foundation_contributions,
             loans=loans,
-            payments=payments,
+            payments=loan_payments,
             payouts=payouts_f,
             fines=fines,
             top_risky=top_risky,
             alerts=alerts,
         )
 
+        st.session_state["__latest_minutes_text__"] = minutes_text
         st.text_area("Generated Minutes (copy/paste)", value=minutes_text, height=420)
 
-        # Optional save to DB if minutes table exists and client passed
-        can_save = False
+        # Optional DB save
         client = sb_service if sb_service is not None else sb_anon
-        if client is not None:
-            can_save = _table_exists(client, schema, "minutes")
+        can_save = _table_exists(client, schema, "minutes")
 
         if can_save:
             st.info("A `minutes` table exists. You can save this minutes text to the database.")
@@ -800,5 +1385,4 @@ def render_ai_suite_panel(
                 else:
                     st.error("Failed to save minutes.")
                     st.code(msg, language="text")
-        else:
-     st.caption("No `minutes` table found (or no DB client passed). Copy/paste the minutes text, or create a minutes table later.")
+        else:       st.caption("No `minutes` table found (or no DB client passed). Copy/paste the minutes text, or create a minutes table later.")
