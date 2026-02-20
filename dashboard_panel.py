@@ -1,13 +1,20 @@
-# dashboard_panel.py ✅ COMPLETE — Dashboard + 🤖 Young AI View + 🌐 Web Search (Tavily)
-# ------------------------------------------------------------------------------
-# - NJANGI STANDARD (NO legacy)
-# - Works with app.py calling: render_dashboard(sb_anon=..., sb_service=..., schema=...)
-# - Adds: "🤖 Young — Dashboard AI Helper" INSIDE dashboard
-# - Young answers from LIVE snapshot (no guessing)
-# - Adds Web Search: use "web:" prefix (example: web: Maryland cosmetology license requirements)
-# - Web search uses TAVILY_API_KEY from environment (Railway Variables)
-# ------------------------------------------------------------------------------
 
+# dashboard_panel.py ✅ COMPLETE SINGLE FILE — Dashboard + 🤖 Young AI View + 🌐 Web Search (Tavily)
+# ------------------------------------------------------------------------------
+# ✅ NJANGI STANDARD (NO legacy)
+# ✅ Works with app.py calling: render_dashboard(sb_anon=..., sb_service=..., schema=...)
+# ✅ Young AI Helper answers ONLY from LIVE snapshot (no guessing)
+# ✅ Web Search: use "web:" prefix (example: web: Maryland cosmetology license requirements)
+# ✅ Web search uses TAVILY_API_KEY from environment (Railway Variables)
+#
+# ✅ IMPORTANT FIXES (restores your “good dashboard” behavior):
+#   1) AUTO-SELECT SESSION:
+#      - If app_state.current_session_id is missing, it auto-selects latest sessions.id
+#      - (Optional) Can auto-create a session if none exist (toggle below)
+#   2) FIXED BUG: removed accidental filter id=1 in app_state select (was breaking reads)
+#   3) Robust session id resolution:
+#      - supports sessions.id OR sessions.session_id
+# ------------------------------------------------------------------------------
 from __future__ import annotations
 
 import os
@@ -16,8 +23,14 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+import pandas as pd
 import streamlit as st
 from postgrest.exceptions import APIError
+
+# ============================================================
+# SETTINGS
+# ============================================================
+AUTO_CREATE_SESSION_IF_NONE = False  # set True if you want the app to create Cycle 1 automatically
 
 # ============================================================
 # TIME + GREETING
@@ -108,6 +121,27 @@ def _safe_select(
         return []
 
 
+def _safe_insert(client, schema: str, table: str, row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if client is None:
+        return []
+    try:
+        _throttle_db()
+        return (client.schema(schema).table(table).insert(row).execute().data or [])
+    except Exception:
+        return []
+
+
+def _safe_update_eq(client, schema: str, table: str, updates: Dict[str, Any], eq_key: str, eq_val: Any) -> bool:
+    if client is None:
+        return False
+    try:
+        _throttle_db()
+        client.schema(schema).table(table).update(updates).eq(eq_key, eq_val).execute()
+        return True
+    except Exception:
+        return False
+
+
 def _table_readable(client, schema: str, table: str) -> bool:
     if client is None:
         return False
@@ -139,6 +173,96 @@ def _count_distinct(rows: List[Dict[str, Any]], key: str) -> int:
         if r.get(key) is not None:
             s.add(str(r.get(key)))
     return len(s)
+
+
+# ============================================================
+# SESSION BOOTSTRAP (RESTORES "GOOD DASHBOARD" BEHAVIOR)
+# ============================================================
+def _resolve_session_id(raw: Any) -> Optional[int]:
+    if raw is None:
+        return None
+    try:
+        s = str(raw).strip()
+        if not s:
+            return None
+        return int(float(s))
+    except Exception:
+        return None
+
+
+def _get_latest_session_id(sb_read, schema: str) -> Optional[int]:
+    if sb_read is None:
+        return None
+
+    # Try sessions.id first
+    rows = _safe_select(sb_read, schema, "sessions", "id,created_at", order_by="id", desc=True, limit=1, show_error=False)
+    if rows and rows[0].get("id") is not None:
+        sid = _resolve_session_id(rows[0].get("id"))
+        if sid is not None:
+            return sid
+
+    # Fallback: some schemas have sessions.session_id
+    rows = _safe_select(sb_read, schema, "sessions", "session_id,created_at", order_by="session_id", desc=True, limit=1, show_error=False)
+    if rows and rows[0].get("session_id") is not None:
+        sid = _resolve_session_id(rows[0].get("session_id"))
+        if sid is not None:
+            return sid
+
+    return None
+
+
+def _ensure_current_session(sb_anon, sb_service, schema: str) -> Tuple[Optional[int], str]:
+    """
+    Returns (session_id, message). Uses service client to write if available.
+    """
+    sb_read = sb_service if sb_service is not None else sb_anon
+    sb_write = sb_service  # writes only if service provided
+
+    # Read app_state (NO BUG FILTERS)
+    app_state_rows = _safe_select(sb_read, schema, "app_state", "id,current_session_id", limit=1, show_error=False)
+    app_state = app_state_rows[0] if app_state_rows else {}
+    app_state_id = app_state.get("id")
+    current_sid = _resolve_session_id(app_state.get("current_session_id"))
+
+    latest_sid = _get_latest_session_id(sb_read, schema)
+
+    # If no sessions exist
+    if latest_sid is None:
+        if not AUTO_CREATE_SESSION_IF_NONE:
+            return None, "No sessions found. Create a session to start a cycle."
+        # Auto-create a session (best effort)
+        if sb_write is None:
+            return None, "No sessions found and service key missing (cannot auto-create)."
+        name = f"Cycle {pd.Timestamp.utcnow().strftime('%Y-%m-%d')}"
+        created = _safe_insert(sb_write, schema, "sessions", {"name": name, "is_active": True})
+        if created and created[0].get("id") is not None:
+            latest_sid = _resolve_session_id(created[0].get("id"))
+        if latest_sid is None:
+            # maybe created returned session_id instead
+            latest_sid = _resolve_session_id((created[0] or {}).get("session_id")) if created else None
+        if latest_sid is None:
+            return None, "Tried to auto-create a session but failed. Create one manually in Supabase."
+
+    # If app_state missing entirely
+    if not app_state_rows:
+        if sb_write is None:
+            return latest_sid, "Selected latest session (app_state missing; cannot write without service key)."
+        ins = _safe_insert(sb_write, schema, "app_state", {"current_session_id": latest_sid})
+        if ins:
+            return latest_sid, "Selected latest session (app_state created)."
+        return latest_sid, "Selected latest session (app_state create failed)."
+
+    # If app_state exists but current_session_id missing -> set it
+    if current_sid is None:
+        if sb_write is None:
+            return latest_sid, "Selected latest session (current_session_id missing; cannot write without service key)."
+        ok = _safe_update_eq(sb_write, schema, "app_state", {"current_session_id": latest_sid}, "id", app_state_id)
+        if ok:
+            return latest_sid, "Selected latest session (app_state updated)."
+        return latest_sid, "Selected latest session (app_state update failed)."
+
+    # Good
+    return current_sid, "Using current session from app_state."
 
 
 # ============================================================
@@ -321,7 +445,6 @@ def _render_young_ai_view(snapshot: Dict[str, Any]):
         ask = st.button("Ask", key="young_dash_ask", width="stretch")
     with cols[1]:
         if ask:
-            # Route: WEB vs GROUNDED
             if _is_web_query(q):
                 if not _has_tavily_key():
                     st.session_state["young_dash_a"] = (
@@ -368,25 +491,10 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
     sb_read = sb_service if sb_service is not None else sb_anon
 
     # --------------------------------------------------------
-    # Current session
+    # ✅ Ensure we have a usable current session
     # --------------------------------------------------------
-    state = _safe_select(sb_read, schema, "app_state", "*", limit=1, show_error=False, id=1)
-    state = state[0] if state else (_safe_select(sb_read, schema, "app_state", "*", limit=1, show_error=False) or [{}])[0]
-
-    raw_sid = state.get("current_session_id")
-    session_id = None
-    try:
-        session_id = int(raw_sid) if raw_sid is not None and str(raw_sid).strip() else None
-    except Exception:
-        session_id = None
-
-    if session_id is None:
-        s = _safe_select(sb_read, schema, "sessions", "id,session_id,created_at", order_by="session_id", desc=True, limit=1, show_error=False)
-        if s:
-            try:
-                session_id = int(s[0].get("session_id") or s[0].get("id"))
-            except Exception:
-                session_id = None
+    session_id, session_msg = _ensure_current_session(sb_anon=sb_anon, sb_service=sb_service, schema=schema)
+    st.caption(f"📌 Session: {session_msg}")
 
     # --------------------------------------------------------
     # Members
@@ -397,8 +505,9 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
     # --------------------------------------------------------
     # Contributions (session)
     # --------------------------------------------------------
-    contrib_rows = []
+    contrib_rows: List[Dict[str, Any]] = []
     if session_id is not None:
+        # Works when contributions.session_id matches sessions.id
         contrib_rows = _safe_select(
             sb_read,
             schema,
@@ -416,7 +525,7 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
     # --------------------------------------------------------
     # Attendance (session)
     # --------------------------------------------------------
-    attendance_rows = []
+    attendance_rows: List[Dict[str, Any]] = []
     if session_id is not None and _table_readable(sb_read, schema, "attendance"):
         attendance_rows = _safe_select(
             sb_read,
@@ -427,6 +536,7 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
             limit=5000,
             show_error=False,
         )
+
     attendance_total = len(attendance_rows) if attendance_rows else 0
     attendance_present = 0
     for r in attendance_rows:
@@ -439,7 +549,7 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
     # --------------------------------------------------------
     # Loans (active)
     # --------------------------------------------------------
-    loans_rows = []
+    loans_rows: List[Dict[str, Any]] = []
     if _table_readable(sb_read, schema, "loans"):
         loans_rows = _safe_select(
             sb_read,
@@ -451,7 +561,7 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
         )
 
     active_status = {"active", "overdue", "late", "open"}
-    loans_active = []
+    loans_active: List[Dict[str, Any]] = []
     for r in loans_rows:
         stt = str(r.get("status") or "").strip().lower()
         if stt in active_status:
