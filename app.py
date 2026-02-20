@@ -1,21 +1,20 @@
-# app.py ✅ COMPLETE SINGLE CODE — NJANGI STANDARD (NO legacy) — FAST VERSION + SLOW/GENTLE MODE
+# app.py ✅ COMPLETE SINGLE CODE — NJANGI STANDARD (NO legacy) — FAST VERSION + SLOW/GENTLE MODE + 🤖 AI MODE
 # ------------------------------------------------------------------------------
-# ✅ FAST VERSION changes (vs slow default):
-#   - Lower cache TTLs (faster refresh)
-#   - Less heavy view loads by default
-#   - Optional “Fast Mode” toggle to reduce throttling
-#   - Keeps “Slow Mode” for stability (Railway/Supabase free limits)
+# ✅ Adds "AI Mode" (Young) in the app:
+#   - A global AI Assistant expander in the sidebar
+#   - A full "🤖 AI Mode" page (chat + smart shortcuts)
+#   - Can route you to Risk Panel, Njangi LLM, Audit AI
 #
-# ✅ CLEAN + FUTURE-PROOF (Streamlit 2025+):
-#   - Uses width="stretch" (no use_container_width)
+# ✅ Fixes your cache crash:
+#   - Never passes Supabase client into @st.cache_data functions
+#   - Cached functions accept only hashable primitives (url, key, schema, ids)
 #
-# ✅ Fixes “competition/demo data” confusion:
-#   - Shows Supabase project ref + read test
-#   - Warns if keys look invalid
+# ✅ FAST/Slow:
+#   - Fast Mode toggle reduces throttle + shorter cache TTL
+#   - Slow Mode keeps stability for Supabase/Railway limits
 #
-# ✅ Safe against blank-screen crashes:
-#   - Lazy import optional modules
-#   - Safe Mode runs Dashboard only
+# ✅ Safe Mode:
+#   - Dashboard only if other modules break
 #
 # ✅ NJANGI STANDARD objects:
 #   tables: members, sessions, app_state, minutes, attendance, contributions, foundation_contributions,
@@ -203,7 +202,6 @@ SUPABASE_SERVICE_KEY = (get_secret("SUPABASE_SERVICE_KEY") or "").strip()
 SUPABASE_SCHEMA = (get_secret("SUPABASE_SCHEMA", "public") or "public").strip()
 
 # FAST defaults (you can override with secrets):
-# FAST_MODE=1 makes throttle smaller and caches shorter
 FAST_MODE_DEFAULT = str(get_secret("FAST_MODE", "1")).strip() not in ("0", "false", "False", "no", "NO")
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
@@ -237,16 +235,16 @@ sb_service = get_service_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_
 # ============================================================
 # SLOW MODE (THROTTLE DB CALLS) + FAST MODE OVERRIDE
 # ============================================================
-SLOW_MODE = str(get_secret("SLOW_MODE", "1")).strip() not in ("0", "false", "False", "no", "NO")
-MIN_SECONDS_BETWEEN_DB_CALLS = float(get_secret("MIN_SECONDS_BETWEEN_DB_CALLS", "0.35") or "0.35")
+SLOW_MODE_DEFAULT = str(get_secret("SLOW_MODE", "1")).strip() not in ("0", "false", "False", "no", "NO")
+MIN_SECONDS_BETWEEN_DB_CALLS_DEFAULT = float(get_secret("MIN_SECONDS_BETWEEN_DB_CALLS", "0.35") or "0.35")
 
 
 def throttle_db():
-    if not st.session_state.get("_slow_mode_override", SLOW_MODE):
+    if not st.session_state.get("_slow_mode_override", SLOW_MODE_DEFAULT):
         return
     last = st.session_state.get("_last_db_call_ts", 0.0)
     now = time.time()
-    wait = float(st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", MIN_SECONDS_BETWEEN_DB_CALLS)) - (now - last)
+    wait = float(st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", MIN_SECONDS_BETWEEN_DB_CALLS_DEFAULT)) - (now - last)
     if wait > 0:
         time.sleep(wait)
     st.session_state["_last_db_call_ts"] = time.time()
@@ -345,7 +343,6 @@ def show_connected_db_banner():
     st.write("Anon key looks valid:", "✅" if looks_like_jwt(SUPABASE_ANON_KEY) else "❌")
     st.write("Service key set:", "✅" if bool(SUPABASE_SERVICE_KEY) else "❌")
 
-    # Try a tiny read test
     try:
         throttle_db()
         r = sb_anon.schema(SUPABASE_SCHEMA).table("members").select("id").limit(1).execute()
@@ -360,12 +357,70 @@ def show_connected_db_banner():
 
 
 # ============================================================
+# 🤖 AI MODE (Young) — lightweight helper (no external LLM)
+# ============================================================
+def _young_reply(user_text: str) -> str:
+    t = (user_text or "").strip().lower()
+
+    if not t:
+        return "Tell me what you want to do: Dashboard, Contributions, Loans, Payouts, Audit, or a Risk check."
+
+    # Routing / shortcuts
+    if any(k in t for k in ["risk", "ai risk", "default", "probability", "score"]):
+        return "Open **🤖 AI Risk Panel** from the left menu. If it says 'single class', you need loans.status with both good/bad labels."
+    if any(k in t for k in ["llm", "assistant", "njangi llm", "chat with data"]):
+        return "Open **🧠 Njangi LLM** from the left menu — ask questions like: *'How much did we collect this session?'*"
+    if any(k in t for k in ["audit", "logs", "who did", "history"]):
+        return "Open **Audit** page — the AI audit panel can summarize recent actions and errors."
+    if any(k in t for k in ["dashboard", "kpi", "net", "cash available", "pot"]):
+        return "Dashboard shows KPIs. If you want, tell me: *which KPI looks wrong* and I’ll guide you to the table causing it."
+
+    # Quick data help
+    if "rls" in t or "policy" in t:
+        return "If reads fail, it is usually **RLS**. Use **Health** page to see which tables are blocked for anon vs service."
+    if "cache" in t and "unhashable" in t:
+        return "That error happens when a Supabase client is passed into @st.cache_data. We fixed that by caching only (url,key,schema)."
+
+    return (
+        "I can help with:\n"
+        "• **Check errors** (paste the traceback)\n"
+        "• **Explain numbers** (pot/cash/net)\n"
+        "• **Guide actions** (record attendance, create session, approve loans)\n\n"
+        "Ask me a question like: *'Why is Cash Available negative?'*"
+    )
+
+
+def ai_sidebar_assistant():
+    with st.sidebar.expander("🤖 AI Mode (Young)", expanded=False):
+        st.caption("Ask Young anything about your Njangi system (lightweight, no OpenAI).")
+        q = st.text_input("Ask Young", key="young_sidebar_q", placeholder="e.g., Why is Cash Available 0?")
+        if st.button("Ask", key="young_sidebar_btn", width=W_STRETCH):
+            st.session_state["young_last_answer"] = _young_reply(q)
+
+        ans = st.session_state.get("young_last_answer")
+        if ans:
+            st.markdown(ans)
+
+        st.divider()
+        st.caption("Quick actions")
+        if st.button("Go to 🤖 AI Risk Panel", key="go_risk", width=W_STRETCH):
+            st.session_state["main_menu"] = "🤖 AI Risk Panel"
+            st.rerun()
+        if st.button("Go to 🧠 Njangi LLM", key="go_llm", width=W_STRETCH):
+            st.session_state["main_menu"] = "🧠 Njangi LLM"
+            st.rerun()
+        if st.button("Go to Audit", key="go_audit", width=W_STRETCH):
+            st.session_state["main_menu"] = "Audit"
+            st.rerun()
+
+
+# ============================================================
 # TOP BAR
 # ============================================================
 left, right = st.columns([1, 0.30])
 with left:
     st.markdown(f"## 🏦 {APP_BRAND} • Bank Dashboard")
-    if st.session_state.get("_slow_mode_override", SLOW_MODE):
+    if st.session_state.get("_slow_mode_override", SLOW_MODE_DEFAULT):
         st.caption("🐢 Slow Mode ON (reduced DB load)")
     else:
         st.caption("⚡ Fast Mode ON (minimal throttling)")
@@ -390,12 +445,10 @@ with st.sidebar.expander("🛟 Safe Mode", expanded=False):
 with st.sidebar.expander("⚡ Fast / 🐢 Slow Mode", expanded=False):
     st.write("Fast mode reduces throttling. Slow mode protects Supabase limits.")
     fast_on = st.checkbox("Enable Fast Mode", value=FAST_MODE_DEFAULT)
-    slow_on = st.checkbox("Enable Slow Mode", value=(not fast_on) and SLOW_MODE)
+    slow_on = st.checkbox("Enable Slow Mode", value=(not fast_on) and SLOW_MODE_DEFAULT)
 
-    # Resolve: Fast wins if checked
     if fast_on:
         st.session_state["_slow_mode_override"] = False
-        # Small throttle just in case
         st.session_state["MIN_SECONDS_BETWEEN_DB_CALLS_UI"] = 0.05
     else:
         st.session_state["_slow_mode_override"] = bool(slow_on)
@@ -407,14 +460,17 @@ with st.sidebar.expander("⚡ Fast / 🐢 Slow Mode", expanded=False):
             step=0.05,
         )
 
+# Add AI Mode block in sidebar
+ai_sidebar_assistant()
+
 # Effective slow settings
-SLOW_MODE = bool(st.session_state.get("_slow_mode_override", SLOW_MODE))
+SLOW_MODE = bool(st.session_state.get("_slow_mode_override", SLOW_MODE_DEFAULT))
 MIN_SECONDS_BETWEEN_DB_CALLS = float(
-    st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", MIN_SECONDS_BETWEEN_DB_CALLS)
+    st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", MIN_SECONDS_BETWEEN_DB_CALLS_DEFAULT)
 )
 
 # ============================================================
-# CACHED LOADERS (FAST TTLs)
+# CACHED LOADERS (FAST TTLs) — IMPORTANT: NO Supabase client in cache args
 # ============================================================
 MEMBERS_TTL = 120 if not SLOW_MODE else 300
 VIEW_TTL = 90 if not SLOW_MODE else 240
@@ -424,7 +480,6 @@ VIEW_TTL = 90 if not SLOW_MODE else 240
 def load_members(url: str, anon_key: str, schema: str) -> pd.DataFrame:
     client = create_client(url, anon_key)
 
-    # Schema-safe: name OR full_name OR display_name
     cols_try = [
         "id,name,display_name,full_name,phone",
         "id,name,display_name,phone",
@@ -466,7 +521,6 @@ def load_members(url: str, anon_key: str, schema: str) -> pd.DataFrame:
         if c in df.columns:
             df[c] = df[c].astype(str).replace({"None": "", "nan": ""})
 
-    # best name
     def _best_name(r):
         for k in ["display_name", "full_name", "name"]:
             if k in r and str(r.get(k, "")).strip():
@@ -480,7 +534,7 @@ def load_members(url: str, anon_key: str, schema: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=VIEW_TTL, show_spinner=False)
-def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFrame:
+def load_contributions_view(url: str, anon_key: str, schema: str, slow_mode: bool) -> pd.DataFrame:
     client = create_client(url, anon_key)
     throttle_db()
     try:
@@ -489,7 +543,7 @@ def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFram
             .table("v_contributions_with_member")
             .select("id,member_id,member_name,session_id,amount,paid_at,note,created_at")
             .order("created_at", desc=True)
-            .limit(500 if not SLOW_MODE else 350)
+            .limit(500 if not slow_mode else 350)
             .execute()
             .data
             or []
@@ -571,6 +625,7 @@ if SAFE_MODE_UI:
 else:
     PAGES = [
         "Dashboard",
+        "🤖 AI Mode",
         "Contributions",
         "Payouts",
         "Loans",
@@ -590,12 +645,59 @@ page = st.sidebar.radio("Menu", PAGES, key="main_menu")
 if page == "Dashboard":
     render_dashboard(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
 
+elif page == "🤖 AI Mode":
+    st.markdown(glass_open(), unsafe_allow_html=True)
+    st.subheader("🤖 AI Mode (Young)")
+    st.caption("Your Njangi assistant — routing + troubleshooting + guidance (no external LLM).")
+
+    if "young_chat" not in st.session_state:
+        st.session_state["young_chat"] = []
+
+    c1, c2 = st.columns([0.72, 0.28])
+    with c2:
+        st.markdown("### Quick actions")
+        if st.button("Open Dashboard", width=W_STRETCH):
+            st.session_state["main_menu"] = "Dashboard"
+            st.rerun()
+        if st.button("Open 🤖 AI Risk Panel", width=W_STRETCH):
+            st.session_state["main_menu"] = "🤖 AI Risk Panel"
+            st.rerun()
+        if st.button("Open 🧠 Njangi LLM", width=W_STRETCH):
+            st.session_state["main_menu"] = "🧠 Njangi LLM"
+            st.rerun()
+        if st.button("Open Audit", width=W_STRETCH):
+            st.session_state["main_menu"] = "Audit"
+            st.rerun()
+
+        st.divider()
+        st.markdown("### Health tips")
+        st.write("• If a page is blank → enable **Safe Mode**")
+        st.write("• If reads fail → check **Health** page for RLS blocks")
+        st.write("• If cache error → never pass `sb_*` into cache")
+
+    with c1:
+        st.markdown("### Chat")
+        for m in st.session_state["young_chat"]:
+            if m["role"] == "user":
+                st.markdown(f"**You:** {m['text']}")
+            else:
+                st.markdown(f"**Young:** {m['text']}")
+
+        user_q = st.text_input("Ask Young", placeholder="e.g., Why is Cash Available negative?", key="young_page_q")
+        if st.button("Send", width=W_STRETCH):
+            ans = _young_reply(user_q)
+            st.session_state["young_chat"].append({"role": "user", "text": user_q})
+            st.session_state["young_chat"].append({"role": "assistant", "text": ans})
+            st.rerun()
+
+    st.markdown(glass_close(), unsafe_allow_html=True)
+
 elif page == "Contributions":
     st.markdown(glass_open(), unsafe_allow_html=True)
     st.subheader("Contributions")
     st.caption("Stored by member_id. Names shown via view if available.")
 
-    df = load_contributions_view(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
+    df = load_contributions_view(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA, slow_mode=SLOW_MODE)
 
     if df.empty and st.session_state.get("_last_contrib_view_error"):
         st.warning("View v_contributions_with_member failed (error below). Falling back to raw contributions.")
@@ -921,9 +1023,8 @@ elif page == "Minutes & Attendance":
 
         st.divider()
         st.markdown("### 💰 Contributions summary (current session)")
-        dfc = load_contributions_view(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
+        dfc = load_contributions_view(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA, slow_mode=SLOW_MODE)
 
-        # If view is empty, fallback to raw contributions for current session
         if dfc.empty:
             c_rows = safe_select(
                 sb_anon,
@@ -941,11 +1042,8 @@ elif page == "Minutes & Attendance":
         if dfc.empty:
             st.info("No contributions for current session.")
         else:
-            # Normalize columns
             if "amount" in dfc.columns:
                 dfc["amount"] = pd.to_numeric(dfc["amount"], errors="coerce").fillna(0.0)
-
-            # Filter to current session if possible
             if "session_id" in dfc.columns:
                 dfc["session_id"] = pd.to_numeric(dfc["session_id"], errors="coerce")
                 dfc = dfc[dfc["session_id"] == float(current_session_id)].copy()
@@ -953,7 +1051,6 @@ elif page == "Minutes & Attendance":
             total_amt = float(dfc["amount"].sum()) if "amount" in dfc.columns else 0.0
             st.metric("Total contributions (session)", f"{total_amt:,.0f}")
 
-            # Member breakdown if possible
             if "member_name" in dfc.columns:
                 by = (
                     dfc.groupby("member_name", dropna=False)["amount"]
@@ -987,13 +1084,11 @@ elif page == "Admin":
         st.markdown(glass_close(), unsafe_allow_html=True)
         st.stop()
 
-    # Try to load an optional admin module if you have one; otherwise provide minimal session tools here.
     admin_fn, admin_err = lazy_import("admin_panel", "render_admin_panel")
     if admin_fn is not None:
         admin_fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
         st.markdown(glass_close(), unsafe_allow_html=True)
     else:
-        # Minimal built-in Admin: Sessions + set current session
         st.markdown("### 📅 Sessions")
         sessions = safe_select(
             sb_anon,
@@ -1045,7 +1140,6 @@ elif page == "Admin":
         if st.button("Save current_session_id", width=W_STRETCH):
             try:
                 throttle_db()
-                # Prefer id=1, otherwise upsert
                 exists = safe_select(sb_service, "app_state", "id", schema=SUPABASE_SCHEMA, limit=1, show_error=False, id=1)
                 if exists:
                     sb_service.schema(SUPABASE_SCHEMA).table("app_state").update(
@@ -1092,7 +1186,6 @@ elif page == "Audit":
     else:
         st.warning(f"{SUPABASE_SCHEMA}.audit_log not readable (missing table or RLS).")
 
-    # Optional external audit panel
     audit_fn, audit_err = lazy_import("audit_panel", "render_audit_panel")
     if audit_fn is not None:
         st.divider()
