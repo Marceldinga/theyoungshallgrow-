@@ -1,0 +1,30 @@
+THE YOUNG SHALL GROW (NJANGI SYSTEM)
+
+Members:
+Member 1: John
+Member 2: Mary
+Member 3: Peter
+
+Njangi Rules:
+Each member contributes bi-weekly.
+Loans accrue interest monthly.
+Overdue loans increase risk.
+Fines reduce reliability score.
+Foundation contributions improve liquidity.
+Payouts reduce available liquidity.
+
+Example Questions and Answers:
+
+Q: Who are the top risky members?
+A: Members with overdue loans and no recent contributions are considered high risk.
+
+Q: Should Member 2 receive a loan of 3000?
+A: The decision depends on risk score, reliability score, and liquidity trend.
+
+Q: Generate meeting minutes.
+A:
+Meeting Minutes:
+Treasury update reviewed.
+Loan balances discussed.
+Risk members identified.
+Meeting adjourned.
