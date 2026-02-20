@@ -1,25 +1,34 @@
 
 # njangi_llm_panel.py
 # ============================================================
-# 🧠 NJANGI LLM PANEL + ✅ TRAINING (XGBoost) — ADVANCED UPDATE
+# 🧠 NJANGI LLM PANEL + ✅ TRAINING (XGBoost) — ADVANCED + INTERNET
 # - NJANGI STANDARD (NO legacy)
 # - Safe for Railway / Streamlit Cloud
 # - Accepts sb_anon / sb_service / schema (matches app.py)
-# - ✅ Lightweight “LLM” (NO OpenAI):
-#     • Intent + Slots + Grounded answers from Supabase snapshots
-#     • Uses selected member + loan filter as defaults
-#     • Can parse member names from question
-#     • Can introduce herself
-# - ✅ ML training (XGBoost):
-#     • label = 1 for active loans, 0 for closed loans
-#     • ✅ NO sklearn required
-#     • ✅ Safe stratified split for tiny datasets
-#     • ✅ Fallback: trains on ALL data when too small to split
+#
+# ✅ Lightweight “LLM” (NO OpenAI):
+#   • Intent + Slots + Grounded answers from Supabase snapshots
+#   • Uses selected member + loan filter as defaults
+#   • Can parse member names from question
+#   • Can introduce herself
+#
+# ✅ Internet Search (Tavily) — optional:
+#   • Reads TAVILY_API_KEY from Railway Variables (never hardcode)
+#   • Cached with st.cache_data (Slow Mode friendly)
+#   • Shows sources/links
+#   • Privacy guard: does NOT web-search Njangi finance/member questions by default
+#
+# ✅ ML training (XGBoost):
+#   • label = 1 for active loans, 0 for closed loans
+#   • ✅ NO sklearn required
+#   • ✅ Safe stratified split for tiny datasets
+#   • ✅ Fallback: trains on ALL data when too small to split
 # ============================================================
 
 from __future__ import annotations
 
 import math
+import os
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -102,13 +111,6 @@ def _days_since(ts: pd.Timestamp | None) -> float:
     return float((now - ts).total_seconds() / 86400.0)
 
 
-def _sigmoid(z: float) -> float:
-    try:
-        return 1.0 / (1.0 + math.exp(-z))
-    except Exception:
-        return 0.5
-
-
 def _bce_loss(y_true, y_prob, eps: float = 1e-9) -> float:
     # Binary cross-entropy
     n = len(y_true)
@@ -119,57 +121,6 @@ def _bce_loss(y_true, y_prob, eps: float = 1e-9) -> float:
         yp = max(eps, min(1.0 - eps, float(yp)))
         s += -(yt * math.log(yp) + (1 - yt) * math.log(1 - yp))
     return s / n
-
-
-# ============================================================
-# Lightweight Assistant v1 (kept for fallback)
-# ============================================================
-def _simple_answer(question: str) -> str:
-    q = question.lower().strip()
-
-    if any(k in q for k in ["introduce", "introduce yourself", "who are you", "your name"]):
-        return _assistant_intro()
-
-    if any(k in q for k in ["risk", "default", "overdue", "late", "delinquent"]):
-        return (
-            "Risk signals to watch:\n"
-            "• Loans with status like 'overdue' / growing unpaid_interest\n"
-            "• Long time since last payment (last_paid_at)\n"
-            "• Many fines + inconsistent contributions\n"
-            "Tip: Combine these into a score and flag top 5 members weekly."
-        )
-
-    if any(k in q for k in ["contribution", "pay", "deposit"]):
-        return (
-            "Contribution discipline tips:\n"
-            "• Track contributions per session_id and highlight missing members\n"
-            "• Rank top contributors by amount and consistency\n"
-            "• Keep contributions in multiples of 500 (your rule) to simplify auditing"
-        )
-
-    if any(k in q for k in ["loan", "borrow", "interest", "principal"]):
-        return (
-            "Loan monitoring tips:\n"
-            "• principal_current should trend down with payments\n"
-            "• unpaid_interest should not grow for compliant borrowers\n"
-            "• Watch last_paid_at; if > 30 days on active loans, follow up"
-        )
-
-    if any(k in q for k in ["minutes", "attendance"]):
-        return (
-            "Meeting operations:\n"
-            "• Store minutes per session_id for traceability\n"
-            "• Use attendance to justify fines (if your rules allow)\n"
-            "• Produce a summary at the end of each session: present/absent + key decisions"
-        )
-
-    return (
-        "I can help with:\n"
-        "• Member risk insights (active + closed loans)\n"
-        "• Contribution summaries\n"
-        "• Loan monitoring tips\n"
-        "Ask something like: 'Summarize active loans' or 'Show closed loans totals'."
-    )
 
 
 # ============================================================
@@ -189,23 +140,20 @@ def _money(x: float) -> str:
 def _assistant_intro() -> str:
     return (
         "Hi 👋🏾 I’m **Njangi Assistant** — a lightweight helper built into **theyoungshallgrow**.\n\n"
-        "I don’t use external AI services (No OpenAI). I answer using your Njangi data:\n"
-        "• **Members, Contributions, Loans, Fines**\n\n"
-        "What you can ask me:\n"
-        "• **'Loans summary'**, **'Active loans'**, **'Closed loans totals'**\n"
-        "• **'Contribution summary'** or **'Contributions for Marcel'**\n"
-        "• **'Fines summary'**\n"
-        "• **'Risk for Donald'**\n\n"
-        "Tip: Include words like **active / closed / all** to control the loan filter."
+        "I can answer in two ways:\n"
+        "1) **Njangi (your DB)**: loans, contributions, fines, risk — using your Supabase data.\n"
+        "2) **Internet (Tavily)**: general questions (laws, licensing, definitions, tutorials).\n\n"
+        "Try:\n"
+        "• **Loans summary** / **Active loans** / **Closed loans**\n"
+        "• **Contribution summary**\n"
+        "• **Fines summary**\n"
+        "• **Risk for Donald**\n"
+        "• **help**"
     )
 
 
 def _pick_member_from_question(question: str, members_df: pd.DataFrame) -> tuple[int | None, str | None]:
-    """
-    Tries to find a member mentioned in the question by matching name/display_name tokens.
-    Lightweight (no fuzzy libs).
-    Returns (member_id, member_name) or (None, None).
-    """
+    """Find a member mentioned in the question by matching name/display_name tokens. (No fuzzy libs)"""
     if members_df is None or members_df.empty:
         return None, None
 
@@ -283,12 +231,7 @@ def _answer_grounded(
     selected_member_label: str | None,
     loan_filter: str,
 ) -> str:
-    """
-    Grounded assistant:
-    - Uses selected member + loan filter as defaults
-    - Tries to extract member from question and override selection
-    - Returns a bank-style answer with real numbers
-    """
+    """Grounded assistant answers from your DB snapshots."""
     qraw = question.strip()
     if not qraw:
         return "Please type a question."
@@ -362,10 +305,11 @@ def _answer_grounded(
     if intent == "help":
         return (
             "Try asking:\n"
-            "• **'Loans summary'** / **'Active loans'** / **'Closed loans totals'**\n"
-            "• **'Contribution summary'** / **'Contributions for <member>'**\n"
-            "• **'Fines summary'**\n"
-            "• **'Risk for <member>'**\n\n"
+            "• **Loans summary** / **Active loans** / **Closed loans totals**\n"
+            "• **Contribution summary** / **Contributions for <member>**\n"
+            "• **Fines summary**\n"
+            "• **Risk for <member>**\n"
+            "• **Introduce yourself**\n\n"
             "Tip: include **active / closed / all** in your question to control the loan filter."
         )
 
@@ -458,7 +402,6 @@ def _answer_grounded(
             "• Export payout receipts for audit"
         )
 
-    # fallback
     return (
         "I can answer with real numbers if you ask:\n"
         "• **Loans summary** / **Active loans** / **Closed loans**\n"
@@ -470,6 +413,86 @@ def _answer_grounded(
 
 
 # ============================================================
+# Internet Search (Tavily) — optional
+# ============================================================
+def _has_tavily_key() -> bool:
+    return bool(os.getenv("TAVILY_API_KEY", "").strip())
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _tavily_search_cached(query: str, search_depth: str = "basic", max_results: int = 5) -> dict:
+    """
+    Cached Tavily search (1 hour).
+    Uses Authorization: Bearer <key>
+    Endpoint: POST https://api.tavily.com/search
+    """
+    import requests
+
+    api_key = os.getenv("TAVILY_API_KEY", "").strip()
+    if not api_key:
+        return {"error": "Missing TAVILY_API_KEY in environment variables."}
+
+    url = "https://api.tavily.com/search"
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    payload = {
+        "query": query,
+        "search_depth": search_depth,
+        "max_results": int(max_results),
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=20)
+        if r.status_code != 200:
+            return {"error": f"Tavily error {r.status_code}: {r.text[:400]}"}
+        return r.json() if isinstance(r.json(), dict) else {"raw": r.text}
+    except Exception as e:
+        return {"error": f"Request failed: {repr(e)}"}
+
+
+def _should_use_web(intent: str, question: str) -> bool:
+    """
+    Privacy guard:
+    - NEVER web-search Njangi finance/member intents by default.
+    - Web search is for general knowledge: licensing, laws, definitions, how-to guides, etc.
+    """
+    q = _normalize_text(question)
+    if any(k in q for k in ["search web", "internet", "google", "online", "web search", "tavily"]):
+        return True
+    if intent in ("loans", "contributions", "fines", "risk", "payouts", "minutes"):
+        return False
+    return True
+
+
+def _format_web_answer(tav: dict) -> tuple[str, list[dict]]:
+    if not isinstance(tav, dict):
+        return ("I couldn’t read the web results.", [])
+    if "error" in tav:
+        return (f"Internet search failed: {tav['error']}", [])
+
+    results = tav.get("results", []) or []
+    if not results:
+        return ("I searched the web but didn’t find clear results. Try rephrasing.", [])
+
+    bullets = []
+    sources = []
+    for r in results[:5]:
+        title = str(r.get("title", "") or "").strip()
+        url = str(r.get("url", "") or "").strip()
+        content = str(r.get("content", "") or "").strip()
+        score = r.get("score", None)
+
+        if content:
+            bullets.append(f"• {content[:220].rstrip()}…")
+        sources.append({"title": title, "url": url, "score": score})
+
+    summary = "Here’s what I found online (top results):\n" + "\n".join(bullets[:3])
+    return (summary, sources)
+
+
+# ============================================================
 # ML: build training dataset
 # ============================================================
 def _build_training_frame(
@@ -478,27 +501,19 @@ def _build_training_frame(
     loans_df: pd.DataFrame,
     fines_df: pd.DataFrame,
 ) -> pd.DataFrame:
-    """
-    Train on LOAN rows (not member rows).
-    Label: active=1, closed=0
-    Features per loan + member aggregates.
-    """
     if loans_df is None or loans_df.empty:
         return pd.DataFrame()
 
     df = loans_df.copy()
-
     if "status_norm" not in df.columns:
         df["status_norm"] = df.get("status", "").apply(_norm_status)
 
-    # labels: active vs closed only
     df = df[df["status_norm"].isin(["active", "closed"])].copy()
     if df.empty:
         return pd.DataFrame()
 
     df["y"] = (df["status_norm"] == "active").astype(int)
 
-    # parse dates
     df["last_paid_dt"] = df.get("last_paid_at", None).apply(_parse_dt) if "last_paid_at" in df.columns else None
     df["created_dt"] = df.get("created_at", None).apply(_parse_dt) if "created_at" in df.columns else None
 
@@ -510,18 +525,11 @@ def _build_training_frame(
 
     df["days_since_last_paid"] = df.apply(_ds, axis=1)
     df["days_since_last_paid"] = pd.to_numeric(df["days_since_last_paid"], errors="coerce")
-
-    # median fallback (if all nan -> 0)
-    if df["days_since_last_paid"].notna().any():
-        med = float(df["days_since_last_paid"].median())
-    else:
-        med = 0.0
+    med = float(df["days_since_last_paid"].median()) if df["days_since_last_paid"].notna().any() else 0.0
     df["days_since_last_paid"] = df["days_since_last_paid"].fillna(med)
 
-    # numeric cols
     df = _to_numeric_cols(df, ["principal", "principal_current", "total_due", "unpaid_interest"])
 
-    # member aggregates: contributions
     if contrib_df is not None and not contrib_df.empty and "member_id" in contrib_df.columns:
         c = contrib_df.copy()
         c = _to_numeric_cols(c, ["amount"])
@@ -529,7 +537,6 @@ def _build_training_frame(
     else:
         contrib_tot = pd.DataFrame(columns=["member_id", "member_contrib_total"])
 
-    # member aggregates: fines
     if fines_df is not None and not fines_df.empty and "member_id" in fines_df.columns:
         f = fines_df.copy()
         if "amount" in f.columns:
@@ -540,10 +547,8 @@ def _build_training_frame(
     else:
         fines_tot = pd.DataFrame(columns=["member_id", "member_fines_total"])
 
-    # member aggregates: loan counts (using df that already filtered to active/closed)
     loan_counts = df.groupby("member_id", dropna=False).size().reset_index(name="member_loan_count")
 
-    # merge aggregates
     df = df.merge(contrib_tot, on="member_id", how="left")
     df = df.merge(fines_tot, on="member_id", how="left")
     df = df.merge(loan_counts, on="member_id", how="left")
@@ -552,7 +557,6 @@ def _build_training_frame(
     df["member_fines_total"] = pd.to_numeric(df["member_fines_total"], errors="coerce").fillna(0)
     df["member_loan_count"] = pd.to_numeric(df["member_loan_count"], errors="coerce").fillna(1)
 
-    # optional member name
     if members_df is not None and not members_df.empty and "id" in members_df.columns:
         m = members_df.copy()
         if "display_name" in m.columns:
@@ -596,7 +600,6 @@ def _build_training_frame(
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
-    # normalize types for ids
     if "member_id" in df.columns:
         df["member_id"] = pd.to_numeric(df["member_id"], errors="coerce")
 
@@ -605,11 +608,10 @@ def _build_training_frame(
 
 def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
     """
-    Trains XGBoost classifier if available.
     ✅ NO sklearn required.
     ✅ Safe on tiny datasets:
-      - Manual stratified split (keeps both classes in train/test)
-      - Fallback: train on all rows if too small to split safely
+      - Manual stratified split
+      - Fallback: train on all rows
     Returns: (model, metrics_dict, feature_cols, df_with_preds)
     """
     try:
@@ -620,11 +622,9 @@ def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
 
     if df is None or df.empty:
         return None, {"error": "No training data."}, [], df
-
     if "y" not in df.columns:
         return None, {"error": "Missing label column 'y'."}, [], df
 
-    # require both classes overall
     y_all = df["y"].astype(int).values
     classes, counts = np.unique(y_all, return_counts=True)
     class_counts = {int(c): int(n) for c, n in zip(classes, counts)}
@@ -665,8 +665,6 @@ def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
 
     rng = np.random.default_rng(int(seed))
 
-    # If dataset is tiny or a class is too small, do not split.
-    # Need at least 2 rows per class to put 1 in train and 1 in test safely.
     if len(y_all) < 8 or min(counts) < 2:
         model.fit(X_all, y_all)
         out = df.copy()
@@ -679,11 +677,10 @@ def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
             "logloss_test": float("nan"),
             "pos_rate": float(df["y"].mean()),
             "class_counts": class_counts,
-            "note": "Trained on ALL rows (dataset too small to split safely). Add more CLOSED loans for validation.",
+            "note": "Trained on ALL rows (dataset too small to split). Add more CLOSED loans for validation.",
         }
         return model, metrics, feature_cols, out
 
-    # Manual stratified split (NO sklearn)
     idx0 = np.where(y_all == 0)[0]
     idx1 = np.where(y_all == 1)[0]
     rng.shuffle(idx0)
@@ -706,7 +703,6 @@ def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
     X_train, y_train = X_all[train_idx], y_all[train_idx]
     X_test, y_test = X_all[test_idx], y_all[test_idx]
 
-    # final guard
     if len(np.unique(y_train)) < 2:
         model.fit(X_all, y_all)
         out = df.copy()
@@ -719,13 +715,12 @@ def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
             "logloss_test": float("nan"),
             "pos_rate": float(df["y"].mean()),
             "class_counts": class_counts,
-            "note": "Fallback: split produced one-class train. Trained on ALL rows.",
+            "note": "Fallback: one-class train after split. Trained on ALL rows.",
         }
         return model, metrics, feature_cols, out
 
     model.fit(X_train, y_train)
 
-    # preds + metrics (NO sklearn)
     p_test = model.predict_proba(X_test)[:, 1]
     yhat_test = (p_test >= 0.5).astype(int)
     acc = float((yhat_test == y_test).mean()) if len(y_test) else float("nan")
@@ -752,11 +747,10 @@ def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
 # ============================================================
 def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public"):
     st.title("🧠 Njangi LLM (Lightweight) + Training")
-    st.caption("Rule-based insights + grounded answers + optional ML training (XGBoost).")
+    st.caption("Grounded Njangi answers + optional Internet Search (Tavily) + ML training (XGBoost).")
 
     st.markdown("---")
 
-    # ✅ Use service client when available (more reliable than anon for analytics)
     sb_read = sb_service if sb_service is not None else sb_anon
 
     # ---------- Load snapshots ----------
@@ -787,16 +781,14 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
     )
     fines_df = pd.DataFrame(_try_read(sb_read, schema, "fines", "*", limit=5000, order_by="created_at", desc=True))
 
-    # numeric cleanup
     contrib_df = _to_numeric_cols(contrib_df, ["amount"])
     loans_df = _to_numeric_cols(loans_df, ["principal", "principal_current", "total_due", "unpaid_interest"])
     fines_df = _to_numeric_cols(fines_df, ["amount"])
 
-    # normalize loan status
     if not loans_df.empty:
         loans_df["status_norm"] = loans_df.get("status", "").apply(_norm_status)
 
-    # ---------- KPIs (top line) ----------
+    # ---------- KPIs ----------
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Members", f"{_safe_count(members_df):,}")
     c2.metric("Contrib rows", f"{_safe_count(contrib_df):,}")
@@ -822,7 +814,7 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
             member_id = int(row["id"])
             member_label = str(row["member_name"])
     else:
-        st.warning("Could not load members. Panel will still work with generic answers.")
+        st.warning("Could not load members. Panel will still work with general answers.")
 
     # ---------- Loans filter ----------
     st.subheader("🏦 Loans filter")
@@ -837,8 +829,19 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
 
     # ---------- Snapshot ----------
     st.subheader("📌 Snapshot")
+    if member_id is None:
+        st.write("All-members snapshot:")
+        st.write(f"• Total contributions amount: **${_safe_sum(contrib_df, 'amount'):,.0f}**")
+        st.write(f"• Total loan principal ({loan_filter}): **${_safe_sum(loans_view, 'principal'):,.0f}**")
+        st.write(f"• Total current balances ({loan_filter}): **${_safe_sum(loans_view, 'principal_current'):,.0f}**")
+        st.write(f"• Total unpaid interest ({loan_filter}): **${_safe_sum(loans_view, 'unpaid_interest'):,.0f}**")
 
-    if member_id is not None:
+        if not loans_df.empty and "status_norm" in loans_df.columns:
+            st.caption(
+                "Loan status counts: "
+                + ", ".join([f"{k}={int(v)}" for k, v in loans_df["status_norm"].value_counts().to_dict().items()])
+            )
+    else:
         mc = (
             contrib_df[contrib_df.get("member_id").astype(str) == str(member_id)].copy()
             if not contrib_df.empty and "member_id" in contrib_df.columns
@@ -847,11 +850,6 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
         ml_all = (
             loans_df[loans_df.get("member_id").astype(str) == str(member_id)].copy()
             if not loans_df.empty and "member_id" in loans_df.columns
-            else pd.DataFrame()
-        )
-        ml = (
-            loans_view[loans_view.get("member_id").astype(str) == str(member_id)].copy()
-            if not loans_view.empty and "member_id" in loans_view.columns
             else pd.DataFrame()
         )
         mf = (
@@ -874,7 +872,6 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
 
         st.caption(f"Member: **{member_label}** • Loan filter: **{loan_filter}** • Generated: {_now_iso()}")
 
-        # simple heuristic
         risk = 0
         if unpaid_interest_all > 0:
             risk += 35
@@ -888,23 +885,10 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
         risk = min(100, risk)
         st.info(f"Quick heuristic risk score: **{risk}/100** (rules).")
 
-    else:
-        st.write("All-members snapshot:")
-        st.write(f"• Total contributions amount: **${_safe_sum(contrib_df, 'amount'):,.0f}**")
-        st.write(f"• Total loan principal ({loan_filter}): **${_safe_sum(loans_view, 'principal'):,.0f}**")
-        st.write(f"• Total current balances ({loan_filter}): **${_safe_sum(loans_view, 'principal_current'):,.0f}**")
-        st.write(f"• Total unpaid interest ({loan_filter}): **${_safe_sum(loans_view, 'unpaid_interest'):,.0f}**")
-
-        if not loans_df.empty and "status_norm" in loans_df.columns:
-            st.caption(
-                "Loan status counts: "
-                + ", ".join([f"{k}={int(v)}" for k, v in loans_df["status_norm"].value_counts().to_dict().items()])
-            )
-
     st.markdown("---")
 
     # ============================================================
-    # ✅ TRAINING SECTION (XGBoost)
+    # ✅ TRAINING (XGBoost)
     # ============================================================
     st.subheader("🧪 Training (XGBoost)")
     st.caption("Label: active=1, closed=0 (trained on loan rows). No sklearn required.")
@@ -941,7 +925,6 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
                 st.caption("Features used:")
                 st.code(", ".join(feature_cols), language="text")
 
-                # show "risk" as 1 - p_active (more intuitive)
                 if pred_df is not None and not pred_df.empty and "member_id" in pred_df.columns and "p_active" in pred_df.columns:
                     tmp = pred_df.copy()
                     tmp["member_id"] = pd.to_numeric(tmp["member_id"], errors="coerce")
@@ -960,16 +943,7 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
                 st.markdown("### 🔎 Sample predictions (loan rows)")
                 show_cols = [
                     c
-                    for c in [
-                        "id",
-                        "member_id",
-                        "member_name",
-                        "y",
-                        "p_active",
-                        "principal_current",
-                        "unpaid_interest",
-                        "days_since_last_paid",
-                    ]
+                    for c in ["id", "member_id", "member_name", "y", "p_active", "principal_current", "unpaid_interest", "days_since_last_paid"]
                     if pred_df is not None and c in pred_df.columns
                 ]
                 if pred_df is not None and show_cols:
@@ -978,29 +952,57 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
     st.markdown("---")
 
     # ============================================================
-    # ✅ Q&A (Advanced Assistant)
+    # ✅ Q&A (Advanced Assistant + Optional Internet)
     # ============================================================
     st.subheader("💬 Ask the Njangi Assistant")
 
-    # Friendly intro (button + optional always-on)
-    colA, colB = st.columns([1, 2])
-    with colA:
+    left, right = st.columns([1.2, 1.8])
+    with left:
         intro_btn = st.button("👋 Introduce yourself")
-    with colB:
-        st.caption("Tip: Ask 'Loans summary', 'Risk for Donald', 'Active loans', 'Contribution summary', or 'help'.")
+    with right:
+        st.caption("Try: 'Loans summary', 'Risk for Donald', 'Contribution summary', or 'help'.")
 
     if intro_btn:
         st.success("Assistant response")
         st.write(_assistant_intro())
 
-    question = st.text_area("Type a question (e.g., 'Explain risk', 'Loan tips', 'Contribution summary')")
+    with st.expander("🌍 Internet Search (Tavily) — optional", expanded=False):
+        if not _has_tavily_key():
+            st.warning("TAVILY_API_KEY not found. Add it in Railway → Shared Variables.")
+            use_web = st.checkbox("Use Internet Search", value=False, disabled=True)
+            depth = "basic"
+            max_results = 5
+        else:
+            use_web = st.checkbox("Use Internet Search", value=True)
+            depth = st.selectbox("Search depth", ["basic", "advanced"], index=0)
+            max_results = st.slider("Max results", min_value=3, max_value=10, value=5, step=1)
+            st.caption("Privacy: Njangi finance/member questions stay local by default. Web search is for general questions.")
+
+    question = st.text_area("Type a question (e.g., 'Maryland cosmetology license requirements', 'What is XGBoost?')")
 
     if st.button("Analyze"):
         if not question.strip():
             st.warning("Please enter a question.")
         else:
             st.success("Assistant response")
-            try:
+
+            intent = _detect_intent(question)
+            if use_web and _should_use_web(intent, question):
+                tav = _tavily_search_cached(query=question.strip(), search_depth=depth, max_results=int(max_results))
+                summary, sources = _format_web_answer(tav)
+
+                st.write(summary)
+
+                if sources:
+                    st.markdown("**Sources:**")
+                    for s in sources[: int(max_results)]:
+                        title = s.get("title") or s.get("url") or "Source"
+                        url = s.get("url") or ""
+                        if url:
+                            st.markdown(f"- [{title}]({url})")
+                        else:
+                            st.markdown(f"- {title}")
+            else:
                 st.write(
                     _answer_grounded(
                         question=question,
@@ -1013,8 +1015,5 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
                         loan_filter=loan_filter,
                     )
                 )
-            except Exception:
-                # ultra-safe fallback (never crash the page)
-                st.write(_simple_answer(question))
 
-    st.caption("Lightweight assistant + Grounded answers + Training • XGBoost • Safe for Railway/Streamlit Cloud")
+    st.caption("Lightweight assistant + Grounded answers + Optional Internet (Tavily) + Training • Safe for Railway/Streamlit Cloud")
