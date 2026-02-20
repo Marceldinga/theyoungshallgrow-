@@ -10,7 +10,7 @@
 #   - API-level session filters (no "download all then filter")
 #   - Low limits, progressive loading, cached reads (TTL)
 #   - Attendance PDF generated ON DEMAND
-#   - Optional "Refresh snapshot" button clears cache
+#   - "Refresh snapshot" button clears cache
 #
 # ✅ Data safety / schema-safe:
 #   - members.display_name optional
@@ -18,6 +18,11 @@
 #   - interest_ledger: NO aggregates (PGRST123 safe), Python sums
 #   - payouts: payout_amount/payout_date or amount/created_at
 #   - loan_payments: uses paid_at or created_at
+#
+# ✅ CRITICAL FIX (your error):
+#   - Streamlit cache cannot hash supabase client objects.
+#   - ALL @st.cache_data functions use `_sb` (leading underscore) so Streamlit
+#     will NOT attempt to hash the Supabase client. (UnhashableParamError fixed)
 #
 # TABLES (NEW ONLY):
 #   app_state, sessions, members, contributions, foundation_contributions,
@@ -29,7 +34,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
-from typing import Any, Optional
+from typing import Any
 
 import pandas as pd
 import streamlit as st
@@ -289,10 +294,11 @@ def _utc_now() -> datetime:
 
 # ============================================================
 # AUTO-REFRESH on app_state stamp change (includes updated_at)
+# ✅ FIX: cached function uses `_sb` so Streamlit doesn't hash Supabase client
 # ============================================================
 @st.cache_data(ttl=TTL_STATE, show_spinner=False)
-def _read_state_stamp_cached(url_key: str, schema: str, sb) -> str:
-    r = safe_single(sb, schema, "app_state", "*", id=1) or {}
+def _read_state_stamp_cached(url_key: str, schema: str, _sb) -> str:
+    r = safe_single(_sb, schema, "app_state", "*", id=1) or {}
     return "|".join(
         [
             str(r.get("current_session_id") or ""),
@@ -304,8 +310,7 @@ def _read_state_stamp_cached(url_key: str, schema: str, sb) -> str:
 
 
 def _auto_refresh_if_state_changed(sb, schema: str):
-    # cache key = schema + a stable marker; sb itself is not hashed in cache_data signature here (passed but ok)
-    stamp = _read_state_stamp_cached(url_key=f"{schema}", schema=schema, sb=sb)
+    stamp = _read_state_stamp_cached(url_key=f"{schema}", schema=schema, _sb=sb)
     prev = st.session_state.get("_state_stamp_dashboard")
     st.session_state["_state_stamp_dashboard"] = stamp
     if prev is None:
@@ -430,8 +435,11 @@ def compute_loans_kpis(sb, schema: str, limit: int = 2500) -> dict[str, Any]:
 
     for r in rows or []:
         status = str(r.get("status") or "").lower().strip()
+
         if status in ("active", "open"):
             active += 1
+
+            # some systems mark overdue with tokens in status while still "active"
             if any(t in status for t in bad_tokens):
                 overdue += 1
 
@@ -441,7 +449,14 @@ def compute_loans_kpis(sb, schema: str, limit: int = 2500) -> dict[str, Any]:
             td = _num(r.get("total_due"), pc + _num(r.get("unpaid_interest"), 0.0))
             total_due_sum += td
 
-        # Some DBs store overdue in status while still active; above token handles that.
+        # if your DB uses status="overdue" as active loan, count it too:
+        if status in ("overdue", "late", "delinquent", "default"):
+            active += 1
+            overdue += 1
+            pc = _num(r.get("principal_current") or r.get("principal"), 0.0)
+            principal_sum += pc
+            td = _num(r.get("total_due"), pc + _num(r.get("unpaid_interest"), 0.0))
+            total_due_sum += td
 
     return {
         "active_loans": int(active),
@@ -508,7 +523,7 @@ def build_repayment_plan(sb, schema: str, last_payment_dates: dict[int, date], l
     today = date.today()
     for r in loans or []:
         status = str(r.get("status") or "").lower().strip()
-        if status not in ("active", "open"):
+        if status not in ("active", "open", "overdue", "late", "delinquent", "default"):
             continue
 
         try:
@@ -762,20 +777,19 @@ def generate_attendance_pdf_bytes(session_id: int, session_window: str, df: pd.D
 
     c.setFont("Helvetica-Oblique", 9)
     c.drawString(x, max(margin - 10, 20), "theyoungshallgrow • Attendance PDF")
-
     c.save()
     return buf.getvalue()
 
 
 # ============================================================
 # Cached loaders (fast + safe)
+# ✅ FIX: all cached loaders use `_sb` (supabase client is not hashed)
 # ============================================================
 @st.cache_data(ttl=TTL_SMALL, show_spinner=False)
-def _load_members(schema: str, sb) -> list[dict]:
-    rows = safe_table(sb, schema, "members", "id,name,display_name,phone", limit=5000, order_by="id", desc=False)
+def _load_members(schema: str, _sb) -> list[dict]:
+    rows = safe_table(_sb, schema, "members", "id,name,display_name,phone", limit=5000, order_by="id", desc=False)
     if not rows:
-        rows = safe_table(sb, schema, "members", "id,name,phone", limit=5000, order_by="id", desc=False)
-    # dedupe
+        rows = safe_table(_sb, schema, "members", "id,name,phone", limit=5000, order_by="id", desc=False)
     seen = set()
     out = []
     for r in rows or []:
@@ -788,18 +802,18 @@ def _load_members(schema: str, sb) -> list[dict]:
 
 
 @st.cache_data(ttl=TTL_SMALL, show_spinner=False)
-def _load_app_state(schema: str, sb) -> dict:
-    stt = safe_single(sb, schema, "app_state", "*", id=1)
+def _load_app_state(schema: str, _sb) -> dict:
+    stt = safe_single(_sb, schema, "app_state", "*", id=1)
     if stt:
         return stt
-    rows = safe_table(sb, schema, "app_state", "*", limit=1)
+    rows = safe_table(_sb, schema, "app_state", "*", limit=1)
     return rows[0] if rows else {}
 
 
 @st.cache_data(ttl=TTL_SMALL, show_spinner=False)
-def _load_latest_session(schema: str, sb) -> dict:
+def _load_latest_session(schema: str, _sb) -> dict:
     srows = safe_table_order_fallback(
-        sb,
+        _sb,
         schema,
         "sessions",
         "id,session_id,start_date,end_date,session_date,created_at",
@@ -811,11 +825,11 @@ def _load_latest_session(schema: str, sb) -> dict:
 
 
 @st.cache_data(ttl=TTL_MED, show_spinner=False)
-def _load_cycle_contribs(schema: str, sb, session_id: int) -> pd.DataFrame:
-    if not session_id or not _table_exists(sb, schema, "contributions"):
+def _load_cycle_contribs(schema: str, _sb, session_id: int) -> pd.DataFrame:
+    if not session_id or not _table_exists(_sb, schema, "contributions"):
         return pd.DataFrame()
     rows = safe_table(
-        sb,
+        _sb,
         schema,
         "contributions",
         "member_id,session_id,amount,paid_at,created_at",
@@ -828,11 +842,10 @@ def _load_cycle_contribs(schema: str, sb, session_id: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=TTL_MED, show_spinner=False)
-def _load_active_loans(schema: str, sb) -> pd.DataFrame:
-    if not _table_exists(sb, schema, "loans"):
+def _load_active_loans(schema: str, _sb) -> pd.DataFrame:
+    if not _table_exists(_sb, schema, "loans"):
         return pd.DataFrame()
-    # we keep limit small for speed, kpis cover sums, this table is for the "alerts" and plan
-    rows = safe_table(sb, schema, "loans", "*", limit=2500)
+    rows = safe_table(_sb, schema, "loans", "*", limit=2500)
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
@@ -842,13 +855,11 @@ def _load_active_loans(schema: str, sb) -> pd.DataFrame:
 def _build_alerts(*, cash_available_raw: float, pot: float, loans_kpis: dict, members_paid: int, total_members: int) -> list[dict]:
     alerts = []
 
-    # Liquidity
     if cash_available_raw < 0:
         alerts.append({"sev": "high", "msg": "Liquidity tight: outstanding principal is greater than cash inflows."})
     elif cash_available_raw < 1000:
         alerts.append({"sev": "med", "msg": "Liquidity low: consider limiting new loan approvals."})
 
-    # Participation
     if total_members > 0:
         rate = members_paid / max(total_members, 1)
         if rate < 0.60:
@@ -856,7 +867,6 @@ def _build_alerts(*, cash_available_raw: float, pot: float, loans_kpis: dict, me
         elif rate < 0.85:
             alerts.append({"sev": "low", "msg": f"Participation moderate: {members_paid}/{total_members} members paid."})
 
-    # Loans
     overdue = int(loans_kpis.get("overdue_active", 0))
     active = int(loans_kpis.get("active_loans", 0))
     if overdue > 0:
@@ -864,7 +874,6 @@ def _build_alerts(*, cash_available_raw: float, pot: float, loans_kpis: dict, me
     elif active >= 5:
         alerts.append({"sev": "low", "msg": f"{active} active loans — monitor repayment cadence."})
 
-    # Pot health
     if pot <= 0 and total_members > 0:
         alerts.append({"sev": "low", "msg": "Current pot is 0 — confirm contributions are being recorded for this session."})
 
@@ -892,6 +901,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     read_sb = sb_service if sb_service is not None else sb_anon
     finance_sb = sb_service if sb_service is not None else sb_anon
 
+    # ✅ fixes your crash: cached stamp reader uses `_sb`
     _auto_refresh_if_state_changed(read_sb, schema)
 
     # Top controls
@@ -1111,7 +1121,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
             st.markdown(glass_open(), unsafe_allow_html=True)
             st.markdown("#### 🗓️ Repayment plan")
             st.caption(f"Due = {DUE_DAYS} days from last payment (or borrow_date if never paid).")
-            # Add simple urgency tag
+
             if "days_to_due" in plan_df.columns:
                 plan_df2 = plan_df.copy()
                 plan_df2["urgency"] = plan_df2["days_to_due"].apply(
@@ -1121,6 +1131,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
                 st.dataframe(plan_df2, width=W_STRETCH, hide_index=True)
             else:
                 st.dataframe(plan_df, width=W_STRETCH, hide_index=True)
+
             st.markdown(glass_close(), unsafe_allow_html=True)
 
     st.divider()
@@ -1163,9 +1174,11 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     else:
         dfc2 = dfc.copy()
         dfc2["amount"] = pd.to_numeric(dfc2.get("amount", 0), errors="coerce").fillna(0.0)
-        # join member names (in python, no view required)
+
         name_map = _member_name_map(members_rows)
-        dfc2["member_name"] = dfc2["member_id"].apply(lambda x: name_map.get(int(x), f"Member {int(x):02d}") if str(x).isdigit() else "—")
+        dfc2["member_name"] = dfc2["member_id"].apply(
+            lambda x: name_map.get(int(x), f"Member {int(x):02d}") if str(x).isdigit() else "—"
+        )
 
         top = (
             dfc2.groupby(["member_id", "member_name"], dropna=False)["amount"]
@@ -1181,9 +1194,7 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
             st.markdown("#### Top contributors (this session)")
             st.dataframe(top, width=W_STRETCH, hide_index=True)
         with c2:
-            # simple sparkline-style chart using Streamlit native
             daily = dfc2.copy()
-            # bucket by day
             dt_col = "paid_at" if "paid_at" in daily.columns else "created_at"
             daily[dt_col] = pd.to_datetime(daily.get(dt_col), errors="coerce")
             daily["day"] = daily[dt_col].dt.date
