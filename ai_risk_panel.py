@@ -342,15 +342,29 @@ def _build_member_features(
             p["paid_at"] = _to_dt_utc(p.get("created_at", pd.NaT))
 
         grp = p.groupby("member_id", dropna=False)
-        pfeat = pfeat.merge(grp["amount"].count().rename("pay_count"), left_on="member_id", right_index=True, how="left")
-        pfeat = pfeat.merge(grp["amount"].sum().rename("pay_total"), left_on="member_id", right_index=True, how="left")
-        pfeat = pfeat.merge(grp["paid_at"].max().rename("pay_last_dt"), left_on="member_id", right_index=True, how="left")
-    else:
-        pfeat["pay_count"] = 0
-        pfeat["pay_total"] = 0.0
-        pfeat["pay_last_dt"] = pd.NaT
+        pfeat = pfeat.merge
+        (grp["amount"].count().rename("pay_count"), left_on="member_id", right_index=True, how="left")
+        # ============================================================
+# Payout aggregation (FIXED for payout_amount)
+# ============================================================
 
-    pfeat["days_since_last_payment"] = _days_since(now, pfeat["pay_last_dt"])
+payouts = (
+    supabase.table("payouts")
+    .select("payout_amount")
+    .eq("member_id", member_id)
+    .execute()
+)
+
+payout_data = payouts.data or []
+
+pay_count = len(payout_data)
+
+pay_total = (
+    sum(float(p["payout_amount"]) for p in payout_data)
+    if payout_data else 0
+)
+
+        
 
     # Fines
     ffeat = base.copy()
