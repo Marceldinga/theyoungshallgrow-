@@ -1,40 +1,26 @@
-
-# app.py ✅ COMPLETE SINGLE CODE — NJANGI STANDARD (NO legacy) — “SLOW / GENTLE MODE”
+# app.py ✅ COMPLETE SINGLE CODE — NJANGI STANDARD (NO legacy) — FAST VERSION + SLOW/GENTLE MODE
 # ------------------------------------------------------------------------------
-# ✅ CLEAN + FUTURE-PROOF (Streamlit 2025+):
-#    - Replaces use_container_width=True ✅ with width="stretch"
-#    - Uses a single constant W_STRETCH
+# ✅ FAST VERSION changes (vs slow default):
+#   - Lower cache TTLs (faster refresh)
+#   - Less heavy view loads by default
+#   - Optional “Fast Mode” toggle to reduce throttling
+#   - Keeps “Slow Mode” for stability (Railway/Supabase free limits)
 #
-# ✅ Fixes "loads but shows competition/demo data" by:
-#    - Displaying connected Supabase project ref (host prefix)
-#    - Warning if URL/keys look mismatched
-#    - Showing real DB errors (no silent empty returns)
-#    - Schema-safe members loader (works with/without display_name)
-#    - Health page checks table/view readability
+# ✅ CLEAN + FUTURE-PROOF (Streamlit 2025+):
+#   - Uses width="stretch" (no use_container_width)
+#
+# ✅ Fixes “competition/demo data” confusion:
+#   - Shows Supabase project ref + read test
+#   - Warns if keys look invalid
 #
 # ✅ Safe against blank-screen crashes:
-#    - Optional modules are lazy-imported inside pages
-#    - Visible secrets/env validation
-#    - Service key optional (writes disabled if missing)
-#    - Safe Mode switch to run Dashboard-only
+#   - Lazy import optional modules
+#   - Safe Mode runs Dashboard only
 #
-# ✅ "SLOW MODE" to reduce Supabase load:
-#    - Global throttle between DB calls
-#    - cache_data TTLs
-#    - Refresh clears cache_data only
-#
-# ✅ Uses NEW tables/views only:
+# ✅ NJANGI STANDARD objects:
 #   tables: members, sessions, app_state, minutes, attendance, contributions, foundation_contributions,
 #           payouts, loans, loan_payments, fines, interest_ledger, audit_log
 #   views (optional): v_next_beneficiary, v_contributions_with_member, v_attendance_with_member
-#
-# ✅ ADDED:
-#   - "🧠 Njangi LLM" page (lazy-imports njangi_llm_panel.render_njangi_llm_panel)
-#
-# ✅ FIXED (Railway):
-#   - sys.path injection so sibling modules import reliably
-#   - lazy_import uses importlib.import_module
-#   - Njangi LLM page calls fn(sb_anon=..., sb_service=..., schema=...)
 # ------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -70,14 +56,13 @@ st.set_page_config(
 # =========================
 # UI CONSTANTS
 # =========================
-W_STRETCH = "stretch"  # Streamlit replacement for use_container_width=True
+W_STRETCH = "stretch"
 
 # ============================================================
 # TIME
 # ============================================================
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 # ============================================================
 # GLOBAL THEME (Midnight Navy + Emerald)
@@ -89,10 +74,8 @@ def inject_global_theme():
         :root{
             --bg0: #0B1426;
             --bg1: #0F1C35;
-
             --text: #EAF0FF;
             --muted: #A9B6D3;
-
             --primary: #00C896;
             --primary2:#00E6A8;
             --link: #60A5FA;
@@ -122,9 +105,7 @@ def inject_global_theme():
         }
 
         html, body, p, div, span, label, small,
-        h1, h2, h3, h4, h5, h6 {
-            color: var(--text) !important;
-        }
+        h1, h2, h3, h4, h5, h6 { color: var(--text) !important; }
         .stCaption, [data-testid="stCaptionContainer"] * { color: var(--muted) !important; }
         a { color: var(--link) !important; }
 
@@ -215,12 +196,16 @@ SUPABASE_ANON_KEY = (get_secret("SUPABASE_ANON_KEY") or "").strip()
 SUPABASE_SERVICE_KEY = (get_secret("SUPABASE_SERVICE_KEY") or "").strip()
 SUPABASE_SCHEMA = (get_secret("SUPABASE_SCHEMA", "public") or "public").strip()
 
+# FAST defaults (you can override with secrets):
+# FAST_MODE=1 makes throttle smaller and caches shorter
+FAST_MODE_DEFAULT = str(get_secret("FAST_MODE", "1")).strip() not in ("0", "false", "False", "no", "NO")
+
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
     st.error(
         "Missing SUPABASE_URL or SUPABASE_ANON_KEY.\n\n"
         "Streamlit Cloud: Manage app → Settings → Secrets\n\n"
         "Add:\n"
-        "SUPABASE_URL\nSUPABASE_ANON_KEY\n(optional) SUPABASE_SERVICE_KEY\nSUPABASE_SCHEMA"
+        "SUPABASE_URL\nSUPABASE_ANON_KEY\n(optional) SUPABASE_SERVICE_KEY\nSUPABASE_SCHEMA\n(optional) FAST_MODE"
     )
     st.stop()
 
@@ -242,17 +227,17 @@ sb_anon = get_anon_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 sb_service = get_service_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_SERVICE_KEY else None
 
 # ============================================================
-# SLOW MODE (THROTTLE DB CALLS)
+# SLOW MODE (THROTTLE DB CALLS) + FAST MODE OVERRIDE
 # ============================================================
 SLOW_MODE = str(get_secret("SLOW_MODE", "1")).strip() not in ("0", "false", "False", "no", "NO")
 MIN_SECONDS_BETWEEN_DB_CALLS = float(get_secret("MIN_SECONDS_BETWEEN_DB_CALLS", "0.35") or "0.35")
 
 def throttle_db():
-    if not SLOW_MODE:
+    if not st.session_state.get("_slow_mode_override", SLOW_MODE):
         return
     last = st.session_state.get("_last_db_call_ts", 0.0)
     now = time.time()
-    wait = MIN_SECONDS_BETWEEN_DB_CALLS - (now - last)
+    wait = float(st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", MIN_SECONDS_BETWEEN_DB_CALLS)) - (now - last)
     if wait > 0:
         time.sleep(wait)
     st.session_state["_last_db_call_ts"] = time.time()
@@ -269,6 +254,8 @@ def _api_msg(e: Exception) -> str:
     return repr(e)
 
 def table_readable(client, schema: str, table_name: str) -> bool:
+    if client is None:
+        return False
     try:
         throttle_db()
         client.schema(schema).table(table_name).select("*").limit(1).execute()
@@ -287,6 +274,8 @@ def safe_select(
     show_error: bool = True,
     **filters,
 ) -> List[Dict]:
+    if client is None:
+        return []
     try:
         throttle_db()
         q = client.schema(schema).table(table_name).select(select_cols)
@@ -340,6 +329,7 @@ def show_connected_db_banner():
     st.write("Anon key looks valid:", "✅" if looks_like_jwt(SUPABASE_ANON_KEY) else "❌")
     st.write("Service key set:", "✅" if bool(SUPABASE_SERVICE_KEY) else "❌")
 
+    # Try a tiny read test
     try:
         throttle_db()
         r = sb_anon.schema(SUPABASE_SCHEMA).table("members").select("id").limit(1).execute()
@@ -349,7 +339,7 @@ def show_connected_db_banner():
         st.error("Anon read test: ❌ cannot read members (likely RLS policy or wrong schema)")
         st.code(_api_msg(e), language="text")
 
-    st.caption("If this shows the WRONG project ref, fix Streamlit Cloud secrets: Manage app → Settings → Secrets.")
+    st.caption("If this shows the WRONG project ref, fix Streamlit secrets / Railway variables.")
     st.markdown(glass_close(), unsafe_allow_html=True)
 
 # ============================================================
@@ -358,19 +348,20 @@ def show_connected_db_banner():
 left, right = st.columns([1, 0.30])
 with left:
     st.markdown(f"## 🏦 {APP_BRAND} • Bank Dashboard")
-    if SLOW_MODE:
+    if st.session_state.get("_slow_mode_override", SLOW_MODE):
         st.caption("🐢 Slow Mode ON (reduced DB load)")
+    else:
+        st.caption("⚡ Fast Mode ON (minimal throttling)")
 with right:
     if st.button("🔄 Refresh data", width=W_STRETCH):
         st.cache_data.clear()
         st.rerun()
 
-# Always show connected DB check (small but critical)
 with st.expander("🔎 Show connected database details", expanded=False):
     show_connected_db_banner()
 
 # ============================================================
-# SIDEBAR SAFE MODE / SLOW MODE
+# SIDEBAR SAFE MODE / FAST/SLOW MODE
 # ============================================================
 with st.sidebar.expander("🛟 Safe Mode", expanded=False):
     SAFE_MODE_UI = st.checkbox(
@@ -379,82 +370,96 @@ with st.sidebar.expander("🛟 Safe Mode", expanded=False):
         help="Use this if Streamlit shows a blank screen; avoids importing other modules.",
     )
 
-with st.sidebar.expander("🐢 Slow Mode", expanded=False):
-    st.write("Reduce Supabase calls (best for Free plan / outages).")
-    SLOW_MODE_UI = st.checkbox("Enable Slow Mode", value=SLOW_MODE)
-    st.session_state["_slow_mode_override"] = SLOW_MODE_UI
-    if "MIN_SECONDS_BETWEEN_DB_CALLS_UI" not in st.session_state:
-        st.session_state["MIN_SECONDS_BETWEEN_DB_CALLS_UI"] = MIN_SECONDS_BETWEEN_DB_CALLS
-    st.session_state["MIN_SECONDS_BETWEEN_DB_CALLS_UI"] = st.slider(
-        "Min seconds between DB calls",
-        min_value=0.00,
-        max_value=2.00,
-        value=float(st.session_state["MIN_SECONDS_BETWEEN_DB_CALLS_UI"]),
-        step=0.05,
-    )
+with st.sidebar.expander("⚡ Fast / 🐢 Slow Mode", expanded=False):
+    st.write("Fast mode reduces throttling. Slow mode protects Supabase limits.")
+    fast_on = st.checkbox("Enable Fast Mode", value=FAST_MODE_DEFAULT)
+    slow_on = st.checkbox("Enable Slow Mode", value=(not fast_on) and SLOW_MODE)
 
+    # Resolve: Fast wins if checked
+    if fast_on:
+        st.session_state["_slow_mode_override"] = False
+        # Small throttle just in case
+        st.session_state["MIN_SECONDS_BETWEEN_DB_CALLS_UI"] = 0.05
+    else:
+        st.session_state["_slow_mode_override"] = bool(slow_on)
+        st.session_state["MIN_SECONDS_BETWEEN_DB_CALLS_UI"] = st.slider(
+            "Min seconds between DB calls",
+            min_value=0.00,
+            max_value=2.00,
+            value=float(get_secret("MIN_SECONDS_BETWEEN_DB_CALLS", "0.35") or "0.35"),
+            step=0.05,
+        )
+
+# Effective slow settings
 SLOW_MODE = bool(st.session_state.get("_slow_mode_override", SLOW_MODE))
-MIN_SECONDS_BETWEEN_DB_CALLS = float(
-    st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", MIN_SECONDS_BETWEEN_DB_CALLS)
-)
+MIN_SECONDS_BETWEEN_DB_CALLS = float(st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", MIN_SECONDS_BETWEEN_DB_CALLS))
 
 # ============================================================
-# CACHED LOADERS (SCHEMA-SAFE)
+# CACHED LOADERS (FAST TTLs)
 # ============================================================
-@st.cache_data(ttl=300)
+MEMBERS_TTL = 120 if not SLOW_MODE else 300
+VIEW_TTL = 90 if not SLOW_MODE else 240
+
+@st.cache_data(ttl=MEMBERS_TTL, show_spinner=False)
 def load_members(url: str, anon_key: str, schema: str) -> pd.DataFrame:
     client = create_client(url, anon_key)
 
-    try:
-        throttle_db()
-        rows = (
-            client.schema(schema)
-            .table("members")
-            .select("id,name,display_name,phone")
-            .order("id", desc=False)
-            .limit(5000)
-            .execute()
-            .data
-            or []
-        )
-    except Exception:
-        throttle_db()
-        rows = (
-            client.schema(schema)
-            .table("members")
-            .select("id,name,phone")
-            .order("id", desc=False)
-            .limit(5000)
-            .execute()
-            .data
-            or []
-        )
+    # Schema-safe: name OR full_name OR display_name
+    cols_try = [
+        "id,name,display_name,full_name,phone",
+        "id,name,display_name,phone",
+        "id,name,phone",
+        "id,full_name,phone",
+        "id,display_name,phone",
+    ]
+    rows = []
+    last_err = None
+    for cols in cols_try:
+        try:
+            throttle_db()
+            rows = (
+                client.schema(schema)
+                .table("members")
+                .select(cols)
+                .order("id", desc=False)
+                .limit(5000)
+                .execute()
+                .data
+                or []
+            )
+            last_err = None
+            break
+        except Exception as e:
+            last_err = _api_msg(e)
+            rows = []
 
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["id", "name", "phone", "member_name", "label"])
+        if last_err:
+            st.session_state["_last_members_error"] = last_err
+        return pd.DataFrame(columns=["id", "member_name", "phone", "label"])
 
     df["id"] = pd.to_numeric(df["id"], errors="coerce").fillna(0).astype(int)
     df = df[df["id"] > 0].copy()
-    df["name"] = df["name"].astype(str)
+
+    for c in ["name", "display_name", "full_name", "phone"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str).replace({"None": "", "nan": ""})
+
+    # best name
+    def _best_name(r):
+        for k in ["display_name", "full_name", "name"]:
+            if k in r and str(r.get(k, "")).strip():
+                return str(r.get(k)).strip()
+        return ""
+
+    df["member_name"] = df.apply(_best_name, axis=1)
     df["phone"] = df.get("phone", "").astype(str).replace({"None": "", "nan": ""})
-
-    if "display_name" in df.columns:
-        df["display_name"] = df["display_name"].astype(str).replace({"None": "", "nan": ""})
-        df["member_name"] = df["display_name"].where(df["display_name"].str.strip() != "", df["name"])
-    else:
-        df["member_name"] = df["name"]
-
     df["label"] = df.apply(lambda r: f"{int(r['id']):02d} • {r['member_name']}", axis=1)
-    return df
+    return df[["id", "member_name", "phone", "label"]].copy()
 
-@st.cache_data(ttl=240)
+@st.cache_data(ttl=VIEW_TTL, show_spinner=False)
 def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFrame:
-    """
-    IMPORTANT:
-    - We don't swallow errors silently
-    - We store the error string in session_state for display (outside cache side-effects)
-    """
     client = create_client(url, anon_key)
     throttle_db()
     try:
@@ -463,12 +468,11 @@ def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFram
             .table("v_contributions_with_member")
             .select("id,member_id,member_name,session_id,amount,paid_at,note,created_at")
             .order("created_at", desc=True)
-            .limit(500)
+            .limit(500 if not SLOW_MODE else 350)
             .execute()
             .data
             or []
         )
-        # Clear old error if success
         st.session_state.pop("_last_contrib_view_error", None)
         return pd.DataFrame(rows) if rows else pd.DataFrame()
     except Exception as e:
@@ -496,7 +500,6 @@ def get_effective_session_id(sb_read, schema: str) -> tuple[Optional[int], str]:
     if cs is not None:
         return cs, "from app_state"
 
-    # Try sessions.session_id first, then sessions.id
     srows = safe_select(
         sb_read,
         "sessions",
@@ -527,7 +530,7 @@ else:
         "Payouts",
         "Loans",
         "🤖 AI Risk Panel",
-        "🧠 Njangi LLM",          # ✅ ADDED
+        "🧠 Njangi LLM",
         "Minutes & Attendance",
         "Admin",
         "Audit",
@@ -550,7 +553,7 @@ elif page == "Contributions":
     df = load_contributions_view(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
 
     if df.empty and st.session_state.get("_last_contrib_view_error"):
-        st.warning("View v_contributions_with_member failed (showing error). Falling back to raw contributions.")
+        st.warning("View v_contributions_with_member failed (error below). Falling back to raw contributions.")
         st.code(st.session_state.get("_last_contrib_view_error"), language="text")
 
     if df.empty:
@@ -565,7 +568,7 @@ elif page == "Contributions":
         )
         df2 = pd.DataFrame(rows)
         if df2.empty:
-            st.info("No contributions found (or RLS blocked). Check the database details expander at the top.")
+            st.info("No contributions found (or RLS blocked). Check DB details at top.")
         else:
             st.warning("Showing raw contributions (view not available or not readable).")
             st.dataframe(df2, width=W_STRETCH, hide_index=True)
@@ -617,7 +620,6 @@ elif page == "🤖 AI Risk Panel":
     else:
         fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
 
-# ✅ ADDED: Njangi LLM page (✅ FIXED call)
 elif page == "🧠 Njangi LLM":
     fn, err = lazy_import("njangi_llm_panel", "render_njangi_llm_panel")
     if fn is None:
@@ -641,7 +643,7 @@ elif page == "Minutes & Attendance":
         st.stop()
 
     if session_note != "from app_state":
-        st.warning("app_state.current_session_id is not set. Using latest session as fallback. Set it in Admin → Rotation.")
+        st.warning("app_state.current_session_id is not set. Using latest session as fallback.")
 
     with st.sidebar.expander("🔐 Role (Minutes/Attendance)", expanded=False):
         role = st.selectbox("Role", ["admin", "treasury", "member"], index=0, key="ma_role")
@@ -649,7 +651,11 @@ elif page == "Minutes & Attendance":
 
     df_members = load_members(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
     if df_members.empty:
-        st.error("No members found (or RLS blocked). Check the database details expander at the top.")
+        if st.session_state.get("_last_members_error"):
+            st.error("Members not readable. Error:")
+            st.code(st.session_state.get("_last_members_error"), language="text")
+        else:
+            st.error("No members found (or RLS blocked). Check DB details at top.")
         st.stop()
 
     tab1, tab2, tab3 = st.tabs(["Minutes / Documentation", "Attendance", "Summaries"])
@@ -729,7 +735,7 @@ elif page == "Minutes & Attendance":
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.subheader("Attendance")
         st.caption(f"Linked session_id: {current_session_id}  •  {session_note}")
-        st.caption("Mark each member Present/Absent. Submit once (slow-mode friendly).")
+        st.caption("Mark each member Present/Absent. Submit once (fast + safe).")
 
         arows_existing = safe_select(
             sb_anon,
@@ -740,6 +746,7 @@ elif page == "Minutes & Attendance":
             order_desc=False,
             limit=2000,
             session_id=int(current_session_id),
+            show_error=False,
         )
         existing_map = {int(r["member_id"]): r for r in arows_existing if r.get("member_id") is not None}
 
@@ -747,7 +754,7 @@ elif page == "Minutes & Attendance":
             attendance_rows: List[Dict] = []
             for _, r in df_members.sort_values("id").iterrows():
                 mid = int(r["id"])
-                name = str(r.get("member_name") or r.get("name") or "")
+                name = str(r.get("member_name") or "")
                 label = f"{mid:02d} • {name}"
 
                 ex = existing_map.get(mid, {})
@@ -822,6 +829,7 @@ elif page == "Minutes & Attendance":
                 order_desc=False,
                 limit=2000,
                 session_id=int(current_session_id),
+                show_error=False,
             )
             dfa = pd.DataFrame(arows)
             if dfa.empty:
@@ -845,7 +853,6 @@ elif page == "Minutes & Attendance":
     with tab3:
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.subheader("Summaries")
-        st.caption("Summaries for Minutes, Attendance, and Contributions.")
 
         st.markdown("### 📝 Minutes summary")
         m_rows = safe_select(sb_anon, "minutes", "*", schema=SUPABASE_SCHEMA, order_by="updated_at", order_desc=True, limit=20, show_error=False)
@@ -896,88 +903,4 @@ elif page == "Minutes & Attendance":
         if dfc.empty:
             st.info("No contributions for current session.")
         else:
-            if "session_id" in dfc.columns:
-                dfc = dfc[dfc["session_id"].astype(str) == str(current_session_id)].copy()
-            if "amount" in dfc.columns:
-                dfc["amount"] = pd.to_numeric(dfc["amount"], errors="coerce").fillna(0)
-            st.metric("Rows", f"{len(dfc):,}")
-            st.metric("Sum", f"{float(dfc['amount'].sum()):,.0f}")
-            group_cols = [c for c in ["member_id", "member_name"] if c in dfc.columns]
-            if group_cols:
-                top = (
-                    dfc.groupby(group_cols, dropna=False)["amount"]
-                    .sum()
-                    .sort_values(ascending=False)
-                    .head(10)
-                    .reset_index()
-                )
-                st.caption("Top contributors (current session)")
-                st.dataframe(top, width=W_STRETCH, hide_index=True)
-
-        st.markdown(glass_close(), unsafe_allow_html=True)
-
-elif page == "Admin":
-    if not sb_service:
-        st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY.")
-        st.stop()
-
-    admin_fn, admin_err = lazy_import("admin_panels", "render_admin")
-    if admin_fn is None:
-        st.error("Admin panel failed to load.")
-        st.code(admin_err or "", language="text")
-    else:
-        admin_fn(sb_service=sb_service, schema=SUPABASE_SCHEMA, actor_email="admin@yourorg.com")
-
-elif page == "Audit":
-    if not sb_service:
-        st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY.")
-        st.stop()
-
-    audit_fn, audit_err = lazy_import("audit_panel", "render_audit")
-    if audit_fn is None:
-        st.error("Audit panel failed to load.")
-        st.code(audit_err or "", language="text")
-    else:
-        audit_fn(sb_service=sb_service, schema=SUPABASE_SCHEMA)
-
-elif page == "Health":
-    st.markdown(glass_open(), unsafe_allow_html=True)
-    st.subheader("🩺 Health Check")
-    st.caption("Confirms which tables/views are readable from anon and service clients.")
-
-    targets = [
-        ("table", "members"),
-        ("table", "sessions"),
-        ("table", "app_state"),
-        ("table", "contributions"),
-        ("table", "foundation_contributions"),
-        ("table", "loans"),
-        ("table", "loan_payments"),
-        ("table", "minutes"),
-        ("table", "attendance"),
-        ("table", "fines"),
-        ("table", "interest_ledger"),
-        ("table", "audit_log"),
-        ("view", "v_contributions_with_member"),
-        ("view", "v_attendance_with_member"),
-        ("view", "v_next_beneficiary"),
-    ]
-
-    rows = []
-    for kind, name in targets:
-        anon_ok = table_readable(sb_anon, SUPABASE_SCHEMA, name)
-        svc_ok = table_readable(sb_service, SUPABASE_SCHEMA, name) if sb_service else False
-        rows.append({"object": f"{kind}:{name}", "anon_read": anon_ok, "service_read": svc_ok})
-
-    st.dataframe(pd.DataFrame(rows), width=W_STRETCH, hide_index=True)
-
-    st.divider()
-    st.markdown("### Quick tips")
-    st.write("• If `anon_read` is ❌ for tables you want to display, your RLS SELECT policies are blocking reads.")
-    st.write("• If project ref is wrong, fix Streamlit Cloud secrets (Manage app → Settings → Secrets).")
-    st.write("• If views are ❌ but raw tables are ✅, your views may not exist in that project/schema.")
-
-    st.markdown(glass_close(), unsafe_allow_html=True)
-
-else:
-    st.info("Page not implemented.")
+            if "session
