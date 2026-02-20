@@ -1,5 +1,4 @@
-
-# ai_risk_panel.py ✅ COMPLETE SINGLE CODE — NJANGI STANDARD (NO legacy) — NO sklearn
+# ai_risk_panel.py ✅ COMPLETE SINGLE-FILE — NJANGI STANDARD (NO legacy)
 # ------------------------------------------------------------------------------
 # ✅ Uses ONLY new tables:
 #   - members
@@ -10,12 +9,18 @@
 #   - fines (optional)
 #
 # ✅ NO sklearn dependency (fixes ModuleNotFoundError)
-# ✅ Schema-safe:
-#    - loans has NO "balance" column in your DB -> uses principal_current as balance
-#    - loan_payments may have member_id OR only loan_id -> auto-joins via loans to get member_id
+# ✅ Schema-safe for YOUR loans columns:
+#    - principal, principal_current, total_due, unpaid_interest, last_paid_at,
+#      borrow_date, due_cycle_days, interest_rate_monthly, status
+# ✅ loan_payments may have member_id OR only loan_id -> auto-joins via loans to get member_id
 # ✅ Always produces numbers (no blank NaNs in snapshot)
 # ✅ Cache-safe: no unhashable supabase clients in cache args
-# ✅ UTC-safe date math
+# ✅ UTC-safe date math (no tz-naive vs tz-aware errors)
+# ✅ Includes REAL ML using NumPy Logistic Regression (NO sklearn):
+#    - Trains on loans: closed=0, active=1
+#    - Predicts member risk as MAX probability among their active loans
+#    - Gate by MIN_LOANS_FOR_ML (default 20)
+# ✅ Offers mode toggle: Heuristic / ML / Hybrid
 # ------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -23,6 +28,13 @@ from __future__ import annotations
 import streamlit as st
 import pandas as pd
 import numpy as np
+
+
+# =========================
+# CONFIG
+# =========================
+MIN_LOANS_FOR_ML = 20  # set to 5 if you want ML to run immediately (unstable when tiny)
+CACHE_TTL_SECONDS = 60
 
 
 # ============================================================
@@ -99,7 +111,8 @@ def _utc_now() -> pd.Timestamp:
 
 def _days_since(now_utc: pd.Timestamp, dt_series) -> pd.Series:
     dt_utc = pd.to_datetime(dt_series, errors="coerce", utc=True)
-    return (now_utc - dt_utc).dt.days
+    out = (now_utc - dt_utc).dt.days
+    return out.fillna(999).astype(int)
 
 
 def _fill_feature_defaults(X: pd.DataFrame) -> pd.DataFrame:
@@ -107,7 +120,7 @@ def _fill_feature_defaults(X: pd.DataFrame) -> pd.DataFrame:
     Ensure snapshot never shows blanks.
     - counts -> 0
     - sums/amounts -> 0.0
-    - days_since -> large number if missing? (we use 999)
+    - days_since -> 999 if missing
     """
     X = X.copy()
     for col in X.columns:
@@ -115,7 +128,7 @@ def _fill_feature_defaults(X: pd.DataFrame) -> pd.DataFrame:
             continue
         if col.endswith("_count") or col.endswith("_n"):
             X[col] = pd.to_numeric(X[col], errors="coerce").fillna(0).astype(int)
-        elif col.startswith("days_since_"):
+        elif col.startswith("days_since_") or col.endswith("_days"):
             X[col] = pd.to_numeric(X[col], errors="coerce").fillna(999).astype(int)
         else:
             X[col] = pd.to_numeric(X[col], errors="coerce").fillna(0.0)
@@ -138,7 +151,7 @@ def _get_client_from_state(use_service: bool = False):
     return sb_anon
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def _load_table_cached(schema: str, table: str, cols: str = "*", limit: int = 5000, use_service: bool = False) -> pd.DataFrame:
     client = _get_client_from_state(use_service=use_service)
     if client is None:
@@ -166,13 +179,13 @@ def _load_table_service(sb_anon, sb_service, schema: str, table: str, cols: str 
 
 
 # ============================================================
-# Payment loader that supports either:
+# Payment loader: supports either:
 #   loan_payments(member_id, amount, paid_at)
-#   OR loan_payments(loan_id, amount, paid_at)  -> join loans to get member_id
+#   OR loan_payments(loan_id, amount, paid_at) -> join loans to get member_id
 # ============================================================
 def _load_payments_schema_safe(sb_anon, sb_service, schema: str, limit: int = 20000) -> pd.DataFrame:
+    # prefer service if available (RLS)
     if sb_service is None:
-        # anon might still read it; try anon first
         pay = _load_table(sb_anon, sb_service, schema, "loan_payments", cols="*", limit=limit)
     else:
         pay = _load_table_service(sb_anon, sb_service, schema, "loan_payments", cols="*", limit=limit)
@@ -182,7 +195,6 @@ def _load_payments_schema_safe(sb_anon, sb_service, schema: str, limit: int = 20
 
     cols = set(pay.columns)
     if "member_id" in cols:
-        # Great — direct member payments
         keep = [c for c in ["member_id", "amount", "paid_at", "created_at", "loan_id"] if c in cols]
         return pay[keep].copy()
 
@@ -191,18 +203,14 @@ def _load_payments_schema_safe(sb_anon, sb_service, schema: str, limit: int = 20
         pay = pay.rename(columns={"loans_id": "loan_id"})
 
     if "loan_id" not in pay.columns:
-        # Can't map
         return pd.DataFrame()
 
     # Load loans map (id -> member_id)
-    loans_map = _load_table_service(
-        sb_anon,
-        sb_service,
-        schema,
-        "loans",
-        cols="id,member_id",
-        limit=10000,
-    ) if sb_service is not None else _load_table(sb_anon, sb_service, schema, "loans", cols="id,member_id", limit=10000)
+    loans_map = (
+        _load_table_service(sb_anon, sb_service, schema, "loans", cols="id,member_id", limit=10000)
+        if sb_service is not None
+        else _load_table(sb_anon, sb_service, schema, "loans", cols="id,member_id", limit=10000)
+    )
 
     if loans_map.empty or "id" not in loans_map.columns or "member_id" not in loans_map.columns:
         return pd.DataFrame()
@@ -215,7 +223,6 @@ def _load_payments_schema_safe(sb_anon, sb_service, schema: str, limit: int = 20
     pay2["loan_id"] = _to_int(pay2["loan_id"])
     pay2 = pay2.merge(loans_map.rename(columns={"id": "loan_id"}), on="loan_id", how="left")
 
-    # ensure amount + paid_at columns exist
     if "amount" not in pay2.columns:
         pay2["amount"] = 0.0
     if "paid_at" not in pay2.columns:
@@ -280,19 +287,16 @@ def _build_member_features(
 
     # ------------------------
     # Loans (YOUR SCHEMA)
-    # - balance doesn't exist -> use principal_current as "balance"
     # ------------------------
     lfeat = base.copy()
     if not loans.empty and "member_id" in loans.columns:
         l = loans.copy()
         l["member_id"] = _to_int(l["member_id"])
 
-        # numeric fields from your table
         for col in ["principal", "principal_current", "total_due", "unpaid_interest"]:
             if col in l.columns:
                 l[col] = _to_num(l[col])
 
-        # derived "balance"
         if "principal_current" in l.columns:
             l["balance_calc"] = l["principal_current"]
         elif "principal" in l.columns:
@@ -305,7 +309,6 @@ def _build_member_features(
         l["created_at"] = _to_dt_utc(l.get("created_at", pd.NaT))
 
         grp = l.groupby("member_id", dropna=False)
-
         lfeat = lfeat.merge(grp.size().rename("loan_count"), left_on="member_id", right_index=True, how="left")
         lfeat = lfeat.merge(grp["balance_calc"].sum().rename("loan_balance_sum"), left_on="member_id", right_index=True, how="left")
 
@@ -319,7 +322,6 @@ def _build_member_features(
         else:
             lfeat["loan_total_due_sum"] = 0.0
 
-        # bad status count (tune tokens to your statuses)
         bad_tokens = ["delinquent", "default", "overdue", "late", "arrears", "past due", "past_due", "unpaid"]
         lfeat = lfeat.merge(
             grp["status"].apply(lambda s: sum(any(tok in str(v) for tok in bad_tokens) for v in s)).rename("loan_bad_status_count"),
@@ -328,7 +330,6 @@ def _build_member_features(
             how="left",
         )
 
-        # last paid date from loans table
         lfeat = lfeat.merge(grp["last_paid_at"].max().rename("loan_last_paid_dt"), left_on="member_id", right_index=True, how="left")
     else:
         lfeat["loan_count"] = 0
@@ -361,7 +362,6 @@ def _build_member_features(
         pfeat["pay_total"] = 0.0
         pfeat["pay_last_dt"] = pd.NaT
 
-    # Prefer payment last dt; fall back to loans.last_paid_at if no payments
     pfeat["days_since_last_payment"] = _days_since(now, pfeat["pay_last_dt"])
 
     # ------------------------
@@ -410,7 +410,6 @@ def _build_member_features(
         .merge(fdfeat, on="member_id", how="left")
     )
 
-    # Drop internal dt columns but keep days_since_*
     for dtcol in ["contrib_last_dt", "pay_last_dt", "foundation_last_dt", "loan_last_paid_dt"]:
         if dtcol in X.columns:
             X.drop(columns=[dtcol], inplace=True)
@@ -420,12 +419,9 @@ def _build_member_features(
 
 
 # ============================================================
-# Simple heuristic risk score (NO ML libs)
+# Heuristic risk score (NO ML libs)
 # ============================================================
 def _compute_risk_score(row: pd.Series) -> tuple[float, list[str]]:
-    """
-    Returns (risk_0_to_1, reasons[])
-    """
     reasons = []
 
     loan_balance = float(row.get("loan_balance_sum", 0.0))
@@ -437,10 +433,8 @@ def _compute_risk_score(row: pd.Series) -> tuple[float, list[str]]:
     contrib_total = float(row.get("contrib_total", 0.0))
     contrib_count = int(row.get("contrib_count", 0))
 
-    # base
     score = 0.0
 
-    # Loan pressure
     if loan_balance > 0:
         score += 0.20
         reasons.append("Has outstanding loan balance")
@@ -453,7 +447,6 @@ def _compute_risk_score(row: pd.Series) -> tuple[float, list[str]]:
         score += min(0.30, 0.10 * bad_status)
         reasons.append("Loan status flagged as overdue/delinquent/etc.")
 
-    # Recency signals
     if days_pay >= 30 and loan_balance > 0:
         score += 0.25
         reasons.append("No recent loan payment (≥30 days) while loan balance > 0")
@@ -468,12 +461,10 @@ def _compute_risk_score(row: pd.Series) -> tuple[float, list[str]]:
         score += 0.08
         reasons.append("No recent contribution (≥14 days)")
 
-    # Fines
     if fine_total > 0:
-        score += min(0.15, fine_total / 2000.0)  # scale gently
+        score += min(0.15, fine_total / 2000.0)
         reasons.append("Has fines")
 
-    # Stabilizers (reduce risk)
     if contrib_total >= 2000:
         score -= 0.05
         reasons.append("Strong contributions reduce risk")
@@ -486,13 +477,164 @@ def _compute_risk_score(row: pd.Series) -> tuple[float, list[str]]:
 
 
 # ============================================================
+# NumPy ML: Logistic Regression (NO sklearn)
+# ============================================================
+def _sigmoid(z):
+    z = np.clip(z, -30, 30)
+    return 1.0 / (1.0 + np.exp(-z))
+
+
+def _standardize_fit(X: np.ndarray):
+    mu = np.nanmean(X, axis=0)
+    sd = np.nanstd(X, axis=0)
+    sd = np.where(sd == 0, 1.0, sd)
+    return mu, sd
+
+
+def _standardize_apply(X: np.ndarray, mu: np.ndarray, sd: np.ndarray):
+    return (X - mu) / sd
+
+
+def _train_logreg_numpy(X: np.ndarray, y: np.ndarray, lr: float = 0.15, steps: int = 2500, l2: float = 0.25):
+    X = X.astype(float)
+    y = y.astype(float)
+
+    mu, sd = _standardize_fit(X)
+    Xs = _standardize_apply(X, mu, sd)
+
+    n, d = Xs.shape
+    w = np.zeros(d, dtype=float)
+    b = 0.0
+
+    for _ in range(int(steps)):
+        p = _sigmoid(Xs @ w + b)
+        dw = (Xs.T @ (p - y)) / n + l2 * w
+        db = np.mean(p - y)
+        w -= lr * dw
+        b -= lr * db
+
+    return w, b, mu, sd
+
+
+def _predict_proba_numpy(X: np.ndarray, w: np.ndarray, b: float, mu: np.ndarray, sd: np.ndarray):
+    Xs = _standardize_apply(X.astype(float), mu, sd)
+    return _sigmoid(Xs @ w + b)
+
+
+def _make_loan_ml_frame(loans: pd.DataFrame) -> pd.DataFrame:
+    if loans is None or loans.empty:
+        return pd.DataFrame()
+
+    l = loans.copy()
+    if "member_id" not in l.columns or "status" not in l.columns:
+        return pd.DataFrame()
+
+    now = _utc_now()
+
+    l["member_id"] = _to_int(l["member_id"])
+    l["status"] = l["status"].astype(str).str.lower().fillna("")
+
+    l["principal"] = _to_num(l.get("principal", 0))
+    l["principal_current"] = _to_num(l.get("principal_current", l["principal"]))
+    l["total_due"] = _to_num(l.get("total_due", 0))
+    l["unpaid_interest"] = _to_num(l.get("unpaid_interest", 0))
+    l["interest_rate_monthly"] = _to_num(l.get("interest_rate_monthly", 0))
+    l["due_cycle_days"] = _to_num(l.get("due_cycle_days", 0))
+
+    l["borrow_date"] = _to_dt_utc(l.get("borrow_date", l.get("created_at", pd.NaT)))
+    l["last_paid_at"] = _to_dt_utc(l.get("last_paid_at", pd.NaT))
+
+    l["loan_age_days"] = _days_since(now, l["borrow_date"])
+    l["days_since_last_payment"] = _days_since(now, l["last_paid_at"].fillna(l["borrow_date"]))
+
+    l["target"] = np.where(l["status"] == "closed", 0, 1).astype(int)
+
+    out = l[
+        [
+            "member_id",
+            "status",
+            "principal",
+            "principal_current",
+            "interest_rate_monthly",
+            "total_due",
+            "unpaid_interest",
+            "due_cycle_days",
+            "loan_age_days",
+            "days_since_last_payment",
+            "target",
+        ]
+    ].copy()
+
+    out = out.replace([np.inf, -np.inf], np.nan).fillna(0)
+    out = out[out["member_id"] > 0].copy()
+    return out
+
+
+def _ml_risk_for_member(loans_ml: pd.DataFrame, member_id: int, min_rows: int = MIN_LOANS_FOR_ML) -> tuple[float | None, str]:
+    if loans_ml is None or loans_ml.empty:
+        return None, "No loans for ML."
+
+    if len(loans_ml) < int(min_rows):
+        return None, f"Need at least {min_rows} loans for ML (currently {len(loans_ml)})."
+
+    vc = loans_ml["target"].value_counts().to_dict()
+    if len(vc) < 2:
+        return None, "ML needs both classes: closed and active."
+
+    feature_cols = [
+        "principal",
+        "principal_current",
+        "interest_rate_monthly",
+        "total_due",
+        "unpaid_interest",
+        "due_cycle_days",
+        "loan_age_days",
+        "days_since_last_payment",
+    ]
+
+    X = loans_ml[feature_cols].to_numpy(dtype=float)
+    y = loans_ml["target"].to_numpy(dtype=int)
+
+    w, b, mu, sd = _train_logreg_numpy(X, y, lr=0.15, steps=2500, l2=0.25)
+
+    mdf = loans_ml[loans_ml["member_id"] == int(member_id)].copy()
+    if mdf.empty:
+        return None, "Member has no loans."
+
+    active = mdf[mdf["status"] == "active"]
+    if not active.empty:
+        mdf = active
+
+    Xm = mdf[feature_cols].to_numpy(dtype=float)
+    proba = _predict_proba_numpy(Xm, w, b, mu, sd)
+
+    risk = float(np.max(proba)) if len(proba) else None
+    if risk is None:
+        return None, "Unable to compute ML risk."
+
+    return risk, "OK"
+
+
+# ============================================================
 # Main render
 # ============================================================
 def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
-    st.header("🤖 AI Risk Panel (Heuristic, No ML libs)")
-    st.caption("NJANGI STANDARD • no legacy • schema-safe (matches your loans columns).")
+    st.header("🤖 AI Risk Panel")
+    st.caption("NJANGI STANDARD • no legacy • Heuristic + ML (NumPy logistic regression).")
 
     _ensure_clients_in_state(sb_anon, sb_service)
+
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        if st.button("🔄 Refresh"):
+            st.cache_data.clear()
+            st.rerun()
+    with c2:
+        mode = st.radio(
+            "Risk mode",
+            ["Heuristic", "ML (NumPy)", "Hybrid"],
+            horizontal=True,
+        )
 
     if not _table_exists(sb_anon, schema, "members"):
         st.error("Missing table: members")
@@ -503,39 +645,48 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
         st.error("members not readable.")
         return
 
-    # Load contributions
-    contrib = _load_table(sb_anon, sb_service, schema, "contributions", cols="member_id,session_id,amount,created_at", limit=20000) \
-        if _table_exists(sb_anon, schema, "contributions") else pd.DataFrame()
-
-    # Load loans (prefer service if available)
-    loans = _load_table_service(
-        sb_anon,
-        sb_service,
-        schema,
-        "loans",
-        cols="id,member_id,status,principal,principal_current,total_due,unpaid_interest,last_paid_at,created_at",
-        limit=20000,
-    ) if (sb_service is not None and _table_exists(sb_service, schema, "loans")) else (
-        _load_table(sb_anon, sb_service, schema, "loans",
-                    cols="id,member_id,status,principal,principal_current,total_due,unpaid_interest,last_paid_at,created_at",
-                    limit=20000)
-        if _table_exists(sb_anon, schema, "loans") else pd.DataFrame()
+    contrib = (
+        _load_table(sb_anon, sb_service, schema, "contributions", cols="member_id,session_id,amount,created_at", limit=20000)
+        if _table_exists(sb_anon, schema, "contributions")
+        else pd.DataFrame()
     )
 
-    # Load payments schema-safe
-    payments = _load_payments_schema_safe(sb_anon, sb_service, schema=schema, limit=30000) \
-        if (_table_exists(sb_service, schema, "loan_payments") if sb_service is not None else _table_exists(sb_anon, schema, "loan_payments")) else pd.DataFrame()
-
-    fines = _load_table_service(sb_anon, sb_service, schema, "fines", cols="member_id,amount,created_at", limit=20000) \
-        if (sb_service is not None and _table_exists(sb_service, schema, "fines")) else (
-            _load_table(sb_anon, sb_service, schema, "fines", cols="member_id,amount,created_at", limit=20000)
-            if _table_exists(sb_anon, schema, "fines") else pd.DataFrame()
+    loans_cols = (
+        "id,member_id,status,principal,principal_current,total_due,unpaid_interest,"
+        "last_paid_at,borrow_date,due_cycle_days,interest_rate_monthly,created_at"
+    )
+    loans = (
+        _load_table_service(sb_anon, sb_service, schema, "loans", cols=loans_cols, limit=20000)
+        if (sb_service is not None and _table_exists(sb_service, schema, "loans"))
+        else (
+            _load_table(sb_anon, sb_service, schema, "loans", cols=loans_cols, limit=20000)
+            if _table_exists(sb_anon, schema, "loans")
+            else pd.DataFrame()
         )
+    )
 
-    foundation = _load_table(sb_anon, sb_service, schema, "foundation_contributions", cols="member_id,amount,created_at", limit=20000) \
-        if _table_exists(sb_anon, schema, "foundation_contributions") else pd.DataFrame()
+    payments = (
+        _load_payments_schema_safe(sb_anon, sb_service, schema=schema, limit=30000)
+        if (_table_exists(sb_service, schema, "loan_payments") if sb_service is not None else _table_exists(sb_anon, schema, "loan_payments"))
+        else pd.DataFrame()
+    )
 
-    # Debug block (optional)
+    fines = (
+        _load_table_service(sb_anon, sb_service, schema, "fines", cols="member_id,amount,created_at", limit=20000)
+        if (sb_service is not None and _table_exists(sb_service, schema, "fines"))
+        else (
+            _load_table(sb_anon, sb_service, schema, "fines", cols="member_id,amount,created_at", limit=20000)
+            if _table_exists(sb_anon, schema, "fines")
+            else pd.DataFrame()
+        )
+    )
+
+    foundation = (
+        _load_table(sb_anon, sb_service, schema, "foundation_contributions", cols="member_id,amount,created_at", limit=20000)
+        if _table_exists(sb_anon, schema, "foundation_contributions")
+        else pd.DataFrame()
+    )
+
     with st.expander("🔎 Debug (rows loaded)", expanded=False):
         st.write("members:", len(members))
         st.write("contributions:", len(contrib))
@@ -547,10 +698,8 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
             st.write("loan status counts:")
             st.dataframe(loans["status"].astype(str).str.lower().value_counts().reset_index(), use_container_width=True)
 
-    # Build features
     X = _build_member_features(members, contrib, loans, payments, fines, foundation)
 
-    # Member picker
     m = members.copy()
     m["id"] = _to_int(m["id"])
     m["name"] = m.get("name", "").astype(str)
@@ -568,18 +717,39 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     if row.empty:
         st.warning("No feature row for selected member.")
         return
-
     row1 = row.iloc[0]
 
-    # Risk score
-    risk, reasons = _compute_risk_score(row1)
+    # Heuristic
+    h_risk, reasons = _compute_risk_score(row1)
 
+    # ML
+    loans_ml = _make_loan_ml_frame(loans)
+    ml_risk, ml_msg = _ml_risk_for_member(loans_ml, member_id=mid, min_rows=MIN_LOANS_FOR_ML)
+
+    # Select final risk
+    if mode == "Heuristic":
+        final_risk = h_risk
+    elif mode == "ML (NumPy)":
+        final_risk = ml_risk if ml_risk is not None else h_risk
+    else:  # Hybrid
+        if ml_risk is None:
+            final_risk = h_risk
+        else:
+            final_risk = float(np.clip((h_risk + ml_risk) / 2.0, 0.0, 1.0))
+
+    # Display
     st.subheader("Risk prediction")
-    st.metric("Predicted Risk", f"{risk * 100:.1f}%")
-    st.progress(float(np.clip(risk, 0.0, 1.0)))
+    st.metric("Predicted Risk", f"{final_risk * 100:.1f}%")
+    st.progress(float(np.clip(final_risk, 0.0, 1.0)))
+
+    if mode in ["ML (NumPy)", "Hybrid"]:
+        if ml_risk is None:
+            st.info(f"ML not ready: {ml_msg}")
+        else:
+            st.caption("ML (NumPy logistic regression) is active.")
 
     if reasons:
-        st.caption("Why this risk score:")
+        st.caption("Heuristic signals:")
         for r in reasons:
             st.write(f"• {r}")
 
