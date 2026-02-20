@@ -28,6 +28,7 @@ from __future__ import annotations
 # ✅ Railway-safe: ensure this file's folder is importable
 import os
 import sys
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
@@ -63,6 +64,7 @@ W_STRETCH = "stretch"
 # ============================================================
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 # ============================================================
 # GLOBAL THEME (Midnight Navy + Emerald)
@@ -171,11 +173,14 @@ def inject_global_theme():
         unsafe_allow_html=True,
     )
 
+
 def glass_open() -> str:
     return "<div class='glass'>"
 
+
 def glass_close() -> str:
     return "</div>"
+
 
 inject_global_theme()
 
@@ -190,6 +195,7 @@ def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
         return st.secrets.get(key, default)
     except Exception:
         return default
+
 
 SUPABASE_URL = (get_secret("SUPABASE_URL") or "").strip()
 SUPABASE_ANON_KEY = (get_secret("SUPABASE_ANON_KEY") or "").strip()
@@ -219,9 +225,11 @@ if not SUPABASE_SERVICE_KEY:
 def get_anon_client(url: str, anon_key: str):
     return create_client(url.strip(), anon_key.strip())
 
+
 @st.cache_resource
 def get_service_client(url: str, service_key: str):
     return create_client(url.strip(), service_key.strip())
+
 
 sb_anon = get_anon_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 sb_service = get_service_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_SERVICE_KEY else None
@@ -232,6 +240,7 @@ sb_service = get_service_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_
 SLOW_MODE = str(get_secret("SLOW_MODE", "1")).strip() not in ("0", "false", "False", "no", "NO")
 MIN_SECONDS_BETWEEN_DB_CALLS = float(get_secret("MIN_SECONDS_BETWEEN_DB_CALLS", "0.35") or "0.35")
 
+
 def throttle_db():
     if not st.session_state.get("_slow_mode_override", SLOW_MODE):
         return
@@ -241,6 +250,7 @@ def throttle_db():
     if wait > 0:
         time.sleep(wait)
     st.session_state["_last_db_call_ts"] = time.time()
+
 
 # ============================================================
 # SAFE ERROR TEXT
@@ -253,6 +263,7 @@ def _api_msg(e: Exception) -> str:
         return str(e)
     return repr(e)
 
+
 def table_readable(client, schema: str, table_name: str) -> bool:
     if client is None:
         return False
@@ -262,6 +273,7 @@ def table_readable(client, schema: str, table_name: str) -> bool:
         return True
     except Exception:
         return False
+
 
 def safe_select(
     client,
@@ -294,6 +306,7 @@ def safe_select(
             st.code(_api_msg(e), language="text")
         return []
 
+
 # ============================================================
 # LAZY IMPORT HELPER ✅ Railway-safe
 # ============================================================
@@ -306,6 +319,7 @@ def lazy_import(path: str, attr: Optional[str] = None) -> Tuple[Any, Optional[st
     except Exception as e:
         return None, repr(e)
 
+
 # ============================================================
 # CONNECTED DB CHECK (KEY FIX FOR “COMPETITION DATA”)
 # ============================================================
@@ -316,8 +330,10 @@ def project_ref_from_url(url: str) -> str:
     except Exception:
         return "unknown"
 
+
 def looks_like_jwt(key: str) -> bool:
     return key.count(".") >= 2 and len(key) > 40
+
 
 def show_connected_db_banner():
     pref = project_ref_from_url(SUPABASE_URL)
@@ -341,6 +357,7 @@ def show_connected_db_banner():
 
     st.caption("If this shows the WRONG project ref, fix Streamlit secrets / Railway variables.")
     st.markdown(glass_close(), unsafe_allow_html=True)
+
 
 # ============================================================
 # TOP BAR
@@ -392,13 +409,16 @@ with st.sidebar.expander("⚡ Fast / 🐢 Slow Mode", expanded=False):
 
 # Effective slow settings
 SLOW_MODE = bool(st.session_state.get("_slow_mode_override", SLOW_MODE))
-MIN_SECONDS_BETWEEN_DB_CALLS = float(st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", MIN_SECONDS_BETWEEN_DB_CALLS))
+MIN_SECONDS_BETWEEN_DB_CALLS = float(
+    st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", MIN_SECONDS_BETWEEN_DB_CALLS)
+)
 
 # ============================================================
 # CACHED LOADERS (FAST TTLs)
 # ============================================================
 MEMBERS_TTL = 120 if not SLOW_MODE else 300
 VIEW_TTL = 90 if not SLOW_MODE else 240
+
 
 @st.cache_data(ttl=MEMBERS_TTL, show_spinner=False)
 def load_members(url: str, anon_key: str, schema: str) -> pd.DataFrame:
@@ -458,6 +478,7 @@ def load_members(url: str, anon_key: str, schema: str) -> pd.DataFrame:
     df["label"] = df.apply(lambda r: f"{int(r['id']):02d} • {r['member_name']}", axis=1)
     return df[["id", "member_name", "phone", "label"]].copy()
 
+
 @st.cache_data(ttl=VIEW_TTL, show_spinner=False)
 def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFrame:
     client = create_client(url, anon_key)
@@ -479,6 +500,28 @@ def load_contributions_view(url: str, anon_key: str, schema: str) -> pd.DataFram
         st.session_state["_last_contrib_view_error"] = _api_msg(e)
         return pd.DataFrame()
 
+
+@st.cache_data(ttl=VIEW_TTL, show_spinner=False)
+def load_attendance_view(url: str, anon_key: str, schema: str, session_id: int) -> pd.DataFrame:
+    client = create_client(url, anon_key)
+    throttle_db()
+    try:
+        rows = (
+            client.schema(schema)
+            .table("v_attendance_with_member")
+            .select("*")
+            .eq("session_id", int(session_id))
+            .order("member_id", desc=False)
+            .limit(5000)
+            .execute()
+            .data
+            or []
+        )
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
 # ============================================================
 # SESSION HELPERS
 # ============================================================
@@ -488,6 +531,7 @@ def get_app_state(sb, schema: str) -> dict:
         return rows[0]
     rows2 = safe_select(sb, "app_state", "*", schema=schema, limit=1, show_error=False)
     return rows2[0] if rows2 else {}
+
 
 def get_effective_session_id(sb_read, schema: str) -> tuple[Optional[int], str]:
     state = get_app_state(sb_read, schema)
@@ -517,6 +561,7 @@ def get_effective_session_id(sb_read, schema: str) -> tuple[Optional[int], str]:
         except Exception:
             return None, "fallback failed"
     return None, "no sessions"
+
 
 # ============================================================
 # NAVIGATION
@@ -594,7 +639,7 @@ elif page == "Loans":
         st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY to enable loans writes.")
         st.stop()
 
-    needed = ["members", "loans", "loan_payments", "loan_requests", "signatures", "interest_ledger"]
+    needed = ["members", "loans", "loan_payments", "signatures", "interest_ledger"]
     missing = [t for t in needed if not table_readable(sb_service, SUPABASE_SCHEMA, t)]
     if missing:
         st.error("Loans module is not ready — missing required table(s) or not readable:")
@@ -820,18 +865,7 @@ elif page == "Minutes & Attendance":
         st.markdown("### Current session attendance (read)")
 
         if table_readable(sb_anon, SUPABASE_SCHEMA, "v_attendance_with_member"):
-            arows = safe_select(
-                sb_anon,
-                "v_attendance_with_member",
-                "*",
-                schema=SUPABASE_SCHEMA,
-                order_by="member_id",
-                order_desc=False,
-                limit=2000,
-                session_id=int(current_session_id),
-                show_error=False,
-            )
-            dfa = pd.DataFrame(arows)
+            dfa = load_attendance_view(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA, int(current_session_id))
             if dfa.empty:
                 st.info("No attendance recorded for this session yet.")
             else:
@@ -855,7 +889,9 @@ elif page == "Minutes & Attendance":
         st.subheader("Summaries")
 
         st.markdown("### 📝 Minutes summary")
-        m_rows = safe_select(sb_anon, "minutes", "*", schema=SUPABASE_SCHEMA, order_by="updated_at", order_desc=True, limit=20, show_error=False)
+        m_rows = safe_select(
+            sb_anon, "minutes", "*", schema=SUPABASE_SCHEMA, order_by="updated_at", order_desc=True, limit=20, show_error=False
+        )
         dfm = pd.DataFrame(m_rows)
         if dfm.empty:
             st.info("No minutes recorded yet.")
@@ -875,17 +911,19 @@ elif page == "Minutes & Attendance":
 
         st.divider()
         st.markdown("### ✅ Attendance summary (current session)")
-        dfa = pd.DataFrame(arows_existing)
-        if dfa.empty:
+        dfa0 = pd.DataFrame(arows_existing)
+        if dfa0.empty:
             st.info("No attendance for current session.")
         else:
-            present_count = int(dfa["present"].astype(bool).sum()) if "present" in dfa.columns else 0
+            present_count = int(dfa0["present"].astype(bool).sum()) if "present" in dfa0.columns else 0
             st.metric("Present count", f"{present_count:,}")
-            st.metric("Absent count", f"{(len(dfa)-present_count):,}")
+            st.metric("Absent count", f"{(len(dfa0) - present_count):,}")
 
         st.divider()
         st.markdown("### 💰 Contributions summary (current session)")
         dfc = load_contributions_view(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
+
+        # If view is empty, fallback to raw contributions for current session
         if dfc.empty:
             c_rows = safe_select(
                 sb_anon,
@@ -903,4 +941,215 @@ elif page == "Minutes & Attendance":
         if dfc.empty:
             st.info("No contributions for current session.")
         else:
-            if "session
+            # Normalize columns
+            if "amount" in dfc.columns:
+                dfc["amount"] = pd.to_numeric(dfc["amount"], errors="coerce").fillna(0.0)
+
+            # Filter to current session if possible
+            if "session_id" in dfc.columns:
+                dfc["session_id"] = pd.to_numeric(dfc["session_id"], errors="coerce")
+                dfc = dfc[dfc["session_id"] == float(current_session_id)].copy()
+
+            total_amt = float(dfc["amount"].sum()) if "amount" in dfc.columns else 0.0
+            st.metric("Total contributions (session)", f"{total_amt:,.0f}")
+
+            # Member breakdown if possible
+            if "member_name" in dfc.columns:
+                by = (
+                    dfc.groupby("member_name", dropna=False)["amount"]
+                    .sum()
+                    .sort_values(ascending=False)
+                    .reset_index()
+                    .rename(columns={"amount": "total_amount"})
+                )
+                st.dataframe(by, width=W_STRETCH, hide_index=True)
+            elif "member_id" in dfc.columns:
+                by = (
+                    dfc.groupby("member_id", dropna=False)["amount"]
+                    .sum()
+                    .sort_values(ascending=False)
+                    .reset_index()
+                    .rename(columns={"amount": "total_amount"})
+                )
+                st.dataframe(by, width=W_STRETCH, hide_index=True)
+            else:
+                st.dataframe(dfc, width=W_STRETCH, hide_index=True)
+
+        st.markdown(glass_close(), unsafe_allow_html=True)
+
+elif page == "Admin":
+    st.markdown(glass_open(), unsafe_allow_html=True)
+    st.subheader("Admin")
+    st.caption("Sessions, members, and basic setup utilities.")
+
+    if not sb_service:
+        st.warning("Service key not configured. Add SUPABASE_SERVICE_KEY to enable admin writes.")
+        st.markdown(glass_close(), unsafe_allow_html=True)
+        st.stop()
+
+    # Try to load an optional admin module if you have one; otherwise provide minimal session tools here.
+    admin_fn, admin_err = lazy_import("admin_panel", "render_admin_panel")
+    if admin_fn is not None:
+        admin_fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
+        st.markdown(glass_close(), unsafe_allow_html=True)
+    else:
+        # Minimal built-in Admin: Sessions + set current session
+        st.markdown("### 📅 Sessions")
+        sessions = safe_select(
+            sb_anon,
+            "sessions",
+            "id,session_id,start_date,end_date,created_at",
+            schema=SUPABASE_SCHEMA,
+            order_by="session_id",
+            order_desc=True,
+            limit=200,
+            show_error=False,
+        )
+        dfs = pd.DataFrame(sessions)
+        if dfs.empty:
+            st.info("No sessions yet.")
+        else:
+            st.dataframe(dfs, width=W_STRETCH, hide_index=True)
+
+        st.divider()
+        st.markdown("### ➕ Create a new session")
+        with st.form("create_session_form"):
+            new_session_id = st.number_input("Session number (session_id)", min_value=1, value=1, step=1)
+            start_date = st.date_input("Start date", value=datetime.now().date())
+            end_date = st.date_input("End date", value=datetime.now().date())
+            create_btn = st.form_submit_button("Create session", width=W_STRETCH)
+
+        if create_btn:
+            try:
+                payload = {
+                    "session_id": int(new_session_id),
+                    "start_date": str(start_date),
+                    "end_date": str(end_date),
+                    "created_at": now_iso(),
+                }
+                throttle_db()
+                sb_service.schema(SUPABASE_SCHEMA).table("sessions").insert(payload).execute()
+                st.success("Session created.")
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as e:
+                st.error("Failed to create session.")
+                st.code(_api_msg(e), language="text")
+
+        st.divider()
+        st.markdown("### 🎯 Set current session (app_state)")
+        current_session_id, note = get_effective_session_id(sb_anon, SUPABASE_SCHEMA)
+        st.write("Current session:", current_session_id, f"({note})")
+        set_to = st.number_input("Set current_session_id to", min_value=1, value=int(current_session_id or 1), step=1)
+
+        if st.button("Save current_session_id", width=W_STRETCH):
+            try:
+                throttle_db()
+                # Prefer id=1, otherwise upsert
+                exists = safe_select(sb_service, "app_state", "id", schema=SUPABASE_SCHEMA, limit=1, show_error=False, id=1)
+                if exists:
+                    sb_service.schema(SUPABASE_SCHEMA).table("app_state").update(
+                        {"current_session_id": int(set_to), "updated_at": now_iso()}
+                    ).eq("id", 1).execute()
+                else:
+                    sb_service.schema(SUPABASE_SCHEMA).table("app_state").insert(
+                        {"id": 1, "current_session_id": int(set_to), "created_at": now_iso(), "updated_at": now_iso()}
+                    ).execute()
+                st.success("Updated app_state.current_session_id")
+                st.cache_data.clear()
+                st.rerun()
+            except Exception as e:
+                st.error("Failed to update app_state.")
+                st.code(_api_msg(e), language="text")
+
+        if admin_err:
+            st.caption("Optional admin_panel not found; using built-in admin tools.")
+            st.code(admin_err, language="text")
+
+        st.markdown(glass_close(), unsafe_allow_html=True)
+
+elif page == "Audit":
+    st.markdown(glass_open(), unsafe_allow_html=True)
+    st.subheader("Audit")
+    st.caption("Reads audit_log if available (or shows status).")
+
+    if table_readable(sb_anon, SUPABASE_SCHEMA, "audit_log"):
+        rows = safe_select(
+            sb_anon,
+            "audit_log",
+            "*",
+            schema=SUPABASE_SCHEMA,
+            order_by="created_at",
+            order_desc=True,
+            limit=300,
+            show_error=False,
+        )
+        dfa = pd.DataFrame(rows)
+        if dfa.empty:
+            st.info("audit_log is readable but has no rows.")
+        else:
+            st.dataframe(dfa, width=W_STRETCH, hide_index=True)
+    else:
+        st.warning(f"{SUPABASE_SCHEMA}.audit_log not readable (missing table or RLS).")
+
+    # Optional external audit panel
+    audit_fn, audit_err = lazy_import("audit_panel", "render_audit_panel")
+    if audit_fn is not None:
+        st.divider()
+        audit_fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
+    elif audit_err:
+        st.caption("Optional audit_panel not loaded (this is okay).")
+        st.code(audit_err, language="text")
+
+    st.markdown(glass_close(), unsafe_allow_html=True)
+
+elif page == "Health":
+    st.markdown(glass_open(), unsafe_allow_html=True)
+    st.subheader("Health")
+    st.caption("Quick readability check for key tables/views. Helps diagnose RLS/schema issues.")
+
+    objects = [
+        ("table", "members"),
+        ("table", "sessions"),
+        ("table", "app_state"),
+        ("table", "contributions"),
+        ("table", "foundation_contributions"),
+        ("table", "loans"),
+        ("table", "loan_payments"),
+        ("table", "interest_ledger"),
+        ("table", "fines"),
+        ("table", "minutes"),
+        ("table", "attendance"),
+        ("table", "payouts"),
+        ("table", "audit_log"),
+        ("view", "v_contributions_with_member"),
+        ("view", "v_attendance_with_member"),
+        ("view", "v_next_beneficiary"),
+    ]
+
+    rows = []
+    for typ, name in objects:
+        ok_anon = table_readable(sb_anon, SUPABASE_SCHEMA, name)
+        ok_srv = table_readable(sb_service, SUPABASE_SCHEMA, name) if sb_service else False
+        rows.append(
+            {
+                "object": f"{typ}:{name}",
+                "anon_read": "✅" if ok_anon else "❌",
+                "service_read": "✅" if ok_srv else ("—" if not sb_service else "❌"),
+            }
+        )
+
+    st.dataframe(pd.DataFrame(rows), width=W_STRETCH, hide_index=True)
+
+    health_fn, health_err = lazy_import("health_panel", "render_health_panel")
+    if health_fn is not None:
+        st.divider()
+        health_fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
+    elif health_err:
+        st.caption("Optional health_panel not loaded (this is okay).")
+        st.code(health_err, language="text")
+
+    st.markdown(glass_close(), unsafe_allow_html=True)
+
+else:
+    st.info("Select a page from the sidebar menu.")
