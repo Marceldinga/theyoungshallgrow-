@@ -1,3 +1,4 @@
+
 # app.py ✅ COMPLETE SINGLE CODE — NJANGI STANDARD (NO legacy) — “SLOW / GENTLE MODE”
 # ------------------------------------------------------------------------------
 # ✅ CLEAN + FUTURE-PROOF (Streamlit 2025+):
@@ -26,6 +27,9 @@
 #   tables: members, sessions, app_state, minutes, attendance, contributions, foundation_contributions,
 #           payouts, loans, loan_payments, fines, interest_ledger, audit_log
 #   views (optional): v_next_beneficiary, v_contributions_with_member, v_attendance_with_member
+#
+# ✅ ADDED:
+#   - "🧠 Njangi LLM" page (lazy-imports njangi_llm_panel.render_njangi_llm_panel)
 # ------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -61,6 +65,7 @@ W_STRETCH = "stretch"  # Streamlit replacement for use_container_width=True
 # ============================================================
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 # ============================================================
 # GLOBAL THEME (Midnight Navy + Emerald)
@@ -510,6 +515,7 @@ else:
         "Payouts",
         "Loans",
         "🤖 AI Risk Panel",
+        "🧠 Njangi LLM",          # ✅ ADDED
         "Minutes & Attendance",
         "Admin",
         "Audit",
@@ -598,6 +604,15 @@ elif page == "🤖 AI Risk Panel":
         st.code(err or "", language="text")
     else:
         fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
+
+# ✅ ADDED: Njangi LLM page (trainer + logs + chat)
+elif page == "🧠 Njangi LLM":
+    fn, err = lazy_import("njangi_llm_panel", "render_njangi_llm_panel")
+    if fn is None:
+        st.error("Njangi LLM panel failed to load.")
+        st.code(err or "", language="text")
+    else:
+        fn()
 
 elif page == "Minutes & Attendance":
     st.subheader("📝 Minutes & ✅ Attendance")
