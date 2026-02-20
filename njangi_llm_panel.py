@@ -1,39 +1,56 @@
 # njangi_llm_panel.py
 # ==============================================================================
-# 👩🏾‍💼 YOUNG — NJANGI “DASHBOARD COPILOT” (SMART • GROUNDED • MODERN)
+# 👩🏾‍💼 YOUNG — NJANGI “DASHBOARD COPILOT” (SMART • GROUNDED • MODERN • HUMAN-LIKE)
 # ------------------------------------------------------------------------------
 # ✅ Single-file module (drop-in)
 # ✅ NJANGI STANDARD tables (NO legacy)
 # ✅ Safe for Railway / Streamlit Cloud
 # ✅ Accepts: sb_anon / sb_service / schema (matches your app.py)
 #
-# ✅ What’s new (advanced “modern” feature):
-#   1) **Young** (assistant persona) runs as a **chat copilot** on the dashboard
-#   2) Loads ALL key data snapshots (members, sessions, loans, payments, interest,
-#      contributions, foundation, fines, attendance, minutes, payouts/app_state, signatures)
-#   3) Answers “almost any question” with:
-#      - Intent + slot detection (member, loan_id, session_id)
-#      - Generic dataframe QA (totals, counts, top lists, overdue, summaries)
-#      - Smart insights / alerts (overdue loans, missing contributors, anomalies)
-#   4) Optional Internet search (Tavily) with **privacy guard**:
-#      - Never web-search member/finance questions unless you explicitly force it
+# ✅ Human-like “ChatGPT style” behavior (but grounded):
+#   - Greets with *greeting of the day* (morning/afternoon/evening) + small human touch
+#   - Understands many intents and questions
+#   - Uses your LIVE Supabase snapshots to answer (no guessing)
+#   - Smart summaries, missing payers, overdue signals, member drilldowns
 #
-# ✅ ML training (XGBoost, NO sklearn required):
-#   - label=1 for active loans, 0 for closed loans
-#   - tiny-data safe split + fallback train-on-all
+# ✅ Optional Internet search (Tavily) with privacy guard:
+#   - Only searches the web when user starts with: web:
+#   - Never sends Njangi/member finance questions to the web
+#
+# ✅ ML training (XGBoost; no sklearn required) + model risk leaderboard
+# ------------------------------------------------------------------------------
+# ENV:
+#   TAVILY_API_KEY = your Tavily key (Railway Variables)
+# DEPENDENCIES:
+#   streamlit, pandas, numpy, xgboost (optional), reportlab (optional elsewhere)
 # ==============================================================================
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
+
+
+# ==============================================================================
+# Constants
+# ==============================================================================
+W_STRETCH = "stretch"
+
+TTL_UI = 15
+TTL_WEB = 15 * 60
+DEFAULT_MAX_ROWS = 5000
+
+TAVILY_ENDPOINT = "https://api.tavily.com/search"
 
 
 # ==============================================================================
@@ -43,14 +60,32 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _greeting() -> str:
-    # Streamlit runs server-side; use local time best-effort
-    h = datetime.now().hour
+def _local_hour() -> int:
+    # Streamlit runs server-side. This is best-effort.
+    return int(datetime.now().hour)
+
+
+def _greeting_of_day() -> str:
+    h = _local_hour()
     if h < 12:
         return "Good morning"
     if h < 18:
         return "Good afternoon"
     return "Good evening"
+
+
+def _tiny_human_touch() -> str:
+    h = _local_hour()
+    # small variation so it feels human, but stable and professional
+    if 5 <= h <= 9:
+        return "Hope your day starts strong."
+    if 10 <= h <= 13:
+        return "Hope your day is going well."
+    if 14 <= h <= 17:
+        return "Hope your afternoon is going smoothly."
+    if 18 <= h <= 22:
+        return "Hope your evening is peaceful."
+    return "Hope everything is okay on your side."
 
 
 def _normalize_text(s: str) -> str:
@@ -74,7 +109,7 @@ def _safe_count(df: pd.DataFrame) -> int:
     return int(len(df)) if df is not None and not df.empty else 0
 
 
-def _to_numeric_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+def _to_numeric_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     for c in cols:
@@ -124,8 +159,33 @@ def _norm_status(x) -> str:
     return s or "unknown"
 
 
-def _try_read(sb, schema: str, table: str, cols: str = "*", limit: int = 2000, order_by: str | None = None, desc: bool = True):
-    """Safe supabase read; returns list[dict]."""
+def _looks_like_key(s: str) -> bool:
+    s = str(s or "").strip()
+    return len(s) >= 12 and " " not in s
+
+
+def _env_or_secret(key: str, default: str = "") -> str:
+    v = os.getenv(key)
+    if v not in (None, ""):
+        return str(v).strip()
+    try:
+        return str(st.secrets.get(key, default)).strip()
+    except Exception:
+        return str(default).strip()
+
+
+# ==============================================================================
+# Safe Supabase reads (no cache decorators w/ client)
+# ==============================================================================
+def _try_read(
+    sb,
+    schema: str,
+    table: str,
+    cols: str = "*",
+    limit: int = 2000,
+    order_by: str | None = None,
+    desc: bool = True,
+) -> List[Dict]:
     if sb is None:
         return []
     q = sb.schema(schema).table(table).select(cols)
@@ -136,7 +196,7 @@ def _try_read(sb, schema: str, table: str, cols: str = "*", limit: int = 2000, o
     try:
         return (q.execute().data or [])
     except Exception:
-        # fallback: try '*' if column list fails
+        # fallback: try '*'
         try:
             q2 = sb.schema(schema).table(table).select("*").limit(int(limit))
             if order_by:
@@ -147,32 +207,40 @@ def _try_read(sb, schema: str, table: str, cols: str = "*", limit: int = 2000, o
 
 
 # ==============================================================================
-# “Young” persona + welcome
+# Persona text (human-like greeting + smart instructions)
 # ==============================================================================
 def _young_intro() -> str:
+    greet = _greeting_of_day()
+    touch = _tiny_human_touch()
     return (
-        f"{_greeting()} 👋🏾 I’m **Young** — your **Njangi Dashboard Copilot** for **theyoungshallgrow**.\n\n"
-        "I’m grounded on **your Supabase data** (members, sessions, contributions, loans, payments, interest, fines, attendance, minutes, payouts).\n\n"
-        "Ask me anything like:\n"
-        "• *Loans summary* / *Active loans* / *Overdue loans*\n"
-        "• *Contribution summary* / *Who hasn’t paid this session?*\n"
-        "• *Foundation total* / *Interest collected this month*\n"
-        "• *Fines summary* / *Attendance vs fines*\n"
-        "• *Risk for Donald* / *Top 5 risky members*\n"
-        "• *Show member Marcel loans* / *loan 12 status*\n\n"
-        "If you want Internet help, say **web:** at the start (example: `web: Maryland cosmetology license requirements`)."
+        f"{greet} 👋🏾 I’m **Young** — your **Njangi Dashboard Copilot** for **theyoungshallgrow**.\n\n"
+        f"_{touch}_\n\n"
+        "I’m grounded on your **Supabase data** (members, sessions, contributions, loans, payments, interest, fines, "
+        "attendance, minutes, payouts).\n\n"
+        "**Ask me anything like:**\n"
+        "• Loans summary / Active loans / Overdue loans\n"
+        "• Contribution summary / Who hasn’t paid this session?\n"
+        "• Foundation total / Interest collected this month\n"
+        "• Fines summary / Attendance vs fines\n"
+        "• Risk for Donald / Top 5 risky members\n"
+        "• Show member Marcel loans / loan 12 status\n\n"
+        "🌐 **Internet help:** start with `web:` (example: `web: Maryland cosmetology license requirements`).\n"
+        "🔒 Privacy: I won’t web-search your Njangi/member finance questions."
     )
 
 
-def _young_welcome_card(project_hint: str = "") -> None:
+def _welcome_card(schema: str):
+    greet = _greeting_of_day()
     st.markdown(
         f"""
         <div style="padding:14px;border-radius:16px;border:1px solid rgba(255,255,255,.12);
                     background:rgba(255,255,255,.04);">
-          <div style="font-size:18px;font-weight:700;">👩🏾‍💼 Young is online</div>
-          <div style="opacity:.9;margin-top:6px;">
-            { _greeting() } — I’m watching your Njangi data and ready to answer questions.
-            <br/>{project_hint}
+          <div style="font-size:18px;font-weight:750;">👩🏾‍💼 Young is online</div>
+          <div style="opacity:.92;margin-top:6px;">
+            {greet} — I’m connected to your Njangi snapshots and ready.
+          </div>
+          <div style="opacity:.70;margin-top:6px;font-size:12px;">
+            schema: <code>{schema}</code> • timestamp: <code>{_now_iso()}</code>
           </div>
         </div>
         """,
@@ -182,55 +250,61 @@ def _young_welcome_card(project_hint: str = "") -> None:
 
 # ==============================================================================
 # Data Hub (loads “all data” snapshots Young can use)
-# - no st.cache_data with sb client; use session_state in-memory cache
+# - uses session_state cache so supabase client is never hashed
 # ==============================================================================
 TABLE_SPECS = [
-    # name, columns (best-effort), order_by, numeric_cols
     ("members", "id,name,display_name,phone,created_at", "id", []),
-    ("sessions", "id,session_date,cycle_index,title,created_at", "created_at", []),
+    ("sessions", "id,session_id,session_date,cycle_index,title,start_date,end_date,created_at", "created_at", []),
     ("contributions", "id,member_id,session_id,amount,paid_at,created_at", "created_at", ["amount"]),
     ("foundation_contributions", "id,member_id,session_id,amount,paid_at,created_at", "created_at", ["amount"]),
-    ("loans", "id,member_id,principal,principal_current,total_due,unpaid_interest,last_paid_at,status,borrow_date,due_cycle_days,interest_rate_monthly,created_at", "created_at",
-     ["principal", "principal_current", "total_due", "unpaid_interest", "due_cycle_days", "interest_rate_monthly"]),
+    (
+        "loans",
+        "id,member_id,principal,principal_current,total_due,unpaid_interest,last_paid_at,status,borrow_date,due_cycle_days,interest_rate_monthly,created_at",
+        "created_at",
+        ["principal", "principal_current", "total_due", "unpaid_interest", "due_cycle_days", "interest_rate_monthly"],
+    ),
     ("loan_payments", "id,loan_id,member_id,amount,paid_at,created_at", "created_at", ["amount"]),
     ("interest_ledger", "id,loan_id,member_id,amount,posted_at,created_at", "created_at", ["amount"]),
     ("fines", "*", "created_at", ["amount"]),
     ("attendance", "*", "created_at", []),
     ("minutes", "*", "created_at", []),
+    ("payouts", "*", "created_at", []),   # optional, if exists
     ("app_state", "*", "created_at", []),
     ("signatures", "*", "created_at", []),
 ]
 
 
 def _hub_key(schema: str, table: str) -> str:
-    return f"hub::{schema}::{table}"
+    return f"younghub::{schema}::{table}"
 
 
-def _load_hub(sb_read, schema: str, slow_mode: bool = True, limit: int = 5000) -> dict[str, pd.DataFrame]:
-    """
-    Returns dict of {table_name: df}.
-    Uses st.session_state as a simple cache. Refresh clears this cache.
-    """
+def _hub_clear(schema: str):
+    cache = st.session_state.get("young_hub_cache", {})
+    for table, *_ in TABLE_SPECS:
+        cache.pop(_hub_key(schema, table), None)
+    st.session_state["young_hub_cache"] = cache
+
+
+def _hub_load(sb_read, schema: str, slow_mode: bool, limit: int) -> Dict[str, pd.DataFrame]:
     if "young_hub_cache" not in st.session_state:
         st.session_state["young_hub_cache"] = {}
 
-    cache: dict[str, pd.DataFrame] = st.session_state["young_hub_cache"]
-    out: dict[str, pd.DataFrame] = {}
+    cache: Dict[str, pd.DataFrame] = st.session_state["young_hub_cache"]
+    out: Dict[str, pd.DataFrame] = {}
 
     for (table, cols, order_by, num_cols) in TABLE_SPECS:
         key = _hub_key(schema, table)
         if key in cache:
-            df = cache[key]
-            out[table] = df
+            out[table] = cache[key]
             continue
 
         if slow_mode:
-            time.sleep(0.10)
+            time.sleep(0.08)
 
         rows = _try_read(sb_read, schema, table, cols=cols, limit=limit, order_by=order_by, desc=True)
         df = pd.DataFrame(rows or [])
+
         if not df.empty:
-            # normalize
             if table == "loans":
                 df["status_norm"] = df.get("status", "").apply(_norm_status)
             df = _to_numeric_cols(df, num_cols)
@@ -238,24 +312,16 @@ def _load_hub(sb_read, schema: str, slow_mode: bool = True, limit: int = 5000) -
         cache[key] = df
         out[table] = df
 
+    st.session_state["young_hub_cache"] = cache
     return out
 
 
-def _clear_hub(schema: str):
-    if "young_hub_cache" not in st.session_state:
-        return
-    cache: dict[str, Any] = st.session_state["young_hub_cache"]
-    for table, *_ in TABLE_SPECS:
-        cache.pop(_hub_key(schema, table), None)
-
-
 # ==============================================================================
-# Slot detection (member / loan_id / session_id)
+# Slots: member / loan_id / session_id
 # ==============================================================================
 def _build_member_labels(members_df: pd.DataFrame) -> pd.DataFrame:
     if members_df is None or members_df.empty:
         return pd.DataFrame()
-
     m = members_df.copy()
     if "display_name" in m.columns:
         m["member_name"] = m["display_name"].fillna("").astype(str)
@@ -266,10 +332,9 @@ def _build_member_labels(members_df: pd.DataFrame) -> pd.DataFrame:
     return m
 
 
-def _pick_member_from_question(question: str, members_df: pd.DataFrame) -> tuple[int | None, str | None]:
+def _pick_member_from_question(question: str, members_df: pd.DataFrame) -> Tuple[int | None, str | None]:
     if members_df is None or members_df.empty:
         return None, None
-
     q = _normalize_text(question)
     if not q:
         return None, None
@@ -278,7 +343,6 @@ def _pick_member_from_question(question: str, members_df: pd.DataFrame) -> tuple
     if m.empty or "id" not in m.columns:
         return None, None
 
-    # longest-name-first contains match
     candidates = []
     for _, r in m.iterrows():
         try:
@@ -303,10 +367,6 @@ def _pick_member_from_question(question: str, members_df: pd.DataFrame) -> tuple
 
 
 def _pick_int_from_text(question: str, label: str) -> int | None:
-    """
-    Finds patterns like:
-      loan 12, loan_id=12, session 5, session_id 5
-    """
     q = _normalize_text(question)
     m = re.search(rf"{re.escape(label)}\s*[:=#]?\s*(\d+)", q)
     if m:
@@ -317,8 +377,16 @@ def _pick_int_from_text(question: str, label: str) -> int | None:
     return None
 
 
+def _who_label(member_id: int | None, member_name: str | None) -> str:
+    if member_id is not None and member_name:
+        return f"**{member_name}**"
+    if member_id is not None:
+        return f"**member_id={member_id}**"
+    return "**All members**"
+
+
 # ==============================================================================
-# Intent detection (expanded)
+# Intent detection (smart)
 # ==============================================================================
 def _detect_intent(question: str) -> str:
     q = _normalize_text(question)
@@ -326,48 +394,48 @@ def _detect_intent(question: str) -> str:
     if q.startswith("web:") or q.startswith("internet:") or q.startswith("tavily:"):
         return "web"
 
-    if any(k in q for k in ["introduce", "who are you", "your name", "young"]):
+    if any(k in q for k in ["introduce", "who are you", "your name"]):
         return "intro"
     if any(k in q for k in ["help", "what can you do", "commands", "examples"]):
         return "help"
 
+    if any(k in q for k in ["who hasn't paid", "who hasnt paid", "not paid", "missing contributors", "missing payments"]):
+        return "missing_contrib"
     if any(k in q for k in ["overdue", "late", "delinquent", "default"]):
         return "overdue"
     if any(k in q for k in ["risk", "score", "risky"]):
         return "risk"
 
-    if any(k in q for k in ["loan", "borrow", "interest", "principal", "balance"]):
+    if any(k in q for k in ["loan", "borrow", "principal", "balance", "total due"]):
         return "loans"
-    if any(k in q for k in ["payment", "repay", "paid back", "loan payment"]):
+    if any(k in q for k in ["payment", "repay", "loan payment"]):
         return "loan_payments"
-    if any(k in q for k in ["interest ledger", "interest collected", "interest paid"]):
+    if any(k in q for k in ["interest", "interest ledger", "interest collected"]):
         return "interest"
 
-    if any(k in q for k in ["contribution", "contrib", "deposit", "paid", "payment in"]):
+    if any(k in q for k in ["contribution", "contrib", "deposit"]):
         return "contributions"
-    if any(k in q for k in ["foundation"]):
+    if "foundation" in q:
         return "foundation"
-
     if any(k in q for k in ["fine", "penalty"]):
         return "fines"
     if any(k in q for k in ["attendance", "present", "absent"]):
         return "attendance"
     if any(k in q for k in ["minutes", "meeting"]):
         return "minutes"
-    if any(k in q for k in ["payout", "rotation", "who is next", "next payout"]):
+    if any(k in q for k in ["payout", "rotation", "next payout", "who is next"]):
         return "payouts"
     if any(k in q for k in ["session", "cycle"]):
         return "sessions"
 
-    # generic questions over data
-    if any(k in q for k in ["total", "sum", "count", "how many", "top", "list", "show", "latest", "recent", "average", "max", "min"]):
+    if any(k in q for k in ["total", "sum", "count", "how many", "top", "list", "show", "latest", "recent"]):
         return "generic"
 
     return "unknown"
 
 
 # ==============================================================================
-# Generic dataframe QA (smart fallback)
+# Generic dataframe QA (fallback)
 # ==============================================================================
 def _df_best_date_col(df: pd.DataFrame) -> str | None:
     for c in ["paid_at", "posted_at", "session_date", "borrow_date", "last_paid_at", "created_at", "updated_at", "date"]:
@@ -390,61 +458,46 @@ def _df_top_n(df: pd.DataFrame, col: str, n: int = 10, asc: bool = False) -> pd.
 def _maybe_filter_member(df: pd.DataFrame, member_id: int | None) -> pd.DataFrame:
     if df is None or df.empty or member_id is None:
         return df
-    for c in ["member_id", "member", "memberid"]:
+    for c in ["member_id", "member"]:
         if c in df.columns:
             return df[df[c].astype(str) == str(member_id)].copy()
     return df
 
 
-def _who_label(member_id: int | None, member_name: str | None) -> str:
-    if member_id is not None and member_name:
-        return f"**{member_name}**"
-    if member_id is not None:
-        return f"**member_id={member_id}**"
-    return "**All members**"
-
-
-def _answer_generic(question: str, hub: dict[str, pd.DataFrame], member_id: int | None, member_name: str | None) -> tuple[str, pd.DataFrame | None]:
-    """
-    Returns (text_answer, optional_dataframe_to_show)
-    """
+def _answer_generic(question: str, hub: Dict[str, pd.DataFrame], member_id: int | None, member_name: str | None) -> Tuple[str, pd.DataFrame | None]:
     q = _normalize_text(question)
     who = _who_label(member_id, member_name)
 
-    # choose a target table by keywords
-    table = None
-    if any(k in q for k in ["loan"]):
+    # pick a table by keywords
+    if "loan" in q:
         table = "loans"
-    elif any(k in q for k in ["contrib"]):
+    elif "contrib" in q:
         table = "contributions"
     elif "foundation" in q:
         table = "foundation_contributions"
     elif "fine" in q:
         table = "fines"
-    elif any(k in q for k in ["attendance", "present", "absent"]):
+    elif "attendance" in q:
         table = "attendance"
     elif "minutes" in q:
         table = "minutes"
-    elif any(k in q for k in ["interest"]):
+    elif "interest" in q:
         table = "interest_ledger"
     elif "payment" in q:
         table = "loan_payments"
     elif "session" in q or "cycle" in q:
         table = "sessions"
     else:
-        # default: try loans first (most asked)
         table = "loans"
 
-    df = hub.get(table, pd.DataFrame())
-    df = _maybe_filter_member(df, member_id)
-
+    df = _maybe_filter_member(hub.get(table, pd.DataFrame()), member_id)
     if df is None or df.empty:
-        return (f"I couldn’t find data in `{table}` for {who}. If the table is empty or not in your DB, I’ll still answer other questions.", None)
+        return (f"I don’t see data in `{table}` for {who}. If this table is empty or blocked by RLS, I’ll still answer other questions.", None)
 
     # totals
-    if any(k in q for k in ["total", "sum"]) and any(k in q for k in ["amount", "contrib", "foundation", "fine", "interest", "payment"]):
+    if any(k in q for k in ["total", "sum"]):
         amt_col = None
-        for c in ["amount", "paid_amount", "value"]:
+        for c in ["amount", "principal_current", "principal", "total_due", "unpaid_interest"]:
             if c in df.columns:
                 amt_col = c
                 break
@@ -452,28 +505,27 @@ def _answer_generic(question: str, hub: dict[str, pd.DataFrame], member_id: int 
             total = _safe_sum(df, amt_col)
             return (f"For {who} in `{table}`: total **{amt_col}** = **{_money(total)}** (rows={len(df):,}).", None)
 
-    # counts
+    # count
     if any(k in q for k in ["count", "how many", "rows"]):
         return (f"For {who} in `{table}`: I see **{len(df):,}** rows.", None)
 
-    # top N by amount/principal/balance
+    # top N
     if "top" in q or "highest" in q:
-        n = 10
+        n = 5
         m = re.search(r"top\s+(\d+)", q)
         if m:
             try:
                 n = max(1, min(50, int(m.group(1))))
             except Exception:
-                n = 10
-
-        candidate_cols = [c for c in ["amount", "principal_current", "principal", "total_due", "unpaid_interest"] if c in df.columns]
+                n = 5
+        candidate_cols = [c for c in ["amount", "principal_current", "unpaid_interest", "total_due"] if c in df.columns]
         if not candidate_cols:
             return (f"I can list top items, but `{table}` has no numeric columns like amount/principal/balance.", None)
         col = candidate_cols[0]
         top_df = _df_top_n(df, col, n=n, asc=False)
         return (f"Top **{n}** rows in `{table}` for {who} by **{col}**:", top_df)
 
-    # latest / recent
+    # latest
     if any(k in q for k in ["latest", "recent", "last"]):
         dcol = _df_best_date_col(df)
         if not dcol:
@@ -483,45 +535,115 @@ def _answer_generic(question: str, hub: dict[str, pd.DataFrame], member_id: int 
         tmp = tmp.dropna(subset=["_dt"]).sort_values("_dt", ascending=False).drop(columns=["_dt"])
         return (f"Most recent rows in `{table}` for {who} (sorted by `{dcol}`):", tmp.head(15))
 
-    # list / show
+    # list/show
     if any(k in q for k in ["list", "show"]):
         return (f"Here are rows from `{table}` for {who}:", df.head(25))
 
-    # fallback summary
     cols_preview = ", ".join(list(df.columns)[:12]) + (" ..." if len(df.columns) > 12 else "")
-    return (f"I can help more if you say **total / count / top / latest / list**. `{table}` columns I see: {cols_preview}", None)
+    return (f"Tell me what you want: **total / count / top / latest / list**. `{table}` columns: {cols_preview}", None)
 
 
 # ==============================================================================
-# Grounded answers (specialized routes)
+# Web Search (Tavily) — only when user starts with `web:`
 # ==============================================================================
-def _answer_grounded(question: str, hub: dict[str, pd.DataFrame], selected_member_id: int | None, selected_member_label: str | None, loan_filter: str) -> tuple[str, pd.DataFrame | None]:
+@st.cache_data(ttl=TTL_WEB, show_spinner=False)
+def _tavily_search_cached(query: str, api_key: str, max_results: int = 5) -> dict:
+    payload = {
+        "api_key": api_key,
+        "query": query,
+        "max_results": int(max_results),
+        "include_answer": True,
+        "include_raw_content": False,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        TAVILY_ENDPOINT,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            return json.loads(body) if body else {}
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            err_body = ""
+        return {"_error": f"HTTPError {getattr(e,'code','')}: {err_body or str(e)}"}
+    except Exception as e:
+        return {"_error": repr(e)}
+
+
+def _format_web_result(res: dict) -> Tuple[str, List[dict]]:
+    if not isinstance(res, dict):
+        return ("I couldn’t read the web results.", [])
+    if res.get("_error"):
+        return (f"Internet search failed: {res.get('_error')}", [])
+    answer = str(res.get("answer") or "").strip()
+    results = res.get("results") or []
+    sources = []
+    for it in results[:5]:
+        if not isinstance(it, dict):
+            continue
+        sources.append(
+            {
+                "title": str(it.get("title") or "").strip(),
+                "url": str(it.get("url") or "").strip(),
+                "content": str(it.get("content") or "").strip(),
+                "score": it.get("score"),
+            }
+        )
+    if not answer:
+        answer = "Here’s what I found online (see sources)."
+    return (answer, sources)
+
+
+def _extract_web_query(q: str) -> str:
+    q2 = q.strip()
+    return re.sub(r"^(web:|internet:|tavily:)\s*", "", q2, flags=re.IGNORECASE).strip()
+
+
+# ==============================================================================
+# Grounded answers (smart routes)
+# ==============================================================================
+def _answer_grounded(
+    question: str,
+    hub: Dict[str, pd.DataFrame],
+    selected_member_id: int | None,
+    selected_member_name: str | None,
+    loan_filter: str,
+) -> Tuple[str, pd.DataFrame | None, List[dict] | None]:
     qraw = question.strip()
     if not qraw:
-        return ("Please type a question.", None)
+        return ("Please type a question.", None, None)
 
     intent = _detect_intent(qraw)
 
     members_df = hub.get("members", pd.DataFrame())
-    loans_df = hub.get("loans", pd.DataFrame())
+    sessions_df = hub.get("sessions", pd.DataFrame())
     contrib_df = hub.get("contributions", pd.DataFrame())
     foundation_df = hub.get("foundation_contributions", pd.DataFrame())
-    fines_df = hub.get("fines", pd.DataFrame())
+    loans_df = hub.get("loans", pd.DataFrame())
     pay_df = hub.get("loan_payments", pd.DataFrame())
     interest_df = hub.get("interest_ledger", pd.DataFrame())
-    sessions_df = hub.get("sessions", pd.DataFrame())
+    fines_df = hub.get("fines", pd.DataFrame())
+    att_df = hub.get("attendance", pd.DataFrame())
+    minutes_df = hub.get("minutes", pd.DataFrame())
+    payouts_df = hub.get("payouts", pd.DataFrame())
+    app_state_df = hub.get("app_state", pd.DataFrame())
 
-    # slot: member from question overrides UI
+    # Slots (member from question overrides UI selection)
     q_member_id, q_member_name = _pick_member_from_question(qraw, members_df)
     member_id = q_member_id if q_member_id is not None else selected_member_id
-    member_name = q_member_name if q_member_name is not None else selected_member_label
+    member_name = q_member_name if q_member_name is not None else selected_member_name
     who = _who_label(member_id, member_name)
 
-    # slot: ids
     loan_id = _pick_int_from_text(qraw, "loan")
     session_id = _pick_int_from_text(qraw, "session")
 
-    # slot: loan filter from question overrides UI
+    # loan filter override by question
     qn = _normalize_text(qraw)
     status_filter = loan_filter
     if "active" in qn:
@@ -532,24 +654,28 @@ def _answer_grounded(question: str, hub: dict[str, pd.DataFrame], selected_membe
         status_filter = "All"
 
     if intent == "intro":
-        return (_young_intro(), None)
+        return (_young_intro(), None, None)
 
     if intent == "help":
         return (
-            "Here are examples you can ask Young:\n"
+            "Here are examples you can ask:\n"
             "• **Loans summary** / **Active loans** / **Overdue loans**\n"
-            "• **Contribution summary** / **Who hasn’t paid this session?**\n"
+            "• **Who hasn’t paid this session?**\n"
             "• **Foundation total** / **Interest collected this month**\n"
-            "• **Fines summary**\n"
+            "• **Fines summary** / **Attendance vs fines**\n"
             "• **Risk for Donald** / **Top 5 risky members**\n"
-            "• **Show latest payments**\n"
-            "• **session 12 summary**\n\n"
-            "Internet help:\n"
-            "• Start your question with **web:** to force an Internet search.\n",
+            "• **Show member Marcel loans** / **loan 12 status**\n\n"
+            "Internet:\n"
+            "• Start with **web:** to search online.\n",
+            None,
             None,
         )
 
-    # Member-scoped frames
+    # Web intent handled elsewhere, but keep safe fallback
+    if intent == "web":
+        return ("To use the internet, start your message with **web:** (example: `web: ...`).", None, None)
+
+    # Member filtered frames
     mc = _maybe_filter_member(contrib_df, member_id)
     mf = _maybe_filter_member(fines_df, member_id)
     mfd = _maybe_filter_member(foundation_df, member_id)
@@ -557,26 +683,15 @@ def _answer_grounded(question: str, hub: dict[str, pd.DataFrame], selected_membe
     mpay = _maybe_filter_member(pay_df, member_id)
     mint = _maybe_filter_member(interest_df, member_id)
 
-    # normalize + filter loans
-    ml = ml_all.copy() if ml_all is not None else pd.DataFrame()
-    if ml is not None and not ml.empty:
-        if "status_norm" not in ml.columns:
-            ml["status_norm"] = ml.get("status", "").apply(_norm_status)
-        if status_filter == "Active":
-            ml = ml[ml["status_norm"] == "active"].copy()
-        elif status_filter == "Closed":
-            ml = ml[ml["status_norm"] == "closed"].copy()
-
     # loan by id
-    if loan_id is not None and not loans_df.empty and "id" in loans_df.columns:
+    if loan_id is not None and loans_df is not None and not loans_df.empty and "id" in loans_df.columns:
         one = loans_df[loans_df["id"].astype(str) == str(loan_id)].copy()
         if one.empty:
-            return (f"I couldn’t find **loan {loan_id}** in your loans table.", None)
-        return (f"Here is **loan {loan_id}**:", one.head(1))
+            return (f"I couldn’t find **loan {loan_id}** in your loans table.", None, None)
+        return (f"Here is **loan {loan_id}**:", one.head(1), None)
 
-    # session by id
+    # session summary
     if session_id is not None:
-        # attempt “session summary”
         c_sess = contrib_df.copy() if contrib_df is not None else pd.DataFrame()
         f_sess = foundation_df.copy() if foundation_df is not None else pd.DataFrame()
         if not c_sess.empty and "session_id" in c_sess.columns:
@@ -586,293 +701,308 @@ def _answer_grounded(question: str, hub: dict[str, pd.DataFrame], selected_membe
 
         contrib_total = _safe_sum(c_sess, "amount")
         foundation_total = _safe_sum(f_sess, "amount")
-        rows_c = _safe_count(c_sess)
-        rows_f = _safe_count(f_sess)
 
-        # list missing contributors if sessions exist + contributions exist
+        title = ""
+        if sessions_df is not None and not sessions_df.empty:
+            sid_col = "session_id" if "session_id" in sessions_df.columns else "id"
+            srow = sessions_df[sessions_df[sid_col].astype(str) == str(session_id)]
+            if not srow.empty:
+                title = str(srow.iloc[0].get("title") or srow.iloc[0].get("session_date") or "").strip()
+
+        # missing contributors list
         missing_note = ""
-        if not members_df.empty and not c_sess.empty and "member_id" in c_sess.columns:
+        missing_df = pd.DataFrame()
+        if members_df is not None and not members_df.empty and "id" in members_df.columns and not c_sess.empty and "member_id" in c_sess.columns:
             paid_ids = set(c_sess["member_id"].astype(str).tolist())
             m = _build_member_labels(members_df)
-            if "id" in m.columns:
-                all_ids = m["id"].astype(str).tolist()
-                missing_ids = [i for i in all_ids if i not in paid_ids]
-                if missing_ids:
-                    miss_names = m[m["id"].astype(str).isin(missing_ids)]["member_name"].tolist()
-                    missing_note = "Missing contributors (based on contributions rows): " + ", ".join(miss_names[:20]) + (" …" if len(miss_names) > 20 else "")
+            all_ids = m["id"].astype(str).tolist()
+            miss_ids = [i for i in all_ids if i not in paid_ids]
+            if miss_ids:
+                miss = m[m["id"].astype(str).isin(miss_ids)][["id", "member_name"]].copy()
+                missing_df = miss.rename(columns={"id": "member_id"})
+                missing_note = f"Missing contributors: **{len(miss_ids)}**"
 
-        sess_title = ""
-        if not sessions_df.empty and "id" in sessions_df.columns:
-            srow = sessions_df[sessions_df["id"].astype(str) == str(session_id)]
-            if not srow.empty:
-                sess_title = f" — {str(srow.iloc[0].get('title') or srow.iloc[0].get('session_date') or '').strip()}"
+        msg = (
+            f"Session **{session_id}** summary"
+            + (f" — {title}" if title else "")
+            + ":\n"
+            f"• Contributions total: **{_money(contrib_total)}** (rows={_safe_count(c_sess):,})\n"
+            f"• Foundation total: **{_money(foundation_total)}** (rows={_safe_count(f_sess):,})\n"
+            + (f"• {missing_note}\n" if missing_note else "")
+        )
+        return (msg, (missing_df.head(25) if not missing_df.empty else None), None)
 
+    # Missing contributions (current session from app_state if possible)
+    if intent == "missing_contrib":
+        # current session id
+        current_session = None
+        if app_state_df is not None and not app_state_df.empty:
+            row0 = app_state_df.iloc[0].to_dict()
+            cs = row0.get("current_session_id")
+            try:
+                current_session = int(cs) if cs is not None and str(cs).strip() != "" else None
+            except Exception:
+                current_session = None
+
+        if current_session is None:
+            return (
+                "I can do this best if **app_state.current_session_id** exists.\n"
+                "Try: `session 5 missing contributors` (replace 5 with your session).",
+                None,
+                None,
+            )
+
+        if members_df is None or members_df.empty or contrib_df is None or contrib_df.empty:
+            return ("I need both **members** and **contributions** data to compute missing contributors.", None, None)
+
+        c = contrib_df.copy()
+        if "session_id" in c.columns:
+            c = c[c["session_id"].astype(str) == str(current_session)]
+        if c.empty or "member_id" not in c.columns:
+            return (f"I don’t see contributions recorded for session **{current_session}** yet.", None, None)
+
+        paid_ids = set(c["member_id"].astype(str).tolist())
+        m = _build_member_labels(members_df)
+        miss = m[~m["id"].astype(str).isin(paid_ids)][["id", "member_name"]].copy()
+        miss = miss.rename(columns={"id": "member_id"})
         return (
-            f"Session **{session_id}** summary{sess_title}:\n"
-            f"• Contributions total: **{_money(contrib_total)}** (rows={rows_c:,})\n"
-            f"• Foundation total: **{_money(foundation_total)}** (rows={rows_f:,})\n"
-            f"{('• ' + missing_note) if missing_note else ''}",
+            f"Session **{current_session}** missing contributors: **{len(miss):,}**",
+            miss.head(60) if not miss.empty else None,
             None,
         )
 
-    # Specialized intents
+    # Contributions
     if intent == "contributions":
-        total_contrib = _safe_sum(mc, "amount")
+        total = _safe_sum(mc, "amount")
         return (
             f"Contribution summary for {who}:\n"
-            f"• Total contributed: **{_money(total_contrib)}**\n"
-            f"• Contribution rows: **{_safe_count(mc):,}**\n\n"
-            "Rule reminder: contributions should be **multiples of 500** (your system rule).",
+            f"• Total contributed: **{_money(total)}**\n"
+            f"• Rows: **{_safe_count(mc):,}**\n"
+            "Reminder: contributions should be **multiples of 500** (your Njangi rule).",
+            None,
             None,
         )
 
+    # Foundation
     if intent == "foundation":
-        total_f = _safe_sum(mfd, "amount")
+        total = _safe_sum(mfd, "amount")
         return (
             f"Foundation summary for {who}:\n"
-            f"• Total foundation contributed: **{_money(total_f)}**\n"
-            f"• Foundation rows: **{_safe_count(mfd):,}**",
+            f"• Total foundation contributed: **{_money(total)}**\n"
+            f"• Rows: **{_safe_count(mfd):,}**",
+            None,
             None,
         )
 
+    # Loans summary
     if intent == "loans":
+        ml = ml_all.copy() if ml_all is not None else pd.DataFrame()
+        if ml is not None and not ml.empty:
+            if "status_norm" not in ml.columns:
+                ml["status_norm"] = ml.get("status", "").apply(_norm_status)
+            if status_filter == "Active":
+                ml = ml[ml["status_norm"] == "active"].copy()
+            elif status_filter == "Closed":
+                ml = ml[ml["status_norm"] == "closed"].copy()
+
         principal = _safe_sum(ml, "principal")
         bal = _safe_sum(ml, "principal_current")
-        unpaid_int = _safe_sum(ml, "unpaid_interest")
-        loan_count = _safe_count(ml)
+        unpaid = _safe_sum(ml, "unpaid_interest")
+        due = _safe_sum(ml, "total_due")
 
-        breakdown = ""
-        if not loans_df.empty and "status_norm" in loans_df.columns:
-            src = loans_df.copy()
-            if member_id is not None and "member_id" in src.columns:
-                src = src[src["member_id"].astype(str) == str(member_id)]
-            vc = src["status_norm"].value_counts().to_dict()
-            if vc:
-                breakdown = "Status counts: " + ", ".join([f"{k}={int(v)}" for k, v in vc.items()])
+        # smart note: last paid age
+        note = ""
+        if ml is not None and not ml.empty and "last_paid_at" in ml.columns:
+            lp = pd.to_datetime(ml["last_paid_at"], errors="coerce", utc=True)
+            if lp.notna().any():
+                days = float((pd.Timestamp.now(tz="UTC") - lp.max()).total_seconds() / 86400.0)
+                if days > 45:
+                    note = f"⚠️ Last payment looks old (~{days:.0f} days). Consider follow-up this session."
 
         return (
             f"Loans summary for {who} (filter: **{status_filter}**):\n"
-            f"• Loan rows: **{loan_count:,}**\n"
-            f"• Total principal: **{_money(principal)}**\n"
-            f"• Total balance (principal_current): **{_money(bal)}**\n"
-            f"• Unpaid interest: **{_money(unpaid_int)}**\n"
-            f"{('• ' + breakdown) if breakdown else ''}\n\n"
-            "Tip: If **last_paid_at** is > 30 days on active loans, follow up this session.",
+            f"• Loans: **{_safe_count(ml):,}**\n"
+            f"• Principal: **{_money(principal)}**\n"
+            f"• Balance (principal_current): **{_money(bal)}**\n"
+            f"• Unpaid interest: **{_money(unpaid)}**\n"
+            f"• Total due: **{_money(due)}**\n"
+            + (f"\n{note}" if note else ""),
+            None,
             None,
         )
 
-    if intent == "loan_payments":
-        if mpay is None or mpay.empty:
-            return (f"I don’t see loan payment rows for {who}.", None)
-        return (f"Here are the most recent loan payments for {who}:", mpay.head(20))
-
-    if intent == "interest":
-        total_i = _safe_sum(mint, "amount")
-        if mint is None or mint.empty:
-            return (f"I don’t see interest ledger rows for {who}.", None)
-        return (
-            f"Interest summary for {who}:\n"
-            f"• Total interest recorded: **{_money(total_i)}**\n"
-            f"• Rows: **{len(mint):,}**\n\n"
-            "Tip: Interest ledger is best as the single source of truth for interest reporting.",
-            mint.head(20),
-        )
-
-    if intent == "fines":
-        fines_total = _safe_sum(mf, "amount") if (mf is not None and not mf.empty and "amount" in mf.columns) else float(_safe_count(mf))
-        return (
-            f"Fines summary for {who}:\n"
-            f"• Fine records: **{_safe_count(mf):,}**\n"
-            f"• Total fines: **{_money(fines_total)}**",
-            None,
-        )
-
+    # Overdue
     if intent == "overdue":
         if ml_all is None or ml_all.empty:
-            return (f"I can’t see loans for {who}.", None)
+            return (f"I can’t see loans for {who}.", None, None)
+
         tmp = ml_all.copy()
         if "status_norm" not in tmp.columns:
             tmp["status_norm"] = tmp.get("status", "").apply(_norm_status)
-        od = tmp[tmp["status_norm"].isin(["overdue", "late", "default", "delinquent"])].copy()
-        if od.empty:
-            # heuristic overdue: active + last_paid_at old
-            if "last_paid_at" in tmp.columns:
-                t2 = tmp[tmp["status_norm"] == "active"].copy()
-                t2["_lp"] = pd.to_datetime(t2["last_paid_at"], errors="coerce", utc=True)
-                t2["_days"] = (pd.Timestamp.now(tz="UTC") - t2["_lp"]).dt.total_seconds() / 86400.0
-                od = t2[t2["_days"] > 30].drop(columns=["_lp", "_days"], errors="ignore")
-        if od.empty:
-            return (f"I don’t see overdue signals for {who} right now.", None)
-        show_cols = [c for c in ["id", "member_id", "principal_current", "unpaid_interest", "last_paid_at", "status", "status_norm"] if c in od.columns]
-        return (f"Overdue / late loans for {who}:", od[show_cols].head(25) if show_cols else od.head(25))
 
+        od = tmp[tmp["status_norm"].isin(["overdue", "late", "default", "delinquent"])].copy()
+
+        # heuristic: active + last_paid_at older than 30 days
+        if od.empty and "last_paid_at" in tmp.columns:
+            t2 = tmp[tmp["status_norm"] == "active"].copy()
+            lp = pd.to_datetime(t2["last_paid_at"], errors="coerce", utc=True)
+            t2["_days"] = (pd.Timestamp.now(tz="UTC") - lp).dt.total_seconds() / 86400.0
+            od = t2[t2["_days"] > 30].drop(columns=["_days"], errors="ignore")
+
+        if od.empty:
+            return (f"I don’t see overdue signals for {who} right now.", None, None)
+
+        show_cols = [c for c in ["id", "member_id", "principal_current", "unpaid_interest", "last_paid_at", "status"] if c in od.columns]
+        return (f"Overdue / late loans for {who}:", (od[show_cols].head(30) if show_cols else od.head(30)), None)
+
+    # Payments
+    if intent == "loan_payments":
+        if mpay is None or mpay.empty:
+            return (f"I don’t see loan payment rows for {who}.", None, None)
+        return (f"Most recent loan payments for {who}:", mpay.head(25), None)
+
+    # Interest
+    if intent == "interest":
+        if mint is None or mint.empty:
+            return (f"I don’t see interest ledger rows for {who}.", None, None)
+        total = _safe_sum(mint, "amount")
+        return (
+            f"Interest summary for {who}:\n"
+            f"• Total interest recorded: **{_money(total)}**\n"
+            f"• Rows: **{len(mint):,}**\n"
+            "Tip: interest_ledger is best as the single source of truth for interest reporting.",
+            mint.head(25),
+            None,
+        )
+
+    # Fines
+    if intent == "fines":
+        if mf is None or mf.empty:
+            return (f"I don’t see fines for {who}.", None, None)
+        total = _safe_sum(mf, "amount") if "amount" in mf.columns else float(len(mf))
+        return (
+            f"Fines summary for {who}:\n"
+            f"• Fine records: **{_safe_count(mf):,}**\n"
+            f"• Total fines: **{_money(total)}**",
+            None,
+            None,
+        )
+
+    # Attendance
+    if intent == "attendance":
+        if att_df is None or att_df.empty:
+            return ("I don’t see attendance records yet.", None, None)
+        return ("Here are recent attendance rows:", att_df.head(25), None)
+
+    # Minutes
+    if intent == "minutes":
+        if minutes_df is None or minutes_df.empty:
+            return ("I don’t see minutes saved yet.", None, None)
+        return ("Here are recent minutes rows:", minutes_df.head(25), None)
+
+    # Payouts
+    if intent == "payouts":
+        if payouts_df is not None and not payouts_df.empty:
+            return ("Here are recent payouts rows:", payouts_df.head(25), None)
+        if app_state_df is not None and not app_state_df.empty:
+            return ("I don’t see `payouts` rows, but here is `app_state` (look for rotation fields):", app_state_df.head(50), None)
+        return ("I can’t see payouts/app_state data yet.", None, None)
+
+    # Risk (heuristic always available; model risk available if trained)
     if intent == "risk":
-        # Hybrid: heuristic risk (always available)
+        # if user asked "top 5 risky", we do leaderboard
+        if ("top" in qn and "risky" in qn) or ("top" in qn and "risk" in qn):
+            # heuristic risk per member (max over loans)
+            loans = hub.get("loans", pd.DataFrame())
+            if loans is None or loans.empty or "member_id" not in loans.columns:
+                return ("Not enough loans data to compute top risks.", None, None)
+            tmp = loans.copy()
+            tmp["status_norm"] = tmp.get("status", "").apply(_norm_status)
+            tmp = _to_numeric_cols(tmp, ["principal_current", "unpaid_interest"])
+            tmp["risk_h"] = 0.0
+            tmp.loc[tmp["unpaid_interest"] > 0, "risk_h"] += 0.35
+            tmp.loc[tmp["principal_current"] > 0, "risk_h"] += 0.25
+            tmp.loc[tmp["status_norm"].isin(["overdue", "late", "default", "delinquent"]), "risk_h"] += 0.45
+            bym = tmp.groupby("member_id", dropna=False)["risk_h"].max().reset_index().sort_values("risk_h", ascending=False)
+            n = 5
+            m = re.search(r"top\s+(\d+)", qn)
+            if m:
+                try:
+                    n = max(1, min(25, int(m.group(1))))
+                except Exception:
+                    n = 5
+            bym = bym.head(n)
+            # attach names
+            mdf = hub.get("members", pd.DataFrame())
+            if mdf is not None and not mdf.empty and "id" in mdf.columns:
+                names = _build_member_labels(mdf)[["id", "member_name"]].rename(columns={"id": "member_id"})
+                bym["member_id"] = pd.to_numeric(bym["member_id"], errors="coerce")
+                names["member_id"] = pd.to_numeric(names["member_id"], errors="coerce")
+                bym = bym.merge(names, on="member_id", how="left")
+            return (f"Top **{n}** risky members (heuristic from loans snapshot):", bym, None)
+
+        # single member risk view
         total_contrib = _safe_sum(mc, "amount")
         bal = _safe_sum(ml_all, "principal_current")
-        unpaid_int = _safe_sum(ml_all, "unpaid_interest")
+        unpaid = _safe_sum(ml_all, "unpaid_interest")
         fines_total = _safe_sum(mf, "amount") if (mf is not None and not mf.empty and "amount" in mf.columns) else 0.0
 
-        risk = 0
-        if unpaid_int > 0:
-            risk += 35
+        score = 0
+        if unpaid > 0:
+            score += 35
         if bal > 0 and total_contrib == 0:
-            risk += 25
+            score += 25
         if ml_all is not None and not ml_all.empty:
             tmp = ml_all.copy()
-            if "status_norm" not in tmp.columns:
-                tmp["status_norm"] = tmp.get("status", "").apply(_norm_status)
+            tmp["status_norm"] = tmp.get("status", "").apply(_norm_status)
             if tmp["status_norm"].astype(str).str.contains("overdue|default|delinquent|late", case=False, na=False).any():
-                risk += 45
-            # last_paid_at age
+                score += 45
             if "last_paid_at" in tmp.columns:
                 lp = pd.to_datetime(tmp["last_paid_at"], errors="coerce", utc=True)
                 if lp.notna().any():
-                    age = (pd.Timestamp.now(tz="UTC") - lp.max()).total_seconds() / 86400.0
+                    age = float((pd.Timestamp.now(tz="UTC") - lp.max()).total_seconds() / 86400.0)
                     if age > 45:
-                        risk += 10
+                        score += 10
         if fines_total > 0:
-            risk += 10
-        risk = min(100, risk)
+            score += 10
+        score = min(100, score)
 
         return (
             f"Risk view for {who} (from current DB snapshot):\n"
-            f"• Balance: **{_money(bal)}** • Unpaid interest: **{_money(unpaid_int)}** • Fines: **{_money(fines_total)}**\n"
-            f"• Quick risk score (heuristic): **{risk}/100**\n\n"
-            "If you want model-based risk, run **Training (XGBoost)** below and I’ll show top-risk members.",
+            f"• Balance: **{_money(bal)}** • Unpaid interest: **{_money(unpaid)}** • Fines: **{_money(fines_total)}**\n"
+            f"• Quick risk score (heuristic): **{score}/100**\n\n"
+            "If you want model-based risk, run **Training (XGBoost)** below, then ask: `top 5 risky members (model)`.",
+            None,
             None,
         )
 
     if intent == "sessions":
         if sessions_df is None or sessions_df.empty:
-            return ("I don’t see a `sessions` table (or it’s empty).", None)
-        return ("Here are recent sessions:", sessions_df.head(20))
-
-    if intent == "payouts":
-        app_state = hub.get("app_state", pd.DataFrame())
-        if app_state is None or app_state.empty:
-            return (
-                "Payout guidance:\n"
-                "• Track payout rotation index in **app_state** (example: `next_payout_index`)\n"
-                "• Validate eligibility using contribution completeness\n"
-                "• Export payout receipts for audit",
-                None,
-            )
-        return ("Here is your `app_state` snapshot (look for payout rotation fields):", app_state.head(50))
-
-    if intent == "minutes":
-        minutes_df = hub.get("minutes", pd.DataFrame())
-        if minutes_df is None or minutes_df.empty:
-            return (
-                "Minutes guidance:\n"
-                "• Store minutes per **session_id** for traceability\n"
-                "• End-of-session summary: decisions, loans approved, payouts, attendance\n",
-                None,
-            )
-        return ("Here are recent minutes rows:", minutes_df.head(20))
-
-    if intent == "attendance":
-        att = hub.get("attendance", pd.DataFrame())
-        if att is None or att.empty:
-            return (
-                "Attendance guidance:\n"
-                "• Track attendance per **session_id**\n"
-                "• If your rules allow: derive fines from absences/late arrivals\n",
-                None,
-            )
-        return ("Here are recent attendance rows:", att.head(25))
+            return ("I don’t see sessions data yet.", None, None)
+        return ("Recent sessions:", sessions_df.head(20), None)
 
     if intent == "generic":
-        return _answer_generic(qraw, hub, member_id, member_name)
+        txt, df_show = _answer_generic(qraw, hub, member_id, member_name)
+        return (txt, df_show, None)
 
     return (
-        "Ask me using these patterns:\n"
-        "• **total / count / top / latest / list** + (loans / contributions / fines / foundation / interest / payments)\n"
+        "Tell me what you want and I’ll do it.\n\n"
         "Examples:\n"
-        "• `top 5 members by unpaid_interest`\n"
-        "• `latest contributions`\n"
-        "• `count active loans`\n"
+        "• `loans summary` • `active loans` • `overdue loans`\n"
+        "• `who hasn’t paid this session?`\n"
+        "• `interest collected` • `foundation total`\n"
+        "• `risk for Donald` • `top 5 risky members`\n"
+        "• `loan 12 status`\n\n"
         "Or type **help**.",
+        None,
         None,
     )
 
 
 # ==============================================================================
-# Internet Search (Tavily) — optional (privacy guarded)
+# ML: training dataset + XGBoost (no sklearn)
 # ==============================================================================
-def _has_tavily_key() -> bool:
-    return bool(os.getenv("TAVILY_API_KEY", "").strip())
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _tavily_search_cached(query: str, search_depth: str = "basic", max_results: int = 5) -> dict:
-    import requests
-
-    api_key = os.getenv("TAVILY_API_KEY", "").strip()
-    if not api_key:
-        return {"error": "Missing TAVILY_API_KEY in environment variables."}
-
-    url = "https://api.tavily.com/search"
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-    payload = {"query": query, "search_depth": search_depth, "max_results": int(max_results)}
-
-    try:
-        r = requests.post(url, headers=headers, json=payload, timeout=20)
-        if r.status_code != 200:
-            return {"error": f"Tavily error {r.status_code}: {r.text[:400]}"}
-        j = r.json()
-        return j if isinstance(j, dict) else {"raw": r.text}
-    except Exception as e:
-        return {"error": f"Request failed: {repr(e)}"}
-
-
-def _format_web_answer(tav: dict) -> tuple[str, list[dict]]:
-    if not isinstance(tav, dict):
-        return ("I couldn’t read the web results.", [])
-    if "error" in tav:
-        return (f"Internet search failed: {tav['error']}", [])
-
-    results = tav.get("results", []) or []
-    if not results:
-        return ("I searched the web but didn’t find clear results. Try rephrasing.", [])
-
-    bullets, sources = [], []
-    for r in results[:5]:
-        title = str(r.get("title", "") or "").strip()
-        url = str(r.get("url", "") or "").strip()
-        content = str(r.get("content", "") or "").strip()
-        score = r.get("score", None)
-
-        if content:
-            bullets.append(f"• {content[:230].rstrip()}…")
-        sources.append({"title": title, "url": url, "score": score})
-
-    summary = "Here’s what I found online (top results):\n" + "\n".join(bullets[:3])
-    return (summary, sources)
-
-
-def _privacy_block_web(question: str) -> bool:
-    """
-    Privacy guard: block web if question looks like Njangi finance/member data.
-    Allow if user forces with `web:`
-    """
-    q = _normalize_text(question)
-    if q.startswith("web:") or q.startswith("internet:") or q.startswith("tavily:"):
-        return False
-    sensitive_keywords = [
-        "member", "members", "contribution", "contrib", "loan", "loans", "fine", "fines",
-        "payout", "attendance", "minutes", "principal", "balance", "unpaid", "interest",
-        "session", "theyoungshallgrow", "njangi",
-        # and common IDs patterns
-        "member_id", "loan_id", "session_id",
-    ]
-    return any(k in q for k in sensitive_keywords)
-
-
-# ==============================================================================
-# ML: training dataset + XGBoost
-# ==============================================================================
-def _build_training_frame(hub: dict[str, pd.DataFrame]) -> pd.DataFrame:
+def _build_training_frame(hub: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     loans_df = hub.get("loans", pd.DataFrame())
     members_df = hub.get("members", pd.DataFrame())
     contrib_df = hub.get("contributions", pd.DataFrame())
@@ -932,7 +1062,6 @@ def _build_training_frame(hub: dict[str, pd.DataFrame]) -> pd.DataFrame:
     for c in ["member_contrib_total", "member_fines_total", "member_loan_count"]:
         df[c] = pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0)
 
-    # names
     if members_df is not None and not members_df.empty and "id" in members_df.columns:
         m = _build_member_labels(members_df).rename(columns={"id": "member_id"})[["member_id", "member_name"]].copy()
         df["member_id"] = pd.to_numeric(df["member_id"], errors="coerce")
@@ -955,11 +1084,6 @@ def _build_training_frame(hub: dict[str, pd.DataFrame]) -> pd.DataFrame:
 
 
 def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
-    """
-    ✅ NO sklearn required.
-    ✅ tiny-data safe split + fallback train-on-all
-    Returns: (model, metrics_dict, feature_cols, df_with_preds)
-    """
     try:
         import numpy as np
         import xgboost as xgb
@@ -1041,7 +1165,6 @@ def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
     X_train, y_train = X_all[train_idx], y_all[train_idx]
     X_test, y_test = X_all[test_idx], y_all[test_idx]
 
-    # if split breaks class balance, fallback
     if len(np.unique(y_train)) < 2:
         model.fit(X_all, y_all)
         out = df.copy()
@@ -1061,13 +1184,12 @@ def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
     model.fit(X_train, y_train)
 
     p_test = model.predict_proba(X_test)[:, 1]
-    yhat_test = (p_test >= 0.5).astype(int)
-    acc = float((yhat_test == y_test).mean()) if len(y_test) else float("nan")
+    yhat = (p_test >= 0.5).astype(int)
+    acc = float((yhat == y_test).mean()) if len(y_test) else float("nan")
     loss = _bce_loss(list(map(int, y_test.tolist())), list(map(float, p_test.tolist())))
 
     out = df.copy()
     out["p_active"] = model.predict_proba(X_all)[:, 1]
-
     metrics = {
         "n_rows": int(len(df)),
         "n_train": int(len(train_idx)),
@@ -1085,82 +1207,81 @@ def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
 # UI — Young Copilot Panel
 # ==============================================================================
 def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public"):
-    st.title("👩🏾‍💼 Young — Dashboard Copilot + Training")
-    st.caption("Smart grounded Q&A over ALL Njangi data + optional Internet (Tavily) + XGBoost training.")
+    st.title("👩🏾‍💼 Young — Njangi Dashboard Copilot")
+    st.caption("Smart grounded Q&A over Njangi data + optional Internet (`web:`) + optional XGBoost training.")
 
     sb_read = sb_service if sb_service is not None else sb_anon
 
-    # ---------------- Settings ----------------
     with st.sidebar:
-        st.subheader("⚙️ Young settings")
+        st.subheader("⚙️ Settings")
         slow_mode = st.checkbox("🐢 Slow Mode (reduce DB pressure)", value=True)
-        limit = st.slider("Max rows per table", min_value=500, max_value=10000, value=5000, step=500)
-        if st.button("🔄 Refresh ALL snapshots"):
-            _clear_hub(schema=schema)
-            st.success("Snapshots cleared. Reloading on next render.")
-        st.markdown("---")
-        st.caption("Internet search uses `TAVILY_API_KEY` env var (Railway Shared Variables).")
-        st.caption("Privacy: Young will NOT web-search Njangi/member finance questions unless you force `web:`.")
+        max_rows = st.slider("Max rows per table", 500, 10000, DEFAULT_MAX_ROWS, 500)
 
-    # ---------------- Load data hub ----------------
-    hub = _load_hub(sb_read=sb_read, schema=schema, slow_mode=slow_mode, limit=int(limit))
+        tavily_key = _env_or_secret("TAVILY_API_KEY", "")
+        web_ready = _looks_like_key(tavily_key)
+        st.markdown("---")
+        st.subheader("🌐 Internet")
+        st.write(f"Key detected: **{'YES' if web_ready else 'NO'}**")
+        st.caption("Internet search runs only when you type `web:` at the start.")
+        max_sources = st.slider("Web sources", 2, 8, 5, 1)
+
+        st.markdown("---")
+        if st.button("🔄 Refresh snapshots", width=W_STRETCH):
+            _hub_clear(schema)
+            st.success("Snapshots cleared. Reloading now…")
+            st.rerun()
+
+    _welcome_card(schema=schema)
+
+    # Load snapshots
+    hub = _hub_load(sb_read=sb_read, schema=schema, slow_mode=slow_mode, limit=int(max_rows))
 
     members_df = hub.get("members", pd.DataFrame())
+    sessions_df = hub.get("sessions", pd.DataFrame())
     contrib_df = hub.get("contributions", pd.DataFrame())
     loans_df = hub.get("loans", pd.DataFrame())
-    fines_df = hub.get("fines", pd.DataFrame())
-    foundation_df = hub.get("foundation_contributions", pd.DataFrame())
     payments_df = hub.get("loan_payments", pd.DataFrame())
     interest_df = hub.get("interest_ledger", pd.DataFrame())
+    fines_df = hub.get("fines", pd.DataFrame())
 
-    # ---------------- KPIs ----------------
+    # KPIs
+    st.markdown("### 📊 Live snapshot health")
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Members", f"{_safe_count(members_df):,}")
-    k2.metric("Contrib rows", f"{_safe_count(contrib_df):,}")
-    k3.metric("Loans rows", f"{_safe_count(loans_df):,}")
-    k4.metric("Payments rows", f"{_safe_count(payments_df):,}")
+    k2.metric("Sessions", f"{_safe_count(sessions_df):,}")
+    k3.metric("Contrib rows", f"{_safe_count(contrib_df):,}")
+    k4.metric("Loans rows", f"{_safe_count(loans_df):,}")
     k5.metric("Fines rows", f"{_safe_count(fines_df):,}")
 
     st.markdown("---")
 
-    # ---------------- Choose member + loan filter ----------------
-    member_id = None
-    member_label = None
-
-    if not members_df.empty and "id" in members_df.columns:
+    # Member selection
+    selected_member_id = None
+    selected_member_name = None
+    if members_df is not None and not members_df.empty and "id" in members_df.columns:
         m = _build_member_labels(members_df)
-        m["label"] = m.apply(lambda r: f"{int(r['id']):02d} • {r.get('member_name','')}", axis=1)
+        m["label"] = m.apply(lambda r: f"{int(r['id']):02d} • {str(r.get('member_name') or '').strip()}", axis=1)
         pick = st.selectbox("Select member (optional)", ["(All members)"] + m["label"].tolist())
         if pick != "(All members)":
             row = m[m["label"] == pick].iloc[0]
-            member_id = int(row["id"])
-            member_label = str(row.get("member_name") or "").strip()
+            selected_member_id = int(row["id"])
+            selected_member_name = str(row.get("member_name") or "").strip()
     else:
-        st.warning("Could not load members. Young will still answer general questions.")
+        st.info("Members table not available or empty. Young will still answer general questions.")
 
     loan_filter = st.radio("Loans filter", ["All", "Active", "Closed"], horizontal=True)
 
-    # ---------------- Welcome card ----------------
-    project_hint = f"Schema: `{schema}` • Generated: `{_now_iso()}`"
-    _young_welcome_card(project_hint=project_hint)
+    # Smart insights
+    st.markdown("### ✨ Smart insights")
+    a, b, c = st.columns(3)
 
-    st.markdown("---")
-
-    # ==============================================================================
-    # Smart Insights (modern dashboard assistant behavior)
-    # ==============================================================================
-    st.subheader("✨ Young Insights")
-    cA, cB, cC = st.columns(3)
-
-    # Insight 1: overdue / late signals
-    with cA:
+    with a:
         st.caption("Overdue / late signals")
         if loans_df is None or loans_df.empty:
             st.write("No loans data.")
         else:
             tmp = loans_df.copy()
-            if "status_norm" not in tmp.columns:
-                tmp["status_norm"] = tmp.get("status", "").apply(_norm_status)
+            tmp["status_norm"] = tmp.get("status", "").apply(_norm_status)
             od = tmp[tmp["status_norm"].isin(["overdue", "late", "default", "delinquent"])].copy()
             if od.empty and "last_paid_at" in tmp.columns:
                 t2 = tmp[tmp["status_norm"] == "active"].copy()
@@ -1169,60 +1290,52 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
                 od = t2[t2["_days"] > 30].drop(columns=["_days"], errors="ignore")
             st.write(f"Count: **{len(od):,}**")
             if not od.empty:
-                show_cols = [c for c in ["id", "member_id", "principal_current", "unpaid_interest", "last_paid_at", "status"] if c in od.columns]
-                st.dataframe(od[show_cols].head(7) if show_cols else od.head(7), width="stretch", hide_index=True)
+                cols = [x for x in ["id", "member_id", "principal_current", "unpaid_interest", "last_paid_at", "status"] if x in od.columns]
+                st.dataframe(od[cols].head(7) if cols else od.head(7), width=W_STRETCH, hide_index=True)
 
-    # Insight 2: totals
-    with cB:
+    with b:
         st.caption("Totals (all members)")
         st.write(f"Contributions: **{_money(_safe_sum(contrib_df, 'amount'))}**")
-        st.write(f"Foundation: **{_money(_safe_sum(foundation_df, 'amount'))}**")
-        st.write(f"Unpaid interest: **{_money(_safe_sum(loans_df, 'unpaid_interest'))}**")
+        st.write(f"Payments: **{_money(_safe_sum(payments_df, 'amount'))}**")
+        st.write(f"Interest ledger: **{_money(_safe_sum(interest_df, 'amount'))}**")
         st.write(f"Fines: **{_money(_safe_sum(fines_df, 'amount'))}**")
 
-    # Insight 3: top risky by heuristic
-    with cC:
+    with c:
         st.caption("Top risk (heuristic)")
         if loans_df is None or loans_df.empty or "member_id" not in loans_df.columns:
-            st.write("Not enough loan data.")
+            st.write("Not enough loans data.")
         else:
             tmp = loans_df.copy()
             tmp["status_norm"] = tmp.get("status", "").apply(_norm_status)
             tmp = _to_numeric_cols(tmp, ["principal_current", "unpaid_interest"])
-            # heuristic risk per loan row
             tmp["risk_h"] = 0.0
             tmp.loc[tmp["unpaid_interest"] > 0, "risk_h"] += 0.35
             tmp.loc[tmp["principal_current"] > 0, "risk_h"] += 0.25
             tmp.loc[tmp["status_norm"].isin(["overdue", "late", "default", "delinquent"]), "risk_h"] += 0.45
             bym = tmp.groupby("member_id", dropna=False)["risk_h"].max().reset_index().sort_values("risk_h", ascending=False).head(7)
-            if not bym.empty and not members_df.empty and "id" in members_df.columns:
-                m = _build_member_labels(members_df)[["id", "member_name"]].copy().rename(columns={"id": "member_id"})
+            if members_df is not None and not members_df.empty and "id" in members_df.columns:
+                names = _build_member_labels(members_df)[["id", "member_name"]].rename(columns={"id": "member_id"})
                 bym["member_id"] = pd.to_numeric(bym["member_id"], errors="coerce")
-                m["member_id"] = pd.to_numeric(m["member_id"], errors="coerce")
-                bym = bym.merge(m, on="member_id", how="left")
-            st.dataframe(bym, width="stretch", hide_index=True)
+                names["member_id"] = pd.to_numeric(names["member_id"], errors="coerce")
+                bym = bym.merge(names, on="member_id", how="left")
+            st.dataframe(bym, width=W_STRETCH, hide_index=True)
 
     st.markdown("---")
 
-    # ==============================================================================
-    # Training (XGBoost)
-    # ==============================================================================
-    st.subheader("🧪 Training (XGBoost)")
-    st.caption("Label: active=1, closed=0 (trained on loan rows). NO sklearn required.")
-
+    # Training
+    st.markdown("### 🧪 Training (XGBoost)")
+    st.caption("Label: active=1, closed=0 (trained on loan rows). No sklearn required.")
     with st.expander("Training settings", expanded=False):
-        seed = st.number_input("Random seed", min_value=0, max_value=999999, value=42, step=1)
-        test_size = st.slider("Test size", min_value=0.10, max_value=0.50, value=0.25, step=0.05)
-        run_train = st.button("🚀 Train model now")
+        seed = st.number_input("Random seed", 0, 999999, 42, 1)
+        test_size = st.slider("Test size", 0.10, 0.50, 0.25, 0.05)
+        run_train = st.button("🚀 Train model now", width=W_STRETCH)
 
     if run_train:
         train_df = _build_training_frame(hub)
-
         if train_df.empty:
             st.error("No training data found. Need loans with statuses that normalize to 'active' and 'closed'.")
         else:
             model, metrics, feature_cols, pred_df = _train_xgboost(train_df, seed=int(seed), test_size=float(test_size))
-
             if model is None:
                 st.error("Training failed.")
                 st.code(metrics.get("error", "Unknown error"), language="text")
@@ -1230,7 +1343,6 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
                     st.caption(f"class_counts: {metrics['class_counts']}")
             else:
                 st.success("Training complete ✅")
-
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("Rows", f"{metrics['n_rows']:,}")
                 m2.metric("Pos rate (active)", f"{metrics['pos_rate']:.2f}")
@@ -1245,89 +1357,92 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
                     tmp = pred_df.copy()
                     tmp["member_id"] = pd.to_numeric(tmp["member_id"], errors="coerce")
                     tmp["risk_score"] = 1.0 - pd.to_numeric(tmp["p_active"], errors="coerce").fillna(0.5)
-
-                    by_member = (
+                    bym = (
                         tmp.groupby(["member_id", "member_name"], dropna=False)["risk_score"]
                         .max()
                         .sort_values(ascending=False)
                         .reset_index()
                         .rename(columns={"risk_score": "risk_max"})
                     )
-                    st.markdown("### 🔥 Top risk (model) — max risk among loans (1 - p_active)")
-                    st.dataframe(by_member.head(15), width="stretch", hide_index=True)
+                    st.markdown("#### 🔥 Top risk (model) — max risk among loans (1 - p_active)")
+                    st.dataframe(bym.head(15), width=W_STRETCH, hide_index=True)
 
-                st.markdown("### 🔎 Sample predictions (loan rows)")
+                st.markdown("#### 🔎 Sample predictions (loan rows)")
                 show_cols = [c for c in ["id", "member_id", "member_name", "y", "p_active", "principal_current", "unpaid_interest", "days_since_last_paid"] if pred_df is not None and c in pred_df.columns]
                 if pred_df is not None and show_cols:
-                    st.dataframe(pred_df[show_cols].head(25), width="stretch", hide_index=True)
+                    st.dataframe(pred_df[show_cols].head(25), width=W_STRETCH, hide_index=True)
 
     st.markdown("---")
 
-    # ==============================================================================
-    # Young Chat Copilot (modern assistant UI)
-    # ==============================================================================
-    st.subheader("💬 Chat with Young")
+    # Chat
+    st.markdown("### 💬 Chat with Young")
 
-    # init chat memory
     if "young_chat" not in st.session_state:
-        st.session_state["young_chat"] = []
-        st.session_state["young_chat"].append({"role": "assistant", "content": _young_intro()})
+        st.session_state["young_chat"] = [{"role": "assistant", "content": _young_intro()}]
 
-    topbar1, topbar2, topbar3 = st.columns([1, 1, 2])
-    with topbar1:
-        if st.button("🧹 Clear chat"):
+    bar1, bar2, bar3 = st.columns([1, 1, 2])
+    with bar1:
+        if st.button("🧹 Clear chat", width=W_STRETCH):
             st.session_state["young_chat"] = [{"role": "assistant", "content": _young_intro()}]
-    with topbar2:
-        if st.button("👋 Welcome"):
+            st.rerun()
+    with bar2:
+        if st.button("👋 Greeting", width=W_STRETCH):
             st.session_state["young_chat"].append({"role": "assistant", "content": _young_intro()})
-    with topbar3:
-        st.caption("Tip: Use `web:` to force Internet answers. Otherwise Young stays grounded on your DB.")
+            st.rerun()
+    with bar3:
+        st.caption("Tip: DB questions stay grounded. Internet needs `web:`.")
 
-    # render chat history
-    for msg in st.session_state["young_chat"]:
+    for msg in st.session_state["young_chat"][-20:]:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+            if msg.get("sources"):
+                st.markdown("**Sources**")
+                for i, s in enumerate(msg["sources"][:6], start=1):
+                    title = s.get("title") or f"Source {i}"
+                    url = s.get("url") or ""
+                    snippet = (s.get("content") or "").strip()
+                    snippet = snippet[:240] + ("…" if len(snippet) > 240 else "")
+                    if url:
+                        st.write(f"{i}. [{title}]({url})")
+                    else:
+                        st.write(f"{i}. {title}")
+                    if snippet:
+                        st.caption(snippet)
 
-    # input
-    user_text = st.chat_input("Ask Young a question… (example: “Active loans summary”, “session 12 summary”, “web: what is XGBoost?”)")
+    user_text = st.chat_input("Ask Young… (example: “who hasn’t paid this session?”, “risk for Donald”, “web: Maryland cosmetology license requirements”)")
     if user_text:
         st.session_state["young_chat"].append({"role": "user", "content": user_text})
 
-        # decide route
-        intent = _detect_intent(user_text)
-        force_web = intent == "web"
-        allow_web = _has_tavily_key() and (force_web or (not _privacy_block_web(user_text)))
+        # WEB route (ONLY if user starts with web:)
+        if _normalize_text(user_text).startswith(("web:", "internet:", "tavily:")):
+            api_key = _env_or_secret("TAVILY_API_KEY", "")
+            if not _looks_like_key(api_key):
+                assistant_text = "Internet is not ready. Add **TAVILY_API_KEY** in Railway Variables (or Streamlit secrets) and redeploy."
+                st.session_state["young_chat"].append({"role": "assistant", "content": assistant_text, "sources": []})
+                st.rerun()
 
-        with st.chat_message("assistant"):
-            if allow_web and (force_web or user_text.strip().lower().startswith("web:")):
-                q = user_text.strip()
-                q = re.sub(r"^(web:|internet:|tavily:)\s*", "", q, flags=re.IGNORECASE).strip()
-                tav = _tavily_search_cached(query=q, search_depth="basic", max_results=5)
-                summary, sources = _format_web_answer(tav)
-                st.markdown(summary)
-                if sources:
-                    st.markdown("**Sources:**")
-                    for s in sources[:5]:
-                        title = s.get("title") or s.get("url") or "Source"
-                        url = s.get("url") or ""
-                        if url:
-                            st.markdown(f"- [{title}]({url})")
-                        else:
-                            st.markdown(f"- {title}")
-                assistant_text = summary
-            else:
-                answer, df_show = _answer_grounded(
-                    question=user_text,
-                    hub=hub,
-                    selected_member_id=member_id,
-                    selected_member_label=member_label,
-                    loan_filter=loan_filter,
-                )
-                st.markdown(answer)
-                if df_show is not None and not df_show.empty:
-                    st.dataframe(df_show, width="stretch", hide_index=True)
-                assistant_text = answer
+            q_web = _extract_web_query(user_text)
+            res = _tavily_search_cached(query=q_web, api_key=api_key, max_results=int(max_sources))
+            answer, sources = _format_web_result(res)
+            st.session_state["young_chat"].append({"role": "assistant", "content": answer, "sources": sources})
+            st.rerun()
 
-        st.session_state["young_chat"].append({"role": "assistant", "content": assistant_text})
+        # GROUNDED route
+        answer, df_show, _ = _answer_grounded(
+            question=user_text,
+            hub=hub,
+            selected_member_id=selected_member_id,
+            selected_member_name=selected_member_name,
+            loan_filter=loan_filter,
+        )
 
-    st.caption("Young Copilot • Grounded DB answers • Optional Internet (Tavily) • XGBoost training • Safe for Railway/Streamlit Cloud")
+        # store assistant answer (and show df separately)
+        st.session_state["young_chat"].append({"role": "assistant", "content": answer})
+        st.rerun()
+
+    # Optional: show last computed dataframe below chat (clean UI)
+    last_df = None
+    # If you want to display df inline, you can set it in state; keeping simple for stability.
+
+
+__all__ = ["render_njangi_llm_panel", "render_njangi_llm_panel"]
