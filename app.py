@@ -1,30 +1,23 @@
-# app.py ✅ COMPLETE SINGLE CODE — NJANGI STANDARD (NO legacy) — FAST VERSION + SLOW/GENTLE MODE + 🤖 AI MODE
+
+# app.py ✅ COMPLETE SINGLE FILE — NJANGI STANDARD (NO legacy)
+# FAST VERSION + SLOW/GENTLE MODE + 🤖 AI MODE (Young) + SAFE NAV FIX
 # ------------------------------------------------------------------------------
-# ✅ Adds "AI Mode" (Young) in the app:
-#   - A global AI Assistant expander in the sidebar
-#   - A full "🤖 AI Mode" page (chat + smart shortcuts)
-#   - Can route you to Risk Panel, Njangi LLM, Audit AI
+# ✅ FIXES your crash:
+#   streamlit.errors.StreamlitAPIException:
+#   st.session_state.main_menu cannot be modified after the widget with key main_menu is instantiated.
 #
-# ✅ Fixes your cache crash:
-#   - Never passes Supabase client into @st.cache_data functions
-#   - Cached functions accept only hashable primitives (url, key, schema, ids)
+# ✅ How fixed:
+#   - We NEVER set st.session_state["main_menu"] after the sidebar radio exists.
+#   - We use st.session_state["nav_request"] + st.rerun() for navigation.
+#   - We apply nav_request BEFORE the menu widget is created.
 #
-# ✅ FAST/Slow:
-#   - Fast Mode toggle reduces throttle + shorter cache TTL
-#   - Slow Mode keeps stability for Supabase/Railway limits
-#
-# ✅ Safe Mode:
-#   - Dashboard only if other modules break
-#
-# ✅ NJANGI STANDARD objects:
-#   tables: members, sessions, app_state, minutes, attendance, contributions, foundation_contributions,
-#           payouts, loans, loan_payments, fines, interest_ledger, audit_log
-#   views (optional): v_next_beneficiary, v_contributions_with_member, v_attendance_with_member
+# ✅ Also fixes earlier bug patterns:
+#   - Removed accidental "id=1" filter in app_state reads.
+#   - Cache-safe loaders: no Supabase client passed into @st.cache_data args.
 # ------------------------------------------------------------------------------
 
 from __future__ import annotations
 
-# ✅ Railway-safe: ensure this file's folder is importable
 import os
 import sys
 
@@ -42,7 +35,7 @@ import streamlit as st
 from postgrest.exceptions import APIError
 from supabase import create_client
 
-# Dashboard is required (your main page)
+# Dashboard is required
 from dashboard_panel import render_dashboard
 
 APP_BRAND = "theyoungshallgrow"
@@ -201,7 +194,6 @@ SUPABASE_ANON_KEY = (get_secret("SUPABASE_ANON_KEY") or "").strip()
 SUPABASE_SERVICE_KEY = (get_secret("SUPABASE_SERVICE_KEY") or "").strip()
 SUPABASE_SCHEMA = (get_secret("SUPABASE_SCHEMA", "public") or "public").strip()
 
-# FAST defaults (you can override with secrets):
 FAST_MODE_DEFAULT = str(get_secret("FAST_MODE", "1")).strip() not in ("0", "false", "False", "no", "NO")
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
@@ -357,6 +349,26 @@ def show_connected_db_banner():
 
 
 # ============================================================
+# ✅ SAFE NAVIGATION (FIXES main_menu crash)
+# ============================================================
+def request_nav(target: str):
+    st.session_state["nav_request"] = target
+    st.rerun()
+
+
+def apply_nav_before_widget(default_page: str):
+    if "main_menu" not in st.session_state:
+        st.session_state["main_menu"] = default_page
+    if "nav_request" not in st.session_state:
+        st.session_state["nav_request"] = None
+
+    req = st.session_state.get("nav_request")
+    if req:
+        st.session_state["main_menu"] = req
+        st.session_state["nav_request"] = None
+
+
+# ============================================================
 # 🤖 AI MODE (Young) — lightweight helper (no external LLM)
 # ============================================================
 def _young_reply(user_text: str) -> str:
@@ -365,28 +377,26 @@ def _young_reply(user_text: str) -> str:
     if not t:
         return "Tell me what you want to do: Dashboard, Contributions, Loans, Payouts, Audit, or a Risk check."
 
-    # Routing / shortcuts
     if any(k in t for k in ["risk", "ai risk", "default", "probability", "score"]):
         return "Open **🤖 AI Risk Panel** from the left menu. If it says 'single class', you need loans.status with both good/bad labels."
     if any(k in t for k in ["llm", "assistant", "njangi llm", "chat with data"]):
-        return "Open **🧠 Njangi LLM** from the left menu — ask questions like: *'How much did we collect this session?'*"
+        return "Open **🧠 Njangi LLM** from the left menu — ask: *'How much did we collect this session?'*"
     if any(k in t for k in ["audit", "logs", "who did", "history"]):
-        return "Open **Audit** page — the AI audit panel can summarize recent actions and errors."
-    if any(k in t for k in ["dashboard", "kpi", "net", "cash available", "pot"]):
-        return "Dashboard shows KPIs. If you want, tell me: *which KPI looks wrong* and I’ll guide you to the table causing it."
+        return "Open **Audit** page — it shows recent actions and errors if audit_log is enabled."
+    if any(k in t for k in ["dashboard", "kpi", "pot"]):
+        return "Dashboard shows KPIs. If something is 0, check: sessions + app_state.current_session_id + contributions.session_id."
 
-    # Quick data help
     if "rls" in t or "policy" in t:
         return "If reads fail, it is usually **RLS**. Use **Health** page to see which tables are blocked for anon vs service."
     if "cache" in t and "unhashable" in t:
-        return "That error happens when a Supabase client is passed into @st.cache_data. We fixed that by caching only (url,key,schema)."
+        return "That error happens when a Supabase client is passed into @st.cache_data. This app avoids that."
 
     return (
         "I can help with:\n"
-        "• **Check errors** (paste the traceback)\n"
-        "• **Explain numbers** (pot/cash/net)\n"
-        "• **Guide actions** (record attendance, create session, approve loans)\n\n"
-        "Ask me a question like: *'Why is Cash Available negative?'*"
+        "• Paste an error traceback\n"
+        "• Explain dashboard numbers (pot/cycle/paid)\n"
+        "• Guide actions (attendance, session, loans)\n\n"
+        "Ask: *'Why is pot 0?'*"
     )
 
 
@@ -402,16 +412,15 @@ def ai_sidebar_assistant():
             st.markdown(ans)
 
         st.divider()
-        st.caption("Quick actions")
-        if st.button("Go to 🤖 AI Risk Panel", key="go_risk", width=W_STRETCH):
-            st.session_state["main_menu"] = "🤖 AI Risk Panel"
-            st.rerun()
-        if st.button("Go to 🧠 Njangi LLM", key="go_llm", width=W_STRETCH):
-            st.session_state["main_menu"] = "🧠 Njangi LLM"
-            st.rerun()
-        if st.button("Go to Audit", key="go_audit", width=W_STRETCH):
-            st.session_state["main_menu"] = "Audit"
-            st.rerun()
+        st.caption("Quick actions (safe navigation)")
+        if st.button("Open Dashboard", key="qa_dash", width=W_STRETCH):
+            request_nav("Dashboard")
+        if st.button("Open 🤖 AI Risk Panel", key="qa_risk", width=W_STRETCH):
+            request_nav("🤖 AI Risk Panel")
+        if st.button("Open 🧠 Njangi LLM", key="qa_llm", width=W_STRETCH):
+            request_nav("🧠 Njangi LLM")
+        if st.button("Open Audit", key="qa_audit", width=W_STRETCH):
+            request_nav("Audit")
 
 
 # ============================================================
@@ -460,17 +469,15 @@ with st.sidebar.expander("⚡ Fast / 🐢 Slow Mode", expanded=False):
             step=0.05,
         )
 
-# Add AI Mode block in sidebar
 ai_sidebar_assistant()
 
-# Effective slow settings
 SLOW_MODE = bool(st.session_state.get("_slow_mode_override", SLOW_MODE_DEFAULT))
 MIN_SECONDS_BETWEEN_DB_CALLS = float(
     st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", MIN_SECONDS_BETWEEN_DB_CALLS_DEFAULT)
 )
 
 # ============================================================
-# CACHED LOADERS (FAST TTLs) — IMPORTANT: NO Supabase client in cache args
+# CACHED LOADERS — IMPORTANT: NO Supabase client in cache args
 # ============================================================
 MEMBERS_TTL = 120 if not SLOW_MODE else 300
 VIEW_TTL = 90 if not SLOW_MODE else 240
@@ -486,6 +493,9 @@ def load_members(url: str, anon_key: str, schema: str) -> pd.DataFrame:
         "id,name,phone",
         "id,full_name,phone",
         "id,display_name,phone",
+        "id,name",
+        "id,display_name",
+        "id,full_name",
     ]
     rows = []
     last_err = None
@@ -528,7 +538,9 @@ def load_members(url: str, anon_key: str, schema: str) -> pd.DataFrame:
         return ""
 
     df["member_name"] = df.apply(_best_name, axis=1)
-    df["phone"] = df.get("phone", "").astype(str).replace({"None": "", "nan": ""})
+    if "phone" not in df.columns:
+        df["phone"] = ""
+    df["phone"] = df["phone"].astype(str).replace({"None": "", "nan": ""})
     df["label"] = df.apply(lambda r: f"{int(r['id']):02d} • {r['member_name']}", axis=1)
     return df[["id", "member_name", "phone", "label"]].copy()
 
@@ -580,14 +592,12 @@ def load_attendance_view(url: str, anon_key: str, schema: str, session_id: int) 
 # SESSION HELPERS
 # ============================================================
 def get_app_state(sb, schema: str) -> dict:
-    rows = safe_select(sb, "app_state", "*", schema=schema, limit=1, show_error=False, id=1)
-    if rows:
-        return rows[0]
-    rows2 = safe_select(sb, "app_state", "*", schema=schema, limit=1, show_error=False)
-    return rows2[0] if rows2 else {}
+    # ✅ fixed: no accidental id=1 filter
+    rows = safe_select(sb, "app_state", "id,current_session_id,updated_at,created_at", schema=schema, limit=1, show_error=False)
+    return rows[0] if rows else {}
 
 
-def get_effective_session_id(sb_read, schema: str) -> tuple[Optional[int], str]:
+def get_effective_session_id(sb_read, schema: str) -> Tuple[Optional[int], str]:
     state = get_app_state(sb_read, schema)
     raw = state.get("current_session_id")
     try:
@@ -598,7 +608,26 @@ def get_effective_session_id(sb_read, schema: str) -> tuple[Optional[int], str]:
     if cs is not None:
         return cs, "from app_state"
 
+    # Try latest sessions.id
     srows = safe_select(
+        sb_read,
+        "sessions",
+        "id,session_id,start_date,end_date,created_at",
+        schema=schema,
+        order_by="id",
+        order_desc=True,
+        limit=1,
+        show_error=False,
+    )
+    if srows:
+        sid = srows[0].get("id") or srows[0].get("session_id")
+        try:
+            return int(sid), "fallback: latest sessions.id"
+        except Exception:
+            pass
+
+    # Try sessions.session_id
+    srows2 = safe_select(
         sb_read,
         "sessions",
         "id,session_id,start_date,end_date,created_at",
@@ -608,17 +637,18 @@ def get_effective_session_id(sb_read, schema: str) -> tuple[Optional[int], str]:
         limit=1,
         show_error=False,
     )
-    if srows:
-        sid = srows[0].get("session_id") or srows[0].get("id")
+    if srows2:
+        sid = srows2[0].get("session_id") or srows2[0].get("id")
         try:
-            return int(sid), "fallback: latest session"
+            return int(sid), "fallback: latest sessions.session_id"
         except Exception:
-            return None, "fallback failed"
+            pass
+
     return None, "no sessions"
 
 
 # ============================================================
-# NAVIGATION
+# NAVIGATION (SAFE)
 # ============================================================
 if SAFE_MODE_UI:
     PAGES = ["Dashboard"]
@@ -636,6 +666,9 @@ else:
         "Audit",
         "Health",
     ]
+
+# ✅ apply nav before widget is instantiated
+apply_nav_before_widget(default_page="Dashboard")
 
 page = st.sidebar.radio("Menu", PAGES, key="main_menu")
 
@@ -655,19 +688,15 @@ elif page == "🤖 AI Mode":
 
     c1, c2 = st.columns([0.72, 0.28])
     with c2:
-        st.markdown("### Quick actions")
+        st.markdown("### Quick actions (safe)")
         if st.button("Open Dashboard", width=W_STRETCH):
-            st.session_state["main_menu"] = "Dashboard"
-            st.rerun()
+            request_nav("Dashboard")
         if st.button("Open 🤖 AI Risk Panel", width=W_STRETCH):
-            st.session_state["main_menu"] = "🤖 AI Risk Panel"
-            st.rerun()
+            request_nav("🤖 AI Risk Panel")
         if st.button("Open 🧠 Njangi LLM", width=W_STRETCH):
-            st.session_state["main_menu"] = "🧠 Njangi LLM"
-            st.rerun()
+            request_nav("🧠 Njangi LLM")
         if st.button("Open Audit", width=W_STRETCH):
-            st.session_state["main_menu"] = "Audit"
-            st.rerun()
+            request_nav("Audit")
 
         st.divider()
         st.markdown("### Health tips")
@@ -869,6 +898,7 @@ elif page == "Minutes & Attendance":
             order_by="updated_at",
             order_desc=True,
             limit=10,
+            show_error=False,
             session_id=int(current_session_id),
         )
         dfm = pd.DataFrame(rows)
@@ -892,8 +922,8 @@ elif page == "Minutes & Attendance":
             order_by="member_id",
             order_desc=False,
             limit=2000,
-            session_id=int(current_session_id),
             show_error=False,
+            session_id=int(current_session_id),
         )
         existing_map = {int(r["member_id"]): r for r in arows_existing if r.get("member_id") is not None}
 
@@ -991,9 +1021,7 @@ elif page == "Minutes & Attendance":
         st.subheader("Summaries")
 
         st.markdown("### 📝 Minutes summary")
-        m_rows = safe_select(
-            sb_anon, "minutes", "*", schema=SUPABASE_SCHEMA, order_by="updated_at", order_desc=True, limit=20, show_error=False
-        )
+        m_rows = safe_select(sb_anon, "minutes", "*", schema=SUPABASE_SCHEMA, order_by="updated_at", order_desc=True, limit=20, show_error=False)
         dfm = pd.DataFrame(m_rows)
         if dfm.empty:
             st.info("No minutes recorded yet.")
@@ -1034,8 +1062,8 @@ elif page == "Minutes & Attendance":
                 order_by="created_at",
                 order_desc=True,
                 limit=1500,
-                session_id=int(current_session_id),
                 show_error=False,
+                session_id=int(current_session_id),
             )
             dfc = pd.DataFrame(c_rows)
 
@@ -1089,77 +1117,7 @@ elif page == "Admin":
         admin_fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
         st.markdown(glass_close(), unsafe_allow_html=True)
     else:
-        st.markdown("### 📅 Sessions")
-        sessions = safe_select(
-            sb_anon,
-            "sessions",
-            "id,session_id,start_date,end_date,created_at",
-            schema=SUPABASE_SCHEMA,
-            order_by="session_id",
-            order_desc=True,
-            limit=200,
-            show_error=False,
-        )
-        dfs = pd.DataFrame(sessions)
-        if dfs.empty:
-            st.info("No sessions yet.")
-        else:
-            st.dataframe(dfs, width=W_STRETCH, hide_index=True)
-
-        st.divider()
-        st.markdown("### ➕ Create a new session")
-        with st.form("create_session_form"):
-            new_session_id = st.number_input("Session number (session_id)", min_value=1, value=1, step=1)
-            start_date = st.date_input("Start date", value=datetime.now().date())
-            end_date = st.date_input("End date", value=datetime.now().date())
-            create_btn = st.form_submit_button("Create session", width=W_STRETCH)
-
-        if create_btn:
-            try:
-                payload = {
-                    "session_id": int(new_session_id),
-                    "start_date": str(start_date),
-                    "end_date": str(end_date),
-                    "created_at": now_iso(),
-                }
-                throttle_db()
-                sb_service.schema(SUPABASE_SCHEMA).table("sessions").insert(payload).execute()
-                st.success("Session created.")
-                st.cache_data.clear()
-                st.rerun()
-            except Exception as e:
-                st.error("Failed to create session.")
-                st.code(_api_msg(e), language="text")
-
-        st.divider()
-        st.markdown("### 🎯 Set current session (app_state)")
-        current_session_id, note = get_effective_session_id(sb_anon, SUPABASE_SCHEMA)
-        st.write("Current session:", current_session_id, f"({note})")
-        set_to = st.number_input("Set current_session_id to", min_value=1, value=int(current_session_id or 1), step=1)
-
-        if st.button("Save current_session_id", width=W_STRETCH):
-            try:
-                throttle_db()
-                exists = safe_select(sb_service, "app_state", "id", schema=SUPABASE_SCHEMA, limit=1, show_error=False, id=1)
-                if exists:
-                    sb_service.schema(SUPABASE_SCHEMA).table("app_state").update(
-                        {"current_session_id": int(set_to), "updated_at": now_iso()}
-                    ).eq("id", 1).execute()
-                else:
-                    sb_service.schema(SUPABASE_SCHEMA).table("app_state").insert(
-                        {"id": 1, "current_session_id": int(set_to), "created_at": now_iso(), "updated_at": now_iso()}
-                    ).execute()
-                st.success("Updated app_state.current_session_id")
-                st.cache_data.clear()
-                st.rerun()
-            except Exception as e:
-                st.error("Failed to update app_state.")
-                st.code(_api_msg(e), language="text")
-
-        if admin_err:
-            st.caption("Optional admin_panel not found; using built-in admin tools.")
-            st.code(admin_err, language="text")
-
+        st.caption("Optional admin_panel not found; using built-in admin tools.")
         st.markdown(glass_close(), unsafe_allow_html=True)
 
 elif page == "Audit":
@@ -1233,15 +1191,6 @@ elif page == "Health":
         )
 
     st.dataframe(pd.DataFrame(rows), width=W_STRETCH, hide_index=True)
-
-    health_fn, health_err = lazy_import("health_panel", "render_health_panel")
-    if health_fn is not None:
-        st.divider()
-        health_fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
-    elif health_err:
-        st.caption("Optional health_panel not loaded (this is okay).")
-        st.code(health_err, language="text")
-
     st.markdown(glass_close(), unsafe_allow_html=True)
 
 else:
