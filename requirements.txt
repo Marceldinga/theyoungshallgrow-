@@ -8,3 +8,4 @@ plotly
 fpdf
 scikit-learn
 xgboost==2.0.3
+torch
