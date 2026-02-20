@@ -1,4 +1,5 @@
-# ai_risk_panel.py ✅ COMPLETE SINGLE-FILE — NJANGI STANDARD (NO legacy)
+
+# ai_risk_panel.py ✅ COMPLETE SINGLE-FILE — NJANGI STANDARD (NO legacy) — XGBoost ML
 # ------------------------------------------------------------------------------
 # ✅ Uses ONLY new tables:
 #   - members
@@ -8,7 +9,6 @@
 #   - foundation_contributions
 #   - fines (optional)
 #
-# ✅ NO sklearn dependency (fixes ModuleNotFoundError)
 # ✅ Schema-safe for YOUR loans columns:
 #    - principal, principal_current, total_due, unpaid_interest, last_paid_at,
 #      borrow_date, due_cycle_days, interest_rate_monthly, status
@@ -16,11 +16,15 @@
 # ✅ Always produces numbers (no blank NaNs in snapshot)
 # ✅ Cache-safe: no unhashable supabase clients in cache args
 # ✅ UTC-safe date math (no tz-naive vs tz-aware errors)
-# ✅ Includes REAL ML using NumPy Logistic Regression (NO sklearn):
-#    - Trains on loans: closed=0, active=1
-#    - Predicts member risk as MAX probability among their active loans
+#
+# ✅ ML uses XGBoost (instead of NumPy/sklearn):
+#    - Trains on loans rows: closed=0, active=1
+#    - Scores member risk as MAX probability among their active loans
 #    - Gate by MIN_LOANS_FOR_ML (default 20)
-# ✅ Offers mode toggle: Heuristic / ML / Hybrid
+#    - Caches trained model in st.session_state using a dataframe fingerprint
+#
+# 🔧 REQUIREMENT (Railway):
+#    Add to requirements.txt:  xgboost==2.0.3
 # ------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -116,12 +120,6 @@ def _days_since(now_utc: pd.Timestamp, dt_series) -> pd.Series:
 
 
 def _fill_feature_defaults(X: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensure snapshot never shows blanks.
-    - counts -> 0
-    - sums/amounts -> 0.0
-    - days_since -> 999 if missing
-    """
     X = X.copy()
     for col in X.columns:
         if col == "member_id":
@@ -184,7 +182,6 @@ def _load_table_service(sb_anon, sb_service, schema: str, table: str, cols: str 
 #   OR loan_payments(loan_id, amount, paid_at) -> join loans to get member_id
 # ============================================================
 def _load_payments_schema_safe(sb_anon, sb_service, schema: str, limit: int = 20000) -> pd.DataFrame:
-    # prefer service if available (RLS)
     if sb_service is None:
         pay = _load_table(sb_anon, sb_service, schema, "loan_payments", cols="*", limit=limit)
     else:
@@ -198,14 +195,12 @@ def _load_payments_schema_safe(sb_anon, sb_service, schema: str, limit: int = 20
         keep = [c for c in ["member_id", "amount", "paid_at", "created_at", "loan_id"] if c in cols]
         return pay[keep].copy()
 
-    # No member_id: try loan_id join
     if "loan_id" not in cols and "loans_id" in cols:
         pay = pay.rename(columns={"loans_id": "loan_id"})
 
     if "loan_id" not in pay.columns:
         return pd.DataFrame()
 
-    # Load loans map (id -> member_id)
     loans_map = (
         _load_table_service(sb_anon, sb_service, schema, "loans", cols="id,member_id", limit=10000)
         if sb_service is not None
@@ -252,9 +247,7 @@ def _build_member_features(
 
     base = pd.DataFrame({"member_id": members["id"].astype(int)})
 
-    # ------------------------
     # Contributions
-    # ------------------------
     cfeat = base.copy()
     if not contrib.empty and "member_id" in contrib.columns:
         c = contrib.copy()
@@ -285,9 +278,7 @@ def _build_member_features(
 
     cfeat["days_since_last_contrib"] = _days_since(now, cfeat["contrib_last_dt"])
 
-    # ------------------------
-    # Loans (YOUR SCHEMA)
-    # ------------------------
+    # Loans
     lfeat = base.copy()
     if not loans.empty and "member_id" in loans.columns:
         l = loans.copy()
@@ -339,15 +330,12 @@ def _build_member_features(
         lfeat["loan_bad_status_count"] = 0
         lfeat["loan_last_paid_dt"] = pd.NaT
 
-    # ------------------------
-    # Payments (schema-safe)
-    # ------------------------
+    # Payments
     pfeat = base.copy()
     if not payments.empty and "member_id" in payments.columns:
         p = payments.copy()
         p["member_id"] = _to_int(p["member_id"])
         p["amount"] = _to_num(p.get("amount", 0))
-
         if "paid_at" in p.columns:
             p["paid_at"] = _to_dt_utc(p.get("paid_at", pd.NaT))
         else:
@@ -364,9 +352,7 @@ def _build_member_features(
 
     pfeat["days_since_last_payment"] = _days_since(now, pfeat["pay_last_dt"])
 
-    # ------------------------
     # Fines
-    # ------------------------
     ffeat = base.copy()
     if not fines.empty and "member_id" in fines.columns:
         f = fines.copy()
@@ -379,9 +365,7 @@ def _build_member_features(
         ffeat["fine_total"] = 0.0
         ffeat["fine_count"] = 0
 
-    # ------------------------
-    # Foundation contributions
-    # ------------------------
+    # Foundation
     fdfeat = base.copy()
     if not foundation.empty and "member_id" in foundation.columns:
         fd = foundation.copy()
@@ -400,9 +384,6 @@ def _build_member_features(
 
     fdfeat["days_since_last_foundation"] = _days_since(now, fdfeat["foundation_last_dt"])
 
-    # ------------------------
-    # Combine
-    # ------------------------
     X = (
         cfeat.merge(lfeat, on="member_id", how="left")
         .merge(pfeat, on="member_id", how="left")
@@ -414,8 +395,7 @@ def _build_member_features(
         if dtcol in X.columns:
             X.drop(columns=[dtcol], inplace=True)
 
-    X = _fill_feature_defaults(X)
-    return X
+    return _fill_feature_defaults(X)
 
 
 # ============================================================
@@ -477,50 +457,9 @@ def _compute_risk_score(row: pd.Series) -> tuple[float, list[str]]:
 
 
 # ============================================================
-# NumPy ML: Logistic Regression (NO sklearn)
+# ML dataset from loans (YOUR schema)
+#   target: closed=0, active=1
 # ============================================================
-def _sigmoid(z):
-    z = np.clip(z, -30, 30)
-    return 1.0 / (1.0 + np.exp(-z))
-
-
-def _standardize_fit(X: np.ndarray):
-    mu = np.nanmean(X, axis=0)
-    sd = np.nanstd(X, axis=0)
-    sd = np.where(sd == 0, 1.0, sd)
-    return mu, sd
-
-
-def _standardize_apply(X: np.ndarray, mu: np.ndarray, sd: np.ndarray):
-    return (X - mu) / sd
-
-
-def _train_logreg_numpy(X: np.ndarray, y: np.ndarray, lr: float = 0.15, steps: int = 2500, l2: float = 0.25):
-    X = X.astype(float)
-    y = y.astype(float)
-
-    mu, sd = _standardize_fit(X)
-    Xs = _standardize_apply(X, mu, sd)
-
-    n, d = Xs.shape
-    w = np.zeros(d, dtype=float)
-    b = 0.0
-
-    for _ in range(int(steps)):
-        p = _sigmoid(Xs @ w + b)
-        dw = (Xs.T @ (p - y)) / n + l2 * w
-        db = np.mean(p - y)
-        w -= lr * dw
-        b -= lr * db
-
-    return w, b, mu, sd
-
-
-def _predict_proba_numpy(X: np.ndarray, w: np.ndarray, b: float, mu: np.ndarray, sd: np.ndarray):
-    Xs = _standardize_apply(X.astype(float), mu, sd)
-    return _sigmoid(Xs @ w + b)
-
-
 def _make_loan_ml_frame(loans: pd.DataFrame) -> pd.DataFrame:
     if loans is None or loans.empty:
         return pd.DataFrame()
@@ -547,6 +486,7 @@ def _make_loan_ml_frame(loans: pd.DataFrame) -> pd.DataFrame:
     l["loan_age_days"] = _days_since(now, l["borrow_date"])
     l["days_since_last_payment"] = _days_since(now, l["last_paid_at"].fillna(l["borrow_date"]))
 
+    # target
     l["target"] = np.where(l["status"] == "closed", 0, 1).astype(int)
 
     out = l[
@@ -570,16 +510,28 @@ def _make_loan_ml_frame(loans: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _ml_risk_for_member(loans_ml: pd.DataFrame, member_id: int, min_rows: int = MIN_LOANS_FOR_ML) -> tuple[float | None, str]:
-    if loans_ml is None or loans_ml.empty:
-        return None, "No loans for ML."
+def _df_fingerprint(df: pd.DataFrame) -> str:
+    """
+    Stable-ish fingerprint for caching the trained model in session_state.
+    """
+    if df is None or df.empty:
+        return "empty"
+    try:
+        cols = df.columns.tolist()
+        h = pd.util.hash_pandas_object(df[cols], index=True).sum()
+        return str(int(h))
+    except Exception:
+        return str(len(df))
 
-    if len(loans_ml) < int(min_rows):
-        return None, f"Need at least {min_rows} loans for ML (currently {len(loans_ml)})."
 
-    vc = loans_ml["target"].value_counts().to_dict()
-    if len(vc) < 2:
-        return None, "ML needs both classes: closed and active."
+def _xgb_get_or_train(loans_ml: pd.DataFrame):
+    """
+    Returns (model, msg). Caches in st.session_state by loans_ml fingerprint.
+    """
+    try:
+        from xgboost import XGBClassifier
+    except Exception as e:
+        return None, f"xgboost not installed or failed to import: {repr(e)}"
 
     feature_cols = [
         "principal",
@@ -592,10 +544,62 @@ def _ml_risk_for_member(loans_ml: pd.DataFrame, member_id: int, min_rows: int = 
         "days_since_last_payment",
     ]
 
+    fp = _df_fingerprint(loans_ml[feature_cols + ["target"]].copy())
+    cache = st.session_state.get("__xgb_cache__", {})
+
+    if cache.get("fp") == fp and cache.get("model") is not None:
+        return cache["model"], "OK (cached)"
+
     X = loans_ml[feature_cols].to_numpy(dtype=float)
     y = loans_ml["target"].to_numpy(dtype=int)
 
-    w, b, mu, sd = _train_logreg_numpy(X, y, lr=0.15, steps=2500, l2=0.25)
+    n_pos = int((y == 1).sum())
+    n_neg = int((y == 0).sum())
+    scale_pos_weight = (n_neg / max(n_pos, 1))
+
+    model = XGBClassifier(
+        n_estimators=250,
+        max_depth=3,
+        learning_rate=0.08,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        reg_lambda=1.0,
+        random_state=42,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        scale_pos_weight=scale_pos_weight,
+    )
+    model.fit(X, y)
+
+    st.session_state["__xgb_cache__"] = {"fp": fp, "model": model}
+    return model, "OK (trained)"
+
+
+def _xgb_risk_for_member(loans_ml: pd.DataFrame, member_id: int, min_rows: int = MIN_LOANS_FOR_ML) -> tuple[float | None, str]:
+    if loans_ml is None or loans_ml.empty:
+        return None, "No loans for ML."
+
+    if len(loans_ml) < int(min_rows):
+        return None, f"Need at least {min_rows} loans for ML (currently {len(loans_ml)})."
+
+    vc = loans_ml["target"].value_counts().to_dict()
+    if len(vc) < 2:
+        return None, "ML needs both classes: closed and active."
+
+    model, msg = _xgb_get_or_train(loans_ml)
+    if model is None:
+        return None, msg
+
+    feature_cols = [
+        "principal",
+        "principal_current",
+        "interest_rate_monthly",
+        "total_due",
+        "unpaid_interest",
+        "due_cycle_days",
+        "loan_age_days",
+        "days_since_last_payment",
+    ]
 
     mdf = loans_ml[loans_ml["member_id"] == int(member_id)].copy()
     if mdf.empty:
@@ -606,13 +610,13 @@ def _ml_risk_for_member(loans_ml: pd.DataFrame, member_id: int, min_rows: int = 
         mdf = active
 
     Xm = mdf[feature_cols].to_numpy(dtype=float)
-    proba = _predict_proba_numpy(Xm, w, b, mu, sd)
+    proba = model.predict_proba(Xm)[:, 1]
 
     risk = float(np.max(proba)) if len(proba) else None
     if risk is None:
         return None, "Unable to compute ML risk."
 
-    return risk, "OK"
+    return float(np.clip(risk, 0.0, 1.0)), msg
 
 
 # ============================================================
@@ -620,7 +624,7 @@ def _ml_risk_for_member(loans_ml: pd.DataFrame, member_id: int, min_rows: int = 
 # ============================================================
 def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     st.header("🤖 AI Risk Panel")
-    st.caption("NJANGI STANDARD • no legacy • Heuristic + ML (NumPy logistic regression).")
+    st.caption("NJANGI STANDARD • no legacy • Heuristic + ML (XGBoost).")
 
     _ensure_clients_in_state(sb_anon, sb_service)
 
@@ -628,13 +632,11 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     with c1:
         if st.button("🔄 Refresh"):
             st.cache_data.clear()
+            # also drop ML cache for safety
+            st.session_state.pop("__xgb_cache__", None)
             st.rerun()
     with c2:
-        mode = st.radio(
-            "Risk mode",
-            ["Heuristic", "ML (NumPy)", "Hybrid"],
-            horizontal=True,
-        )
+        mode = st.radio("Risk mode", ["Heuristic", "ML (XGBoost)", "Hybrid"], horizontal=True)
 
     if not _table_exists(sb_anon, schema, "members"):
         st.error("Missing table: members")
@@ -724,12 +726,12 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
 
     # ML
     loans_ml = _make_loan_ml_frame(loans)
-    ml_risk, ml_msg = _ml_risk_for_member(loans_ml, member_id=mid, min_rows=MIN_LOANS_FOR_ML)
+    ml_risk, ml_msg = _xgb_risk_for_member(loans_ml, member_id=mid, min_rows=MIN_LOANS_FOR_ML)
 
-    # Select final risk
+    # Final risk
     if mode == "Heuristic":
         final_risk = h_risk
-    elif mode == "ML (NumPy)":
+    elif mode == "ML (XGBoost)":
         final_risk = ml_risk if ml_risk is not None else h_risk
     else:  # Hybrid
         if ml_risk is None:
@@ -742,11 +744,11 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     st.metric("Predicted Risk", f"{final_risk * 100:.1f}%")
     st.progress(float(np.clip(final_risk, 0.0, 1.0)))
 
-    if mode in ["ML (NumPy)", "Hybrid"]:
+    if mode in ["ML (XGBoost)", "Hybrid"]:
         if ml_risk is None:
             st.info(f"ML not ready: {ml_msg}")
         else:
-            st.caption("ML (NumPy logistic regression) is active.")
+            st.caption(f"ML active: {ml_msg}")
 
     if reasons:
         st.caption("Heuristic signals:")
