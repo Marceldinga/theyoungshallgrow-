@@ -1,37 +1,188 @@
+
 # njangi_llm_panel.py
-# ================================================
-# NJANGI AI ASSISTANT PANEL (Lightweight Version)
-# No external LLM required
-# Safe for Streamlit Cloud
-# ================================================
+# ============================================================
+# 🧠 NJANGI LLM PANEL (Lightweight / No external LLM)
+# - NJANGI STANDARD (NO legacy)
+# - Safe for Railway / Streamlit Cloud
+# - Accepts sb_anon / sb_service / schema (matches app.py)
+# ============================================================
 
 from __future__ import annotations
+
 import streamlit as st
 import pandas as pd
+from datetime import datetime, timezone
 
 
-def render_llm_panel(client):
-    st.title("🤖 NJANGI AI Assistant")
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    st.info("This is a lightweight AI helper panel for insights and summaries.")
 
-    question = st.text_area("Ask something about your Njangi system")
+def _safe_sum(df: pd.DataFrame, col: str) -> float:
+    if df is None or df.empty or col not in df.columns:
+        return 0.0
+    return float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
+
+
+def _safe_count(df: pd.DataFrame) -> int:
+    return int(len(df)) if df is not None and not df.empty else 0
+
+
+def _try_read(sb, schema: str, table: str, cols: str = "*", limit: int = 2000, order_by: str | None = None, desc: bool = True):
+    if sb is None:
+        return []
+    q = sb.schema(schema).table(table).select(cols)
+    if order_by:
+        q = q.order(order_by, desc=desc)
+    if limit:
+        q = q.limit(int(limit))
+    return (q.execute().data or [])
+
+
+def _simple_answer(question: str) -> str:
+    q = question.lower().strip()
+
+    if any(k in q for k in ["risk", "default", "overdue", "late", "delinquent"]):
+        return (
+            "Risk signals to watch:\n"
+            "• Loans with status like 'overdue' / long unpaid_interest\n"
+            "• Long time since last payment (last_paid_at)\n"
+            "• Many fines + inconsistent contributions\n"
+            "Tip: Combine these into a score and flag top 5 members weekly."
+        )
+
+    if any(k in q for k in ["contribution", "pay", "deposit"]):
+        return (
+            "Contribution discipline tips:\n"
+            "• Track contributions per session_id and highlight missing members\n"
+            "• Rank top contributors by amount and consistency\n"
+            "• Keep contributions in multiples of 500 (your rule) to simplify auditing"
+        )
+
+    if any(k in q for k in ["loan", "borrow", "interest", "principal"]):
+        return (
+            "Loan monitoring tips:\n"
+            "• principal_current should trend down with payments\n"
+            "• unpaid_interest should not grow for compliant borrowers\n"
+            "• Set a reminder if last_paid_at > 30 days for any active loan"
+        )
+
+    if any(k in q for k in ["minutes", "attendance"]):
+        return (
+            "Meeting operations:\n"
+            "• Store minutes per session_id for traceability\n"
+            "• Use attendance to justify fines (if your rules allow)\n"
+            "• Produce a summary at the end of each session: present/absent + key decisions"
+        )
+
+    return (
+        "I can help with:\n"
+        "• Member risk insights\n"
+        "• Contribution summaries\n"
+        "• Loan monitoring tips\n"
+        "Ask something like: 'Who is high risk?' or 'Summarize contributions for this session'."
+    )
+
+
+def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public"):
+    st.title("🧠 Njangi LLM (Lightweight)")
+    st.caption("No external LLM. Uses simple rules + your NJANGI data (if readable).")
+
+    st.markdown("---")
+
+    # ---------- Try pull small snapshots ----------
+    members_df = pd.DataFrame(_try_read(sb_anon, schema, "members", "id,name,display_name,phone", limit=5000, order_by="id", desc=False))
+    contrib_df = pd.DataFrame(_try_read(sb_anon, schema, "contributions", "id,member_id,session_id,amount,paid_at,created_at", limit=5000, order_by="created_at", desc=True))
+    loans_df = pd.DataFrame(_try_read(sb_anon, schema, "loans", "id,member_id,principal,principal_current,total_due,unpaid_interest,last_paid_at,status,created_at", limit=5000, order_by="created_at", desc=True))
+    fines_df = pd.DataFrame(_try_read(sb_anon, schema, "fines", "*", limit=5000, order_by="created_at", desc=True))
+
+    # ---------- KPIs ----------
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Members", f"{_safe_count(members_df):,}")
+    with c2:
+        st.metric("Contrib rows", f"{_safe_count(contrib_df):,}")
+    with c3:
+        st.metric("Loans rows", f"{_safe_count(loans_df):,}")
+    with c4:
+        st.metric("Fines rows", f"{_safe_count(fines_df):,}")
+
+    st.markdown("---")
+
+    # ---------- Choose member (if possible) ----------
+    member_id = None
+    member_label = None
+
+    if not members_df.empty:
+        # schema-safe label
+        if "display_name" in members_df.columns:
+            members_df["member_name"] = members_df["display_name"].fillna("").astype(str)
+            members_df.loc[members_df["member_name"].str.strip() == "", "member_name"] = members_df["name"].astype(str)
+        else:
+            members_df["member_name"] = members_df["name"].astype(str)
+
+        members_df["label"] = members_df.apply(lambda r: f"{int(r['id']):02d} • {r['member_name']}", axis=1)
+        pick = st.selectbox("Select member (optional)", ["(All members)"] + members_df["label"].tolist())
+        if pick != "(All members)":
+            row = members_df[members_df["label"] == pick].iloc[0]
+            member_id = int(row["id"])
+            member_label = str(row["member_name"])
+    else:
+        st.warning("Could not load members (RLS blocked or table missing). Panel will still work with generic answers.")
+
+    # ---------- Snapshot ----------
+    st.subheader("📌 Snapshot")
+
+    if member_id is not None:
+        mc = contrib_df[contrib_df.get("member_id").astype(str) == str(member_id)] if not contrib_df.empty and "member_id" in contrib_df.columns else pd.DataFrame()
+        ml = loans_df[loans_df.get("member_id").astype(str) == str(member_id)] if not loans_df.empty and "member_id" in loans_df.columns else pd.DataFrame()
+        mf = fines_df[fines_df.get("member_id").astype(str) == str(member_id)] if not fines_df.empty and "member_id" in fines_df.columns else pd.DataFrame()
+
+        total_contrib = _safe_sum(mc, "amount")
+        total_principal = _safe_sum(ml, "principal")
+        total_balance = _safe_sum(ml, "principal_current")
+        unpaid_interest = _safe_sum(ml, "unpaid_interest")
+        total_fines = _safe_sum(mf, "amount") if "amount" in mf.columns else float(len(mf))
+
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Total contributions", f"${total_contrib:,.0f}")
+        s2.metric("Total principal", f"${total_principal:,.0f}")
+        s3.metric("Current balance", f"${total_balance:,.0f}")
+        s4.metric("Unpaid interest", f"${unpaid_interest:,.0f}")
+
+        st.caption(f"Member: **{member_label}** • Generated: {_now_iso()}")
+
+        # Simple risk heuristic
+        risk = 0
+        if unpaid_interest > 0:
+            risk += 40
+        if total_balance > 0 and total_contrib == 0:
+            risk += 30
+        if not ml.empty and "status" in ml.columns:
+            if ml["status"].astype(str).str.contains("overdue|late|default", case=False, na=False).any():
+                risk += 40
+        risk = min(100, risk)
+
+        st.info(f"Quick heuristic risk score: **{risk}/100** (not ML, just rules).")
+
+    else:
+        st.write("All-members snapshot:")
+        st.write(f"• Total contributions amount: **${_safe_sum(contrib_df, 'amount'):,.0f}**")
+        st.write(f"• Total loan principal: **${_safe_sum(loans_df, 'principal'):,.0f}**")
+        st.write(f"• Total current balances: **${_safe_sum(loans_df, 'principal_current'):,.0f}**")
+        st.write(f"• Total unpaid interest: **${_safe_sum(loans_df, 'unpaid_interest'):,.0f}**")
+
+    st.markdown("---")
+
+    # ---------- Q&A ----------
+    st.subheader("💬 Ask the Njangi Assistant")
+    question = st.text_area("Type a question (e.g., 'Explain risk', 'Loan tips', 'Contribution summary')")
 
     if st.button("Analyze"):
         if not question.strip():
             st.warning("Please enter a question.")
-            return
-
-        # Example simple intelligence
-        if "risk" in question.lower():
-            st.success("AI Insight: Members with overdue loans and unpaid interest are high risk.")
-
-        elif "contribution" in question.lower():
-            st.success("AI Insight: Consistent contribution frequency improves payout reliability.")
-
-        elif "loan" in question.lower():
-            st.success("AI Insight: Monitor principal_current and unpaid_interest closely.")
-
         else:
-            st.write("AI Assistant Response:")
-            st.write("This version runs locally without OpenAI. You can upgrade later.")
+            st.success("Assistant response")
+            st.write(_simple_answer(question))
+
+    st.caption("Lightweight assistant • No OpenAI • Safe for Railway/Streamlit Cloud")
