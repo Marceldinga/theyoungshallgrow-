@@ -1,5 +1,5 @@
 
-# ai_risk_panel.py ✅ COMPLETE SINGLE-FILE — NJANGI STANDARD (NO legacy) — XGBoost ML
+# ai_risk_panel.py ✅ COMPLETE SINGLE-FILE — NJANGI STANDARD (NO legacy) — XGBoost ML + PAYOUTS FIXED
 # ------------------------------------------------------------------------------
 # ✅ Uses ONLY new tables:
 #   - members
@@ -8,6 +8,7 @@
 #   - loan_payments (optional)
 #   - foundation_contributions
 #   - fines (optional)
+#   - payouts (optional)  ✅ FIXED: payout_amount / payout_date
 #
 # ✅ Schema-safe for YOUR loans columns:
 #    - principal, principal_current, total_due, unpaid_interest, last_paid_at,
@@ -17,7 +18,7 @@
 # ✅ Cache-safe: no unhashable supabase clients in cache args
 # ✅ UTC-safe date math (no tz-naive vs tz-aware errors)
 #
-# ✅ ML uses XGBoost (instead of NumPy/sklearn):
+# ✅ ML uses XGBoost:
 #    - Trains on loans rows: closed=0, active=1
 #    - Scores member risk as MAX probability among their active loans
 #    - Gate by MIN_LOANS_FOR_ML (default 20)
@@ -79,7 +80,7 @@ def _safe_select(
 
 
 def _safe_select_autosort(client, schema: str, table: str, cols: str = "*", limit: int = 5000, desc: bool = True):
-    for c in ["updated_at", "created_at", "paid_at", "last_paid_at", "borrow_date", "id"]:
+    for c in ["updated_at", "created_at", "paid_at", "last_paid_at", "borrow_date", "payout_date", "id"]:
         rows = _safe_select(client, schema, table, cols=cols, limit=limit, order_by=c, desc=desc, silent=True)
         if rows:
             return rows
@@ -177,9 +178,7 @@ def _load_table_service(sb_anon, sb_service, schema: str, table: str, cols: str 
 
 
 # ============================================================
-# Payment loader: supports either:
-#   loan_payments(member_id, amount, paid_at)
-#   OR loan_payments(loan_id, amount, paid_at) -> join loans to get member_id
+# Payment loader schema-safe
 # ============================================================
 def _load_payments_schema_safe(sb_anon, sb_service, schema: str, limit: int = 20000) -> pd.DataFrame:
     if sb_service is None:
@@ -237,6 +236,7 @@ def _build_member_features(
     contrib: pd.DataFrame,
     loans: pd.DataFrame,
     payments: pd.DataFrame,
+    payouts: pd.DataFrame,
     fines: pd.DataFrame,
     foundation: pd.DataFrame,
 ) -> pd.DataFrame:
@@ -247,7 +247,9 @@ def _build_member_features(
 
     base = pd.DataFrame({"member_id": members["id"].astype(int)})
 
+    # ----------------------------
     # Contributions
+    # ----------------------------
     cfeat = base.copy()
     if not contrib.empty and "member_id" in contrib.columns:
         c = contrib.copy()
@@ -278,7 +280,9 @@ def _build_member_features(
 
     cfeat["days_since_last_contrib"] = _days_since(now, cfeat["contrib_last_dt"])
 
+    # ----------------------------
     # Loans
+    # ----------------------------
     lfeat = base.copy()
     if not loans.empty and "member_id" in loans.columns:
         l = loans.copy()
@@ -330,7 +334,9 @@ def _build_member_features(
         lfeat["loan_bad_status_count"] = 0
         lfeat["loan_last_paid_dt"] = pd.NaT
 
-    # Payments
+    # ----------------------------
+    # Loan payments (repayments)
+    # ----------------------------
     pfeat = base.copy()
     if not payments.empty and "member_id" in payments.columns:
         p = payments.copy()
@@ -342,31 +348,50 @@ def _build_member_features(
             p["paid_at"] = _to_dt_utc(p.get("created_at", pd.NaT))
 
         grp = p.groupby("member_id", dropna=False)
-        pfeat = pfeat.merge
-        (grp["amount"].count().rename("pay_count"), left_on="member_id", right_index=True, how="left")
-        # ============================================================
-# Payout aggregation (FIXED for payout_amount)
-# ============================================================
+        pfeat = pfeat.merge(grp["amount"].count().rename("pay_count"), left_on="member_id", right_index=True, how="left")
+        pfeat = pfeat.merge(grp["amount"].sum().rename("pay_total"), left_on="member_id", right_index=True, how="left")
+        pfeat = pfeat.merge(grp["paid_at"].max().rename("pay_last_dt"), left_on="member_id", right_index=True, how="left")
+    else:
+        pfeat["pay_count"] = 0
+        pfeat["pay_total"] = 0.0
+        pfeat["pay_last_dt"] = pd.NaT
 
-payouts = (
-    supabase.table("payouts")
-    .select("payout_amount")
-    .eq("member_id", member_id)
-    .execute()
-)
+    pfeat["days_since_last_payment"] = _days_since(now, pfeat["pay_last_dt"])
 
-payout_data = payouts.data or []
+    # ----------------------------
+    # Payouts ✅ (your table uses payout_amount / payout_date)
+    # ----------------------------
+    poutfeat = base.copy()
+    if not payouts.empty and "member_id" in payouts.columns:
+        po = payouts.copy()
+        po["member_id"] = _to_int(po["member_id"])
 
-pay_count = len(payout_data)
+        amt_col = "payout_amount" if "payout_amount" in po.columns else ("amount" if "amount" in po.columns else None)
+        if amt_col is None:
+            po["payout_amount_calc"] = 0.0
+        else:
+            po["payout_amount_calc"] = _to_num(po[amt_col])
 
-pay_total = (
-    sum(float(p["payout_amount"]) for p in payout_data)
-    if payout_data else 0
-)
+        dt_col = "payout_date" if "payout_date" in po.columns else ("created_at" if "created_at" in po.columns else None)
+        if dt_col is None:
+            po["payout_dt_calc"] = pd.NaT
+        else:
+            po["payout_dt_calc"] = _to_dt_utc(po[dt_col])
 
-        
+        grp = po.groupby("member_id", dropna=False)
+        poutfeat = poutfeat.merge(grp["payout_amount_calc"].count().rename("payout_count"), left_on="member_id", right_index=True, how="left")
+        poutfeat = poutfeat.merge(grp["payout_amount_calc"].sum().rename("payout_total"), left_on="member_id", right_index=True, how="left")
+        poutfeat = poutfeat.merge(grp["payout_dt_calc"].max().rename("payout_last_dt"), left_on="member_id", right_index=True, how="left")
+    else:
+        poutfeat["payout_count"] = 0
+        poutfeat["payout_total"] = 0.0
+        poutfeat["payout_last_dt"] = pd.NaT
 
+    poutfeat["days_since_last_payout"] = _days_since(now, poutfeat["payout_last_dt"])
+
+    # ----------------------------
     # Fines
+    # ----------------------------
     ffeat = base.copy()
     if not fines.empty and "member_id" in fines.columns:
         f = fines.copy()
@@ -379,7 +404,9 @@ pay_total = (
         ffeat["fine_total"] = 0.0
         ffeat["fine_count"] = 0
 
+    # ----------------------------
     # Foundation
+    # ----------------------------
     fdfeat = base.copy()
     if not foundation.empty and "member_id" in foundation.columns:
         fd = foundation.copy()
@@ -398,14 +425,19 @@ pay_total = (
 
     fdfeat["days_since_last_foundation"] = _days_since(now, fdfeat["foundation_last_dt"])
 
+    # ----------------------------
+    # Merge all features
+    # ----------------------------
     X = (
         cfeat.merge(lfeat, on="member_id", how="left")
         .merge(pfeat, on="member_id", how="left")
+        .merge(poutfeat, on="member_id", how="left")
         .merge(ffeat, on="member_id", how="left")
         .merge(fdfeat, on="member_id", how="left")
     )
 
-    for dtcol in ["contrib_last_dt", "pay_last_dt", "foundation_last_dt", "loan_last_paid_dt"]:
+    # Drop raw date cols (keep only days_since_* numbers)
+    for dtcol in ["contrib_last_dt", "pay_last_dt", "foundation_last_dt", "loan_last_paid_dt", "payout_last_dt"]:
         if dtcol in X.columns:
             X.drop(columns=[dtcol], inplace=True)
 
@@ -413,7 +445,7 @@ pay_total = (
 
 
 # ============================================================
-# Heuristic risk score (NO ML libs)
+# Heuristic risk score
 # ============================================================
 def _compute_risk_score(row: pd.Series) -> tuple[float, list[str]]:
     reasons = []
@@ -525,9 +557,6 @@ def _make_loan_ml_frame(loans: pd.DataFrame) -> pd.DataFrame:
 
 
 def _df_fingerprint(df: pd.DataFrame) -> str:
-    """
-    Stable-ish fingerprint for caching the trained model in session_state.
-    """
     if df is None or df.empty:
         return "empty"
     try:
@@ -539,9 +568,6 @@ def _df_fingerprint(df: pd.DataFrame) -> str:
 
 
 def _xgb_get_or_train(loans_ml: pd.DataFrame):
-    """
-    Returns (model, msg). Caches in st.session_state by loans_ml fingerprint.
-    """
     try:
         from xgboost import XGBClassifier
     except Exception as e:
@@ -638,7 +664,7 @@ def _xgb_risk_for_member(loans_ml: pd.DataFrame, member_id: int, min_rows: int =
 # ============================================================
 def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     st.header("🤖 AI Risk Panel")
-    st.caption("NJANGI STANDARD • no legacy • Heuristic + ML (XGBoost).")
+    st.caption("NJANGI STANDARD • no legacy • Heuristic + ML (XGBoost) • payouts fixed.")
 
     _ensure_clients_in_state(sb_anon, sb_service)
 
@@ -646,7 +672,6 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     with c1:
         if st.button("🔄 Refresh"):
             st.cache_data.clear()
-            # also drop ML cache for safety
             st.session_state.pop("__xgb_cache__", None)
             st.rerun()
     with c2:
@@ -687,6 +712,16 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
         else pd.DataFrame()
     )
 
+    payouts = (
+        _load_table_service(sb_anon, sb_service, schema, "payouts", cols="member_id,session_id,payout_amount,payout_date,created_at", limit=20000)
+        if (sb_service is not None and _table_exists(sb_service, schema, "payouts"))
+        else (
+            _load_table(sb_anon, sb_service, schema, "payouts", cols="member_id,session_id,payout_amount,payout_date,created_at", limit=20000)
+            if _table_exists(sb_anon, schema, "payouts")
+            else pd.DataFrame()
+        )
+    )
+
     fines = (
         _load_table_service(sb_anon, sb_service, schema, "fines", cols="member_id,amount,created_at", limit=20000)
         if (sb_service is not None and _table_exists(sb_service, schema, "fines"))
@@ -708,13 +743,14 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
         st.write("contributions:", len(contrib))
         st.write("loans:", len(loans))
         st.write("loan_payments:", len(payments))
+        st.write("payouts:", len(payouts))
         st.write("fines:", len(fines))
         st.write("foundation_contributions:", len(foundation))
         if not loans.empty and "status" in loans.columns:
             st.write("loan status counts:")
             st.dataframe(loans["status"].astype(str).str.lower().value_counts().reset_index(), use_container_width=True)
 
-    X = _build_member_features(members, contrib, loans, payments, fines, foundation)
+    X = _build_member_features(members, contrib, loans, payments, payouts, fines, foundation)
 
     m = members.copy()
     m["id"] = _to_int(m["id"])
@@ -748,10 +784,7 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     elif mode == "ML (XGBoost)":
         final_risk = ml_risk if ml_risk is not None else h_risk
     else:  # Hybrid
-        if ml_risk is None:
-            final_risk = h_risk
-        else:
-            final_risk = float(np.clip((h_risk + ml_risk) / 2.0, 0.0, 1.0))
+        final_risk = h_risk if ml_risk is None else float(np.clip((h_risk + ml_risk) / 2.0, 0.0, 1.0))
 
     # Display
     st.subheader("Risk prediction")
