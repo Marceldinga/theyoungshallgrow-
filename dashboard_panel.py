@@ -1,40 +1,15 @@
-# dashboard_panel.py ✅ BEST MODERN DASHBOARD — NJANGI STANDARD (NO legacy, NO SQL)
+# dashboard_panel.py ✅ BEST MODERN DASHBOARD + 🤖 "YOUNG" AI HELPER — NJANGI STANDARD (NO legacy, NO SQL)
 # ------------------------------------------------------------------------------
-# ✅ Modern "Banking-grade" dashboard UI (2025+):
-#   - Modern HERO header + KPI grid + alert chips + sections
-#   - Mobile friendly (Railway / Streamlit Cloud)
-#   - Fast Mode + Slow Mode aware (respects app.py throttle externally)
-#   - Uses sb_service for reads when available (RLS-safe), sb_anon fallback
-#
-# ✅ Performance:
-#   - API-level session filters (no "download all then filter")
-#   - Low limits, progressive loading, cached reads (TTL)
-#   - Attendance PDF generated ON DEMAND
-#   - "Refresh snapshot" button clears cache
-#
-# ✅ Data safety / schema-safe:
-#   - members.display_name optional
-#   - sessions.session_id OR sessions.id
-#   - interest_ledger: NO aggregates (PGRST123 safe), Python sums
-#   - payouts: payout_amount/payout_date or amount/created_at
-#   - loan_payments: uses paid_at or created_at
-#
-# ✅ CRITICAL FIX (your error):
-#   - Streamlit cache cannot hash supabase client objects.
-#   - ALL @st.cache_data functions use `_sb` (leading underscore) so Streamlit
-#     will NOT attempt to hash the Supabase client. (UnhashableParamError fixed)
-#
-# TABLES (NEW ONLY):
-#   app_state, sessions, members, contributions, foundation_contributions,
-#   loans, loan_payments, interest_ledger, payouts, fines, attendance
-#   v_next_beneficiary (optional)
+# ✅ Modern "Banking-grade" dashboard UI (2025+)
+# ✅ Embedded AI helper: "Young" (grounded answers from your Supabase snapshots)
+# ✅ FIXED: Streamlit cache cannot hash supabase client -> cached fns use `_sb`
+# ✅ NJANGI STANDARD tables only (no legacy, no SQL)
 # ------------------------------------------------------------------------------
-
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
-from typing import Any
+from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
@@ -50,21 +25,17 @@ from reportlab.lib.units import inch
 W_STRETCH = "stretch"
 DUE_DAYS = 28
 
-# cache TTLs (fast enough + stable)
 TTL_STATE = 12
 TTL_SMALL = 25
 TTL_MED = 45
-TTL_BIG = 75
-
 
 # ============================================================
-# THEME (inherits app.py theme if present; dashboard adds components only)
+# THEME
 # ============================================================
 def inject_dashboard_theme():
     st.markdown(
         """
         <style>
-        /* --- dashboard scoped helpers --- */
         .tysg-hero {
             border-radius: 22px;
             padding: 18px 18px;
@@ -163,7 +134,7 @@ def glass_close() -> str:
 
 
 # ============================================================
-# SAFE HELPERS (NO SQL) — FAST + FILTERED
+# SAFE HELPERS
 # ============================================================
 def _api_msg(e: Exception) -> str:
     return repr(e)
@@ -288,13 +259,9 @@ def _to_date(x) -> date | None:
         return None
 
 
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 # ============================================================
-# AUTO-REFRESH on app_state stamp change (includes updated_at)
-# ✅ FIX: cached function uses `_sb` so Streamlit doesn't hash Supabase client
+# AUTO-REFRESH on app_state stamp change
+# ✅ FIX: cached function uses `_sb` (supabase client is NOT hashed)
 # ============================================================
 @st.cache_data(ttl=TTL_STATE, show_spinner=False)
 def _read_state_stamp_cached(url_key: str, schema: str, _sb) -> str:
@@ -324,249 +291,7 @@ def _auto_refresh_if_state_changed(sb, schema: str):
 
 
 # ============================================================
-# INTEREST LEDGER (NO aggregates) — PGRST123 safe
-# ============================================================
-def compute_interest_ledger(sb, schema: str, limit: int = 5000) -> tuple[float, float]:
-    st.session_state.pop("_interest_ledger_error", None)
-
-    if not _table_exists(sb, schema, "interest_ledger"):
-        st.session_state["_interest_ledger_error"] = "interest_ledger not readable (missing table OR RLS blocks SELECT)."
-        return 0.0, 0.0
-
-    month_prefix = date.today().strftime("%Y-%m")
-
-    cols_try = [
-        "id,amount,interest_month,created_at",
-        "id,interest_amount,interest_month,created_at",
-        "id,amount,created_at",
-        "id,interest_amount,created_at",
-        "id,amount",
-        "id,interest_amount",
-        "*",
-    ]
-
-    rows: list[dict] = []
-    last_err: str | None = None
-
-    for cols in cols_try:
-        try:
-            rows = safe_table_order_fallback(
-                sb,
-                schema,
-                "interest_ledger",
-                cols,
-                limit=limit,
-                order_candidates=["created_at", "id"],
-                desc=True,
-            )
-            last_err = None
-            break
-        except Exception as e:
-            last_err = repr(e)
-            rows = []
-
-    if not rows:
-        st.session_state["_interest_ledger_error"] = f"interest_ledger returned 0 rows. {('Last error: ' + last_err) if last_err else ''}"
-        return 0.0, 0.0
-
-    all_time = 0.0
-    this_month = 0.0
-
-    for r in rows:
-        v = _num(r.get("amount") if r.get("amount") is not None else r.get("interest_amount"), 0.0)
-        all_time += v
-
-        im = str(r.get("interest_month") or "").strip()
-        if im:
-            if im.startswith(month_prefix):
-                this_month += v
-            continue
-
-        d = _to_date(r.get("created_at"))
-        if d and d.strftime("%Y-%m") == month_prefix:
-            this_month += v
-
-    return float(this_month), float(all_time)
-
-
-# ============================================================
-# KPIs + data builders (limited reads)
-# ============================================================
-def compute_loan_payments(sb, schema: str, limit: int = 2500) -> tuple[float, dict[int, date]]:
-    if not _table_exists(sb, schema, "loan_payments"):
-        return 0.0, {}
-
-    rows = safe_table_order_fallback(
-        sb,
-        schema,
-        "loan_payments",
-        "loan_id,amount,paid_at,created_at,id",
-        limit=limit,
-        order_candidates=["paid_at", "created_at", "id"],
-        desc=True,
-    )
-    total = 0.0
-    last_by_loan: dict[int, date] = {}
-
-    for r in rows or []:
-        total += _num(r.get("amount"), 0.0)
-        try:
-            lid = int(r.get("loan_id"))
-        except Exception:
-            continue
-        d = _to_date(r.get("paid_at") or r.get("created_at"))
-        if d is not None and (lid not in last_by_loan or d > last_by_loan[lid]):
-            last_by_loan[lid] = d
-
-    return float(total), last_by_loan
-
-
-def compute_loans_kpis(sb, schema: str, limit: int = 2500) -> dict[str, Any]:
-    if not _table_exists(sb, schema, "loans"):
-        return {"active_loans": 0, "principal_active": 0.0, "total_due_active": 0.0, "overdue_active": 0}
-
-    rows = safe_table(sb, schema, "loans", "*", limit=limit)
-    active = 0
-    overdue = 0
-    principal_sum = 0.0
-    total_due_sum = 0.0
-
-    bad_tokens = ["delinquent", "default", "overdue", "late", "arrears", "past due", "past_due", "unpaid"]
-
-    for r in rows or []:
-        status = str(r.get("status") or "").lower().strip()
-
-        if status in ("active", "open"):
-            active += 1
-
-            # some systems mark overdue with tokens in status while still "active"
-            if any(t in status for t in bad_tokens):
-                overdue += 1
-
-            pc = _num(r.get("principal_current") or r.get("principal"), 0.0)
-            principal_sum += pc
-
-            td = _num(r.get("total_due"), pc + _num(r.get("unpaid_interest"), 0.0))
-            total_due_sum += td
-
-        # if your DB uses status="overdue" as active loan, count it too:
-        if status in ("overdue", "late", "delinquent", "default"):
-            active += 1
-            overdue += 1
-            pc = _num(r.get("principal_current") or r.get("principal"), 0.0)
-            principal_sum += pc
-            td = _num(r.get("total_due"), pc + _num(r.get("unpaid_interest"), 0.0))
-            total_due_sum += td
-
-    return {
-        "active_loans": int(active),
-        "overdue_active": int(overdue),
-        "principal_active": float(principal_sum),
-        "total_due_active": float(total_due_sum),
-    }
-
-
-def sum_table_amount(sb, schema: str, table: str, amount_cols: list[str], limit: int = 2500, **eq_filters) -> float:
-    if not _table_exists(sb, schema, table):
-        return 0.0
-    rows = safe_table(sb, schema, table, "*", limit=limit, **eq_filters)
-    total = 0.0
-    for r in rows or []:
-        val = None
-        for c in amount_cols:
-            if c in r:
-                val = r.get(c)
-                break
-        total += _num(val, 0.0)
-    return float(total)
-
-
-def compute_fines_paid_total(sb, schema: str, limit: int = 2500) -> float:
-    if not _table_exists(sb, schema, "fines"):
-        return 0.0
-
-    rows = safe_table_order_fallback(
-        sb,
-        schema,
-        "fines",
-        "amount,status,paid_at,created_at,id",
-        limit=limit,
-        order_candidates=["paid_at", "created_at", "id"],
-        desc=True,
-    )
-    total = 0.0
-    for r in rows or []:
-        if str(r.get("status") or "").lower().strip() == "paid":
-            total += _num(r.get("amount"), 0.0)
-    return float(total)
-
-
-def get_session_window(sb, schema: str, session_id: int) -> str:
-    if not session_id:
-        return "—"
-    srow = safe_single(sb, schema, "sessions", "*", session_id=int(session_id))
-    if not srow:
-        srow = safe_single(sb, schema, "sessions", "*", id=int(session_id))
-    sd = srow.get("start_date") or srow.get("session_date")
-    ed = srow.get("end_date")
-    if sd and ed:
-        return f"{sd} → {ed}"
-    if sd:
-        return f"{sd}"
-    return "—"
-
-
-def build_repayment_plan(sb, schema: str, last_payment_dates: dict[int, date], limit: int = 2500) -> pd.DataFrame:
-    loans = safe_table(sb, schema, "loans", "*", limit=limit)
-    out: list[dict[str, Any]] = []
-
-    today = date.today()
-    for r in loans or []:
-        status = str(r.get("status") or "").lower().strip()
-        if status not in ("active", "open", "overdue", "late", "delinquent", "default"):
-            continue
-
-        try:
-            lid = int(r.get("id"))
-        except Exception:
-            continue
-
-        principal = _num(r.get("principal_current") or r.get("principal"), 0.0)
-        unpaid_interest = _num(r.get("unpaid_interest"), 0.0)
-        total_due = _num(r.get("total_due"), principal + unpaid_interest)
-
-        borrow_date = _to_date(r.get("borrow_date")) or _to_date(r.get("created_at")) or today
-
-        if lid in last_payment_dates:
-            last_paid = last_payment_dates[lid]
-            next_due = last_paid + timedelta(days=DUE_DAYS)
-        else:
-            last_paid = None
-            next_due = borrow_date + timedelta(days=DUE_DAYS)
-
-        days_to_due = (next_due - today).days
-
-        out.append(
-            {
-                "loan_id": lid,
-                "member_id": r.get("member_id"),
-                "principal_current": principal,
-                "unpaid_interest": unpaid_interest,
-                "total_due": total_due,
-                "last_paid": last_paid.isoformat() if isinstance(last_paid, date) else "—",
-                "next_due_date": next_due.isoformat(),
-                "days_to_due": int(days_to_due),
-            }
-        )
-
-    df = pd.DataFrame(out)
-    if df.empty:
-        return df
-    return df.sort_values(["days_to_due", "next_due_date"], ascending=True).reset_index(drop=True)
-
-
-# ============================================================
-# Attendance helpers + PDF export (on demand)
+# ATTENDANCE + PDF
 # ============================================================
 def _member_name_map(members_rows: list[dict[str, Any]]) -> dict[int, str]:
     out: dict[int, str] = {}
@@ -587,78 +312,55 @@ def _dedupe_attendance_latest(att_rows: list[dict[str, Any]]) -> list[dict[str, 
     df = pd.DataFrame(att_rows)
     if df.empty:
         return []
-
     for col in ("member_id", "session_id", "id"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-
     if "created_at" in df.columns:
         df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
     else:
         df["created_at"] = pd.NaT
-
     sort_cols = [c for c in ("created_at", "id") if c in df.columns]
     if sort_cols:
         df = df.sort_values(sort_cols, ascending=[False] * len(sort_cols))
-
     if "member_id" in df.columns and "session_id" in df.columns:
         df = df.drop_duplicates(subset=["member_id", "session_id"], keep="first")
-
     return df.to_dict("records")
 
 
 def build_attendance_df(sb, schema: str, session_id: int, members_rows: list[dict[str, Any]], limit: int = 2500) -> pd.DataFrame:
     if not session_id or not _table_exists(sb, schema, "attendance"):
         return pd.DataFrame()
-
     att_rows = safe_table_order_fallback(
-        sb,
-        schema,
-        "attendance",
-        "*",
-        limit=limit,
-        order_candidates=["created_at", "id"],
-        desc=True,
-        session_id=int(session_id),
+        sb, schema, "attendance", "*", limit=limit, order_candidates=["created_at", "id"], desc=True, session_id=int(session_id)
     )
     if not att_rows:
         return pd.DataFrame()
-
     filtered = _dedupe_attendance_latest(att_rows)
     if not filtered:
         return pd.DataFrame()
-
     name_map = _member_name_map(members_rows)
-
     out_rows = []
     for r in filtered:
         try:
             mid = int(r.get("member_id"))
         except Exception:
             continue
-
         present = r.get("present")
         is_present = bool(present) if isinstance(present, bool) else str(present).lower().strip() in ("true", "1", "yes")
-        note = str(r.get("note") or "").strip()
-        created_at = str(r.get("created_at") or "").strip()
-
         out_rows.append(
             {
                 "member_id": mid,
                 "member_name": name_map.get(mid, f"Member {mid:02d}"),
                 "status": "Present" if is_present else "Absent",
-                "note": note,
-                "recorded_at": created_at or "—",
+                "note": str(r.get("note") or "").strip(),
+                "recorded_at": str(r.get("created_at") or "").strip() or "—",
             }
         )
-
     df = pd.DataFrame(out_rows)
     if df.empty:
         return df
-
     df["member_id"] = pd.to_numeric(df["member_id"], errors="coerce").fillna(0).astype(int)
-    df = df.sort_values("member_id", ascending=True).reset_index(drop=True)
-    return df
+    return df.sort_values("member_id", ascending=True).reset_index(drop=True)
 
 
 def _pdf_draw_wrapped(c: canvas.Canvas, text: str, x: float, y: float, max_width: float, line_height: float = 12) -> float:
@@ -762,17 +464,12 @@ def generate_attendance_pdf_bytes(session_id: int, session_window: str, df: pd.D
             y = page_h - margin
             y = draw_header(y)
 
-        mid = str(r.get("member_id") or "")
-        name = str(r.get("member_name") or "")
-        status = str(r.get("status") or "")
-        note = str(r.get("note") or "")
-
-        c.drawString(col1, y, mid)
-        c.drawString(col2, y, name[:28])
-        c.drawString(col3, y, status)
+        c.drawString(col1, y, str(r.get("member_id") or ""))
+        c.drawString(col2, y, str(r.get("member_name") or "")[:28])
+        c.drawString(col3, y, str(r.get("status") or ""))
 
         y_note_start = y
-        y_after = _pdf_draw_wrapped(c, note, col4, y_note_start, max_width=max_note_w, line_height=11)
+        y_after = _pdf_draw_wrapped(c, str(r.get("note") or ""), col4, y_note_start, max_width=max_note_w, line_height=11)
         y = min(y_note_start - 14, y_after - 2)
 
     c.setFont("Helvetica-Oblique", 9)
@@ -782,8 +479,7 @@ def generate_attendance_pdf_bytes(session_id: int, session_window: str, df: pd.D
 
 
 # ============================================================
-# Cached loaders (fast + safe)
-# ✅ FIX: all cached loaders use `_sb` (supabase client is not hashed)
+# CACHED LOADERS (cache-safe: `_sb`)
 # ============================================================
 @st.cache_data(ttl=TTL_SMALL, show_spinner=False)
 def _load_members(schema: str, _sb) -> list[dict]:
@@ -842,54 +538,150 @@ def _load_cycle_contribs(schema: str, _sb, session_id: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=TTL_MED, show_spinner=False)
-def _load_active_loans(schema: str, _sb) -> pd.DataFrame:
+def _load_loans(schema: str, _sb) -> pd.DataFrame:
     if not _table_exists(_sb, schema, "loans"):
         return pd.DataFrame()
     rows = safe_table(_sb, schema, "loans", "*", limit=2500)
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
+@st.cache_data(ttl=TTL_MED, show_spinner=False)
+def _load_fines(schema: str, _sb) -> pd.DataFrame:
+    if not _table_exists(_sb, schema, "fines"):
+        return pd.DataFrame()
+    rows = safe_table_order_fallback(_sb, schema, "fines", "*", limit=2500, order_candidates=["paid_at", "created_at", "id"], desc=True)
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
 # ============================================================
-# ALERTS (bank-style)
+# "YOUNG" — GROUNDED DASHBOARD AI
 # ============================================================
-def _build_alerts(*, cash_available_raw: float, pot: float, loans_kpis: dict, members_paid: int, total_members: int) -> list[dict]:
-    alerts = []
-
-    if cash_available_raw < 0:
-        alerts.append({"sev": "high", "msg": "Liquidity tight: outstanding principal is greater than cash inflows."})
-    elif cash_available_raw < 1000:
-        alerts.append({"sev": "med", "msg": "Liquidity low: consider limiting new loan approvals."})
-
-    if total_members > 0:
-        rate = members_paid / max(total_members, 1)
-        if rate < 0.60:
-            alerts.append({"sev": "med", "msg": f"Low participation this cycle: {members_paid}/{total_members} members paid."})
-        elif rate < 0.85:
-            alerts.append({"sev": "low", "msg": f"Participation moderate: {members_paid}/{total_members} members paid."})
-
-    overdue = int(loans_kpis.get("overdue_active", 0))
-    active = int(loans_kpis.get("active_loans", 0))
-    if overdue > 0:
-        alerts.append({"sev": "high", "msg": f"Overdue signals detected on active loans: {overdue} flagged."})
-    elif active >= 5:
-        alerts.append({"sev": "low", "msg": f"{active} active loans — monitor repayment cadence."})
-
-    if pot <= 0 and total_members > 0:
-        alerts.append({"sev": "low", "msg": "Current pot is 0 — confirm contributions are being recorded for this session."})
-
-    return alerts[:6]
+def _normalize_text(s: str) -> str:
+    return " ".join(str(s or "").lower().strip().split())
 
 
-def _chip(sev: str, msg: str) -> str:
-    dot = {"high": "#f87171", "med": "#fb923c", "low": "#60a5fa"}.get(sev, "#34d399")
-    label = {"high": "HIGH", "med": "MED", "low": "INFO"}.get(sev, "INFO")
-    return f"""
-    <span class="chip">
-        <span class="chip-dot" style="background:{dot};"></span>
-        <b style="letter-spacing:0.08em;">{label}</b>
-        <span style="opacity:0.85;">{msg}</span>
-    </span>
-    """
+def _money(x: float) -> str:
+    try:
+        return f"${float(x):,.0f}"
+    except Exception:
+        return "$0"
+
+
+def _safe_sum_df(df: pd.DataFrame, col: str) -> float:
+    if df is None or df.empty or col not in df.columns:
+        return 0.0
+    return float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
+
+
+def _assistant_intro_young() -> str:
+    return (
+        "Hi 👋🏾 I’m **Young** — your dashboard AI helper for **theyoungshallgrow**.\n\n"
+        "✅ I can answer using **live Supabase numbers** (grounded):\n"
+        "• Pot & participation this cycle\n"
+        "• Loans totals + who is overdue risk\n"
+        "• Fines + repayments + interest totals\n"
+        "• Attendance summary\n\n"
+        "Try:\n"
+        "• **How much is the pot this session?**\n"
+        "• **Who has active loans and how much is due?**\n"
+        "• **Show fines total and repayments total**\n"
+        "• **Attendance summary**\n"
+    )
+
+
+def _answer_young(question: str, *, session_id: int | None, members_rows: list[dict], dfc: pd.DataFrame, loans_df: pd.DataFrame, fines_df: pd.DataFrame, att_df: pd.DataFrame) -> str:
+    q = question.strip()
+    if not q:
+        return "Type a question."
+
+    qn = _normalize_text(q)
+
+    # quick stats available on dashboard snapshots
+    total_members = len(members_rows or [])
+    pot = _safe_sum_df(dfc, "amount") if dfc is not None and not dfc.empty else 0.0
+    members_paid = int(dfc["member_id"].nunique()) if dfc is not None and not dfc.empty and "member_id" in dfc.columns else 0
+
+    # loans
+    principal_current = _safe_sum_df(loans_df, "principal_current")
+    unpaid_interest = _safe_sum_df(loans_df, "unpaid_interest")
+    total_due = _safe_sum_df(loans_df, "total_due")
+    active_like = 0
+    overdue_like = 0
+    if loans_df is not None and not loans_df.empty and "status" in loans_df.columns:
+        s = loans_df["status"].astype(str).str.lower().fillna("")
+        active_like = int(s.isin(["active", "open"]).sum() + s.isin(["overdue", "late", "delinquent", "default"]).sum())
+        overdue_like = int(s.isin(["overdue", "late", "delinquent", "default"]).sum())
+
+    # fines
+    fines_total = _safe_sum_df(fines_df, "amount")
+
+    # attendance
+    present = 0
+    absent = 0
+    if att_df is not None and not att_df.empty and "status" in att_df.columns:
+        present = int((att_df["status"] == "Present").sum())
+        absent = int((att_df["status"] == "Absent").sum())
+
+    # intent
+    if any(k in qn for k in ["hi", "hello", "introduce", "who are you", "your name"]):
+        return _assistant_intro_young()
+
+    if any(k in qn for k in ["pot", "this session", "cycle contribution", "cycle"]):
+        sid = session_id if session_id else "—"
+        return (
+            f"**Cycle snapshot (session {sid})**:\n"
+            f"• Pot so far: **{_money(pot)}**\n"
+            f"• Members paid: **{members_paid}/{total_members}**\n"
+            f"Tip: If pot looks low, confirm contributions are being recorded with the correct `session_id`."
+        )
+
+    if any(k in qn for k in ["loan", "due", "balance", "principal", "interest", "overdue"]):
+        return (
+            "**Loans snapshot (limited to recent rows loaded on dashboard):**\n"
+            f"• Active-like loans: **{active_like}**\n"
+            f"• Overdue-like loans: **{overdue_like}**\n"
+            f"• Principal current total: **{_money(principal_current)}**\n"
+            f"• Unpaid interest total: **{_money(unpaid_interest)}**\n"
+            f"• Total due total: **{_money(total_due)}**\n\n"
+            "If you want the exact list of overdue members, open the **Loans** page for full detail."
+        )
+
+    if any(k in qn for k in ["fine", "penalty"]):
+        return (
+            "**Fines snapshot:**\n"
+            f"• Total fines (loaded): **{_money(fines_total)}**\n"
+            "If fines are missing, it may be RLS blocking SELECT or the table is empty."
+        )
+
+    if any(k in qn for k in ["attendance", "present", "absent"]):
+        sid = session_id if session_id else "—"
+        recorded = int(len(att_df)) if att_df is not None and not att_df.empty else 0
+        return (
+            f"**Attendance snapshot (session {sid})**:\n"
+            f"• Records: **{recorded}**\n"
+            f"• Present: **{present}**\n"
+            f"• Absent: **{absent}**\n"
+            "You can generate the PDF in the Attendance section."
+        )
+
+    if any(k in qn for k in ["help", "what can you do", "commands"]):
+        return (
+            "Ask me things like:\n"
+            "• **How much is the pot this session?**\n"
+            "• **Loans summary / total due / overdue count**\n"
+            "• **Fines total**\n"
+            "• **Attendance summary**\n"
+            "• **Introduce yourself**"
+        )
+
+    return (
+        "I can answer using dashboard numbers. Try:\n"
+        "• **Pot this session**\n"
+        "• **Loans summary**\n"
+        "• **Fines total**\n"
+        "• **Attendance summary**\n"
+        "• **help**"
+    )
 
 
 # ============================================================
@@ -897,14 +689,11 @@ def _chip(sev: str, msg: str) -> str:
 # ============================================================
 def render_dashboard(sb_anon, sb_service, schema: str = "public"):
     inject_dashboard_theme()
-
     read_sb = sb_service if sb_service is not None else sb_anon
-    finance_sb = sb_service if sb_service is not None else sb_anon
 
-    # ✅ fixes your crash: cached stamp reader uses `_sb`
     _auto_refresh_if_state_changed(read_sb, schema)
 
-    # Top controls
+    # HERO + refresh
     topL, topR = st.columns([1, 0.22])
     with topL:
         st.markdown(
@@ -912,8 +701,8 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
             <div class="tysg-hero">
               <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-end;flex-wrap:wrap;">
                 <div>
-                  <div style="font-size:22px;font-weight:850;">🏦 Bank Dashboard</div>
-                  <div class="tysg-sub">Modern Njangi analytics • fast snapshot • no legacy • no SQL</div>
+                  <div style="font-size:22px;font-weight:850;">🏦 theyoungshallgrow • Bank Dashboard</div>
+                  <div class="tysg-sub">Modern Njangi analytics + AI helper • no legacy • no SQL</div>
                 </div>
                 <div class="tysg-sub">Status: <b style="color:#00E6A8;">LIVE</b></div>
               </div>
@@ -922,11 +711,11 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
             unsafe_allow_html=True,
         )
     with topR:
-        if st.button("🔄 Refresh snapshot", width=W_STRETCH):
+        if st.button("🔄 Refresh", width=W_STRETCH):
             st.cache_data.clear()
             st.rerun()
 
-    # State + session
+    # Load state/session
     state = _load_app_state(schema, read_sb)
     raw_cs = state.get("current_session_id")
 
@@ -943,300 +732,125 @@ def render_dashboard(sb_anon, sb_service, schema: str = "public"):
         except Exception:
             current_session_id = None
 
-    session_note = "from app_state" if state.get("current_session_id") else "fallback: latest session"
-    next_member_id = state.get("next_member_id")
-
-    # Members
+    # Members + cycle snapshots
     members_rows = _load_members(schema, read_sb)
-    total_members = int(len(members_rows or []))
+    dfc = _load_cycle_contribs(schema, read_sb, int(current_session_id)) if isinstance(current_session_id, int) else pd.DataFrame()
+    loans_df = _load_loans(schema, read_sb)
+    fines_df = _load_fines(schema, read_sb)
 
-    # Beneficiary
-    beneficiary_name = "—"
-    beneficiary_id = next_member_id
-
-    v = safe_single(read_sb, schema, "v_next_beneficiary", "*")
-    if v:
-        beneficiary_name = str(v.get("beneficiary_name") or v.get("member_name") or "—")
-        beneficiary_id = v.get("beneficiary_id") or v.get("member_id") or beneficiary_id
-    else:
-        try:
-            bid = int(beneficiary_id) if beneficiary_id is not None else None
-        except Exception:
-            bid = None
-        if bid is not None:
-            for m in members_rows or []:
-                if str(m.get("id")) == str(bid):
-                    dn = str(m.get("display_name") or "").strip()
-                    nm = str(m.get("name") or "").strip()
-                    beneficiary_name = dn or nm or f"Member {bid:02d}"
-                    break
-
-    # Session window
-    window = "—"
-    if isinstance(current_session_id, int) and current_session_id > 0:
-        window = get_session_window(read_sb, schema, int(current_session_id))
-
-    # Contributions (cycle)
-    pot = 0.0
-    members_paid = 0
-    if isinstance(current_session_id, int) and current_session_id > 0:
-        dfc = _load_cycle_contribs(schema, finance_sb, int(current_session_id))
-        if not dfc.empty:
-            if "amount" in dfc.columns:
-                dfc["amount"] = pd.to_numeric(dfc["amount"], errors="coerce").fillna(0.0)
-                pot = float(dfc["amount"].sum())
-            if "member_id" in dfc.columns:
-                members_paid = int(dfc["member_id"].nunique())
-    else:
-        dfc = pd.DataFrame()
-
-    # Financial totals (fast, limited)
-    foundation_total = sum_table_amount(finance_sb, schema, "foundation_contributions", ["amount"], limit=2500)
-    payouts_total = sum_table_amount(finance_sb, schema, "payouts", ["payout_amount", "amount"], limit=2500)
-
-    interest_this_month, interest_all_time = compute_interest_ledger(finance_sb, schema, limit=5000)
-    repayments_total, last_payment_dates = compute_loan_payments(finance_sb, schema, limit=2500)
-    fines_paid_total = compute_fines_paid_total(finance_sb, schema, limit=2500)
-    loan_kpis = compute_loans_kpis(finance_sb, schema, limit=2500)
-    loans_outstanding = float(loan_kpis.get("principal_active", 0.0))
-
-    cash_available_raw = foundation_total + repayments_total + interest_all_time + fines_paid_total - loans_outstanding
-    cash_available = max(cash_available_raw, 0.0)
-    net_available = cash_available + float(pot)
-
-    # Alerts chips
-    alerts = _build_alerts(
-        cash_available_raw=cash_available_raw,
-        pot=pot,
-        loans_kpis=loan_kpis,
-        members_paid=members_paid,
-        total_members=total_members,
+    # Attendance snapshot (light)
+    att_df = (
+        build_attendance_df(read_sb, schema, int(current_session_id), members_rows, limit=2500)
+        if isinstance(current_session_id, int) and current_session_id > 0
+        else pd.DataFrame()
     )
 
-    if alerts:
-        st.markdown("#### 🚨 Live signals")
-        chips_html = " ".join([_chip(a["sev"], a["msg"]) for a in alerts])
-        st.markdown(chips_html, unsafe_allow_html=True)
+    total_members = len(members_rows or [])
+    pot = float(pd.to_numeric(dfc["amount"], errors="coerce").fillna(0).sum()) if not dfc.empty and "amount" in dfc.columns else 0.0
+    members_paid = int(dfc["member_id"].nunique()) if not dfc.empty and "member_id" in dfc.columns else 0
 
+    # KPI top
     st.divider()
-
-    # KPI GRID (top)
     st.markdown(glass_open(), unsafe_allow_html=True)
-    r1c1, r1c2, r1c3, r1c4 = st.columns(4)
-    with r1c1:
-        st.markdown(_kpi_card("Session ID", str(current_session_id or "—"), "#60A5FA", sub=session_note), unsafe_allow_html=True)
-    with r1c2:
-        st.markdown(_kpi_card("Session Window", window, "#FB923C"), unsafe_allow_html=True)
-    with r1c3:
-        st.markdown(_kpi_card("Total Members", str(total_members), "#A78BFA", sub="members registry"), unsafe_allow_html=True)
-    with r1c4:
-        st.markdown(
-            _kpi_card(
-                "Current Beneficiary",
-                beneficiary_name,
-                "#00E6A8",
-                sub=f"member_id: {beneficiary_id if beneficiary_id is not None else '—'}",
-            ),
-            unsafe_allow_html=True,
-        )
-
-    st.divider()
-    r2c1, r2c2, r2c3, r2c4 = st.columns(4)
-    with r2c1:
+    a, b, c, d = st.columns(4)
+    with a:
+        st.markdown(_kpi_card("Session ID", str(current_session_id or "—"), "#60A5FA"), unsafe_allow_html=True)
+    with b:
+        st.markdown(_kpi_card("Total Members", str(total_members), "#A78BFA"), unsafe_allow_html=True)
+    with c:
         st.markdown(_kpi_card("Current Pot", _fmt_money(pot, 0), "#00E6A8", sub="cycle contributions"), unsafe_allow_html=True)
-    with r2c2:
-        st.markdown(_kpi_card("Members Paid", f"{members_paid}/{total_members}", "#A78BFA", sub="this cycle"), unsafe_allow_html=True)
-    with r2c3:
-        st.markdown(_kpi_card("Cash Available", _fmt_money(cash_available, 0), "#00E6A8", sub="cash-in minus principal"), unsafe_allow_html=True)
-    with r2c4:
-        st.markdown(_kpi_card("Net Available", _fmt_money(net_available, 0), "#60A5FA", sub="Cash Available + Pot"), unsafe_allow_html=True)
+    with d:
+        st.markdown(_kpi_card("Members Paid", f"{members_paid}/{total_members}", "#FB923C"), unsafe_allow_html=True)
     st.markdown(glass_close(), unsafe_allow_html=True)
 
-    if cash_available_raw < 0:
-        st.warning(
-            f"⚠️ Cash Available RAW is negative ({cash_available_raw:,.0f}) before flooring to 0. "
-            "Outstanding loans exceed inflows."
-        )
-
     st.divider()
 
-    # Two-column layout: Attendance + Loans overview
+    # --- Attendance block ---
     left, right = st.columns([1.05, 0.95])
-
     with left:
         st.markdown("### 🧾 Attendance (session)")
-        st.caption("Preview is light; PDF is generated only when you click the button.")
-
-        if not (isinstance(current_session_id, int) and current_session_id > 0):
-            st.info("No current_session_id available yet.")
-            att_df = pd.DataFrame()
-        else:
-            att_df = build_attendance_df(read_sb, schema, int(current_session_id), members_rows, limit=2500)
-
-            if att_df.empty:
-                st.warning("No attendance recorded for this session yet.")
-            else:
-                st.markdown(glass_open(), unsafe_allow_html=True)
-                st.dataframe(att_df, width=W_STRETCH, hide_index=True)
-                st.markdown(glass_close(), unsafe_allow_html=True)
-
-            if st.button("🧾 Generate Attendance PDF", width=W_STRETCH):
-                pdf_bytes = generate_attendance_pdf_bytes(
-                    session_id=int(current_session_id),
-                    session_window=window,
-                    df=att_df,
-                    total_members=total_members,
-                )
-                fname = f"attendance_session_{int(current_session_id)}.pdf"
-                st.download_button(
-                    "⬇️ Download Attendance PDF",
-                    data=pdf_bytes,
-                    file_name=fname,
-                    mime="application/pdf",
-                    width=W_STRETCH,
-                )
-
-    with right:
-        st.markdown("### 💳 Loans overview")
-        st.caption("Quick KPIs + repayment plan based on last payment date (or borrow date).")
-
-        st.markdown(glass_open(), unsafe_allow_html=True)
-        l1, l2 = st.columns(2)
-        with l1:
-            st.markdown(_kpi_card("Active Loans", str(int(loan_kpis.get("active_loans", 0))), "#A78BFA"), unsafe_allow_html=True)
-        with l2:
-            st.markdown(_kpi_card("Total Due (active)", _fmt_money(loan_kpis.get("total_due_active", 0.0), 0), "#F87171"), unsafe_allow_html=True)
-
-        l3, l4 = st.columns(2)
-        with l3:
-            st.markdown(_kpi_card("Outstanding Principal", _fmt_money(loans_outstanding, 0), "#FB923C"), unsafe_allow_html=True)
-        with l4:
-            st.markdown(_kpi_card("Interest (this month)", _fmt_money(interest_this_month, 2), "#00E6A8"), unsafe_allow_html=True)
-        st.markdown(glass_close(), unsafe_allow_html=True)
-
-        plan_df = build_repayment_plan(finance_sb, schema, last_payment_dates, limit=2500)
-        if plan_df.empty:
-            st.info("No active/open loans found.")
+        if att_df.empty:
+            st.info("No attendance records for this session yet.")
         else:
             st.markdown(glass_open(), unsafe_allow_html=True)
-            st.markdown("#### 🗓️ Repayment plan")
-            st.caption(f"Due = {DUE_DAYS} days from last payment (or borrow_date if never paid).")
-
-            if "days_to_due" in plan_df.columns:
-                plan_df2 = plan_df.copy()
-                plan_df2["urgency"] = plan_df2["days_to_due"].apply(
-                    lambda d: "OVERDUE" if d < 0 else ("DUE SOON" if d <= 7 else ("UPCOMING" if d <= 21 else "OK"))
-                )
-                plan_df2 = plan_df2[["loan_id", "member_id", "total_due", "last_paid", "next_due_date", "days_to_due", "urgency"]]
-                st.dataframe(plan_df2, width=W_STRETCH, hide_index=True)
-            else:
-                st.dataframe(plan_df, width=W_STRETCH, hide_index=True)
-
+            st.dataframe(att_df, width=W_STRETCH, hide_index=True)
             st.markdown(glass_close(), unsafe_allow_html=True)
 
-    st.divider()
+        if isinstance(current_session_id, int) and current_session_id > 0 and st.button("🧾 Generate Attendance PDF", width=W_STRETCH):
+            pdf_bytes = generate_attendance_pdf_bytes(
+                session_id=int(current_session_id),
+                session_window=str(current_session_id),
+                df=att_df,
+                total_members=int(total_members),
+            )
+            st.download_button(
+                "⬇️ Download Attendance PDF",
+                data=pdf_bytes,
+                file_name=f"attendance_session_{int(current_session_id)}.pdf",
+                mime="application/pdf",
+                width=W_STRETCH,
+            )
 
-    # Financial summary section
-    st.markdown("### 🏦 Financial Summary")
-    st.caption("Built from NJANGI STANDARD tables (no aggregates on PostgREST).")
+    # --- 🤖 YOUNG AI Helper block ---
+    with right:
+        st.markdown("### 🤖 Young — Dashboard AI Helper")
+        st.caption("Young answers using the live dashboard snapshot (no guessing).")
 
-    _interest_err = st.session_state.get("_interest_ledger_error")
-    if _interest_err:
-        st.warning("Interest might show 0 because interest_ledger isn't readable (RLS / missing table / schema mismatch).")
-        st.code(_interest_err, language="text")
+        if "young_chat" not in st.session_state:
+            st.session_state["young_chat"] = [
+                {"role": "assistant", "content": _assistant_intro_young()}
+            ]
 
-    st.markdown(glass_open(), unsafe_allow_html=True)
-    f1, f2, f3, f4 = st.columns(4)
-    with f1:
-        st.markdown(_kpi_card("Foundation Total", _fmt_money(foundation_total, 0), "#60A5FA", sub="foundation_contributions"), unsafe_allow_html=True)
-    with f2:
-        st.markdown(_kpi_card("Loan Payments", _fmt_money(repayments_total, 0), "#00E6A8", sub="loan_payments"), unsafe_allow_html=True)
-    with f3:
-        st.markdown(_kpi_card("Fines Paid", _fmt_money(fines_paid_total, 0), "#A78BFA", sub="fines.status='paid'"), unsafe_allow_html=True)
-    with f4:
-        st.markdown(_kpi_card("Payouts Total", _fmt_money(payouts_total, 0), "#FB923C", sub="informational"), unsafe_allow_html=True)
+        for m in st.session_state["young_chat"][-12:]:
+            with st.chat_message(m["role"]):
+                st.write(m["content"])
 
-    st.divider()
-    g1, g2, g3 = st.columns(3)
-    with g1:
-        st.markdown(_kpi_card("Interest (All-time)", _fmt_money(interest_all_time, 2), "#00E6A8", sub="interest_ledger"), unsafe_allow_html=True)
-    with g2:
-        st.markdown(_kpi_card("Cash Available", _fmt_money(cash_available, 0), "#00E6A8", sub="inflows − principal"), unsafe_allow_html=True)
-    with g3:
-        st.markdown(_kpi_card("Net Available", _fmt_money(net_available, 0), "#60A5FA", sub="Cash Available + Pot"), unsafe_allow_html=True)
-    st.markdown(glass_close(), unsafe_allow_html=True)
+        user_q = st.chat_input("Ask Young… (e.g., 'pot this session', 'loans summary', 'attendance summary')")
+        if user_q:
+            st.session_state["young_chat"].append({"role": "user", "content": user_q})
+            ans = _answer_young(
+                user_q,
+                session_id=current_session_id,
+                members_rows=members_rows,
+                dfc=dfc,
+                loans_df=loans_df,
+                fines_df=fines_df,
+                att_df=att_df,
+            )
+            st.session_state["young_chat"].append({"role": "assistant", "content": ans})
+            st.rerun()
 
-    # Optional: show top contributors this cycle (lightweight)
-    st.divider()
-    st.markdown("### 💰 Cycle insights")
-    if dfc is None or dfc.empty:
-        st.info("No cycle contributions found for this session.")
-    else:
-        dfc2 = dfc.copy()
-        dfc2["amount"] = pd.to_numeric(dfc2.get("amount", 0), errors="coerce").fillna(0.0)
+        # quick buttons
+        q1, q2, q3 = st.columns(3)
+        with q1:
+            if st.button("💰 Pot?", width=W_STRETCH):
+                st.session_state["young_chat"].append({"role": "user", "content": "How much is the pot this session?"})
+                st.session_state["young_chat"].append({"role": "assistant", "content": _answer_young("pot this session", session_id=current_session_id, members_rows=members_rows, dfc=dfc, loans_df=loans_df, fines_df=fines_df, att_df=att_df)})
+                st.rerun()
+        with q2:
+            if st.button("💳 Loans?", width=W_STRETCH):
+                st.session_state["young_chat"].append({"role": "user", "content": "Loans summary"})
+                st.session_state["young_chat"].append({"role": "assistant", "content": _answer_young("loans summary", session_id=current_session_id, members_rows=members_rows, dfc=dfc, loans_df=loans_df, fines_df=fines_df, att_df=att_df)})
+                st.rerun()
+        with q3:
+            if st.button("🧾 Attendance?", width=W_STRETCH):
+                st.session_state["young_chat"].append({"role": "user", "content": "Attendance summary"})
+                st.session_state["young_chat"].append({"role": "assistant", "content": _answer_young("attendance summary", session_id=current_session_id, members_rows=members_rows, dfc=dfc, loans_df=loans_df, fines_df=fines_df, att_df=att_df)})
+                st.rerun()
 
-        name_map = _member_name_map(members_rows)
-        dfc2["member_name"] = dfc2["member_id"].apply(
-            lambda x: name_map.get(int(x), f"Member {int(x):02d}") if str(x).isdigit() else "—"
-        )
-
-        top = (
-            dfc2.groupby(["member_id", "member_name"], dropna=False)["amount"]
-            .sum()
-            .sort_values(ascending=False)
-            .head(10)
-            .reset_index()
-        )
-
-        st.markdown(glass_open(), unsafe_allow_html=True)
-        c1, c2 = st.columns([0.52, 0.48])
-        with c1:
-            st.markdown("#### Top contributors (this session)")
-            st.dataframe(top, width=W_STRETCH, hide_index=True)
-        with c2:
-            daily = dfc2.copy()
-            dt_col = "paid_at" if "paid_at" in daily.columns else "created_at"
-            daily[dt_col] = pd.to_datetime(daily.get(dt_col), errors="coerce")
-            daily["day"] = daily[dt_col].dt.date
-            series = daily.groupby("day")["amount"].sum().reset_index()
-            if not series.empty:
-                series = series.sort_values("day")
-                st.markdown("#### Daily contributions")
-                st.line_chart(series.set_index("day"))
-            else:
-                st.info("Not enough timestamped rows for daily chart.")
-        st.markdown(glass_close(), unsafe_allow_html=True)
-
-    # Debug
     with st.expander("🔎 Debug", expanded=False):
-        st.write("Using read client:", "service" if sb_service is not None else "anon")
         st.write("schema:", schema)
-        st.write("state:", state)
         st.write("current_session_id:", current_session_id)
-        st.write("session_note:", session_note)
-        st.write("next_member_id:", next_member_id)
-        st.write("beneficiary_id:", beneficiary_id)
-        st.write("beneficiary_name:", beneficiary_name)
-        st.write("window:", window)
-        st.write("pot:", pot)
-        st.write("members_paid:", members_paid)
-        st.write("total_members:", total_members)
-        st.write("foundation_total:", foundation_total)
-        st.write("payouts_total:", payouts_total)
-        st.write("interest_this_month:", interest_this_month)
-        st.write("interest_all_time:", interest_all_time)
-        st.write("interest_ledger_error:", st.session_state.get("_interest_ledger_error"))
-        st.write("loan_payments_total:", repayments_total)
-        st.write("fines_paid_total:", fines_paid_total)
-        st.write("loan_kpis:", loan_kpis)
-        st.write("loans_outstanding:", loans_outstanding)
-        st.write("cash_available_raw:", cash_available_raw)
-        st.write("cash_available:", cash_available)
-        st.write("net_available:", net_available)
+        st.write("state:", state)
+        st.write("members:", len(members_rows or []))
+        st.write("dfc rows:", 0 if dfc is None else len(dfc))
+        st.write("loans rows:", 0 if loans_df is None else len(loans_df))
+        st.write("fines rows:", 0 if fines_df is None else len(fines_df))
+        st.write("attendance rows:", 0 if att_df is None else len(att_df))
 
 
 # ============================================================
-# COMPATIBILITY EXPORTS (prevents import errors)
+# COMPATIBILITY EXPORTS
 # ============================================================
 def render_dashbaord(sb_anon, sb_service, schema: str = "public"):
     return render_dashboard(sb_anon, sb_service, schema=schema)
