@@ -1,22 +1,29 @@
 
 # njangi_llm_panel.py
 # ============================================================
-# 🧠 NJANGI LLM PANEL + ✅ TRAINING (XGBoost)
+# 🧠 NJANGI LLM PANEL + ✅ TRAINING (XGBoost) — ADVANCED UPDATE
 # - NJANGI STANDARD (NO legacy)
 # - Safe for Railway / Streamlit Cloud
 # - Accepts sb_anon / sb_service / schema (matches app.py)
-# - ✅ Supports ACTIVE + CLOSED (and overdue/unknown) loans
-# - ✅ Adds optional ML training (XGBoost) using:
-#     label = 1 for active loans, 0 for closed loans
-# - ✅ NO sklearn required
+# - ✅ Lightweight “LLM” (NO OpenAI):
+#     • Intent + Slots + Grounded answers from Supabase snapshots
+#     • Uses selected member + loan filter as defaults
+#     • Can parse member names from question
+#     • Can introduce herself
+# - ✅ ML training (XGBoost):
+#     • label = 1 for active loans, 0 for closed loans
+#     • ✅ NO sklearn required
+#     • ✅ Safe stratified split for tiny datasets
+#     • ✅ Fallback: trains on ALL data when too small to split
 # ============================================================
 
 from __future__ import annotations
 
 import math
-import streamlit as st
-import pandas as pd
 from datetime import datetime, timezone
+
+import pandas as pd
+import streamlit as st
 
 
 # ============================================================
@@ -114,8 +121,14 @@ def _bce_loss(y_true, y_prob, eps: float = 1e-9) -> float:
     return s / n
 
 
+# ============================================================
+# Lightweight Assistant v1 (kept for fallback)
+# ============================================================
 def _simple_answer(question: str) -> str:
     q = question.lower().strip()
+
+    if any(k in q for k in ["introduce", "introduce yourself", "who are you", "your name"]):
+        return _assistant_intro()
 
     if any(k in q for k in ["risk", "default", "overdue", "late", "delinquent"]):
         return (
@@ -160,6 +173,303 @@ def _simple_answer(question: str) -> str:
 
 
 # ============================================================
+# Lightweight Assistant v2: Intent + Slots + Grounded Answers
+# ============================================================
+def _normalize_text(s: str) -> str:
+    return " ".join(str(s or "").lower().strip().split())
+
+
+def _money(x: float) -> str:
+    try:
+        return f"${float(x):,.0f}"
+    except Exception:
+        return "$0"
+
+
+def _assistant_intro() -> str:
+    return (
+        "Hi 👋🏾 I’m **Njangi Assistant** — a lightweight helper built into **theyoungshallgrow**.\n\n"
+        "I don’t use external AI services (No OpenAI). I answer using your Njangi data:\n"
+        "• **Members, Contributions, Loans, Fines**\n\n"
+        "What you can ask me:\n"
+        "• **'Loans summary'**, **'Active loans'**, **'Closed loans totals'**\n"
+        "• **'Contribution summary'** or **'Contributions for Marcel'**\n"
+        "• **'Fines summary'**\n"
+        "• **'Risk for Donald'**\n\n"
+        "Tip: Include words like **active / closed / all** to control the loan filter."
+    )
+
+
+def _pick_member_from_question(question: str, members_df: pd.DataFrame) -> tuple[int | None, str | None]:
+    """
+    Tries to find a member mentioned in the question by matching name/display_name tokens.
+    Lightweight (no fuzzy libs).
+    Returns (member_id, member_name) or (None, None).
+    """
+    if members_df is None or members_df.empty:
+        return None, None
+
+    q = _normalize_text(question)
+    if not q:
+        return None, None
+
+    m = members_df.copy()
+    if "display_name" in m.columns:
+        m["member_name"] = m["display_name"].fillna("").astype(str)
+        m.loc[m["member_name"].str.strip() == "", "member_name"] = m.get("name", "").astype(str)
+    else:
+        m["member_name"] = m.get("name", "").astype(str)
+
+    candidates = []
+    for _, r in m.iterrows():
+        try:
+            mid = int(r["id"])
+        except Exception:
+            continue
+        name = str(r.get("member_name", "")).strip()
+        if not name:
+            continue
+        candidates.append((len(name), mid, name, _normalize_text(name)))
+
+    candidates.sort(reverse=True, key=lambda t: t[0])
+
+    for _, mid, name, name_norm in candidates:
+        if name_norm and name_norm in q:
+            return mid, name
+        toks = [t for t in name_norm.split() if len(t) >= 3]
+        if toks and all(t in q for t in toks):
+            return mid, name
+
+    return None, None
+
+
+def _detect_intent(question: str) -> str:
+    q = _normalize_text(question)
+
+    if any(k in q for k in ["introduce", "introduce yourself", "who are you", "your name"]):
+        return "intro"
+
+    if any(k in q for k in ["help", "what can you do", "commands", "examples"]):
+        return "help"
+
+    if any(k in q for k in ["minutes", "attendance", "meeting"]):
+        return "minutes"
+
+    if any(k in q for k in ["fine", "penalty"]):
+        return "fines"
+
+    if any(k in q for k in ["payout", "rotation", "who is next", "next payout"]):
+        return "payouts"
+
+    if any(k in q for k in ["contribution", "contrib", "deposit", "paid", "payment in"]):
+        return "contributions"
+
+    if any(k in q for k in ["risk", "default", "overdue", "late", "delinquent"]):
+        return "risk"
+
+    if any(k in q for k in ["loan", "borrow", "interest", "principal", "balance"]):
+        return "loans"
+
+    return "unknown"
+
+
+def _answer_grounded(
+    question: str,
+    members_df: pd.DataFrame,
+    contrib_df: pd.DataFrame,
+    loans_df: pd.DataFrame,
+    fines_df: pd.DataFrame,
+    selected_member_id: int | None,
+    selected_member_label: str | None,
+    loan_filter: str,
+) -> str:
+    """
+    Grounded assistant:
+    - Uses selected member + loan filter as defaults
+    - Tries to extract member from question and override selection
+    - Returns a bank-style answer with real numbers
+    """
+    qraw = question.strip()
+    if not qraw:
+        return "Please type a question."
+
+    intent = _detect_intent(qraw)
+
+    if intent == "intro":
+        return _assistant_intro()
+
+    # slot: member (from question overrides UI)
+    q_member_id, q_member_name = _pick_member_from_question(qraw, members_df)
+    member_id = q_member_id if q_member_id is not None else selected_member_id
+    member_name = q_member_name if q_member_name is not None else selected_member_label
+
+    # slot: loan status filter from question overrides UI
+    qn = _normalize_text(qraw)
+    status_filter = loan_filter
+    if "active" in qn:
+        status_filter = "Active"
+    elif "closed" in qn or "paid" in qn or "completed" in qn:
+        status_filter = "Closed"
+    elif "all" in qn:
+        status_filter = "All"
+
+    # prepare views (string-safe compare)
+    if member_id is not None:
+        mc = (
+            contrib_df[contrib_df.get("member_id").astype(str) == str(member_id)].copy()
+            if (contrib_df is not None and not contrib_df.empty and "member_id" in contrib_df.columns)
+            else pd.DataFrame()
+        )
+        ml = (
+            loans_df[loans_df.get("member_id").astype(str) == str(member_id)].copy()
+            if (loans_df is not None and not loans_df.empty and "member_id" in loans_df.columns)
+            else pd.DataFrame()
+        )
+        mf = (
+            fines_df[fines_df.get("member_id").astype(str) == str(member_id)].copy()
+            if (fines_df is not None and not fines_df.empty and "member_id" in fines_df.columns)
+            else pd.DataFrame()
+        )
+    else:
+        mc = contrib_df.copy() if contrib_df is not None else pd.DataFrame()
+        ml = loans_df.copy() if loans_df is not None else pd.DataFrame()
+        mf = fines_df.copy() if fines_df is not None else pd.DataFrame()
+
+    # normalize + filter loans
+    if ml is not None and not ml.empty:
+        if "status_norm" not in ml.columns:
+            ml["status_norm"] = ml.get("status", "").apply(_norm_status)
+        if status_filter == "Active":
+            ml = ml[ml["status_norm"] == "active"].copy()
+        elif status_filter == "Closed":
+            ml = ml[ml["status_norm"] == "closed"].copy()
+
+    # aggregates
+    total_contrib = _safe_sum(mc, "amount")
+    principal_all = _safe_sum(ml, "principal")
+    bal_all = _safe_sum(ml, "principal_current")
+    unpaid_int = _safe_sum(ml, "unpaid_interest")
+    fines_total = (
+        _safe_sum(mf, "amount") if (mf is not None and not mf.empty and "amount" in mf.columns) else float(len(mf) if mf is not None else 0)
+    )
+
+    loan_count = _safe_count(ml)
+    contrib_rows = _safe_count(mc)
+    fine_rows = _safe_count(mf)
+
+    who = f"**{member_name}**" if member_id is not None and member_name else "**All members**"
+
+    if intent == "help":
+        return (
+            "Try asking:\n"
+            "• **'Loans summary'** / **'Active loans'** / **'Closed loans totals'**\n"
+            "• **'Contribution summary'** / **'Contributions for <member>'**\n"
+            "• **'Fines summary'**\n"
+            "• **'Risk for <member>'**\n\n"
+            "Tip: include **active / closed / all** in your question to control the loan filter."
+        )
+
+    if intent == "contributions":
+        return (
+            f"Contribution summary for {who}:\n"
+            f"• Total contributed: **{_money(total_contrib)}**\n"
+            f"• Contribution rows: **{contrib_rows:,}**\n\n"
+            "Operations:\n"
+            "• Track missing contributors per session\n"
+            "• Keep contributions in multiples of **500** (your rule) for easier auditing"
+        )
+
+    if intent == "loans":
+        breakdown = ""
+        if loans_df is not None and not loans_df.empty and "status_norm" in loans_df.columns:
+            src = loans_df.copy()
+            if member_id is not None and "member_id" in src.columns:
+                src = src[src["member_id"].astype(str) == str(member_id)]
+            vc = src["status_norm"].value_counts().to_dict()
+            if vc:
+                breakdown = "Status: " + ", ".join([f"{k}={int(v)}" for k, v in vc.items()])
+
+        return (
+            f"Loans summary for {who} (filter: **{status_filter}**):\n"
+            f"• Loan rows: **{loan_count:,}**\n"
+            f"• Total principal: **{_money(principal_all)}**\n"
+            f"• Total balance (principal_current): **{_money(bal_all)}**\n"
+            f"• Unpaid interest: **{_money(unpaid_int)}**\n"
+            f"{('• ' + breakdown) if breakdown else ''}\n\n"
+            "Monitoring tips:\n"
+            "• **principal_current** should go down as payments are made\n"
+            "• If **last_paid_at** is > 30 days on active loans, follow up"
+        )
+
+    if intent == "fines":
+        return (
+            f"Fines summary for {who}:\n"
+            f"• Fine records: **{fine_rows:,}**\n"
+            f"• Total fines: **{_money(fines_total)}**\n\n"
+            "Tip: connect fines to attendance/minutes if your rules allow."
+        )
+
+    if intent == "risk":
+        risk = 0
+        if unpaid_int > 0:
+            risk += 35
+        if bal_all > 0 and total_contrib == 0:
+            risk += 25
+        if ml is not None and not ml.empty and "status_norm" in ml.columns:
+            if ml["status_norm"].astype(str).str.contains("overdue|default|delinquent|late", case=False, na=False).any():
+                risk += 45
+        if fines_total > 0:
+            risk += 10
+        risk = min(100, risk)
+
+        guidance = []
+        if unpaid_int > 0:
+            guidance.append("unpaid_interest > 0")
+        if fines_total > 0:
+            guidance.append("fines exist")
+        if bal_all > 0 and total_contrib == 0:
+            guidance.append("balance > 0 but no contributions recorded")
+        if not guidance:
+            guidance.append("no strong negative signals in snapshot")
+
+        return (
+            f"Risk view for {who} (from current DB snapshot):\n"
+            f"• Balance: **{_money(bal_all)}** • Unpaid interest: **{_money(unpaid_int)}** • Fines: **{_money(fines_total)}**\n"
+            f"• Quick risk score (rules): **{risk}/100**\n"
+            f"Why: {', '.join(guidance)}.\n\n"
+            "Next action:\n"
+            "• If active loans exist and last payment is old, request a partial payment this session.\n"
+            "• For model-based scoring, use **Training (XGBoost)** below."
+        )
+
+    if intent == "minutes":
+        return (
+            "Minutes & attendance guidance:\n"
+            "• Store minutes per **session_id** for traceability\n"
+            "• Attendance can drive fines (based on your rules)\n"
+            "• End-of-session summary: present/absent + decisions + loans/payouts approved"
+        )
+
+    if intent == "payouts":
+        return (
+            "Payout guidance:\n"
+            "• Track payout rotation index in app_state\n"
+            "• Validate payout eligibility using contribution completeness\n"
+            "• Export payout receipts for audit"
+        )
+
+    # fallback
+    return (
+        "I can answer with real numbers if you ask:\n"
+        "• **Loans summary** / **Active loans** / **Closed loans**\n"
+        "• **Contribution summary**\n"
+        "• **Fines summary**\n"
+        "• **Risk for <member>**\n"
+        "Or type **help**."
+    )
+
+
+# ============================================================
 # ML: build training dataset
 # ============================================================
 def _build_training_frame(
@@ -178,7 +488,6 @@ def _build_training_frame(
 
     df = loans_df.copy()
 
-    # basic required
     if "status_norm" not in df.columns:
         df["status_norm"] = df.get("status", "").apply(_norm_status)
 
@@ -193,7 +502,6 @@ def _build_training_frame(
     df["last_paid_dt"] = df.get("last_paid_at", None).apply(_parse_dt) if "last_paid_at" in df.columns else None
     df["created_dt"] = df.get("created_at", None).apply(_parse_dt) if "created_at" in df.columns else None
 
-    # days since last payment (fallback to created_at)
     def _ds(row):
         d = row.get("last_paid_dt")
         if d is None:
@@ -201,7 +509,14 @@ def _build_training_frame(
         return _days_since(d)
 
     df["days_since_last_paid"] = df.apply(_ds, axis=1)
-    df["days_since_last_paid"] = pd.to_numeric(df["days_since_last_paid"], errors="coerce").fillna(df["days_since_last_paid"].median() if df["days_since_last_paid"].notna().any() else 0)
+    df["days_since_last_paid"] = pd.to_numeric(df["days_since_last_paid"], errors="coerce")
+
+    # median fallback (if all nan -> 0)
+    if df["days_since_last_paid"].notna().any():
+        med = float(df["days_since_last_paid"].median())
+    else:
+        med = 0.0
+    df["days_since_last_paid"] = df["days_since_last_paid"].fillna(med)
 
     # numeric cols
     df = _to_numeric_cols(df, ["principal", "principal_current", "total_due", "unpaid_interest"])
@@ -225,7 +540,7 @@ def _build_training_frame(
     else:
         fines_tot = pd.DataFrame(columns=["member_id", "member_fines_total"])
 
-    # member aggregates: loan counts
+    # member aggregates: loan counts (using df that already filtered to active/closed)
     loan_counts = df.groupby("member_id", dropna=False).size().reset_index(name="member_loan_count")
 
     # merge aggregates
@@ -245,12 +560,12 @@ def _build_training_frame(
             m.loc[m["member_name"].str.strip() == "", "member_name"] = m.get("name", "").astype(str)
         else:
             m["member_name"] = m.get("name", "").astype(str)
-        m = m.rename(columns={"id": "member_id"})[["member_id", "member_name"]]
+
+        m = m.rename(columns={"id": "member_id"})[["member_id", "member_name"]].copy()
         df["member_id"] = pd.to_numeric(df["member_id"], errors="coerce")
         m["member_id"] = pd.to_numeric(m["member_id"], errors="coerce")
         df = df.merge(m, on="member_id", how="left")
 
-    # feature set
     keep = [
         "id",
         "member_id",
@@ -268,10 +583,22 @@ def _build_training_frame(
     keep = [c for c in keep if c in df.columns]
     df = df[keep].copy()
 
-    # fill missing
-    for c in ["principal", "principal_current", "total_due", "unpaid_interest", "member_contrib_total", "member_fines_total", "member_loan_count", "days_since_last_paid"]:
+    for c in [
+        "principal",
+        "principal_current",
+        "total_due",
+        "unpaid_interest",
+        "member_contrib_total",
+        "member_fines_total",
+        "member_loan_count",
+        "days_since_last_paid",
+    ]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    # normalize types for ids
+    if "member_id" in df.columns:
+        df["member_id"] = pd.to_numeric(df["member_id"], errors="coerce")
 
     return df
 
@@ -279,6 +606,10 @@ def _build_training_frame(
 def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
     """
     Trains XGBoost classifier if available.
+    ✅ NO sklearn required.
+    ✅ Safe on tiny datasets:
+      - Manual stratified split (keeps both classes in train/test)
+      - Fallback: train on all rows if too small to split safely
     Returns: (model, metrics_dict, feature_cols, df_with_preds)
     """
     try:
@@ -290,9 +621,15 @@ def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
     if df is None or df.empty:
         return None, {"error": "No training data."}, [], df
 
-    # require both classes
-    if df["y"].nunique(dropna=True) < 2:
-        return None, {"error": "Not enough labeled classes. Need both active(1) and closed(0) loans."}, [], df
+    if "y" not in df.columns:
+        return None, {"error": "Missing label column 'y'."}, [], df
+
+    # require both classes overall
+    y_all = df["y"].astype(int).values
+    classes, counts = np.unique(y_all, return_counts=True)
+    class_counts = {int(c): int(n) for c, n in zip(classes, counts)}
+    if len(classes) < 2:
+        return None, {"error": "Need both active(1) and closed(0) loans to train.", "class_counts": class_counts}, [], df
 
     feature_cols = [
         c
@@ -308,22 +645,11 @@ def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
         ]
         if c in df.columns
     ]
+    if not feature_cols:
+        return None, {"error": "No feature columns found."}, [], df
 
-    X = df[feature_cols].astype(float).values
-    y = df["y"].astype(int).values
+    X_all = df[feature_cols].astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).values
 
-    # split
-    n = len(df)
-    rng = np.random.default_rng(seed)
-    idx = np.arange(n)
-    rng.shuffle(idx)
-    cut = int((1.0 - test_size) * n)
-    train_idx, test_idx = idx[:cut], idx[cut:]
-
-    X_train, y_train = X[train_idx], y[train_idx]
-    X_test, y_test = X[test_idx], y[test_idx]
-
-    # model
     model = xgb.XGBClassifier(
         n_estimators=250,
         max_depth=4,
@@ -333,30 +659,90 @@ def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
         reg_lambda=1.0,
         objective="binary:logistic",
         eval_metric="logloss",
-        random_state=seed,
+        random_state=int(seed),
         n_jobs=1,
     )
 
+    rng = np.random.default_rng(int(seed))
+
+    # If dataset is tiny or a class is too small, do not split.
+    # Need at least 2 rows per class to put 1 in train and 1 in test safely.
+    if len(y_all) < 8 or min(counts) < 2:
+        model.fit(X_all, y_all)
+        out = df.copy()
+        out["p_active"] = model.predict_proba(X_all)[:, 1]
+        metrics = {
+            "n_rows": int(len(df)),
+            "n_train": int(len(df)),
+            "n_test": 0,
+            "accuracy_test": float("nan"),
+            "logloss_test": float("nan"),
+            "pos_rate": float(df["y"].mean()),
+            "class_counts": class_counts,
+            "note": "Trained on ALL rows (dataset too small to split safely). Add more CLOSED loans for validation.",
+        }
+        return model, metrics, feature_cols, out
+
+    # Manual stratified split (NO sklearn)
+    idx0 = np.where(y_all == 0)[0]
+    idx1 = np.where(y_all == 1)[0]
+    rng.shuffle(idx0)
+    rng.shuffle(idx1)
+
+    def _n_test(n: int) -> int:
+        k = int(round(n * float(test_size)))
+        k = max(1, k)
+        k = min(n - 1, k)
+        return k
+
+    n0_test = _n_test(len(idx0))
+    n1_test = _n_test(len(idx1))
+
+    test_idx = np.concatenate([idx0[:n0_test], idx1[:n1_test]])
+    train_idx = np.concatenate([idx0[n0_test:], idx1[n1_test:]])
+    rng.shuffle(test_idx)
+    rng.shuffle(train_idx)
+
+    X_train, y_train = X_all[train_idx], y_all[train_idx]
+    X_test, y_test = X_all[test_idx], y_all[test_idx]
+
+    # final guard
+    if len(np.unique(y_train)) < 2:
+        model.fit(X_all, y_all)
+        out = df.copy()
+        out["p_active"] = model.predict_proba(X_all)[:, 1]
+        metrics = {
+            "n_rows": int(len(df)),
+            "n_train": int(len(df)),
+            "n_test": 0,
+            "accuracy_test": float("nan"),
+            "logloss_test": float("nan"),
+            "pos_rate": float(df["y"].mean()),
+            "class_counts": class_counts,
+            "note": "Fallback: split produced one-class train. Trained on ALL rows.",
+        }
+        return model, metrics, feature_cols, out
+
     model.fit(X_train, y_train)
 
-    # preds
-    p_train = model.predict_proba(X_train)[:, 1]
+    # preds + metrics (NO sklearn)
     p_test = model.predict_proba(X_test)[:, 1]
     yhat_test = (p_test >= 0.5).astype(int)
-
     acc = float((yhat_test == y_test).mean()) if len(y_test) else float("nan")
     loss = _bce_loss(list(map(int, y_test.tolist())), list(map(float, p_test.tolist())))
 
     out = df.copy()
-    out["p_active"] = model.predict_proba(X)[:, 1]
+    out["p_active"] = model.predict_proba(X_all)[:, 1]
 
     metrics = {
-        "n_rows": int(n),
+        "n_rows": int(len(df)),
         "n_train": int(len(train_idx)),
         "n_test": int(len(test_idx)),
         "accuracy_test": acc,
         "logloss_test": loss,
         "pos_rate": float(df["y"].mean()),
+        "class_counts": class_counts,
+        "note": "Manual stratified split (no sklearn).",
     }
     return model, metrics, feature_cols, out
 
@@ -366,7 +752,7 @@ def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
 # ============================================================
 def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public"):
     st.title("🧠 Njangi LLM (Lightweight) + Training")
-    st.caption("Rule-based insights + optional ML training (XGBoost).")
+    st.caption("Rule-based insights + grounded answers + optional ML training (XGBoost).")
 
     st.markdown("---")
 
@@ -495,7 +881,7 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
         if total_balance_all > 0 and total_contrib == 0:
             risk += 25
         if not ml_all.empty and "status_norm" in ml_all.columns:
-            if ml_all["status_norm"].astype(str).str.contains("overdue|default", case=False, na=False).any():
+            if ml_all["status_norm"].astype(str).str.contains("overdue|default|delinquent|late", case=False, na=False).any():
                 risk += 45
         if total_fines > 0:
             risk += 10
@@ -539,40 +925,74 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
             if model is None:
                 st.error("Training failed.")
                 st.code(metrics.get("error", "Unknown error"), language="text")
+                if "class_counts" in metrics:
+                    st.caption(f"class_counts: {metrics['class_counts']}")
             else:
                 st.success("Training complete ✅")
 
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("Rows", f"{metrics['n_rows']:,}")
                 m2.metric("Pos rate (active)", f"{metrics['pos_rate']:.2f}")
-                m3.metric("Test accuracy", f"{metrics['accuracy_test']:.2f}")
-                m4.metric("Test logloss", f"{metrics['logloss_test']:.3f}")
+                m3.metric("Test accuracy", "—" if str(metrics["accuracy_test"]) == "nan" else f"{metrics['accuracy_test']:.2f}")
+                m4.metric("Test logloss", "—" if str(metrics["logloss_test"]) == "nan" else f"{metrics['logloss_test']:.3f}")
+
+                st.caption(metrics.get("note", ""))
 
                 st.caption("Features used:")
                 st.code(", ".join(feature_cols), language="text")
 
-                # show top risky members based on max p_active among their loans
-                if "member_id" in pred_df.columns and "p_active" in pred_df.columns:
+                # show "risk" as 1 - p_active (more intuitive)
+                if pred_df is not None and not pred_df.empty and "member_id" in pred_df.columns and "p_active" in pred_df.columns:
                     tmp = pred_df.copy()
                     tmp["member_id"] = pd.to_numeric(tmp["member_id"], errors="coerce")
+                    tmp["risk_score"] = 1.0 - pd.to_numeric(tmp["p_active"], errors="coerce").fillna(0.5)
+
                     by_member = (
-                        tmp.groupby(["member_id", "member_name"], dropna=False)["p_active"]
+                        tmp.groupby(["member_id", "member_name"], dropna=False)["risk_score"]
                         .max()
                         .sort_values(ascending=False)
                         .reset_index()
-                        .rename(columns={"p_active": "risk_p_active"})
+                        .rename(columns={"risk_score": "risk_max"})
                     )
-                    st.markdown("### 🔥 Top risk (model) — max probability among loans")
+                    st.markdown("### 🔥 Top risk (model) — max risk among loans (1 - p_active)")
                     st.dataframe(by_member.head(15), width="stretch", hide_index=True)
 
                 st.markdown("### 🔎 Sample predictions (loan rows)")
-                show_cols = [c for c in ["id", "member_id", "member_name", "y", "p_active", "principal_current", "unpaid_interest", "days_since_last_paid"] if c in pred_df.columns]
-                st.dataframe(pred_df[show_cols].head(25), width="stretch", hide_index=True)
+                show_cols = [
+                    c
+                    for c in [
+                        "id",
+                        "member_id",
+                        "member_name",
+                        "y",
+                        "p_active",
+                        "principal_current",
+                        "unpaid_interest",
+                        "days_since_last_paid",
+                    ]
+                    if pred_df is not None and c in pred_df.columns
+                ]
+                if pred_df is not None and show_cols:
+                    st.dataframe(pred_df[show_cols].head(25), width="stretch", hide_index=True)
 
     st.markdown("---")
 
-    # ---------- Q&A ----------
+    # ============================================================
+    # ✅ Q&A (Advanced Assistant)
+    # ============================================================
     st.subheader("💬 Ask the Njangi Assistant")
+
+    # Friendly intro (button + optional always-on)
+    colA, colB = st.columns([1, 2])
+    with colA:
+        intro_btn = st.button("👋 Introduce yourself")
+    with colB:
+        st.caption("Tip: Ask 'Loans summary', 'Risk for Donald', 'Active loans', 'Contribution summary', or 'help'.")
+
+    if intro_btn:
+        st.success("Assistant response")
+        st.write(_assistant_intro())
+
     question = st.text_area("Type a question (e.g., 'Explain risk', 'Loan tips', 'Contribution summary')")
 
     if st.button("Analyze"):
@@ -580,6 +1000,21 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
             st.warning("Please enter a question.")
         else:
             st.success("Assistant response")
-            st.write(_simple_answer(question))
+            try:
+                st.write(
+                    _answer_grounded(
+                        question=question,
+                        members_df=members_df,
+                        contrib_df=contrib_df,
+                        loans_df=loans_df,
+                        fines_df=fines_df,
+                        selected_member_id=member_id,
+                        selected_member_label=member_label,
+                        loan_filter=loan_filter,
+                    )
+                )
+            except Exception:
+                # ultra-safe fallback (never crash the page)
+                st.write(_simple_answer(question))
 
-    st.caption("Lightweight assistant + Training • XGBoost • Safe for Railway/Streamlit Cloud")
+    st.caption("Lightweight assistant + Grounded answers + Training • XGBoost • Safe for Railway/Streamlit Cloud")
