@@ -875,4 +875,4 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                 st.dataframe(df_show, use_container_width=True)
 
     st.caption(f"Source used: {used_source} • member_id: {member_id_focus or '—'} • Internet: {'ON' if internet_on else 'OFF'}")
-```0
+
