@@ -1,35 +1,21 @@
 
-# njangi_llm_panel.py
+# njangi_llm_panel.py ✅ UPDATED — FIX “List all members” (NO more “not in snapshot”)
 # =============================================================================
 # 💬 younchat — Hugging Face Router + Optional Internet Search ✅ SINGLE COMPLETE FILE (HARDENED)
 #
-# ✅ What you asked for (FIXED + MORE RELIABLE):
-#   1) The ONLY name shown is: "younchat" (no "Your Chat", no "Young")
-#   2) Introduces itself using real time of the day: Good morning/afternoon/evening
-#   3) Chats like a human (Streamlit chat UI + conversation memory)
-#   4) Uses member_id context automatically (selectbox OR typed in chat OR keeps last member_id)
-#   5) "Internet is ON" only when you set TAVILY_API_KEY (otherwise OFF safely)
-#   6) Still GROUNDED on live Njangi snapshot for ALL Njangi numbers (no guessing)
-#   7) ✅ HF reliability upgrade:
-#        - Retries transient HF errors (429/5xx/timeouts) with backoff
-#        - Automatic model failover list if HF returns 5xx
+# ✅ FIXED (your exact issue):
+#   - When user asks: “list all the members” / “show members” / “members list”
+#     → younchat answers LOCALLY from LIVE members table (already loaded in snapshot)
+#     → It prints the full names (and IDs), NOT “I don’t have that in the snapshot.”
 #
-# ✅ Hugging Face Router (OpenAI-compatible):
-#   - Chat:         https://router.huggingface.co/v1/chat/completions
-#   - Completions:  https://router.huggingface.co/v1/completions
-#
-# ✅ Railway env vars:
-#   HF_TOKEN = hf_...
-#   HF_MODEL = mistralai/Mistral-7B-Instruct-v0.2   (default)
-#   HF_FORCE_MODE = auto | completions | chat       (default auto)
-#
-# ✅ Recommended for stability (Railway Variables):
-#   HF_FORCE_MODE = completions
-#   HF_MODEL = meta-llama/Meta-Llama-3-8B-Instruct   (often steadier)
-#
-# ✅ Optional Internet Search (Tavily):
-#   TAVILY_API_KEY = tvly-...
-#   INTERNET_MODE = on | off      (default: on if key exists, else off)
+# ✅ Keeps your existing behavior:
+#   - ONLY name shown: "younchat"
+#   - Good morning/afternoon/evening greeting
+#   - Streamlit chat memory
+#   - member_id context selection & persistence
+#   - Internet is ON only if TAVILY_API_KEY exists (and INTERNET_MODE not off)
+#   - Grounded on live Njangi snapshot for Njangi numbers (no guessing)
+#   - HF reliability (retries + model failover)
 #
 # Works with app.py:
 #   render_njangi_llm_panel(sb_anon=..., sb_service=..., schema=...)
@@ -73,7 +59,7 @@ def _now_iso() -> str:
 def _tod_greeting() -> str:
     """
     Uses server local time. If you want it to match your timezone,
-    set Railway Variable: TZ=America/New_York (or your timezone).
+    set Railway Variable: TZ=America/Chicago (or your timezone).
     """
     h = datetime.now().hour
     if 5 <= h < 12:
@@ -149,6 +135,7 @@ def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
 # Snapshot builder (GROUNDING)
 # -----------------------------------------------------------------------------
 def _build_snapshot(sb_anon, sb_service, schema: str) -> Dict[str, Any]:
+    # NOTE: members is FULL table (limit 3000) — we use it locally for "list members"
     members = _sb_select(sb_anon, sb_service, schema, "members", cols="*", limit=3000)
     sessions = _sb_select(sb_anon, sb_service, schema, "sessions", cols="*", limit=3000)
     contributions = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=10000)
@@ -206,6 +193,7 @@ def _build_snapshot(sb_anon, sb_service, schema: str) -> Dict[str, Any]:
             "loans_status_col": loans_status_col,
             "loans_member_col": loans_member_col,
         },
+        # For the selectbox only (keep it light)
         "members_preview": (
             members[[c for c in [member_id_col, name_col] if c and c in members.columns]]
             .head(200)
@@ -213,7 +201,7 @@ def _build_snapshot(sb_anon, sb_service, schema: str) -> Dict[str, Any]:
             if not members.empty and member_id_col and name_col
             else []
         ),
-        # Raw tables stay local-only (not shown to HF). Used for computations.
+        # Raw tables stay local-only (not shown to HF). Used for computations & "list members".
         "_raw": {
             "members": members,
             "sessions": sessions,
@@ -265,6 +253,85 @@ def _extract_member_id_from_text(snapshot: Dict[str, Any], text: str) -> Optiona
             return cand
 
     return None
+
+
+# -----------------------------------------------------------------------------
+# INTENT: list members (LOCAL ANSWER)
+# -----------------------------------------------------------------------------
+def _wants_list_members(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    phrases = [
+        "list all members",
+        "list members",
+        "show all members",
+        "show members",
+        "members list",
+        "all the members",
+        "all members",
+        "member list",
+        "display members",
+        "who are the members",
+    ]
+    if any(p in t for p in phrases):
+        return True
+    # short commands like: "members"
+    if t in {"members", "member"}:
+        return True
+    return False
+
+
+def _local_list_members_answer(snapshot: Dict[str, Any]) -> Tuple[str, pd.DataFrame]:
+    raw_members = snapshot.get("_raw", {}).get("members", pd.DataFrame())
+    cols = snapshot.get("columns", {})
+    id_col = cols.get("members_id_col") or "id"
+    name_col = cols.get("members_name_col") or "name"
+
+    if raw_members is None or raw_members.empty:
+        return "I couldn’t load **members** from the database snapshot.", pd.DataFrame()
+
+    df = raw_members.copy()
+    if name_col not in df.columns:
+        # try fallback
+        for alt in ["display_name", "name", "full_name"]:
+            if alt in df.columns:
+                name_col = alt
+                break
+    if id_col not in df.columns:
+        for alt in ["id", "member_id"]:
+            if alt in df.columns:
+                id_col = alt
+                break
+
+    show_cols = [c for c in [id_col, name_col] if c in df.columns]
+    if not show_cols:
+        return "Members table loaded, but I can’t find name/id columns to display.", pd.DataFrame()
+
+    out = df[show_cols].copy()
+    out.columns = ["member_id", "member_name"] if len(show_cols) == 2 else ["member_value"]
+    if "member_id" in out.columns:
+        out["member_id"] = out["member_id"].astype(str)
+    if "member_name" in out.columns:
+        out["member_name"] = out["member_name"].astype(str)
+
+    # sort nicely by id if numeric-like
+    if "member_id" in out.columns:
+        try:
+            out["_id_num"] = pd.to_numeric(out["member_id"], errors="coerce")
+            out = out.sort_values(["_id_num", "member_id"], ascending=True).drop(columns=["_id_num"])
+        except Exception:
+            pass
+
+    lines = ["Here are all members:"]
+    if "member_id" in out.columns and "member_name" in out.columns:
+        for i, r in enumerate(out.itertuples(index=False), start=1):
+            lines.append(f"{i}. {r.member_id} • {r.member_name}")
+    else:
+        for i, v in enumerate(out.iloc[:, 0].tolist(), start=1):
+            lines.append(f"{i}. {v}")
+
+    return "\n".join(lines), out
 
 
 # -----------------------------------------------------------------------------
@@ -416,8 +483,8 @@ def _build_grounded_messages(
     sys = (
         "You are **younchat**, a friendly, human-like assistant for a Njangi finance app.\n"
         "CRITICAL RULES:\n"
-        "1) For ANY Njangi totals, counts, members, loans, payouts, contributions, interest, fines — use ONLY SNAPSHOT_FACTS and SELECTED_MEMBER_FACTS.\n"
-        "2) If something is missing in the snapshot, say exactly: 'I don’t have that in the snapshot.'\n"
+        "1) For ANY Njangi totals, counts, loans, payouts, contributions, interest, fines — use ONLY SNAPSHOT_FACTS and SELECTED_MEMBER_FACTS.\n"
+        "2) If something is missing in the snapshot facts provided, say exactly: 'I don’t have that in the snapshot.'\n"
         "3) You MAY use INTERNET_SOURCES only for general questions (definitions, laws, how-to), NOT for Njangi numbers.\n"
         "4) Speak naturally like a real person. Short paragraphs.\n"
         "5) Ask ONE helpful follow-up question when it makes sense.\n"
@@ -531,14 +598,10 @@ def _hf_call(model: str, token: str, messages: List[Dict[str, str]]) -> Tuple[bo
     """
     Returns (ok, text_or_error, mode_used)
     mode_used: "completions" | "chat" | "failed"
-    - Tries preferred mode order depending on HF_FORCE_MODE and model style
-    - Retries handled inside _post_with_retries
-    - Failover to other models for transient 5xx/429/timeouts
     """
     force = (os.getenv("HF_FORCE_MODE", "") or "auto").strip().lower()
     prompt = _messages_to_prompt(messages)
 
-    # Primary model then fallbacks (unique)
     model_order: List[str] = []
     primary = (model or "").strip()
     if primary:
@@ -572,9 +635,20 @@ def _hf_call(model: str, token: str, messages: List[Dict[str, str]]) -> Tuple[bo
                     return True, txt, "chat"
                 last_err = txt
 
-        # Decide whether to try next model (only if transient)
         err_lc = (last_err or "").lower()
-        transient = any(s in err_lc for s in ["hf error 500", "hf error 502", "hf error 503", "hf error 504", "hf error 429", "timeout", "server error", "transient"])
+        transient = any(
+            s in err_lc
+            for s in [
+                "hf error 500",
+                "hf error 502",
+                "hf error 503",
+                "hf error 504",
+                "hf error 429",
+                "timeout",
+                "server error",
+                "transient",
+            ]
+        )
         if not transient:
             break
 
@@ -588,8 +662,12 @@ def _local_fallback_answer(snapshot: Dict[str, Any], question: str, member_id: O
     greet = _tod_greeting()
     q = (question or "").lower().strip()
 
+    if _wants_list_members(question):
+        txt, _ = _local_list_members_answer(snapshot)
+        return txt
+
     if any(x in q for x in ["hi", "hello", "hey"]):
-        return f"{greet} 👋🏽 I’m **younchat**. Ask me about totals, loans, payouts, or tell me a member_id."
+        return f"{greet} 👋🏽 I’m **younchat**. Ask me: **members**, **loans**, **totals**, or give a **member_id**."
 
     if "total" in q and "contribution" in q:
         return f"{greet} 👋🏽 Total contributions (all members): **{snapshot['totals']['contributions_total']:.2f}**. Want totals for foundation too?"
@@ -613,10 +691,10 @@ def _local_fallback_answer(snapshot: Dict[str, Any], question: str, member_id: O
     return (
         f"{greet} 👋🏽 I can answer from your LIVE Njangi snapshot.\n"
         "Try:\n"
+        "- **Members** (lists everyone)\n"
         "- Total contributions?\n"
         "- Total foundation money?\n"
         "- Show member_id 10 status\n"
-        "- Who has the highest active loan balance?"
     )
 
 
@@ -679,8 +757,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                 "role": "assistant",
                 "content": (
                     f"{greet} 👋🏽 I’m **younchat**.\n\n"
-                    "I can read your live Njangi snapshot (totals, loans, payouts, interest, fines). "
-                    "If you want member details, tell me a **member_id** (like `10`) or pick a member above."
+                    "Try: **members**, **loans**, **total contributions**, or give a **member_id** (like `10`)."
                 ),
             }
         ]
@@ -713,6 +790,18 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     with st.chat_message("user"):
         st.markdown(question)
 
+    # ✅ LOCAL SHORT-CIRCUIT: list members (no HF, no internet, 100% grounded)
+    if _wants_list_members(question):
+        answer, members_df = _local_list_members_answer(snapshot)
+        st.session_state["younchat_history"].append({"role": "assistant", "content": answer})
+        with st.chat_message("assistant"):
+            st.markdown(answer)
+            with st.expander("Members table (ground truth)", expanded=False):
+                if not members_df.empty:
+                    st.dataframe(members_df, use_container_width=True)
+        st.caption("HF mode used: local • Internet: OFF • member_id: —")
+        return
+
     # Resolve member_id context:
     detected_from_text = _extract_member_id_from_text(snapshot, question)
     member_id_focus = selected_member_id or detected_from_text or st.session_state.get("younchat_last_member_id")
@@ -721,12 +810,13 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
 
     member_fin = _compute_member_financials(snapshot, member_id_focus) if member_id_focus else None
 
-    # Optional internet pack: only when enabled AND question looks like general web question (not Njangi totals)
+    # Optional internet pack: ONLY when enabled AND question is general web question (not Njangi)
     internet_pack: Optional[Dict[str, Any]] = None
     if internet_on:
         ql = question.lower()
         is_njangi = any(k in ql for k in ["contribution", "foundation", "loan", "payout", "interest", "fine", "member", "session", "njangi"])
-        needs_web = any(k in ql for k in ["how", "what is", "requirements", "steps", "permit", "license", "llc", "zoning", "tax", "law", "maryland"])
+        needs_web = any(k in ql for k in ["requirements", "steps", "permit", "license", "llc", "zoning", "tax", "law", "maryland"])
+        # ✅ IMPORTANT: we do NOT treat plain "how" as a web request anymore (avoids dictionary spam)
         if needs_web and not is_njangi:
             with st.spinner("🌐 Searching the internet…"):
                 internet_pack = _tavily_search(question)
@@ -746,6 +836,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         st.session_state["younchat_history"].append({"role": "assistant", "content": answer})
         with st.chat_message("assistant"):
             st.markdown(answer)
+        st.caption(f"HF mode used: local • Internet: {'ON' if internet_on else 'OFF'} • member_id: {member_id_focus or '—'}")
         return
 
     # Call HF
@@ -758,6 +849,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         st.session_state["younchat_history"].append({"role": "assistant", "content": answer})
         with st.chat_message("assistant"):
             st.markdown(answer, unsafe_allow_html=True)
+        st.caption(f"HF mode used: failed • Internet: {'ON' if internet_on else 'OFF'} • member_id: {member_id_focus or '—'}")
         return
 
     final = (text_or_err or "").strip()
