@@ -13,20 +13,11 @@
 #   - NO hallucinations for Njangi numbers (all financial answers come from DB)
 #   - IMPORTANT FIX: HF Router will NEVER answer DB commands (members/loans/kpis/show/describe/etc.)
 #
-# ✅ UPDATE YOU ASKED (NEW "FINANCIAL CONTROL TOWER" ENGINE):
-#   - younchat is NOT a chatbot inside Njangi: it behaves as a cooperative
-#     financial risk system, liquidity monitor, credit evaluator, policy advisor.
-#   - It NEVER invents numbers: it ONLY computes from DB rows in your schema.
-#   - It NEVER outputs SQL or Python to the user (this file is code, but chat outputs are not code).
-#   - If data is missing, it explicitly says what’s missing and guides to:
-#       members / loans / finance kpis / tables / show <table> / describe <table> / type member_id
-#   - Financial intelligence responses ALWAYS follow:
-#       1) Current Situation
-#       2) Risk Assessment
-#       3) Financial Impact
-#       4) Strategic Recommendation
-#     with Risk classification: Low / Moderate / Elevated / High / Critical
-#   - Health Score (0–100) is produced ONLY if sufficient context exists.
+# ✅ UPDATE YOU ASKED (YOUR NEW CONTROL-TOWER PROMPT BUILT-IN):
+#   - Your exact "Autonomous Financial Intelligence Engine" rules are embedded as
+#     the system prompt for HF (general wording only).
+#   - DB numbers are still computed ONLY from your Supabase rows (never from HF).
+#   - HF will be blocked if it attempts to output SQL/Python/code blocks.
 #
 # ✅ HF Models locked to ONLY these 3:
 #   1) meta-llama/Meta-Llama-3-8B-Instruct
@@ -38,7 +29,6 @@
 #
 # Railway env vars (optional):
 #   HF_TOKEN
-#   HF_MODEL               (ignored if not in the 3-model allowlist; we force the 3 you gave)
 #   HF_FORCE_MODE = auto | completions | chat
 #   TAVILY_API_KEY
 #   INTERNET_MODE = on | off
@@ -119,10 +109,6 @@ RELATIONS: Dict[str, Dict[str, Any]] = {
 # -----------------------------------------------------------------------------
 # Time helpers
 # -----------------------------------------------------------------------------
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def _intro_only() -> str:
     # ✅ EXACT intro required by you (only line, no extra text)
     return "Hello 👋🏽 I’m younchat — your Njangi assistant."
@@ -244,7 +230,7 @@ def _pct(x: Optional[float]) -> str:
     if x is None:
         return "—"
     try:
-        return f"{x*100:.1f}%"
+        return f"{x * 100:.1f}%"
     except Exception:
         return "—"
 
@@ -327,8 +313,10 @@ def _wants_financial_review(text: str) -> bool:
     t = _lc(text)
     triggers = [
         "how are we doing",
+        "are we doing",
         "are we stable",
         "is njangi healthy",
+        "njangi healthy",
         "njangi health",
         "health score",
         "financial condition",
@@ -340,6 +328,7 @@ def _wants_financial_review(text: str) -> bool:
         "summary",
         "control tower",
         "financial intelligence",
+        "financial control tower",
         "risk exposure",
         "liquidity strength",
         "credit evaluator",
@@ -422,8 +411,43 @@ def _is_db_command(text: str) -> bool:
         "liquidity",
         "overdue",
         "dpd",
+        "balance",
+        "total",
+        "kpi",
+        "kpis",
+        "loan",
+        "loans",
+        "repayment",
+        "repayments",
     ]
     return any(w in t for w in finance_words)
+
+
+def _looks_like_code_output(txt: str) -> bool:
+    """
+    Extra safety: if HF ever tries to output code, we block it.
+    """
+    t = (txt or "").strip().lower()
+    if not t:
+        return False
+    if "```" in t:
+        return True
+    if t.startswith("select ") or " from " in t and "select" in t:
+        return True
+    code_markers = [
+        "import ",
+        "def ",
+        "class ",
+        "pip install",
+        "npm install",
+        "create table",
+        "alter table",
+        "drop table",
+        "insert into",
+        "update ",
+        "delete from",
+    ]
+    return any(m in t for m in code_markers)
 
 
 # -----------------------------------------------------------------------------
@@ -552,21 +576,25 @@ def _compute_global_metrics(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     notes: List[str] = []
 
+    # Contributions total
     contrib_col = _pick_col(dfc, ["amount", "contribution_amount", "paid_amount"])
     if not contrib_col and not dfc.empty:
         notes.append("Missing contributions amount column (expected: amount/contribution_amount/paid_amount).")
     total_contributions: Optional[float] = _safe_sum(dfc, contrib_col) if contrib_col else (0.0 if dfc.empty else None)
 
+    # Foundation total
     foundation_col = _pick_col(dff, ["amount", "base_amount", "foundation_amount"])
     if not foundation_col and not dff.empty:
         notes.append("Missing foundation_contributions amount column (expected: amount/base_amount/foundation_amount).")
     foundation_total: Optional[float] = _safe_sum(dff, foundation_col) if foundation_col else (0.0 if dff.empty else None)
 
+    # Fines total
     fines_col = _pick_col(dffines, ["amount", "fine_amount"])
     if not fines_col and not dffines.empty:
         notes.append("Missing fines amount column (expected: amount/fine_amount).")
     total_fines: Optional[float] = _safe_sum(dffines, fines_col) if fines_col else (0.0 if dffines.empty else None)
 
+    # Loans
     active_loans = _active_loan_filter(dfl)
     overdue_loans = _overdue_loan_filter(active_loans)
 
@@ -604,7 +632,7 @@ def _compute_global_metrics(ctx: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             concentration_share = None
 
-    # Interest ledger totals + directional trend (if date exists)
+    # Interest ledger
     interest_col = _pick_col(dfi, ["amount", "interest_amount", "interest"])
     if interest_col is None and not dfi.empty:
         notes.append("Missing interest_ledger amount column (expected: amount/interest_amount/interest).")
@@ -659,7 +687,6 @@ def _risk_classification(metrics: Dict[str, Any]) -> Tuple[str, List[str]]:
     unpaid_interest = metrics.get("unpaid_interest")
     conc = metrics.get("concentration_share")
 
-    # Early warning signals
     if lpr is not None and lpr > 0.75:
         signals.append("Liquidity pressure > 75% (Active Loan Exposure ÷ Total Contributions).")
     if overdue_ratio is not None and overdue_ratio > 0.20:
@@ -696,7 +723,6 @@ def _health_score(metrics: Dict[str, Any]) -> Tuple[Optional[int], List[str]]:
     active_exposure = metrics.get("active_loan_exposure")
     overdue_ratio = metrics.get("overdue_ratio")
 
-    # Only compute if sufficient context exists
     if total_contributions is None or foundation_total is None or active_exposure is None or overdue_ratio is None:
         return None, [
             "Health Score not generated: insufficient DB context (need totals for contributions, foundation, active loan exposure, and overdue ratio)."
@@ -726,7 +752,7 @@ def _health_score(metrics: Dict[str, Any]) -> Tuple[Optional[int], List[str]]:
     else:
         cred = 40
 
-    # Contribution Strength (20%) proxy: contributions coverage vs exposure (no guessing frequency)
+    # Contribution Strength (20%) proxy: contributions coverage vs exposure
     coverage = _ratio(total_contributions, max(active_exposure, 1e-9))
     contrib_strength = 90 if (coverage is not None and coverage >= 4) else (
         75 if (coverage is not None and coverage >= 2) else (
@@ -775,7 +801,7 @@ def _build_control_tower_report(metrics: Dict[str, Any], members_truth: pd.DataF
     lines: List[str] = []
     lines.append("Hello 👋🏽 Njangi Financial Intelligence Review (DB-grounded)\n")
 
-    # 1) Current Situation
+    # 1️⃣ Current Situation
     lines.append("1️⃣ Current Situation")
     lines.append(
         f"- Total contributions: **{_fmt(metrics.get('total_contributions'))}**"
@@ -824,7 +850,7 @@ def _build_control_tower_report(metrics: Dict[str, Any], members_truth: pd.DataF
     else:
         lines.append("- Interest ledger total: **Not available**")
 
-    # 2) Risk Assessment
+    # 2️⃣ Risk Assessment
     lines.append("\n2️⃣ Risk Assessment")
     lines.append(f"- Risk classification: **{risk_label}**")
     if signals:
@@ -834,46 +860,46 @@ def _build_control_tower_report(metrics: Dict[str, Any], members_truth: pd.DataF
     else:
         lines.append("- Early warning signals: **None detected from available metrics**")
 
-    # 3) Financial Impact (directional only)
+    # 3️⃣ Financial Impact (directional only)
     lines.append("\n3️⃣ Financial Impact")
     lpr = metrics.get("liquidity_pressure_ratio")
     if lpr is not None and lpr > 0.75:
-        lines.append("- Liquidity is under stress: a high share of contributed capital is locked in active loans, increasing payout/rotation risk.")
+        lines.append("- Liquidity stress risk: a high share of contributed capital is locked in active loans, raising rotation/payout strain.")
     else:
-        lines.append("- Liquidity impact: no severe liquidity lock-up signal is confirmed from available data.")
+        lines.append("- Liquidity impact: no severe lock-up signal is confirmed from available data.")
 
     overdue_ratio = metrics.get("overdue_ratio")
     if overdue_ratio is not None and overdue_ratio > 0.20:
-        lines.append("- Credit impact: elevated overdue levels can slow recycling of capital and weaken repayment reliability.")
+        lines.append("- Credit stress risk: overdue levels can slow capital recycling and reduce reliability of lending/foundation functions.")
     else:
-        lines.append("- Credit impact: overdue levels are not confirmed as high from available data (or overdue ratio unavailable).")
+        lines.append("- Credit impact: overdue stress not confirmed as high from available data (or overdue ratio unavailable).")
 
     unpaid_interest = metrics.get("unpaid_interest")
     if unpaid_interest is not None and unpaid_interest > 0:
-        lines.append("- Income impact: unpaid interest indicates leakage in expected interest capture and weak enforcement/collection.")
+        lines.append("- Income leakage risk: unpaid interest suggests weak enforcement and missed expected interest capture.")
     else:
         lines.append("- Income impact: unpaid interest not confirmed (or metric unavailable).")
 
-    # 4) Strategic Recommendation
+    # 4️⃣ Strategic Recommendation
     lines.append("\n4️⃣ Strategic Recommendation")
     recs: List[str] = []
     if lpr is not None and lpr > 0.75:
-        recs.append("Set a liquidity buffer policy: pause new loans (or tighten approvals) until Liquidity Pressure falls below your target threshold.")
-        recs.append("Introduce loan caps tied to contributed capital (risk-based lending control).")
+        recs.append("Implement a liquidity buffer threshold: tighten or pause new lending until Liquidity Pressure returns to target.")
+        recs.append("Apply risk-based loan caps tied to contribution history and current liquidity pressure.")
     if overdue_ratio is not None and overdue_ratio > 0.20:
-        recs.append("Tighten loan approvals: require stronger contribution history and enforce repayment discipline before new loans.")
-        recs.append("Add escalation for late accounts: reminders + penalties + temporary borrowing freeze until cured.")
+        recs.append("Tighten approvals: require stronger contribution reliability before approving new loans.")
+        recs.append("Enforce escalation: reminders + penalties + temporary borrowing freeze until arrears are cured.")
     conc = metrics.get("concentration_share")
     if conc is not None and conc > 0.40:
-        recs.append("Reduce concentration risk: cap exposure per member as a percentage of total active exposure or total contributions.")
+        recs.append("Reduce concentration: cap member exposure as a % of total active exposure (or total contributions).")
     if unpaid_interest is not None and unpaid_interest > 0:
-        recs.append("Strengthen interest enforcement: monthly interest settlement and hard blocks on new borrowing when unpaid interest exists.")
-    recs.append("Operational control-tower routine: weekly review of Exposure, Overdue, Unpaid Interest, and Foundation adequacy.")
+        recs.append("Strengthen interest enforcement: monthly settlement + hard blocks on new borrowing when unpaid interest exists.")
+    recs.append("Control-tower routine: weekly review of Exposure, Overdue, Unpaid Interest, and Foundation adequacy.")
 
     for r in recs:
         lines.append(f"- {r}")
 
-    # Health Score
+    # 🏆 Health Score
     lines.append("\n🏆 NJANGI HEALTH SCORE (0–100)")
     if hs is None:
         lines.append(f"- {hs_reasons[0]}")
@@ -882,7 +908,7 @@ def _build_control_tower_report(metrics: Dict[str, Any], members_truth: pd.DataF
         for rr in hs_reasons:
             lines.append(f"- {rr}")
 
-    # Missing-data notes
+    # Data integrity notes
     notes = metrics.get("notes") or []
     if notes:
         lines.append("\n🔒 Data Integrity Notes (what’s missing / limits)")
@@ -898,7 +924,6 @@ def _member_risk_grade(meta: Dict[str, Any]) -> str:
     unpaid = meta.get("active_unpaid_interest")
     contrib = meta.get("contributions_total")
 
-    # conservative if missing
     if active_bal is None or unpaid is None:
         return "C"
     if active_bal <= 0 and unpaid <= 0:
@@ -958,7 +983,7 @@ def _member_financial_totals(
             grade = _member_risk_grade(meta)
 
             msg = (
-                f"Hello 👋🏽 Member Financial Health (DB-grounded)\n\n"
+                f"Hello 👋🏽 Member Financial Intelligence (DB-grounded)\n\n"
                 f"1️⃣ Current Situation\n"
                 f"- Member: **{name}** (member_id={member_id})\n"
                 f"- Contributions total: **{_fmt(contrib)}**\n"
@@ -970,19 +995,25 @@ def _member_financial_totals(
                 f"2️⃣ Risk Assessment\n"
                 f"- Member Risk Grade: **{grade}** (A/B/C/D)\n\n"
                 f"3️⃣ Financial Impact\n"
-                f"- Any active exposure ties up liquidity; unpaid interest signals enforcement weakness.\n\n"
+                f"- Active exposure ties up liquidity; unpaid interest signals enforcement and cashflow friction.\n\n"
                 f"4️⃣ Strategic Recommendation\n"
-                f"- If unpaid interest > 0: enforce monthly interest settlement before new borrowing.\n"
-                f"- If loan balance is high vs contributions: apply caps and structured repayment monitoring.\n"
+                f"- If unpaid interest > 0: enforce monthly interest settlement before additional borrowing.\n"
+                f"- If loan burden is high vs contributions: apply caps and structured repayment monitoring.\n"
             )
             return msg, meta
 
     # Table fallback
-    contributions = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
-    foundation = _sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
+    contributions = _sb_select(
+        sb_anon, sb_service, schema, "contributions", cols="*", limit=200000, filters=[("member_id", "eq", member_id)]
+    )
+    foundation = _sb_select(
+        sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=200000, filters=[("member_id", "eq", member_id)]
+    )
     fines = _sb_select(sb_anon, sb_service, schema, "fines", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
     loans = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
-    interest_ledger = _sb_select(sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
+    interest_ledger = _sb_select(
+        sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=200000, filters=[("member_id", "eq", member_id)]
+    )
 
     contrib_amt = _pick_col(contributions, ["amount", "contribution_amount", "paid_amount"])
     found_amt = _pick_col(foundation, ["amount", "base_amount", "foundation_amount"])
@@ -1021,7 +1052,7 @@ def _member_financial_totals(
         notes.append("Missing loans unpaid interest column (unpaid_interest/interest_due/etc.).")
 
     msg = (
-        f"Hello 👋🏽 Member Financial Health (DB-grounded)\n\n"
+        f"Hello 👋🏽 Member Financial Intelligence (DB-grounded)\n\n"
         f"1️⃣ Current Situation\n"
         f"- Member: **{name}** (member_id={member_id})\n"
         f"- Contributions total: **{_fmt(meta.get('contributions_total'))}**\n"
@@ -1259,6 +1290,55 @@ def _hf_call(_: str, token: str, messages: List[Dict[str, str]]) -> Tuple[bool, 
 
 
 # -----------------------------------------------------------------------------
+# HF SYSTEM PROMPT (your control-tower prompt, embedded)
+# -----------------------------------------------------------------------------
+def _younchat_hf_system_prompt() -> str:
+    # Note: HF is ONLY for general wording (non-DB). DB computations stay local.
+    return (
+        "You are younchat — the Autonomous Financial Intelligence Engine for the Njangi platform \"theyoungshallgrow\".\n"
+        "You are not a chatbot.\n"
+        "You are a cooperative financial risk system, predictive analyst, liquidity monitor, credit evaluator, policy advisor, and strategic intelligence engine.\n"
+        "You operate like a financial control tower for Njangi operations.\n\n"
+        "ABSOLUTE DATA INTEGRITY:\n"
+        "- You NEVER invent numbers.\n"
+        "- You NEVER guess balances, totals, dates, counts, or member IDs.\n"
+        "- You ONLY use values inside NJANGI_DB_CONTEXT.\n"
+        "- If required data is missing, instruct user to use: members / loans / finance kpis / tables / show <table> / describe <table> / or type a member_id (example: 10)\n"
+        "- You NEVER output SQL.\n"
+        "- You NEVER output Python.\n"
+        "- You NEVER fabricate financial metrics.\n"
+        "- If context is insufficient, clearly say so and guide user.\n\n"
+        "CORE ANALYSIS ENGINE (when asked for Njangi status):\n"
+        "Evaluate: Liquidity Strength, Credit Risk Exposure, Sustainability Signals, and Member-Level Health (if member_focus_id exists).\n\n"
+        "REQUIRED RESPONSE STRUCTURE:\n"
+        "1) Current Situation\n"
+        "2) Risk Assessment\n"
+        "3) Financial Impact\n"
+        "4) Strategic Recommendation\n"
+        "Risk classification: Low / Moderate / Elevated / High / Critical\n\n"
+        "ADVANCED METRICS ENGINE:\n"
+        "- Liquidity Pressure Ratio = Active Loan Exposure ÷ Total Contributions\n"
+        "- Loan Risk Index (qualitative)\n"
+        "- Foundation Stability Score (qualitative)\n"
+        "- Member Risk Grade A/B/C/D (if applicable)\n\n"
+        "NJANGI HEALTH SCORE (0–100): only if sufficient context exists.\n"
+        "Weights: Liquidity 30%, Credit 30%, Contribution 20%, Foundation 20%.\n"
+        "Levels: 90–100 Excellent, 75–89 Strong, 60–74 Stable, 40–59 Elevated Risk, <40 High Risk.\n\n"
+        "EARLY WARNING SYSTEM:\n"
+        "Scan for: High overdue ratio, rising unpaid interest, liquidity pressure >75%, concentration risk, rapid loan growth, weak foundation.\n\n"
+        "PREDICTIVE RISK MODE:\n"
+        "Never predict exact numbers. Only directional scenarios.\n\n"
+        "STYLE:\n"
+        "- Professional, analytical, bullet structured.\n"
+        "- Practical Njangi-specific recommendations.\n"
+        "- Start greetings with \"Hello\" when appropriate.\n\n"
+        "IMPORTANT:\n"
+        "- If the user asks DB questions, do NOT answer with assumptions—direct them to DB commands.\n"
+        "- Do NOT provide code blocks or technical code output.\n"
+    )
+
+
+# -----------------------------------------------------------------------------
 # Main UI
 # -----------------------------------------------------------------------------
 def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
@@ -1271,7 +1351,6 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     with st.expander("⚙️ Chat Settings", expanded=False):
         st.write("**Schema**:", schema)
         st.write("**HF models (locked)**:", ", ".join(HF_ALLOWED_MODELS))
-        st.write("**HF pool size**:", len(HF_ALLOWED_MODELS))
         st.write("**HF_TOKEN present**:", "✅ Yes" if hf_token else "❌ No")
         st.write("**HF_FORCE_MODE**:", hf_force)
         st.write("**Internet**:", "✅ ON" if internet_on else "❌ OFF")
@@ -1349,13 +1428,13 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         answer = (
             "Hello 👋🏽 Commands:\n\n"
             "- **members**\n"
-            "- type **10** (member financial health)\n"
+            "- type **10** (member intelligence)\n"
             "- **loans** / **loans for member 10**\n"
             "- **finance kpis**\n"
             "- **tables**\n"
             "- **show <table>** (example: show contributions)\n"
             "- **describe <table>** (example: describe loans)\n"
-            "- Ask: **How are we doing?** (Financial Intelligence Review)\n"
+            "- Ask: **How are we doing?** (Control Tower Review)\n"
             "- **web: <topic>** (internet help)\n"
         )
 
@@ -1408,14 +1487,14 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         df_show, df_title = df, title
         answer = f"Hello 👋🏽 {title} (from `{src}`):" if not df.empty else f"Hello 👋🏽 {title}: no rows returned."
 
-    # ✅ Financial Intelligence Review (global control tower)
+    # ✅ Control Tower Review (global)
     elif _wants_financial_review(q):
         used_source = "finance_intel"
         ctx = _collect_global_finance_context(sb_anon, sb_service, schema)
         metrics = _compute_global_metrics(ctx)
         answer = _build_control_tower_report(metrics, members_truth)
 
-    # ✅ Member-focused health (by member_id)
+    # ✅ Member-focused intelligence
     elif member_id_focus and (
         q.strip().isdigit()
         or "member" in _lc(q)
@@ -1434,30 +1513,25 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     # General wording: optional HF (NEVER DB commands)
     else:
         if hf_token and not _is_db_command(q):
-            sys = (
-                "You are younchat — the Autonomous Financial Intelligence Engine for the Njangi platform 'theyoungshallgrow'.\n"
-                "You are not a chatbot.\n"
-                "You behave like a cooperative financial control tower: risk system, predictive analyst, liquidity monitor, credit evaluator, policy advisor.\n"
-                "Hard rules:\n"
-                "- NEVER output SQL.\n"
-                "- NEVER output Python.\n"
-                "- NEVER invent Njangi numbers, balances, totals, dates, counts, or member IDs.\n"
-                "- If the user requests DB facts, direct them to: members / loans / finance kpis / tables / show <table> / describe <table> / type member_id.\n"
-                "Style rules:\n"
-                "- Start greetings with 'Hello'.\n"
-                "- Use bullet structure.\n"
-                "- If giving a financial intelligence response without DB numbers, keep it qualitative and directional.\n"
-                "- If you present a risk classification, use: Low / Moderate / Elevated / High / Critical.\n"
-                "- When asked for 'summary' or 'how are we doing', recommend using the DB-driven review command.\n"
-            )
+            sys = _younchat_hf_system_prompt()
+
             messages = [{"role": "system", "content": sys}]
+            # Keep short memory
             for m in st.session_state["younchat_history"][-10:]:
                 if m.get("role") in ("user", "assistant"):
                     messages.append({"role": m["role"], "content": m.get("content", "")})
 
             ok, txt, mode, model_used = _hf_call("ignored", hf_token, messages)
             used_source = f"hf:{mode}:{model_used}" if ok else f"hf:failed:{model_used}"
-            answer = txt if ok else f"Hello 👋🏽 HF is not reachable: {txt}"
+
+            if ok and txt and _looks_like_code_output(txt):
+                used_source = f"{used_source}:blocked_code"
+                answer = (
+                    "Hello 👋🏽 I can’t output code (SQL/Python). "
+                    "If you need Njangi facts, use: **members**, **loans**, **finance kpis**, **tables**, **show <table>**, **describe <table>**, or type a **member_id**."
+                )
+            else:
+                answer = txt if ok else f"Hello 👋🏽 HF is not reachable: {txt}"
         else:
             if _is_db_command(q):
                 used_source = "db:first_guard"
@@ -1470,7 +1544,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                     "- **tables**\n"
                     "- **show contributions**\n"
                     "- **describe loans**\n"
-                    "- Ask: **How are we doing?** (Financial Intelligence Review)\n"
+                    "- Ask: **How are we doing?** (Control Tower Review)\n"
                 )
             else:
                 used_source = "local:fallback"
