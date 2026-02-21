@@ -58,7 +58,6 @@ HF_FALLBACK_MODELS = [
 ]
 
 # ✅ Allowlist relations (tables + views).
-# Keep this aligned with what exists in Supabase (your screenshot shows many v_* views).
 RELATIONS: Dict[str, Dict[str, Any]] = {
     # Tables
     "members": {"type": "table", "truth": True},
@@ -66,6 +65,8 @@ RELATIONS: Dict[str, Dict[str, Any]] = {
     "foundation_contributions": {"type": "table"},
     "loans": {"type": "table"},
     "loan_payments": {"type": "table"},
+    "loan_repayments_pending": {"type": "table"},  # ✅ columns confirmed in your screenshots
+    "loan_requests": {"type": "table"},            # ✅ columns confirmed in your screenshots
     "fines": {"type": "table"},
     "payouts": {"type": "table"},
     "sessions": {"type": "table"},
@@ -74,8 +75,6 @@ RELATIONS: Dict[str, Dict[str, Any]] = {
     "signatures": {"type": "table"},
     "audit_log": {"type": "table"},
     "app_state": {"type": "table"},
-    "loan_requests": {"type": "table"},
-    "loan_repayments_pending": {"type": "table"},
     "profiles": {"type": "table"},
     "ml_training_data": {"type": "table"},
     "member_contribution_totals": {"type": "table"},
@@ -129,7 +128,7 @@ def _api_msg(e: Exception) -> str:
 
 
 # -----------------------------------------------------------------------------
-# DB Read helpers
+# DB Read helpers (allowlist enforced)
 # -----------------------------------------------------------------------------
 def _sb_select(
     sb_anon,
@@ -213,6 +212,26 @@ def _fmt(x: Any) -> str:
     return f"{v:,.2f}"
 
 
+def _coalesce_note_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    ✅ Your schema shows mixed 'note' and 'notes' across tables.
+    This makes previews consistent (adds 'note_text' if any exist).
+    """
+    if df is None or df.empty:
+        return df
+    if "note_text" in df.columns:
+        return df
+    cand = None
+    if "notes" in df.columns:
+        cand = "notes"
+    elif "note" in df.columns:
+        cand = "note"
+    if cand:
+        df = df.copy()
+        df["note_text"] = df[cand]
+    return df
+
+
 # -----------------------------------------------------------------------------
 # Intent helpers
 # -----------------------------------------------------------------------------
@@ -294,7 +313,21 @@ def _is_db_command(text: str) -> bool:
         return True
     if _wants_show_table(t) or _wants_describe(t) or _wants_help(t):
         return True
-    finance_words = ["contribution", "contributions", "payout", "payouts", "attendance", "minutes", "fines", "interest"]
+    finance_words = [
+        "contribution",
+        "contributions",
+        "foundation",
+        "payout",
+        "payouts",
+        "attendance",
+        "minutes",
+        "fines",
+        "interest",
+        "repayments_pending",
+        "loan_requests",
+        "audit_log",
+        "app_state",
+    ]
     return any(w in t for w in finance_words)
 
 
@@ -380,9 +413,6 @@ def _member_name_from_truth(members_truth: pd.DataFrame, member_id: str) -> str:
     return str(hit.iloc[0]["member_name"])
 
 
-# -----------------------------------------------------------------------------
-# View helpers (important for your “view shows everything”)
-# -----------------------------------------------------------------------------
 def _find_row_for_member(df: pd.DataFrame, member_id: str) -> pd.DataFrame:
     """
     Some views use member_id / memberid / id. This finds the right row.
@@ -409,10 +439,9 @@ def _member_financial_totals(
 ) -> Tuple[str, Dict[str, Any]]:
     name = _member_name_from_truth(members_truth, member_id)
 
-    # ✅ Preferred: use the view that shows everything
+    # ✅ Preferred: view that shows everything (if you created it)
     if "v_member_financial_totals" in RELATIONS:
         v_all = _sb_select(sb_anon, sb_service, schema, "v_member_financial_totals", cols="*", limit=5000)
-
         hit = _find_row_for_member(v_all, member_id)
         if not hit.empty:
             row = hit.iloc[0].to_dict()
@@ -435,23 +464,17 @@ def _member_financial_totals(
             )
             return msg, {"source": "v_member_financial_totals", "row": row, "member_name": name}
 
-        # If view exists but no row for this member
         return (
-            f"Hello 👋🏽 I don’t see member_id={member_id} in `v_member_financial_totals` (view returned rows: {len(v_all)}).",
+            f"Hello 👋🏽 I don’t see member_id={member_id} in `v_member_financial_totals` (view rows: {len(v_all)}).",
             {"source": "v_member_financial_totals:no_row"},
         )
 
     # -------------------------------------------------------------------------
-    # Fallback: compute from tables (only if view not available)
+    # Fallback: compute from tables
     # -------------------------------------------------------------------------
     contributions = _sb_select(
         sb_anon, sb_service, schema, "contributions", cols="*", limit=20000, filters=[("member_id", "eq", member_id)]
     )
-    if contributions.empty:
-        contributions = _sb_select(
-            sb_anon, sb_service, schema, "contributions", cols="*", limit=20000, filters=[("memberid", "eq", member_id)]
-        )
-
     foundation = _sb_select(
         sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=20000, filters=[("member_id", "eq", member_id)]
     )
@@ -461,13 +484,13 @@ def _member_financial_totals(
         sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=20000, filters=[("member_id", "eq", member_id)]
     )
 
-    contrib_amt = _pick_col(contributions, ["amount", "contribution_amount", "paid_amount", "amount_paid"])
-    found_amt = _pick_col(foundation, ["amount", "base_amount", "foundation_amount"])
-    fines_amt = _pick_col(fines, ["amount", "fine_amount"])
-    int_amt = _pick_col(interest_ledger, ["amount", "interest_amount", "interest"])
+    contrib_amt = _pick_col(contributions, ["amount"])
+    found_amt = _pick_col(foundation, ["amount"])
+    fines_amt = _pick_col(fines, ["amount"])
+    int_amt = _pick_col(interest_ledger, ["amount"])
 
     status_col = _pick_col(loans, ["status"])
-    principal_current = _pick_col(loans, ["principal_current", "balance", "outstanding_principal"])
+    principal_current = _pick_col(loans, ["principal_current"])
     principal = _pick_col(loans, ["principal", "amount"])
 
     active = loans
@@ -501,8 +524,10 @@ def _loans_with_member(
         filters = [("member_id", "eq", member_id)] if member_id else None
         df = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=5000, filters=filters)
         if not df.empty and "member_id" in df.columns and not members_truth.empty:
-            df = df.merge(members_truth, how="left", left_on="member_id", right_on="member_id")
+            df = df.merge(members_truth, how="left", on="member_id")
         src = "loans (+ members join)"
+
+    df = _coalesce_note_cols(df)
 
     title = "Loans"
     if member_id:
@@ -527,6 +552,7 @@ def _describe_relation(sb_anon, sb_service, schema: str, relation: str) -> Tuple
 
 def _show_relation(sb_anon, sb_service, schema: str, relation: str) -> Tuple[str, pd.DataFrame, str]:
     df = _sb_select(sb_anon, sb_service, schema, relation, cols="*", limit=2000)
+    df = _coalesce_note_cols(df)
     msg = f"Hello 👋🏽 Preview of **{relation}** ({RELATIONS[relation]['type']}):"
     return msg, df, f"show:{relation}"
 
@@ -679,6 +705,23 @@ def _hf_call(model: str, token: str, messages: List[Dict[str, str]]) -> Tuple[bo
 
 
 # -----------------------------------------------------------------------------
+# Members truth cache (NO st.cache_data to avoid unhashable supabase clients)
+# -----------------------------------------------------------------------------
+def _get_members_truth_cached(sb_anon, sb_service, schema: str, ttl_sec: int = 30) -> pd.DataFrame:
+    now = time.time()
+    cache = st.session_state.get("_younchat_members_truth_cache", None)
+    if isinstance(cache, dict):
+        ts = float(cache.get("ts", 0))
+        df = cache.get("df", None)
+        if (now - ts) < ttl_sec and isinstance(df, pd.DataFrame):
+            return df
+
+    df = _load_members_truth(sb_anon, sb_service, schema, limit=3000)
+    st.session_state["_younchat_members_truth_cache"] = {"ts": now, "df": df}
+    return df
+
+
+# -----------------------------------------------------------------------------
 # Main UI
 # -----------------------------------------------------------------------------
 def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
@@ -696,11 +739,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         st.write("**Internet**:", "✅ ON" if internet_on else "❌ OFF")
         st.caption("Njangi numbers are ALWAYS answered from DB. HF is only for general chat wording (never DB commands).")
 
-    @st.cache_data(ttl=30, show_spinner=False)
-    def _cached_members_truth(_ts: int) -> pd.DataFrame:
-        return _load_members_truth(sb_anon, sb_service, schema, limit=3000)
-
-    members_truth = _cached_members_truth(int(time.time() // 10))
+    members_truth = _get_members_truth_cached(sb_anon, sb_service, schema, ttl_sec=30)
 
     # ✅ ONLY INTRO LINE
     if "younchat_history" not in st.session_state:
@@ -712,11 +751,12 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
 
     colA, colB = st.columns([1, 1], gap="small")
     if colA.button("🔄 Refresh", use_container_width=True):
-        st.cache_data.clear()
+        st.session_state.pop("_younchat_members_truth_cache", None)
         st.rerun()
     if colB.button("🧹 Clear chat", use_container_width=True):
         st.session_state["younchat_history"] = [{"role": "assistant", "content": _intro_only()}]
         st.session_state.pop("younchat_last_member_id", None)
+        st.session_state.pop("_younchat_members_truth_cache", None)
         st.rerun()
 
     q = st.chat_input("Type your message…")
@@ -868,6 +908,8 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                     "- **finance kpis**\n"
                     "- **tables**\n"
                     "- **show contributions**\n"
+                    "- **show loan_requests**\n"
+                    "- **show loan_repayments_pending**\n"
                     "- **describe loans**\n"
                 )
             else:
@@ -881,5 +923,6 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
             with st.expander(df_title, expanded=False):
                 st.dataframe(df_show, use_container_width=True)
 
-    st.caption(f"Source used: {used_source} • member_id: {member_id_focus or '—'} • Internet: {'ON' if internet_on else 'OFF'}")
-
+    st.caption(
+        f"Source used: {used_source} • member_id: {member_id_focus or '—'} • Internet: {'ON' if internet_on else 'OFF'}"
+    )
