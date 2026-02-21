@@ -1,15 +1,18 @@
 
 # njangi_llm_panel.py
 # =============================================================================
-# 💬 younchat — Hugging Face Router + Optional Internet Search ✅ SINGLE COMPLETE FILE
+# 💬 younchat — Hugging Face Router + Optional Internet Search ✅ SINGLE COMPLETE FILE (HARDENED)
 #
-# ✅ What you asked for (FIXED):
+# ✅ What you asked for (FIXED + MORE RELIABLE):
 #   1) The ONLY name shown is: "younchat" (no "Your Chat", no "Young")
 #   2) Introduces itself using real time of the day: Good morning/afternoon/evening
 #   3) Chats like a human (Streamlit chat UI + conversation memory)
 #   4) Uses member_id context automatically (selectbox OR typed in chat OR keeps last member_id)
 #   5) "Internet is ON" only when you set TAVILY_API_KEY (otherwise OFF safely)
 #   6) Still GROUNDED on live Njangi snapshot for ALL Njangi numbers (no guessing)
+#   7) ✅ HF reliability upgrade:
+#        - Retries transient HF errors (429/5xx/timeouts) with backoff
+#        - Automatic model failover list if HF returns 5xx
 #
 # ✅ Hugging Face Router (OpenAI-compatible):
 #   - Chat:         https://router.huggingface.co/v1/chat/completions
@@ -19,6 +22,10 @@
 #   HF_TOKEN = hf_...
 #   HF_MODEL = mistralai/Mistral-7B-Instruct-v0.2   (default)
 #   HF_FORCE_MODE = auto | completions | chat       (default auto)
+#
+# ✅ Recommended for stability (Railway Variables):
+#   HF_FORCE_MODE = completions
+#   HF_MODEL = meta-llama/Meta-Llama-3-8B-Instruct   (often steadier)
 #
 # ✅ Optional Internet Search (Tavily):
 #   TAVILY_API_KEY = tvly-...
@@ -47,6 +54,13 @@ W_STRETCH = "stretch"
 HF_ROUTER_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
 HF_ROUTER_COMPLETIONS_URL = "https://router.huggingface.co/v1/completions"
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
+
+# If HF has a transient outage (500s), younchat will try these automatically.
+HF_FALLBACK_MODELS = [
+    "meta-llama/Meta-Llama-3-8B-Instruct",
+    "meta-llama/Llama-3.1-8B-Instruct",
+    "mistralai/Mistral-7B-Instruct-v0.2",
+]
 
 
 # -----------------------------------------------------------------------------
@@ -199,6 +213,7 @@ def _build_snapshot(sb_anon, sb_service, schema: str) -> Dict[str, Any]:
             if not members.empty and member_id_col and name_col
             else []
         ),
+        # Raw tables stay local-only (not shown to HF). Used for computations.
         "_raw": {
             "members": members,
             "sessions": sessions,
@@ -244,7 +259,6 @@ def _extract_member_id_from_text(snapshot: Dict[str, Any], text: str) -> Optiona
             if cand in valid_ids:
                 return cand
 
-    # fallback: any number that matches an existing member id
     for nm in _ANY_NUM.findall(txt):
         cand = str(nm)
         if cand in valid_ids:
@@ -351,7 +365,6 @@ def _internet_enabled() -> bool:
     mode = (os.getenv("INTERNET_MODE") or "").strip().lower()
     if mode == "off":
         return False
-    # default: ON if key exists
     return bool(key)
 
 
@@ -398,6 +411,7 @@ def _build_grounded_messages(
     member_fin: Optional[Dict[str, Any]],
     internet_pack: Optional[Dict[str, Any]],
     chat_history: List[Dict[str, str]],
+    member_id_focus: Optional[str],
 ) -> List[Dict[str, str]]:
     sys = (
         "You are **younchat**, a friendly, human-like assistant for a Njangi finance app.\n"
@@ -405,13 +419,15 @@ def _build_grounded_messages(
         "1) For ANY Njangi totals, counts, members, loans, payouts, contributions, interest, fines — use ONLY SNAPSHOT_FACTS and SELECTED_MEMBER_FACTS.\n"
         "2) If something is missing in the snapshot, say exactly: 'I don’t have that in the snapshot.'\n"
         "3) You MAY use INTERNET_SOURCES only for general questions (definitions, laws, how-to), NOT for Njangi numbers.\n"
-        "4) Speak naturally like a real person. Short paragraphs. Ask ONE helpful follow-up question.\n"
+        "4) Speak naturally like a real person. Short paragraphs.\n"
+        "5) Ask ONE helpful follow-up question when it makes sense.\n"
     )
 
     facts = {
         "generated_at_utc": snapshot.get("generated_at_utc"),
         "counts": snapshot.get("counts", {}),
         "totals": snapshot.get("totals", {}),
+        "member_id_focus": member_id_focus,
     }
 
     content = "SNAPSHOT_FACTS:\n" + json.dumps(facts, indent=2)
@@ -451,64 +467,116 @@ def _messages_to_prompt(messages: List[Dict[str, str]]) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Hugging Face Router calls
+# Hugging Face Router (retries + failover)
 # -----------------------------------------------------------------------------
+def _post_with_retries(url: str, headers: dict, payload: dict, timeout: int = 60) -> Tuple[bool, str]:
+    """
+    Retries transient HF errors (429/5xx/network/timeouts) with backoff.
+    Returns (ok, response_text_or_error).
+    """
+    last_err = ""
+    for attempt in range(4):  # 0..3
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_err = f"HF error {r.status_code}: {r.text[:600]}"
+                time.sleep(1.0 + attempt * 1.5)
+                continue
+
+            if r.status_code >= 400:
+                return False, f"HF error {r.status_code}: {r.text[:600]}"
+
+            return True, r.text
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(1.0 + attempt * 1.5)
+
+    return False, last_err or "HF transient error"
+
+
 def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], timeout: int = 60) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {"model": model, "messages": messages, "temperature": 0.4, "max_tokens": 650}
 
+    ok, raw = _post_with_retries(HF_ROUTER_CHAT_URL, headers, payload, timeout=timeout)
+    if not ok:
+        return False, raw
+
     try:
-        r = requests.post(HF_ROUTER_CHAT_URL, headers=headers, json=payload, timeout=timeout)
-        if r.status_code >= 400:
-            return False, f"HF error {r.status_code}: {r.text[:500]}"
-        data = r.json()
+        data = json.loads(raw)
         text = (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
         return True, str(text).strip()
-    except Exception as e:
-        return False, str(e)
+    except Exception:
+        return False, f"Bad HF chat response: {raw[:600]}"
 
 
 def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 60) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {"model": model, "prompt": prompt, "temperature": 0.4, "max_tokens": 650}
 
+    ok, raw = _post_with_retries(HF_ROUTER_COMPLETIONS_URL, headers, payload, timeout=timeout)
+    if not ok:
+        return False, raw
+
     try:
-        r = requests.post(HF_ROUTER_COMPLETIONS_URL, headers=headers, json=payload, timeout=timeout)
-        if r.status_code >= 400:
-            return False, f"HF error {r.status_code}: {r.text[:500]}"
-        data = r.json()
+        data = json.loads(raw)
         text = ((data.get("choices") or [{}])[0].get("text") or "")
         return True, str(text).strip()
-    except Exception as e:
-        return False, str(e)
+    except Exception:
+        return False, f"Bad HF completions response: {raw[:600]}"
 
 
 def _hf_call(model: str, token: str, messages: List[Dict[str, str]]) -> Tuple[bool, str, str]:
+    """
+    Returns (ok, text_or_error, mode_used)
+    mode_used: "completions" | "chat" | "failed"
+    - Tries preferred mode order depending on HF_FORCE_MODE and model style
+    - Retries handled inside _post_with_retries
+    - Failover to other models for transient 5xx/429/timeouts
+    """
     force = (os.getenv("HF_FORCE_MODE", "") or "auto").strip().lower()
     prompt = _messages_to_prompt(messages)
 
-    model_lc = (model or "").lower()
-    looks_instruct = any(x in model_lc for x in ["instruct", "instruction", "mistral-7b-instruct", "llama-3", "llama-3.1"])
+    # Primary model then fallbacks (unique)
+    model_order: List[str] = []
+    primary = (model or "").strip()
+    if primary:
+        model_order.append(primary)
+    for m in HF_FALLBACK_MODELS:
+        if m and m not in model_order:
+            model_order.append(m)
 
-    if force == "chat":
-        order = ["chat"]
-    elif force == "completions":
-        order = ["completions"]
-    else:
-        order = ["completions", "chat"] if looks_instruct else ["chat", "completions"]
+    def _looks_instruct(mname: str) -> bool:
+        mlc = (mname or "").lower()
+        return any(x in mlc for x in ["instruct", "instruction", "mistral-7b-instruct", "llama-3", "llama-3.1"])
 
     last_err = ""
-    for mode in order:
-        if mode == "completions":
-            ok, txt = _hf_router_completions(model, token, prompt)
-            if ok and txt:
-                return True, txt, "completions"
-            last_err = txt
+    for chosen_model in model_order:
+        if force == "chat":
+            order = ["chat"]
+        elif force == "completions":
+            order = ["completions"]
         else:
-            ok, txt = _hf_router_chat(model, token, messages)
-            if ok and txt:
-                return True, txt, "chat"
-            last_err = txt
+            order = ["completions", "chat"] if _looks_instruct(chosen_model) else ["chat", "completions"]
+
+        for mode in order:
+            if mode == "completions":
+                ok, txt = _hf_router_completions(chosen_model, token, prompt)
+                if ok and txt:
+                    return True, txt, "completions"
+                last_err = txt
+            else:
+                ok, txt = _hf_router_chat(chosen_model, token, messages)
+                if ok and txt:
+                    return True, txt, "chat"
+                last_err = txt
+
+        # Decide whether to try next model (only if transient)
+        err_lc = (last_err or "").lower()
+        transient = any(s in err_lc for s in ["hf error 500", "hf error 502", "hf error 503", "hf error 504", "hf error 429", "timeout", "server error", "transient"])
+        if not transient:
+            break
 
     return False, last_err or "Unknown HF error", "failed"
 
@@ -523,16 +591,22 @@ def _local_fallback_answer(snapshot: Dict[str, Any], question: str, member_id: O
     if any(x in q for x in ["hi", "hello", "hey"]):
         return f"{greet} 👋🏽 I’m **younchat**. Ask me about totals, loans, payouts, or tell me a member_id."
 
+    if "total" in q and "contribution" in q:
+        return f"{greet} 👋🏽 Total contributions (all members): **{snapshot['totals']['contributions_total']:.2f}**. Want totals for foundation too?"
+
+    if "total" in q and "foundation" in q:
+        return f"{greet} 👋🏽 Total foundation contributions (all members): **{snapshot['totals']['foundation_total']:.2f}**. Want totals for contributions too?"
+
     if member_id:
         fin = _compute_member_financials(snapshot, member_id)
         return (
             f"{greet} 👋🏽 Here’s what I have for **{fin['member_name']}** (member_id={fin['member_id']}):\n"
-            f"- Contributions: {fin['contributions_total']:.2f}\n"
-            f"- Foundation: {fin['foundation_total']:.2f}\n"
-            f"- Fines: {fin['fines_total']:.2f}\n"
-            f"- Loans: {fin['loans_count']} • Active balance: {fin['active_loan_balance']:.2f}\n"
-            f"- Unpaid interest: {fin['active_unpaid_interest']:.2f}\n"
-            f"- Interest ledger total: {fin['interest_total']:.2f}\n"
+            f"- Contributions: **{fin['contributions_total']:.2f}**\n"
+            f"- Foundation: **{fin['foundation_total']:.2f}**\n"
+            f"- Fines: **{fin['fines_total']:.2f}**\n"
+            f"- Loans: **{fin['loans_count']}** • Active balance: **{fin['active_loan_balance']:.2f}**\n"
+            f"- Unpaid interest: **{fin['active_unpaid_interest']:.2f}**\n"
+            f"- Interest ledger total: **{fin['interest_total']:.2f}**\n"
             "\nWant me to check another member_id?"
         )
 
@@ -566,6 +640,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         st.write("**Internet**:", "✅ ON" if internet_on else "❌ OFF")
         if not tavily_key:
             st.caption("To enable Internet: set TAVILY_API_KEY in Railway. (INTERNET_MODE=off disables it.)")
+        st.caption("Tip: For fewer HF failures, set HF_FORCE_MODE=completions and HF_MODEL=meta-llama/Meta-Llama-3-8B-Instruct.")
 
     @st.cache_data(ttl=30, show_spinner=False)
     def _cached_snapshot(_ts: int) -> Dict[str, Any]:
@@ -639,12 +714,8 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         st.markdown(question)
 
     # Resolve member_id context:
-    # 1) selectbox selection
-    # 2) member_id typed in the message
-    # 3) last used member_id
     detected_from_text = _extract_member_id_from_text(snapshot, question)
     member_id_focus = selected_member_id or detected_from_text or st.session_state.get("younchat_last_member_id")
-
     if member_id_focus:
         st.session_state["younchat_last_member_id"] = member_id_focus
 
@@ -666,6 +737,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         member_fin=member_fin,
         internet_pack=internet_pack,
         chat_history=st.session_state["younchat_history"],
+        member_id_focus=member_id_focus,
     )
 
     # If no HF token -> local grounded fallback
