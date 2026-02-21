@@ -1,24 +1,23 @@
 
 # njangi_llm_panel.py
 # =============================================================================
-# 🤖 YOUNG — Hugging Face Router (Grounded) ✅ SINGLE COMPLETE FILE
+# 🤖 YOUNG — Hugging Face Router (Grounded) ✅ SINGLE COMPLETE FILE (FIXED)
 #
-# ✅ Uses Hugging Face Router (OpenAI-compatible):
-#   - Chat models:        https://router.huggingface.co/v1/chat/completions
-#   - Instruct models:    https://router.huggingface.co/v1/completions
-#
-# ✅ IMPORTANT:
-#   - mistralai/Mistral-7B-Instruct-v0.3 is typically NOT a chat model
-#   - So we default to /v1/completions (more reliable)
-#   - Optional fallback to chat (if you force it)
+# ✅ FIXES your issue:
+#   - Default model changed to: mistralai/Mistral-7B-Instruct-v0.2
+#   - Uses HF Router OpenAI-compatible endpoints:
+#       • Chat models:     https://router.huggingface.co/v1/chat/completions
+#       • Instruct models: https://router.huggingface.co/v1/completions
+#   - Instruct models default to /v1/completions (more reliable)
 #
 # ✅ Grounded:
 #   - Pulls LIVE snapshot from Supabase tables (NJANGI STANDARD)
-#   - LLM only formats answer; numbers come from snapshot
+#   - LLM ONLY formats answer; all numbers come from snapshot
+#   - If a fact is missing -> Young says so (no guessing)
 #
 # ✅ Railway env vars:
 #   HF_TOKEN = hf_...
-#   HF_MODEL = (optional) default: mistralai/Mistral-7B-Instruct-v0.3
+#   HF_MODEL = (optional) default: mistralai/Mistral-7B-Instruct-v0.2
 #   HF_FORCE_MODE = auto | completions | chat   (optional; default: auto)
 #
 # Works with app.py that calls:
@@ -66,17 +65,25 @@ def _api_msg(e: Exception) -> str:
 # -----------------------------------------------------------------------------
 # Safe Supabase read (schema-safe)
 # -----------------------------------------------------------------------------
-def _sb_select(sb_anon, sb_service, schema: str, table: str, cols: str = "*", limit: int = 1000) -> pd.DataFrame:
+def _sb_select(
+    sb_anon,
+    sb_service,
+    schema: str,
+    table: str,
+    cols: str = "*",
+    limit: int = 1000,
+) -> pd.DataFrame:
     sb = sb_service or sb_anon
     if sb is None:
         return pd.DataFrame()
 
+    # Try with schema first (recommended)
     try:
         res = sb.schema(schema).table(table).select(cols).limit(limit).execute()
         data = getattr(res, "data", None) or []
         return pd.DataFrame(data)
     except Exception:
-        # Try without schema (some clients ignore schema)
+        # Fallback: try without schema (some clients ignore schema)
         try:
             res = sb.table(table).select(cols).limit(limit).execute()
             data = getattr(res, "data", None) or []
@@ -173,6 +180,7 @@ def _build_snapshot(sb_anon, sb_service, schema: str) -> Dict[str, Any]:
             if not members.empty and member_id_col and name_col
             else []
         ),
+        # Keep raw tables for local compute ONLY (not shown to LLM)
         "_raw": {
             "members": members,
             "sessions": sessions,
@@ -287,7 +295,11 @@ def _compute_member_financials(snapshot: Dict[str, Any], member_id: str) -> Dict
 # -----------------------------------------------------------------------------
 # Prompt builders
 # -----------------------------------------------------------------------------
-def _build_grounded_messages(snapshot: Dict[str, Any], question: str, member_fin: Optional[Dict[str, Any]]) -> List[Dict[str, str]]:
+def _build_grounded_messages(
+    snapshot: Dict[str, Any],
+    question: str,
+    member_fin: Optional[Dict[str, Any]],
+) -> List[Dict[str, str]]:
     sys = (
         "You are Young, a finance assistant for a Njangi app. "
         "You MUST answer ONLY using the provided SNAPSHOT FACTS. "
@@ -317,7 +329,7 @@ def _build_grounded_messages(snapshot: Dict[str, Any], question: str, member_fin
 
 def _messages_to_prompt(messages: List[Dict[str, str]]) -> str:
     # For /v1/completions we provide a single prompt string
-    out = []
+    out: List[str] = []
     for m in messages:
         role = m.get("role", "user")
         content = m.get("content", "")
@@ -358,7 +370,6 @@ def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 6
         if r.status_code >= 400:
             return False, f"HF error {r.status_code}: {r.text[:500]}"
         data = r.json()
-        # OpenAI completions format: {"choices":[{"text":"..."}]}
         text = ((data.get("choices") or [{}])[0].get("text") or "")
         return True, str(text).strip()
     except Exception as e:
@@ -373,17 +384,14 @@ def _hf_call(model: str, token: str, messages: List[Dict[str, str]]) -> Tuple[bo
     force = (os.getenv("HF_FORCE_MODE", "") or "auto").strip().lower()
     prompt = _messages_to_prompt(messages)
 
-    # Heuristic: Instruct models work best with /v1/completions
     model_lc = (model or "").lower()
     looks_instruct = any(x in model_lc for x in ["instruct", "instruction", "mistral-7b-instruct", "llama-3", "llama-3.1"])
 
-    # Decide order
     if force == "chat":
         order = ["chat"]
     elif force == "completions":
         order = ["completions"]
     else:
-        # auto
         order = ["completions", "chat"] if looks_instruct else ["chat", "completions"]
 
     last_err = ""
@@ -445,7 +453,10 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     st.subheader("🤖 Young — Hugging Face AI Helper", anchor=False)
 
     hf_token = os.getenv("HF_TOKEN", "").strip()
-    hf_model = os.getenv("HF_MODEL", "").strip() or "mistralai/Mistral-7B-Instruct-v0.3"
+
+    # ✅ IMPORTANT FIX: default to v0.2 (not v0.3)
+    hf_model = os.getenv("HF_MODEL", "").strip() or "mistralai/Mistral-7B-Instruct-v0.2"
+
     hf_force = (os.getenv("HF_FORCE_MODE", "") or "auto").strip().lower()
 
     with st.expander("🔧 AI Settings", expanded=False):
@@ -460,7 +471,6 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
 
     snapshot = _cached_snapshot(int(time.time() // 10))
 
-    # Member select (optional)
     members_preview = snapshot.get("members_preview", [])
     id_col = snapshot.get("columns", {}).get("members_id_col") or "id"
     name_col = snapshot.get("columns", {}).get("members_name_col") or "name"
@@ -481,7 +491,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
 
     question = st.text_input(
         "Ask Young (grounded on live snapshot)",
-        placeholder="e.g., Total foundation money? What is my loan status?"
+        placeholder="e.g., Total foundation money? What is my loan status?",
     )
 
     colA, colB = st.columns([1, 1], gap="small")
