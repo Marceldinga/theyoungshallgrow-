@@ -6,7 +6,7 @@
 #   - The ONLY intro message must be EXACTLY:
 #       "Hello 👋🏽 I’m younchat — your Njangi assistant."
 #   - No extra intro text in the intro.
-#   - Salute must be "Hello"
+#   - Salute must be "Hello" (enforced for ALL replies incl HF)
 #   - younchat reads your DB from an allowlist (RELATIONS)
 #   - members table is the source of truth for identity (name display)
 #   - NO hallucinations for Njangi numbers (all financial answers come from DB)
@@ -17,6 +17,7 @@
 #   - ✅ "health" + "counts" commands to assess all tables quickly
 #   - ✅ Optional "random model routing" for HF (general chat ONLY, never DB/PDF)
 #   - ✅ Supports ~40 model pool (random) for HF router general chat
+#   - ✅ HF "model_not_supported" / provider errors auto-skip to next model
 #
 # Railway env vars (optional):
 #   HF_TOKEN
@@ -78,64 +79,50 @@ HF_FALLBACK_MODELS: List[str] = [
     "meta-llama/Meta-Llama-3-70B-Instruct",
     "meta-llama/Llama-3.1-8B-Instruct",
     "meta-llama/Llama-3.1-70B-Instruct",
-
     # Mistral family
     "mistralai/Mistral-7B-Instruct-v0.2",
     "mistralai/Mistral-7B-Instruct-v0.3",
     "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "mistralai/Mixtral-8x22B-Instruct-v0.1",
-
     # Nous Hermes
     "NousResearch/Nous-Hermes-2-Mixtral-8x7B-DPO",
     "NousResearch/Nous-Hermes-2-Yi-34B",
     "NousResearch/Nous-Hermes-2-Mistral-7B-DPO",
-
     # Qwen instruct
     "Qwen/Qwen2-7B-Instruct",
     "Qwen/Qwen2-14B-Instruct",
     "Qwen/Qwen2-72B-Instruct",
-
     # DeepSeek chat
     "deepseek-ai/deepseek-llm-7b-chat",
     "deepseek-ai/deepseek-llm-67b-chat",
-
     # OpenChat
     "openchat/openchat-3.5-0106",
     "openchat/openchat-3.5-1210",
-
     # Zephyr
     "HuggingFaceH4/zephyr-7b-beta",
     "HuggingFaceH4/zephyr-7b-alpha",
-
     # Phi instruct
     "microsoft/Phi-3-mini-4k-instruct",
     "microsoft/Phi-3-small-8k-instruct",
     "microsoft/Phi-3-medium-4k-instruct",
-
     # Yi chat
     "01-ai/Yi-6B-Chat",
     "01-ai/Yi-34B-Chat",
-
     # Gemma instruct
     "google/gemma-2b-it",
     "google/gemma-7b-it",
-
     # Falcon instruct
     "tiiuae/falcon-7b-instruct",
     "tiiuae/falcon-40b-instruct",
-
     # StableLM chat
     "stabilityai/stablelm-2-1_6b-chat",
     "stabilityai/stablelm-2-12b-chat",
-
     # Orca style
     "Open-Orca/Mistral-7B-OpenOrca",
     "Open-Orca/Mixtral-8x7B-OpenOrca",
-
     # Command R family
     "CohereForAI/c4ai-command-r-v01",
     "CohereForAI/c4ai-command-r-plus-v01",
-
     # Misc strong instruct
     "teknium/OpenHermes-2.5-Mistral-7B",
     "teknium/OpenHermes-2.5-Mixtral-8x7B",
@@ -143,6 +130,10 @@ HF_FALLBACK_MODELS: List[str] = [
     "allenai/tulu-2-dpo-13b",
 ]
 
+# Optional hard denylist (you can add models that repeatedly fail for your account/providers)
+HF_MODEL_DENYLIST = set(
+    m.strip() for m in (os.getenv("HF_MODEL_DENYLIST_CSV") or "").split(",") if m.strip()
+)
 
 # ✅ Allowlist relations (tables + views).
 RELATIONS: Dict[str, Dict[str, Any]] = {
@@ -191,11 +182,22 @@ RELATIONS: Dict[str, Dict[str, Any]] = {
 # Time helpers
 # -----------------------------------------------------------------------------
 def _intro_only() -> str:
+    # ✅ MUST be exact
     return "Hello 👋🏽 I’m younchat — your Njangi assistant."
 
 
 def _utc_now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _force_hello_prefix(text: str) -> str:
+    """Enforce salute rule for every response (including HF)."""
+    t = (text or "").strip()
+    if not t:
+        return "Hello 👋🏽"
+    if not t.lower().startswith("hello"):
+        return "Hello 👋🏽 " + t
+    return t
 
 
 # -----------------------------------------------------------------------------
@@ -428,14 +430,24 @@ def _is_pdf_command(text: str) -> bool:
 
 
 def _extract_relation_name(text: str) -> Optional[str]:
+    """
+    More forgiving extraction:
+    - strips command prefix, then scans tokens for any allowlisted relation
+    """
     t = _lc(text)
     t = re.sub(r"^(show|preview|open|describe|columns|cols|schema)\s+", "", t).strip()
     t = re.sub(r"^table\s+", "", t).strip()
-    t = re.sub(r"[^\w]+$", "", t)
+    t = re.sub(r"[^\w\s]+", " ", t).strip()
     if not t:
         return None
-    token = t.split()[0]
-    return token if token in RELATIONS else None
+    toks = [x for x in t.split() if x]
+    # exact token match
+    for tok in toks:
+        if tok in RELATIONS:
+            return tok
+    # fallback: sometimes user pastes relation with punctuation; try raw first token
+    first = toks[0] if toks else None
+    return first if first in RELATIONS else None
 
 
 _MEMBER_ID_PATTERNS = [
@@ -647,10 +659,10 @@ def _pdf_minutes(sb_anon, sb_service, schema: str, session_id: str) -> Tuple[str
     title = f"theyoungshallgrow — Minutes (session {session_id})"
     body = str(row.get("body") or "")
     pdf_bytes = _make_simple_pdf(title, [str(row.get("title") or ""), "", body])
-    return f"Hello 👋🏽 Minutes PDF is ready for session_id={session_id}.", pdf_bytes, f"minutes_session_{int(session_id)}.pdf"
+    return _force_hello_prefix(f"Minutes PDF is ready for session_id={session_id}."), pdf_bytes, f"minutes_session_{int(session_id)}.pdf"
 
 
-def _pdf_attendance(sb_anon, sb_service, schema: str, session_id: str) -> Tuple[str, bytes, str]:
+def _pdf_attendance(sb_anon, sb_service, schema: str, session_id: str, members_truth: pd.DataFrame) -> Tuple[str, bytes, str]:
     df = _sb_select(
         sb_anon, sb_service, schema, "attendance",
         cols="*", limit=5000,
@@ -665,17 +677,21 @@ def _pdf_attendance(sb_anon, sb_service, schema: str, session_id: str) -> Tuple[
     else:
         for r in df.to_dict("records"):
             mid = r.get("member_id")
+            mid_s = str(mid) if mid is not None else ""
+            name = _member_name_from_truth(members_truth, mid_s) if mid_s else "(unknown)"
             present = "present" if bool(r.get("present")) else "absent"
             note = r.get("note") or ""
-            lines.append(f"{mid}  •  {present}  •  {note}")
+            lines.append(f"{mid_s} • {name} • {present} • {note}")
     pdf_bytes = _make_simple_pdf(f"theyoungshallgrow — Attendance (session {session_id})", lines)
-    return f"Hello 👋🏽 Attendance PDF is ready for session_id={session_id}.", pdf_bytes, f"attendance_session_{int(session_id)}.pdf"
+    return _force_hello_prefix(f"Attendance PDF is ready for session_id={session_id}."), pdf_bytes, f"attendance_session_{int(session_id)}.pdf"
 
 
 # -----------------------------------------------------------------------------
 # Local DB answers (grounded)
 # -----------------------------------------------------------------------------
-def _member_financial_totals(sb_anon, sb_service, schema: str, member_id: str, members_truth: pd.DataFrame) -> Tuple[str, Dict[str, Any]]:
+def _member_financial_totals(
+    sb_anon, sb_service, schema: str, member_id: str, members_truth: pd.DataFrame
+) -> Tuple[str, Dict[str, Any]]:
     name = _member_name_from_truth(members_truth, member_id)
 
     if "v_member_financial_totals" in RELATIONS:
@@ -694,7 +710,7 @@ def _member_financial_totals(sb_anon, sb_service, schema: str, member_id: str, m
                 f"- Active unpaid interest: **{_fmt(row.get('active_unpaid_interest', row.get('unpaid_interest_total', 0)))}**\n"
                 f"- Interest ledger total: **{_fmt(row.get('interest_total', row.get('interest_ledger_total', 0)))}**\n"
             )
-            return msg, {"source": "v_member_financial_totals", "row": row}
+            return _force_hello_prefix(msg), {"source": "v_member_financial_totals", "row": row}
 
     mid_int = int(member_id)
 
@@ -736,10 +752,12 @@ def _member_financial_totals(sb_anon, sb_service, schema: str, member_id: str, m
         f"- Active unpaid interest: **{_fmt(unpaid_interest)}**\n"
         f"- Interest ledger total: **{_fmt(_safe_sum(interest_ledger, int_amt))}**\n"
     )
-    return msg, {"source": "tables_fallback"}
+    return _force_hello_prefix(msg), {"source": "tables_fallback"}
 
 
-def _loans_with_member(sb_anon, sb_service, schema: str, member_id: Optional[str], members_truth: pd.DataFrame) -> Tuple[str, pd.DataFrame, str]:
+def _loans_with_member(
+    sb_anon, sb_service, schema: str, member_id: Optional[str], members_truth: pd.DataFrame
+) -> Tuple[str, pd.DataFrame, str]:
     if "v_loans_with_member" in RELATIONS:
         filters = [("member_id", "eq", int(member_id))] if member_id else None
         df = _sb_select(sb_anon, sb_service, schema, "v_loans_with_member", cols="*", limit=5000, filters=filters)
@@ -777,7 +795,7 @@ def _describe_relation(sb_anon, sb_service, schema: str, relation: str) -> Tuple
     if isinstance(df, tuple): df = df[0]
     cols = list(df.columns) if df is not None else []
     out = pd.DataFrame({"column_name": cols})
-    msg = f"Hello 👋🏽 Columns for **{relation}** ({RELATIONS[relation]['type']}):"
+    msg = _force_hello_prefix(f"Columns for **{relation}** ({RELATIONS[relation]['type']}):")
     return msg, out, f"describe:{relation}"
 
 
@@ -792,7 +810,7 @@ def _show_relation(sb_anon, sb_service, schema: str, relation: str) -> Tuple[str
         except Exception:
             pass
 
-    msg = f"Hello 👋🏽 Preview of **{relation}** ({RELATIONS[relation]['type']}):"
+    msg = _force_hello_prefix(f"Preview of **{relation}** ({RELATIONS[relation]['type']}):")
     return msg, df, f"show:{relation}"
 
 
@@ -889,7 +907,9 @@ def _messages_to_prompt(messages: List[Dict[str, str]]) -> str:
     return "\n".join(out)
 
 
-def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], timeout: int = 60, temperature: float = 0.35) -> Tuple[bool, str]:
+def _hf_router_chat(
+    model: str, token: str, messages: List[Dict[str, str]], timeout: int = 60, temperature: float = 0.35
+) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {"model": model, "messages": messages, "temperature": float(temperature), "max_tokens": 500}
     ok, raw = _post_with_retries(HF_ROUTER_CHAT_URL, headers, payload, timeout=timeout)
@@ -903,7 +923,9 @@ def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], time
         return False, f"Bad HF chat response: {raw[:600]}"
 
 
-def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 60, temperature: float = 0.35) -> Tuple[bool, str]:
+def _hf_router_completions(
+    model: str, token: str, prompt: str, timeout: int = 60, temperature: float = 0.35
+) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {"model": model, "prompt": prompt, "temperature": float(temperature), "max_tokens": 500}
     ok, raw = _post_with_retries(HF_ROUTER_COMPLETIONS_URL, headers, payload, timeout=timeout)
@@ -923,7 +945,7 @@ def _get_hf_model_pool(primary_model: str) -> List[str]:
       1) HF_MODELS_CSV (Railway env var)
       2) HF_MODEL (primary)
       3) HF_FALLBACK_MODELS (curated list)
-    Dedup while keeping order.
+    Dedup while keeping order. Apply denylist.
     """
     pool: List[str] = []
     csv = (os.getenv("HF_MODELS_CSV") or "").strip()
@@ -944,13 +966,18 @@ def _get_hf_model_pool(primary_model: str) -> List[str]:
     seen = set()
     out: List[str] = []
     for m in pool:
-        if m not in seen:
+        if m and m not in seen:
             seen.add(m)
             out.append(m)
+
+    # apply denylist
+    out = [m for m in out if m not in HF_MODEL_DENYLIST]
     return out
 
 
-def _hf_call(model: str, token: str, messages: List[Dict[str, str]], random_route: bool, temperature: float) -> Tuple[bool, str, str, str]:
+def _hf_call(
+    model: str, token: str, messages: List[Dict[str, str]], random_route: bool, temperature: float
+) -> Tuple[bool, str, str, str]:
     """
     Returns: ok, text, mode_used, model_used
     """
@@ -958,6 +985,8 @@ def _hf_call(model: str, token: str, messages: List[Dict[str, str]], random_rout
     prompt = _messages_to_prompt(messages)
 
     model_pool = _get_hf_model_pool(model)
+    if not model_pool:
+        return False, "No HF models available (pool empty).", "failed", ""
 
     # Random routing: choose one model but keep others as fallback
     if random_route and model_pool:
@@ -973,6 +1002,14 @@ def _hf_call(model: str, token: str, messages: List[Dict[str, str]], random_rout
     last_err = ""
     last_mode = "failed"
     last_model = model_order[0] if model_order else ""
+
+    # Treat these as "try next model" errors (important for model_not_supported/provider mismatch)
+    def _should_try_next(err_text: str) -> bool:
+        e = (err_text or "").lower()
+        return any(s in e for s in [
+            "429", "500", "502", "503", "504", "timeout", "server error",
+            "model_not_supported", "not supported by any provider", "invalid_request_error", "param\":\"model\"",
+        ])
 
     for chosen in model_order:
         last_model = chosen
@@ -996,8 +1033,8 @@ def _hf_call(model: str, token: str, messages: List[Dict[str, str]], random_rout
                     return True, txt, "chat", chosen
                 last_err = txt
 
-        err = (last_err or "").lower()
-        if not any(s in err for s in ["429", "500", "502", "503", "504", "timeout", "server error"]):
+        # if model/provider mismatch etc -> try next model; otherwise stop
+        if not _should_try_next(last_err):
             break
 
     return False, last_err or "Unknown HF error", last_mode, last_model
@@ -1043,6 +1080,9 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
 
         with st.expander("🔎 View HF model pool", expanded=False):
             st.write(pool)
+        if HF_MODEL_DENYLIST:
+            with st.expander("⛔ Denylisted HF models", expanded=False):
+                st.write(sorted(HF_MODEL_DENYLIST))
 
     # If a PDF was generated earlier, keep it visible
     if st.session_state.get("younchat_last_pdf_bytes") and st.session_state.get("younchat_last_pdf_name"):
@@ -1087,7 +1127,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     with st.chat_message("user"):
         st.markdown(q)
 
-    # ✅ FIX: set member focus ONLY when user clearly means member id
+    # ✅ Focus: set member focus ONLY when user clearly means member id
     detected_id = _extract_member_id(q)
     t = _lc(q)
     is_explicit_member = ("member" in t and "id" in t) or t.strip().startswith("member")
@@ -1152,7 +1192,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
             answer = "Hello 👋🏽 Say: **attendance pdf session 12**."
         else:
             try:
-                msg, pdf_bytes, filename = _pdf_attendance(sb_anon, sb_service, schema, str(sid))
+                msg, pdf_bytes, filename = _pdf_attendance(sb_anon, sb_service, schema, str(sid), members_truth)
                 st.session_state["younchat_last_pdf_bytes"] = pdf_bytes
                 st.session_state["younchat_last_pdf_name"] = filename
                 answer = msg
@@ -1241,8 +1281,8 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         df_show, df_title = df, title
         answer = f"Hello 👋🏽 {title} (from `{src}`):" if not df.empty else f"Hello 👋🏽 {title}: no rows returned."
 
-    # Member summary (grounded)
-    elif (q.strip().isdigit() and member_id_focus) or t.startswith("member ") or t.startswith("summary "):
+    # Member summary (grounded) ✅ clearer trigger
+    elif q.strip().isdigit() or t.startswith("member ") or t.startswith("summary "):
         mid = _extract_member_id(q) or member_id_focus
         if mid:
             answer, meta = _member_financial_totals(sb_anon, sb_service, schema, str(mid), members_truth)
@@ -1305,6 +1345,10 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
             else:
                 used_source = "local:fallback"
                 answer = "Hello 👋🏽"
+
+    # ✅ enforce Hello salute rule for every assistant output (but keep intro untouched)
+    if answer != _intro_only():
+        answer = _force_hello_prefix(answer)
 
     st.session_state["younchat_history"].append({"role": "assistant", "content": answer})
     with st.chat_message("assistant"):
