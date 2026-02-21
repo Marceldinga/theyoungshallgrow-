@@ -1,3 +1,4 @@
+
 # njangi_llm_panel.py
 # ==============================================================================
 # 👩🏾‍💼 YOUNG — NJANGI “DASHBOARD COPILOT” (SMART • GROUNDED • MODERN • HUMAN-LIKE)
@@ -7,22 +8,21 @@
 # ✅ Safe for Railway / Streamlit Cloud
 # ✅ Accepts: sb_anon / sb_service / schema (matches your app.py)
 #
-# ✅ Human-like “ChatGPT style” behavior (but grounded):
-#   - Greets with *greeting of the day* (morning/afternoon/evening) + small human touch
-#   - Understands many intents and questions
-#   - Uses your LIVE Supabase snapshots to answer (no guessing)
-#   - Smart summaries, missing payers, overdue signals, member drilldowns
+# ✅ REAL TIMEZONE + greeting of the day (via Internet time API):
+#   - Uses worldtimeapi.org to get timezone + current local time (cached)
+#   - Falls back safely to server time if internet fails
 #
-# ✅ Optional Internet search (Tavily) with privacy guard:
-#   - Only searches the web when user starts with: web:
-#   - Never sends Njangi/member finance questions to the web
+# ✅ Internet answers (Tavily):
+#   - You can enable “Internet mode” (answers from web with sources)
+#   - Privacy guard: Njangi/member finance questions NEVER go to the web unless you force “Allow Njangi web”
 #
 # ✅ ML training (XGBoost; no sklearn required) + model risk leaderboard
 # ------------------------------------------------------------------------------
-# ENV:
-#   TAVILY_API_KEY = your Tavily key (Railway Variables)
+# ENV (Railway Variables or Streamlit secrets):
+#   TAVILY_API_KEY = your Tavily key
+# ------------------------------------------------------------------------------
 # DEPENDENCIES:
-#   streamlit, pandas, numpy, xgboost (optional), reportlab (optional elsewhere)
+#   streamlit, pandas, numpy, xgboost(optional)
 # ==============================================================================
 
 from __future__ import annotations
@@ -40,7 +40,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import streamlit as st
 
-
 # ==============================================================================
 # Constants
 # ==============================================================================
@@ -48,44 +47,17 @@ W_STRETCH = "stretch"
 
 TTL_UI = 15
 TTL_WEB = 15 * 60
+TTL_TIME = 10 * 60  # timezone/time refresh cache
 DEFAULT_MAX_ROWS = 5000
 
 TAVILY_ENDPOINT = "https://api.tavily.com/search"
-
+WORLDTIME_API = "https://worldtimeapi.org/api/ip"
 
 # ==============================================================================
 # Helpers (safe + formatting)
 # ==============================================================================
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _local_hour() -> int:
-    # Streamlit runs server-side. This is best-effort.
-    return int(datetime.now().hour)
-
-
-def _greeting_of_day() -> str:
-    h = _local_hour()
-    if h < 12:
-        return "Good morning"
-    if h < 18:
-        return "Good afternoon"
-    return "Good evening"
-
-
-def _tiny_human_touch() -> str:
-    h = _local_hour()
-    # small variation so it feels human, but stable and professional
-    if 5 <= h <= 9:
-        return "Hope your day starts strong."
-    if 10 <= h <= 13:
-        return "Hope your day is going well."
-    if 14 <= h <= 17:
-        return "Hope your afternoon is going smoothly."
-    if 18 <= h <= 22:
-        return "Hope your evening is peaceful."
-    return "Hope everything is okay on your side."
 
 
 def _normalize_text(s: str) -> str:
@@ -175,6 +147,79 @@ def _env_or_secret(key: str, default: str = "") -> str:
 
 
 # ==============================================================================
+# REAL TIMEZONE + Greeting (Internet)
+# ==============================================================================
+@st.cache_data(ttl=TTL_TIME, show_spinner=False)
+def _worldtime_ip_cached() -> dict:
+    """
+    Uses internet to get user's IP-based timezone and local time.
+    Cached to avoid hammering free APIs.
+    """
+    try:
+        req = urllib.request.Request(WORLDTIME_API, headers={"User-Agent": "njangi-young/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+        return json.loads(body) if body else {}
+    except Exception as e:
+        return {"_error": repr(e)}
+
+
+def _get_real_local_time() -> Tuple[str, datetime]:
+    """
+    Returns (timezone_name, local_datetime).
+    If internet fails, falls back to server local time.
+    """
+    data = _worldtime_ip_cached()
+    if isinstance(data, dict) and not data.get("_error"):
+        tzname = str(data.get("timezone") or "").strip() or "Unknown"
+        dt_str = str(data.get("datetime") or "").strip()
+        try:
+            # worldtimeapi gives ISO8601 with offset
+            dt = pd.to_datetime(dt_str, utc=True, errors="coerce")
+            if pd.isna(dt):
+                raise ValueError("bad datetime")
+            # Convert to the API-provided timezone for display
+            # (pandas can localize by name in many environments; if not, keep offset)
+            try:
+                dt_local = dt.tz_convert(tzname).to_pydatetime()
+            except Exception:
+                dt_local = dt.to_pydatetime()
+            return tzname, dt_local
+        except Exception:
+            pass
+
+    # fallback
+    return "ServerTime", datetime.now()
+
+
+def _greeting_of_day() -> Tuple[str, str]:
+    """
+    Returns (greeting, tzname) using real timezone (internet).
+    """
+    tzname, dt_local = _get_real_local_time()
+    h = int(dt_local.hour)
+    if h < 12:
+        greet = "Good morning"
+    elif h < 18:
+        greet = "Good afternoon"
+    else:
+        greet = "Good evening"
+    return greet, tzname
+
+
+def _tiny_human_touch(h: int) -> str:
+    if 5 <= h <= 9:
+        return "Hope your day starts strong."
+    if 10 <= h <= 13:
+        return "Hope your day is going well."
+    if 14 <= h <= 17:
+        return "Hope your afternoon is going smoothly."
+    if 18 <= h <= 22:
+        return "Hope your evening is peaceful."
+    return "Hope everything is okay on your side."
+
+
+# ==============================================================================
 # Safe Supabase reads (no cache decorators w/ client)
 # ==============================================================================
 def _try_read(
@@ -210,11 +255,14 @@ def _try_read(
 # Persona text (human-like greeting + smart instructions)
 # ==============================================================================
 def _young_intro() -> str:
-    greet = _greeting_of_day()
-    touch = _tiny_human_touch()
+    tzname, dt_local = _get_real_local_time()
+    h = int(dt_local.hour)
+    greet, _tz = _greeting_of_day()
+    touch = _tiny_human_touch(h)
     return (
         f"{greet} 👋🏾 I’m **Young** — your **Njangi Dashboard Copilot** for **theyoungshallgrow**.\n\n"
         f"_{touch}_\n\n"
+        f"🕒 Timezone: **{tzname}** • Local time: **{dt_local.strftime('%Y-%m-%d %H:%M')}**\n\n"
         "I’m grounded on your **Supabase data** (members, sessions, contributions, loans, payments, interest, fines, "
         "attendance, minutes, payouts).\n\n"
         "**Ask me anything like:**\n"
@@ -224,23 +272,25 @@ def _young_intro() -> str:
         "• Fines summary / Attendance vs fines\n"
         "• Risk for Donald / Top 5 risky members\n"
         "• Show member Marcel loans / loan 12 status\n\n"
-        "🌐 **Internet help:** start with `web:` (example: `web: Maryland cosmetology license requirements`).\n"
-        "🔒 Privacy: I won’t web-search your Njangi/member finance questions."
+        "🌐 Internet: turn on **Internet mode** in the sidebar (I’ll answer with sources).\n"
+        "🔒 Privacy: by default I won’t web-search your Njangi/member finance questions."
     )
 
 
 def _welcome_card(schema: str):
-    greet = _greeting_of_day()
+    tzname, dt_local = _get_real_local_time()
+    greet, _ = _greeting_of_day()
     st.markdown(
         f"""
         <div style="padding:14px;border-radius:16px;border:1px solid rgba(255,255,255,.12);
                     background:rgba(255,255,255,.04);">
           <div style="font-size:18px;font-weight:750;">👩🏾‍💼 Young is online</div>
           <div style="opacity:.92;margin-top:6px;">
-            {greet} — I’m connected to your Njangi snapshots and ready.
+            {greet} — connected to your Njangi snapshots and ready.
           </div>
           <div style="opacity:.70;margin-top:6px;font-size:12px;">
-            schema: <code>{schema}</code> • timestamp: <code>{_now_iso()}</code>
+            timezone: <code>{tzname}</code> • local: <code>{dt_local.strftime('%Y-%m-%d %H:%M')}</code><br/>
+            schema: <code>{schema}</code> • utc: <code>{_now_iso()}</code>
           </div>
         </div>
         """,
@@ -268,7 +318,7 @@ TABLE_SPECS = [
     ("fines", "*", "created_at", ["amount"]),
     ("attendance", "*", "created_at", []),
     ("minutes", "*", "created_at", []),
-    ("payouts", "*", "created_at", []),   # optional, if exists
+    ("payouts", "*", "created_at", []),   # optional
     ("app_state", "*", "created_at", []),
     ("signatures", "*", "created_at", []),
 ]
@@ -391,9 +441,6 @@ def _who_label(member_id: int | None, member_name: str | None) -> str:
 def _detect_intent(question: str) -> str:
     q = _normalize_text(question)
 
-    if q.startswith("web:") or q.startswith("internet:") or q.startswith("tavily:"):
-        return "web"
-
     if any(k in q for k in ["introduce", "who are you", "your name"]):
         return "intro"
     if any(k in q for k in ["help", "what can you do", "commands", "examples"]):
@@ -468,7 +515,6 @@ def _answer_generic(question: str, hub: Dict[str, pd.DataFrame], member_id: int 
     q = _normalize_text(question)
     who = _who_label(member_id, member_name)
 
-    # pick a table by keywords
     if "loan" in q:
         table = "loans"
     elif "contrib" in q:
@@ -494,7 +540,6 @@ def _answer_generic(question: str, hub: Dict[str, pd.DataFrame], member_id: int 
     if df is None or df.empty:
         return (f"I don’t see data in `{table}` for {who}. If this table is empty or blocked by RLS, I’ll still answer other questions.", None)
 
-    # totals
     if any(k in q for k in ["total", "sum"]):
         amt_col = None
         for c in ["amount", "principal_current", "principal", "total_due", "unpaid_interest"]:
@@ -505,11 +550,9 @@ def _answer_generic(question: str, hub: Dict[str, pd.DataFrame], member_id: int 
             total = _safe_sum(df, amt_col)
             return (f"For {who} in `{table}`: total **{amt_col}** = **{_money(total)}** (rows={len(df):,}).", None)
 
-    # count
     if any(k in q for k in ["count", "how many", "rows"]):
         return (f"For {who} in `{table}`: I see **{len(df):,}** rows.", None)
 
-    # top N
     if "top" in q or "highest" in q:
         n = 5
         m = re.search(r"top\s+(\d+)", q)
@@ -525,7 +568,6 @@ def _answer_generic(question: str, hub: Dict[str, pd.DataFrame], member_id: int 
         top_df = _df_top_n(df, col, n=n, asc=False)
         return (f"Top **{n}** rows in `{table}` for {who} by **{col}**:", top_df)
 
-    # latest
     if any(k in q for k in ["latest", "recent", "last"]):
         dcol = _df_best_date_col(df)
         if not dcol:
@@ -535,7 +577,6 @@ def _answer_generic(question: str, hub: Dict[str, pd.DataFrame], member_id: int 
         tmp = tmp.dropna(subset=["_dt"]).sort_values("_dt", ascending=False).drop(columns=["_dt"])
         return (f"Most recent rows in `{table}` for {who} (sorted by `{dcol}`):", tmp.head(15))
 
-    # list/show
     if any(k in q for k in ["list", "show"]):
         return (f"Here are rows from `{table}` for {who}:", df.head(25))
 
@@ -544,7 +585,7 @@ def _answer_generic(question: str, hub: Dict[str, pd.DataFrame], member_id: int 
 
 
 # ==============================================================================
-# Web Search (Tavily) — only when user starts with `web:`
+# Internet Search (Tavily)
 # ==============================================================================
 @st.cache_data(ttl=TTL_WEB, show_spinner=False)
 def _tavily_search_cached(query: str, api_key: str, max_results: int = 5) -> dict:
@@ -584,7 +625,7 @@ def _format_web_result(res: dict) -> Tuple[str, List[dict]]:
     answer = str(res.get("answer") or "").strip()
     results = res.get("results") or []
     sources = []
-    for it in results[:5]:
+    for it in results[:6]:
         if not isinstance(it, dict):
             continue
         sources.append(
@@ -600,9 +641,18 @@ def _format_web_result(res: dict) -> Tuple[str, List[dict]]:
     return (answer, sources)
 
 
-def _extract_web_query(q: str) -> str:
-    q2 = q.strip()
-    return re.sub(r"^(web:|internet:|tavily:)\s*", "", q2, flags=re.IGNORECASE).strip()
+def _is_njangi_sensitive(q: str) -> bool:
+    """
+    Privacy guard: if question looks like Njangi finance/member data, don't send to web by default.
+    """
+    qn = _normalize_text(q)
+    keywords = [
+        "njangi", "theyoungshallgrow", "member", "members", "loan", "loans",
+        "contribution", "contributions", "foundation", "fine", "fines",
+        "attendance", "minutes", "payout", "interest", "ledger", "supabase",
+        "session", "cycle", "member_id", "principal", "balance", "paid",
+    ]
+    return any(k in qn for k in keywords)
 
 
 # ==============================================================================
@@ -612,7 +662,7 @@ def _answer_grounded(
     question: str,
     hub: Dict[str, pd.DataFrame],
     selected_member_id: int | None,
-    selected_member_name: str | None,
+    selected_member_name: int | None,
     loan_filter: str,
 ) -> Tuple[str, pd.DataFrame | None, List[dict] | None]:
     qraw = question.strip()
@@ -638,7 +688,7 @@ def _answer_grounded(
     q_member_id, q_member_name = _pick_member_from_question(qraw, members_df)
     member_id = q_member_id if q_member_id is not None else selected_member_id
     member_name = q_member_name if q_member_name is not None else selected_member_name
-    who = _who_label(member_id, member_name)
+    who = _who_label(member_id, member_name if isinstance(member_name, str) else None)
 
     loan_id = _pick_int_from_text(qraw, "loan")
     session_id = _pick_int_from_text(qraw, "session")
@@ -658,22 +708,16 @@ def _answer_grounded(
 
     if intent == "help":
         return (
-            "Here are examples you can ask:\n"
+            "Examples you can ask:\n"
             "• **Loans summary** / **Active loans** / **Overdue loans**\n"
             "• **Who hasn’t paid this session?**\n"
             "• **Foundation total** / **Interest collected this month**\n"
             "• **Fines summary** / **Attendance vs fines**\n"
             "• **Risk for Donald** / **Top 5 risky members**\n"
-            "• **Show member Marcel loans** / **loan 12 status**\n\n"
-            "Internet:\n"
-            "• Start with **web:** to search online.\n",
+            "• **Show member Marcel loans** / **loan 12 status**\n",
             None,
             None,
         )
-
-    # Web intent handled elsewhere, but keep safe fallback
-    if intent == "web":
-        return ("To use the internet, start your message with **web:** (example: `web: ...`).", None, None)
 
     # Member filtered frames
     mc = _maybe_filter_member(contrib_df, member_id)
@@ -734,7 +778,6 @@ def _answer_grounded(
 
     # Missing contributions (current session from app_state if possible)
     if intent == "missing_contrib":
-        # current session id
         current_session = None
         if app_state_df is not None and not app_state_df.empty:
             row0 = app_state_df.iloc[0].to_dict()
@@ -771,7 +814,6 @@ def _answer_grounded(
             None,
         )
 
-    # Contributions
     if intent == "contributions":
         total = _safe_sum(mc, "amount")
         return (
@@ -783,7 +825,6 @@ def _answer_grounded(
             None,
         )
 
-    # Foundation
     if intent == "foundation":
         total = _safe_sum(mfd, "amount")
         return (
@@ -794,7 +835,6 @@ def _answer_grounded(
             None,
         )
 
-    # Loans summary
     if intent == "loans":
         ml = ml_all.copy() if ml_all is not None else pd.DataFrame()
         if ml is not None and not ml.empty:
@@ -810,7 +850,6 @@ def _answer_grounded(
         unpaid = _safe_sum(ml, "unpaid_interest")
         due = _safe_sum(ml, "total_due")
 
-        # smart note: last paid age
         note = ""
         if ml is not None and not ml.empty and "last_paid_at" in ml.columns:
             lp = pd.to_datetime(ml["last_paid_at"], errors="coerce", utc=True)
@@ -831,7 +870,6 @@ def _answer_grounded(
             None,
         )
 
-    # Overdue
     if intent == "overdue":
         if ml_all is None or ml_all.empty:
             return (f"I can’t see loans for {who}.", None, None)
@@ -842,7 +880,6 @@ def _answer_grounded(
 
         od = tmp[tmp["status_norm"].isin(["overdue", "late", "default", "delinquent"])].copy()
 
-        # heuristic: active + last_paid_at older than 30 days
         if od.empty and "last_paid_at" in tmp.columns:
             t2 = tmp[tmp["status_norm"] == "active"].copy()
             lp = pd.to_datetime(t2["last_paid_at"], errors="coerce", utc=True)
@@ -855,13 +892,11 @@ def _answer_grounded(
         show_cols = [c for c in ["id", "member_id", "principal_current", "unpaid_interest", "last_paid_at", "status"] if c in od.columns]
         return (f"Overdue / late loans for {who}:", (od[show_cols].head(30) if show_cols else od.head(30)), None)
 
-    # Payments
     if intent == "loan_payments":
         if mpay is None or mpay.empty:
             return (f"I don’t see loan payment rows for {who}.", None, None)
         return (f"Most recent loan payments for {who}:", mpay.head(25), None)
 
-    # Interest
     if intent == "interest":
         if mint is None or mint.empty:
             return (f"I don’t see interest ledger rows for {who}.", None, None)
@@ -875,7 +910,6 @@ def _answer_grounded(
             None,
         )
 
-    # Fines
     if intent == "fines":
         if mf is None or mf.empty:
             return (f"I don’t see fines for {who}.", None, None)
@@ -888,19 +922,16 @@ def _answer_grounded(
             None,
         )
 
-    # Attendance
     if intent == "attendance":
         if att_df is None or att_df.empty:
             return ("I don’t see attendance records yet.", None, None)
         return ("Here are recent attendance rows:", att_df.head(25), None)
 
-    # Minutes
     if intent == "minutes":
         if minutes_df is None or minutes_df.empty:
             return ("I don’t see minutes saved yet.", None, None)
         return ("Here are recent minutes rows:", minutes_df.head(25), None)
 
-    # Payouts
     if intent == "payouts":
         if payouts_df is not None and not payouts_df.empty:
             return ("Here are recent payouts rows:", payouts_df.head(25), None)
@@ -908,11 +939,8 @@ def _answer_grounded(
             return ("I don’t see `payouts` rows, but here is `app_state` (look for rotation fields):", app_state_df.head(50), None)
         return ("I can’t see payouts/app_state data yet.", None, None)
 
-    # Risk (heuristic always available; model risk available if trained)
     if intent == "risk":
-        # if user asked "top 5 risky", we do leaderboard
         if ("top" in qn and "risky" in qn) or ("top" in qn and "risk" in qn):
-            # heuristic risk per member (max over loans)
             loans = hub.get("loans", pd.DataFrame())
             if loans is None or loans.empty or "member_id" not in loans.columns:
                 return ("Not enough loans data to compute top risks.", None, None)
@@ -932,7 +960,6 @@ def _answer_grounded(
                 except Exception:
                     n = 5
             bym = bym.head(n)
-            # attach names
             mdf = hub.get("members", pd.DataFrame())
             if mdf is not None and not mdf.empty and "id" in mdf.columns:
                 names = _build_member_labels(mdf)[["id", "member_name"]].rename(columns={"id": "member_id"})
@@ -941,7 +968,6 @@ def _answer_grounded(
                 bym = bym.merge(names, on="member_id", how="left")
             return (f"Top **{n}** risky members (heuristic from loans snapshot):", bym, None)
 
-        # single member risk view
         total_contrib = _safe_sum(mc, "amount")
         bal = _safe_sum(ml_all, "principal_current")
         unpaid = _safe_sum(ml_all, "unpaid_interest")
@@ -971,7 +997,7 @@ def _answer_grounded(
             f"Risk view for {who} (from current DB snapshot):\n"
             f"• Balance: **{_money(bal)}** • Unpaid interest: **{_money(unpaid)}** • Fines: **{_money(fines_total)}**\n"
             f"• Quick risk score (heuristic): **{score}/100**\n\n"
-            "If you want model-based risk, run **Training (XGBoost)** below, then ask: `top 5 risky members (model)`.",
+            "If you want model-based risk, run **Training (XGBoost)** below.",
             None,
             None,
         )
@@ -982,7 +1008,7 @@ def _answer_grounded(
         return ("Recent sessions:", sessions_df.head(20), None)
 
     if intent == "generic":
-        txt, df_show = _answer_generic(qraw, hub, member_id, member_name)
+        txt, df_show = _answer_generic(qraw, hub, member_id, member_name if isinstance(member_name, str) else None)
         return (txt, df_show, None)
 
     return (
@@ -1076,7 +1102,10 @@ def _build_training_frame(hub: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     keep = [c for c in keep if c in df.columns]
     df = df[keep].copy()
 
-    for c in ["principal", "principal_current", "total_due", "unpaid_interest", "days_since_last_paid", "member_contrib_total", "member_fines_total", "member_loan_count"]:
+    for c in [
+        "principal", "principal_current", "total_due", "unpaid_interest",
+        "days_since_last_paid", "member_contrib_total", "member_fines_total", "member_loan_count"
+    ]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
@@ -1125,7 +1154,6 @@ def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
 
     rng = np.random.default_rng(int(seed))
 
-    # tiny set -> train all
     if len(y_all) < 8 or min(counts) < 2:
         model.fit(X_all, y_all)
         out = df.copy()
@@ -1142,7 +1170,6 @@ def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
         }
         return model, metrics, feature_cols, out
 
-    # manual stratified split
     idx0 = np.where(y_all == 0)[0]
     idx1 = np.where(y_all == 1)[0]
     rng.shuffle(idx0)
@@ -1208,7 +1235,7 @@ def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
 # ==============================================================================
 def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public"):
     st.title("👩🏾‍💼 Young — Njangi Dashboard Copilot")
-    st.caption("Smart grounded Q&A over Njangi data + optional Internet (`web:`) + optional XGBoost training.")
+    st.caption("Smart grounded Q&A over Njangi data + REAL timezone greeting + Internet mode + optional XGBoost training.")
 
     sb_read = sb_service if sb_service is not None else sb_anon
 
@@ -1217,12 +1244,26 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
         slow_mode = st.checkbox("🐢 Slow Mode (reduce DB pressure)", value=True)
         max_rows = st.slider("Max rows per table", 500, 10000, DEFAULT_MAX_ROWS, 500)
 
+        st.markdown("---")
+        st.subheader("🕒 Timezone (real)")
+        if st.button("♻️ Refresh timezone/time", width=W_STRETCH):
+            try:
+                _worldtime_ip_cached.clear()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            st.rerun()
+        tzname, dt_local = _get_real_local_time()
+        st.write(f"Timezone: **{tzname}**")
+        st.caption(f"Local time: {dt_local.strftime('%Y-%m-%d %H:%M')}")
+
         tavily_key = _env_or_secret("TAVILY_API_KEY", "")
         web_ready = _looks_like_key(tavily_key)
+
         st.markdown("---")
         st.subheader("🌐 Internet")
-        st.write(f"Key detected: **{'YES' if web_ready else 'NO'}**")
-        st.caption("Internet search runs only when you type `web:` at the start.")
+        st.write(f"Tavily key detected: **{'YES' if web_ready else 'NO'}**")
+        internet_mode = st.checkbox("✅ Internet mode (answer from web when needed)", value=True)
+        allow_njangi_web = st.checkbox("⚠️ Allow Njangi web (NOT recommended)", value=False)
         max_sources = st.slider("Web sources", 2, 8, 5, 1)
 
         st.markdown("---")
@@ -1257,7 +1298,7 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
 
     # Member selection
     selected_member_id = None
-    selected_member_name = None
+    selected_member_name: Optional[str] = None
     if members_df is not None and not members_df.empty and "id" in members_df.columns:
         m = _build_member_labels(members_df)
         m["label"] = m.apply(lambda r: f"{int(r['id']):02d} • {str(r.get('member_name') or '').strip()}", axis=1)
@@ -1378,21 +1419,21 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
     st.markdown("### 💬 Chat with Young")
 
     if "young_chat" not in st.session_state:
-        st.session_state["young_chat"] = [{"role": "assistant", "content": _young_intro()}]
+        st.session_state["young_chat"] = [{"role": "assistant", "content": _young_intro(), "sources": []}]
 
     bar1, bar2, bar3 = st.columns([1, 1, 2])
     with bar1:
         if st.button("🧹 Clear chat", width=W_STRETCH):
-            st.session_state["young_chat"] = [{"role": "assistant", "content": _young_intro()}]
+            st.session_state["young_chat"] = [{"role": "assistant", "content": _young_intro(), "sources": []}]
             st.rerun()
     with bar2:
         if st.button("👋 Greeting", width=W_STRETCH):
-            st.session_state["young_chat"].append({"role": "assistant", "content": _young_intro()})
+            st.session_state["young_chat"].append({"role": "assistant", "content": _young_intro(), "sources": []})
             st.rerun()
     with bar3:
-        st.caption("Tip: DB questions stay grounded. Internet needs `web:`.")
+        st.caption("Internet mode: ON means I can answer general questions from the web (with sources).")
 
-    for msg in st.session_state["young_chat"][-20:]:
+    for msg in st.session_state["young_chat"][-25:]:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             if msg.get("sources"):
@@ -1409,25 +1450,11 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
                     if snippet:
                         st.caption(snippet)
 
-    user_text = st.chat_input("Ask Young… (example: “who hasn’t paid this session?”, “risk for Donald”, “web: Maryland cosmetology license requirements”)")
+    user_text = st.chat_input("Ask Young… (Njangi questions stay grounded. Internet mode answers general questions with sources.)")
     if user_text:
-        st.session_state["young_chat"].append({"role": "user", "content": user_text})
+        st.session_state["young_chat"].append({"role": "user", "content": user_text, "sources": []})
 
-        # WEB route (ONLY if user starts with web:)
-        if _normalize_text(user_text).startswith(("web:", "internet:", "tavily:")):
-            api_key = _env_or_secret("TAVILY_API_KEY", "")
-            if not _looks_like_key(api_key):
-                assistant_text = "Internet is not ready. Add **TAVILY_API_KEY** in Railway Variables (or Streamlit secrets) and redeploy."
-                st.session_state["young_chat"].append({"role": "assistant", "content": assistant_text, "sources": []})
-                st.rerun()
-
-            q_web = _extract_web_query(user_text)
-            res = _tavily_search_cached(query=q_web, api_key=api_key, max_results=int(max_sources))
-            answer, sources = _format_web_result(res)
-            st.session_state["young_chat"].append({"role": "assistant", "content": answer, "sources": sources})
-            st.rerun()
-
-        # GROUNDED route
+        # 1) Always try GROUNDED first
         answer, df_show, _ = _answer_grounded(
             question=user_text,
             hub=hub,
@@ -1436,13 +1463,34 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
             loan_filter=loan_filter,
         )
 
-        # store assistant answer (and show df separately)
-        st.session_state["young_chat"].append({"role": "assistant", "content": answer})
+        # 2) If unknown/generic and Internet mode is ON, do web search
+        do_web = False
+        qn = _normalize_text(user_text)
+        if internet_mode and web_ready:
+            # if question is Njangi-sensitive, only web-search if user allowed it
+            if _is_njangi_sensitive(user_text) and not allow_njangi_web:
+                do_web = False
+            else:
+                # Use web if grounded answer looks like "tell me what you want" or "examples"
+                if any(k in _normalize_text(answer) for k in ["tell me what you want", "examples:", "type help"]):
+                    do_web = True
+
+        if do_web:
+            res = _tavily_search_cached(query=user_text, api_key=tavily_key, max_results=int(max_sources))
+            web_answer, sources = _format_web_result(res)
+            st.session_state["young_chat"].append({"role": "assistant", "content": web_answer, "sources": sources})
+            st.rerun()
+
+        # Grounded answer
+        st.session_state["young_chat"].append({"role": "assistant", "content": answer, "sources": []})
+
+        # Show dataframe (if any) right after the answer
+        if df_show is not None and isinstance(df_show, pd.DataFrame) and not df_show.empty:
+            st.session_state["young_chat"].append({"role": "assistant", "content": "Here’s the table I used:", "sources": []})
+            with st.chat_message("assistant"):
+                st.dataframe(df_show, width=W_STRETCH, hide_index=True)
+
         st.rerun()
 
-    # Optional: show last computed dataframe below chat (clean UI)
-    last_df = None
-    # If you want to display df inline, you can set it in state; keeping simple for stability.
 
-
-__all__ = ["render_njangi_llm_panel", "render_njangi_llm_panel"]
+__all__ = ["render_njangi_llm_panel"]
