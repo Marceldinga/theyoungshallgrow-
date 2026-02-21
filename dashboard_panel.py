@@ -1,33 +1,31 @@
 
-# dashboard_panel.py ✅ COMPLETE SINGLE FILE (FIXED + CLEAN)
-# --------------------------------------------------------
+# dashboard_panel.py ✅ COMPLETE SINGLE FILE — CLEAN Dashboard + 🤖 Young AI (grounded) + Safe Nav
+# ---------------------------------------------------------------------------------------------
 # ✅ NJANGI STANDARD (NO legacy)
 # ✅ CLEAN DASHBOARD (your request):
-#   - NO extra text at top (no status lines, no "modern analytics" banner)
-#   - Only: KPIs + Attendance + younchat Dashboard AI box
+#   - Only KPIs + Attendance + Young AI box
+#   - No extra banners/status text at the top
 #
-# ✅ Dashboard AI = younchat (your style):
-#   - Salute is always: "Hello"
-#   - Modern intro (short)
-#   - Grounded answers ONLY from LIVE snapshot (no guessing)
-#   - Optional: HF Router for nicer wording (still grounded on snapshot)
-#   - Optional: Tavily web search ONLY when query starts with "web:"
+# ✅ Young AI behavior (your request):
+#   - Uses name: "Young"
+#   - Responses MUST match the question asked (no random answers)
+#   - ChatGPT-standard style: short + direct + grounded
+#   - Grounded ONLY on LIVE snapshot (no guessing)
+#   - Optional HF Router for nicer wording (still grounded)
+#   - Optional Tavily web search ONLY when query starts with "web:"
 #
 # ✅ Safe navigation buttons:
 #   - Buttons set st.session_state["page"] then st.rerun()
-#   - Make sure your app.py uses EXACT page labels (match your sidebar labels)
+#   - Page labels MUST match your app.py sidebar labels exactly.
 #
-# ✅ SAFE IMPORT FIX:
-#   - APIError import is wrapped (prevents crashes if postgrest differs)
-#
-# Optional Railway Variables:
-#   LOCAL_TZ=America/Chicago (or America/New_York)
-#   TAVILY_API_KEY=...
+# Optional env vars:
+#   LOCAL_TZ=America/Chicago
 #   HF_TOKEN=...
 #   HF_MODEL=meta-llama/Meta-Llama-3-8B-Instruct
 #   HF_FORCE_MODE=auto|chat|completions
+#   TAVILY_API_KEY=...
 #
-# Requirements (optional):
+# Optional requirements:
 #   pip install requests
 
 from __future__ import annotations
@@ -42,13 +40,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import streamlit as st
 
-# ✅ SAFE import (fix)
+# SAFE import for APIError
 try:
     from postgrest.exceptions import APIError
 except Exception:
     APIError = Exception  # type: ignore
 
-# ✅ requests optional
+# requests optional
 try:
     import requests
 except Exception:
@@ -58,11 +56,11 @@ except Exception:
 # ============================================================
 # SETTINGS
 # ============================================================
-AUTO_CREATE_SESSION_IF_NONE = False  # set True only if you want to auto-create sessions
+AUTO_CREATE_SESSION_IF_NONE = False  # set True only if you want auto-create sessions
 
 
 # ============================================================
-# LOCAL TIMEZONE (for human-touch line only)
+# LOCAL TIMEZONE (only for 1 human-touch line)
 # ============================================================
 def _local_now() -> datetime:
     tz_name = (os.getenv("LOCAL_TZ", "") or "America/Chicago").strip()
@@ -73,8 +71,7 @@ def _local_now() -> datetime:
         return datetime.now(timezone.utc)
 
 
-def _greeting_of_day() -> str:
-    # Your requirement: salute must ALWAYS be Hello
+def _hello() -> str:
     return "Hello"
 
 
@@ -111,7 +108,7 @@ def _api_msg(e: Exception) -> str:
 
 
 # ============================================================
-# LIGHT THROTTLE (uses app.py session_state if present)
+# THROTTLE (respects app.py session_state knobs if present)
 # ============================================================
 def _throttle_db():
     slow = bool(st.session_state.get("_slow_mode_override", True))
@@ -126,6 +123,9 @@ def _throttle_db():
     st.session_state["_last_db_call_ts"] = time.time()
 
 
+# ============================================================
+# SAFE DB HELPERS
+# ============================================================
 def _safe_select(
     client,
     schema: str,
@@ -231,17 +231,13 @@ def _get_latest_session_id(sb_read, schema: str) -> Optional[int]:
     if sb_read is None:
         return None
 
-    # sessions.id
-    rows = _safe_select(sb_read, schema, "sessions", "id,created_at", order_by="id", desc=True, limit=1, show_error=False)
+    rows = _safe_select(sb_read, schema, "sessions", "id,created_at", order_by="id", desc=True, limit=1)
     if rows and rows[0].get("id") is not None:
         sid = _resolve_session_id(rows[0].get("id"))
         if sid is not None:
             return sid
 
-    # fallback sessions.session_id
-    rows = _safe_select(
-        sb_read, schema, "sessions", "session_id,created_at", order_by="session_id", desc=True, limit=1, show_error=False
-    )
+    rows = _safe_select(sb_read, schema, "sessions", "session_id,created_at", order_by="session_id", desc=True, limit=1)
     if rows and rows[0].get("session_id") is not None:
         sid = _resolve_session_id(rows[0].get("session_id"))
         if sid is not None:
@@ -254,7 +250,7 @@ def _ensure_current_session(sb_anon, sb_service, schema: str) -> Tuple[Optional[
     sb_read = sb_service if sb_service is not None else sb_anon
     sb_write = sb_service
 
-    app_state_rows = _safe_select(sb_read, schema, "app_state", "id,current_session_id", limit=1, show_error=False)
+    app_state_rows = _safe_select(sb_read, schema, "app_state", "id,current_session_id", limit=1)
     app_state = app_state_rows[0] if app_state_rows else {}
     app_state_id = app_state.get("id")
     current_sid = _resolve_session_id(app_state.get("current_session_id"))
@@ -295,7 +291,7 @@ def _ensure_current_session(sb_anon, sb_service, schema: str) -> Tuple[Optional[
 
 
 # ============================================================
-# WEB SEARCH (Tavily)
+# WEB SEARCH (Tavily) — ONLY when user types "web:"
 # ============================================================
 def _has_tavily_key() -> bool:
     return bool(os.getenv("TAVILY_API_KEY", "").strip())
@@ -353,17 +349,13 @@ def _format_web_results(tav: Dict[str, Any]) -> Tuple[str, List[Dict[str, str]]]
         if url:
             sources.append({"title": title, "url": url})
 
-    summary = "Here’s what I found online (top results):\n" + ("\n".join(bullets[:3]) if bullets else "• (No snippets returned)")
+    summary = "Here’s what I found online:\n" + ("\n".join(bullets[:3]) if bullets else "• (No snippets returned)")
     return (summary, sources)
 
 
 # ============================================================
-# HF ROUTER (optional) — better wording, STILL grounded on snapshot
+# HF ROUTER (optional) — nicer wording, STILL grounded on snapshot
 # ============================================================
-HF_ROUTER_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
-HF_ROUTER_COMPLETIONS_URL = "https://router.huggingface.co/v1/completions"
-
-
 def _has_hf_token() -> bool:
     return bool((os.getenv("HF_TOKEN") or "").strip())
 
@@ -398,7 +390,7 @@ def _post_with_retries(url: str, headers: dict, payload: dict, timeout: int = 60
 
 def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], timeout: int = 60) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "temperature": 0.2, "max_tokens": 400}
+    payload = {"model": model, "messages": messages, "temperature": 0.15, "max_tokens": 220}
     ok, raw = _post_with_retries(HF_ROUTER_CHAT_URL, headers, payload, timeout=timeout)
     if not ok:
         return False, raw
@@ -412,7 +404,7 @@ def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], time
 
 def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 60) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": model, "prompt": prompt, "temperature": 0.2, "max_tokens": 400}
+    payload = {"model": model, "prompt": prompt, "temperature": 0.15, "max_tokens": 220}
     ok, raw = _post_with_retries(HF_ROUTER_COMPLETIONS_URL, headers, payload, timeout=timeout)
     if not ok:
         return False, raw
@@ -425,14 +417,18 @@ def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 6
 
 
 def _snapshot_prompt(snapshot: Dict[str, Any], question: str) -> str:
+    # This prompt forces the model to answer ONLY the question asked.
     return (
-        "You are younchat inside a dashboard.\n"
-        "You MUST answer using ONLY the provided DASHBOARD_SNAPSHOT JSON.\n"
-        "If missing, say what is missing.\n"
-        "Never invent numbers.\n\n"
+        "You are Young, an assistant inside a dashboard.\n"
+        "Rules:\n"
+        "- Use ONLY the DASHBOARD_SNAPSHOT.\n"
+        "- Answer ONLY what the user asked. Do not add unrelated facts.\n"
+        "- If the answer is not in snapshot, say: 'I don’t have that in this snapshot.'\n"
+        "- Never invent numbers.\n"
+        "- Keep it short.\n\n"
         f"DASHBOARD_SNAPSHOT:\n{json.dumps(snapshot, ensure_ascii=False)}\n\n"
         f"USER_QUESTION:\n{question}\n\n"
-        "Answer now, grounded on the snapshot:"
+        "Now answer:"
     )
 
 
@@ -444,9 +440,10 @@ def _hf_grounded_answer(question: str, snapshot: Dict[str, Any]) -> Tuple[bool, 
         return False, "HF_TOKEN missing", "hf:missing"
 
     sys = (
-        "You are younchat.\n"
-        "Start with 'Hello 👋🏽'. Keep it modern.\n"
-        "Answer ONLY from DASHBOARD_SNAPSHOT. No guessing.\n"
+        "You are Young.\n"
+        "Start every answer with: 'Hello 👋🏽'.\n"
+        "Answer ONLY from DASHBOARD_SNAPSHOT. Answer ONLY the question asked.\n"
+        "Keep it short, like ChatGPT.\n"
     )
     messages = [
         {"role": "system", "content": sys},
@@ -470,9 +467,9 @@ def _hf_grounded_answer(question: str, snapshot: Dict[str, Any]) -> Tuple[bool, 
 
 
 # ============================================================
-# younchat — grounded rules (always available)
+# Young — local grounded rules (fallback)
 # ============================================================
-def _youn_answer_rules(q: str, snap: Dict[str, Any]) -> str:
+def _young_answer_rules(q: str, snap: Dict[str, Any]) -> str:
     t = (q or "").strip().lower()
 
     session_id = snap.get("session_id")
@@ -497,72 +494,54 @@ def _youn_answer_rules(q: str, snap: Dict[str, Any]) -> str:
         except Exception:
             return str(x)
 
+    # Only answer what is asked (simple intent checks)
     if not t:
-        return "Hello 👋🏽 Ask me: **pot this session**, **loans summary**, **fines total**, or **attendance summary**."
+        return "Hello 👋🏽 Ask a question about this dashboard snapshot."
 
-    if "session" in t and ("id" in t or "which" in t):
-        return f"Hello 👋🏽 Current **Session ID** is **{session_id}**."
+    if "total members" in t or ("members" in t and "total" in t):
+        return f"Hello 👋🏽 Total members: **{total_members}**."
+
+    if t.strip() in {"members", "member"}:
+        return f"Hello 👋🏽 Total members: **{total_members}**."
+
+    if "members paid" in t or ("paid" in t and "members" in t):
+        return f"Hello 👋🏽 Members paid: **{members_paid}/{total_members}**."
+
+    if "session" in t and "id" in t:
+        return f"Hello 👋🏽 Session ID: **{session_id}**."
 
     if "pot" in t:
-        return (
-            f"Hello 👋🏽 Here’s your snapshot:\n\n"
-            f"- **Pot (Session {session_id})**: **{money(pot)}**\n"
-            f"- **Members paid**: **{members_paid}/{total_members}**\n"
-            f"- **Cycle contributions total**: **{money(cycle_total)}**"
-        )
+        return f"Hello 👋🏽 Current pot (Session {session_id}): **{money(pot)}**."
 
-    if "contribution" in t or "cycle" in t:
-        return (
-            f"Hello 👋🏽 Cycle contributions (Session {session_id}) = **{money(cycle_total)}**.\n\n"
-            f"Members paid: **{members_paid}/{total_members}**."
-        )
+    if "cycle" in t and "contribution" in t:
+        return f"Hello 👋🏽 Cycle contributions (Session {session_id}): **{money(cycle_total)}**."
 
-    if "attendance" in t or "present" in t or "absent" in t:
+    if "attendance" in t:
         if attendance_total == 0:
-            return f"Hello 👋🏽 No attendance records yet for **Session {session_id}**."
+            return f"Hello 👋🏽 No attendance recorded for Session **{session_id}** yet."
         absent = max(attendance_total - attendance_present, 0)
-        return (
-            f"Hello 👋🏽 Attendance (Session {session_id}):\n\n"
-            f"- Present: **{attendance_present}**\n"
-            f"- Absent: **{absent}**\n"
-            f"- Total marked: **{attendance_total}**"
-        )
+        return f"Hello 👋🏽 Attendance (Session {session_id}): Present **{attendance_present}**, Absent **{absent}**, Marked **{attendance_total}**."
 
     if "loan" in t:
         if loans_active_count == 0:
-            return "Hello 👋🏽 I see **no active loans** in the current snapshot."
-        return (
-            "Hello 👋🏽 Loans snapshot:\n\n"
-            f"- Active loans: **{loans_active_count}**\n"
-            f"- Active principal total: **{money(loans_active_total)}**\n\n"
-            "If you want *who owes what*, open **Loans** or **🤖 AI Risk Panel**."
-        )
+            return "Hello 👋🏽 Active loans: **0**."
+        return f"Hello 👋🏽 Active loans: **{loans_active_count}** (total **{money(loans_active_total)}**)."
 
     if "fine" in t:
-        return f"Hello 👋🏽 Fines total (snapshot) = **{money(fines_total)}**."
+        return f"Hello 👋🏽 Fines total: **{money(fines_total)}**."
 
     if "repay" in t or "payment" in t:
-        return f"Hello 👋🏽 Repayments total (snapshot) = **{money(repayments_total)}**."
+        return f"Hello 👋🏽 Repayments total: **{money(repayments_total)}**."
 
     if "interest" in t:
-        return f"Hello 👋🏽 Interest total (snapshot) = **{money(interest_total)}**."
+        return f"Hello 👋🏽 Interest total: **{money(interest_total)}**."
 
-    if "status" in t or "live" in t:
-        return "Hello 👋🏽 Status: **LIVE** (reading from Supabase)."
-
-    return (
-        "Hello 👋🏽 I can answer from the dashboard snapshot:\n"
-        "- **pot this session**\n"
-        "- **cycle contributions**\n"
-        "- **loans summary**\n"
-        "- **fines total** / **repayments total** / **interest total**\n"
-        "- **attendance summary**\n\n"
-        "For web help, start with **web:** (example: `web: Maryland cosmetology license requirements`)."
-    )
+    # Unknown question
+    return "Hello 👋🏽 I don’t have that in this snapshot. Check another page (Loans / Contributions / Minutes)."
 
 
 # ============================================================
-# 🧭 SAFE NAVIGATION
+# NAV BUTTONS
 # ============================================================
 def _nav_to(page_name: str):
     st.session_state["page"] = str(page_name)
@@ -573,47 +552,46 @@ def _safe_nav_buttons():
     st.markdown("#### Quick actions")
     st.caption("Opens pages by setting **st.session_state['page']** (must match your app.py menu labels).")
 
-    # ✅ IMPORTANT:
-    # These labels MUST match your sidebar labels exactly.
-    # If your app.py uses "AI Risk Panel" (no emoji), change it here too.
     c1, c2 = st.columns(2)
 
     with c1:
         if st.button("Dashboard", use_container_width=True):
             _nav_to("Dashboard")
+        if st.button("💬 younchat", use_container_width=True):
+            _nav_to("💬 younchat")
         if st.button("Contributions", use_container_width=True):
             _nav_to("Contributions")
         if st.button("Loans", use_container_width=True):
             _nav_to("Loans")
-        if st.button("Payouts", use_container_width=True):
-            _nav_to("Payouts")
 
     with c2:
-        if st.button("AI Risk Panel", use_container_width=True):
-            _nav_to("AI Risk Panel")
+        if st.button("Payouts", use_container_width=True):
+            _nav_to("Payouts")
+        if st.button("🤖 AI Risk Panel", use_container_width=True):
+            _nav_to("🤖 AI Risk Panel")
         if st.button("Minutes & Attendance", use_container_width=True):
             _nav_to("Minutes & Attendance")
-        if st.button("Audit", use_container_width=True):
-            _nav_to("Audit")
         if st.button("Health", use_container_width=True):
             _nav_to("Health")
 
 
-def _render_youn_ai_view(snapshot: Dict[str, Any]):
-    st.markdown("### 💬 younchat — Dashboard AI")
+# ============================================================
+# Young AI view
+# ============================================================
+def _render_young_ai_view(snapshot: Dict[str, Any]):
+    st.markdown("### 🤖 Young — Dashboard AI")
 
     _safe_nav_buttons()
     st.divider()
 
-    # ✅ YOUR REQUEST: short, clean intro
-    st.write(f"{_greeting_of_day()} 👋🏽 I’m **younchat** — your dashboard assistant.")
+    st.write(f"{_hello()} 👋🏽 I’m **Young** — your dashboard assistant.")
     st.caption(_human_touch())
 
     use_hf = st.toggle(
         "Use HF for nicer wording (still grounded)",
         value=False,
-        help="Requires HF_TOKEN. If off, I use local grounded rules.",
-        key="youn_use_hf",
+        help="Requires HF_TOKEN. If off, uses local grounded rules.",
+        key="young_use_hf",
     )
 
     colA, colB = st.columns(2)
@@ -622,51 +600,50 @@ def _render_youn_ai_view(snapshot: Dict[str, Any]):
     with colB:
         st.caption(f"🌐 Tavily: {'READY' if _has_tavily_key() else 'OFF'}")
 
-    q = st.text_input(
-        "Ask younchat…",
-        placeholder="e.g., pot this session  |  loans summary  |  web: Maryland cosmetology license requirements",
-        key="youn_dash_q",
-    )
-    ask = st.button("Ask", key="youn_dash_ask", use_container_width=True)
+    q = st.text_input("Ask Young…", placeholder="Ask about KPIs, attendance, loans, fines, etc.", key="young_dash_q")
+    ask = st.button("Ask", key="young_dash_ask", use_container_width=True)
 
     if ask:
         if _is_web_query(q):
             if not _has_tavily_key():
-                st.session_state["youn_dash_a"] = "Hello 👋🏽 Web search is OFF. Add **TAVILY_API_KEY** in Railway Variables."
-                st.session_state["youn_dash_sources"] = []
-                st.session_state["youn_dash_used"] = "web:off"
+                st.session_state["young_dash_a"] = "Hello 👋🏽 Web search is OFF. Add **TAVILY_API_KEY** in Railway Variables."
+                st.session_state["young_dash_sources"] = []
+                st.session_state["young_dash_used"] = "web:off"
             else:
                 query = _strip_web_prefix(q)
                 tav = _tavily_search_cached(query=query, max_results=5, search_depth="basic")
                 summary, sources = _format_web_results(tav)
-                st.session_state["youn_dash_a"] = "Hello 👋🏽 " + summary
-                st.session_state["youn_dash_sources"] = sources
-                st.session_state["youn_dash_used"] = "web:tavily"
+                st.session_state["young_dash_a"] = "Hello 👋🏽 " + summary
+                st.session_state["young_dash_sources"] = sources
+                st.session_state["young_dash_used"] = "web:tavily"
         else:
             if use_hf and _has_hf_token():
                 ok, txt, used = _hf_grounded_answer(q, snapshot)
                 if ok and txt:
-                    st.session_state["youn_dash_a"] = txt if txt.lower().startswith("hello") else ("Hello 👋🏽 " + txt)
-                    st.session_state["youn_dash_sources"] = []
-                    st.session_state["youn_dash_used"] = used
+                    ans = txt.strip()
+                    if not ans.lower().startswith("hello"):
+                        ans = "Hello 👋🏽 " + ans
+                    st.session_state["young_dash_a"] = ans
+                    st.session_state["young_dash_sources"] = []
+                    st.session_state["young_dash_used"] = used
                 else:
-                    st.session_state["youn_dash_a"] = (
+                    st.session_state["young_dash_a"] = (
                         "Hello 👋🏽 HF failed — using local grounded rules.\n\n"
                         f"**HF error:** {txt}\n\n"
-                        + _youn_answer_rules(q, snapshot)
+                        + _young_answer_rules(q, snapshot)
                     )
-                    st.session_state["youn_dash_sources"] = []
-                    st.session_state["youn_dash_used"] = used
+                    st.session_state["young_dash_sources"] = []
+                    st.session_state["young_dash_used"] = used
             else:
-                st.session_state["youn_dash_a"] = _youn_answer_rules(q, snapshot)
-                st.session_state["youn_dash_sources"] = []
-                st.session_state["youn_dash_used"] = "local"
+                st.session_state["young_dash_a"] = _young_answer_rules(q, snapshot)
+                st.session_state["young_dash_sources"] = []
+                st.session_state["young_dash_used"] = "local"
 
-    a = st.session_state.get("youn_dash_a")
+    a = st.session_state.get("young_dash_a")
     if a:
         st.markdown(a)
 
-    sources = st.session_state.get("youn_dash_sources") or []
+    sources = st.session_state.get("young_dash_sources") or []
     if sources:
         st.markdown("**Sources:**")
         for s in sources[:5]:
@@ -677,10 +654,9 @@ def _render_youn_ai_view(snapshot: Dict[str, Any]):
             else:
                 st.markdown(f"- {title}")
 
-    used = st.session_state.get("youn_dash_used", "—")
+    used = st.session_state.get("young_dash_used", "—")
     st.caption(f"Source used: {used} • Snapshot time (UTC): {snapshot.get('generated_at','—')}")
 
-    # Keep debug hidden by default (clean)
     with st.expander("🔎 Debug snapshot", expanded=False):
         st.json(snapshot)
 
@@ -693,18 +669,18 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
     CLEAN dashboard:
       - KPIs
       - Attendance
-      - younchat AI
+      - Young AI
     """
     sb_read = sb_service if sb_service is not None else sb_anon
 
-    # Ensure current session (we do NOT print the verbose message on the dashboard)
-    session_id, _session_msg = _ensure_current_session(sb_anon=sb_anon, sb_service=sb_service, schema=schema)
+    # Ensure current session (do not print the verbose message)
+    session_id, _ = _ensure_current_session(sb_anon=sb_anon, sb_service=sb_service, schema=schema)
 
     # Members count
     members_rows = _safe_select(sb_read, schema, "members", "id", limit=5000, show_error=False)
     total_members = len(members_rows) if members_rows else 0
 
-    # Contributions for current session
+    # Contributions (current session)
     contrib_rows: List[Dict[str, Any]] = []
     if session_id is not None:
         contrib_rows = _safe_select(
@@ -721,7 +697,7 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
     members_paid = _count_distinct(contrib_rows, "member_id")
     current_pot = float(cycle_total)
 
-    # Attendance for current session
+    # Attendance (current session)
     attendance_rows: List[Dict[str, Any]] = []
     if session_id is not None and _table_readable(sb_read, schema, "attendance"):
         attendance_rows = _safe_select(
@@ -802,7 +778,7 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
 
     st.divider()
 
-    # Attendance block
+    # Attendance
     st.subheader("🧾 Attendance (session)")
     if session_id is None:
         st.info("No session selected.")
@@ -815,7 +791,7 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
 
     st.divider()
 
-    # Snapshot for younchat AI
+    # Snapshot for Young AI
     snapshot = {
         "schema": schema,
         "session_id": session_id,
@@ -833,4 +809,4 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
         "generated_at": _now_iso(),
     }
 
-    _render_youn_ai_view(snapshot)
+    _render_young_ai_view(snapshot)
