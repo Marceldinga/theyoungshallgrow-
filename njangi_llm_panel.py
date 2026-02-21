@@ -1,7 +1,7 @@
 
-# njangi_llm_panel.py ✅ SINGLE COMPLETE FILE — younchat reads ALL your tables/views (members = source of truth)
+# njangi_llm_panel.py ✅ SINGLE COMPLETE FILE — younchat reads your DB (members = source of truth)
 # =============================================================================
-# 💬 younchat — DB-TOOLS FIRST (views + tables) + Optional HF Router + Optional Tavily
+# 💬 younchat — DB-TOOLS FIRST (tables + views) + Optional HF Router + Optional Tavily
 #
 # ✅ YOUR REQUEST (IMPORTANT):
 #   - The ONLY intro message must be EXACTLY:
@@ -11,6 +11,8 @@
 #   - younchat reads ALL your tables/views (based on RELATIONS allowlist you control)
 #   - members table is the source of truth for identity (name display)
 #   - NO hallucinations for Njangi numbers (all financial answers come from DB)
+#   - IMPORTANT FIX: HF Router will NEVER answer DB commands (members/loans/kpis/show/describe/etc.)
+#       -> prevents the fake SQL/Python responses you were seeing
 #
 # Works with app.py:
 #   render_njangi_llm_panel(sb_anon=..., sb_service=..., schema=...)
@@ -145,6 +147,7 @@ def _sb_select(
     if sb is None:
         return pd.DataFrame()
 
+    # Guard: only allowlist relations
     if relation not in RELATIONS:
         return pd.DataFrame()
 
@@ -169,6 +172,7 @@ def _sb_select(
         res = q.execute()
         return pd.DataFrame(getattr(res, "data", None) or [])
     except Exception:
+        # fallback without schema()
         try:
             q = sb.table(relation).select(cols).limit(limit)
             if filters:
@@ -244,6 +248,11 @@ def _wants_list_members(text: str) -> bool:
         "all members",
         "member list",
         "who are the members",
+        "list all the members",
+        "list members id",
+        "list all members id",
+        "members id",
+        "member ids",
     ]
     return t in {"members", "member"} or any(p in t for p in phrases)
 
@@ -271,6 +280,36 @@ def _wants_kpis(text: str) -> bool:
 def _wants_loans(text: str) -> bool:
     t = _lc(text)
     return any(k in t for k in ["loan", "loans", "borrow", "repay", "overdue", "dpd", "interest due"])
+
+
+def _wants_internet(text: str) -> bool:
+    # user can force internet with "web:" prefix
+    t = _lc(text)
+    return t.startswith("web:") or t.startswith("internet:") or t.startswith("tavily:")
+
+
+def _strip_web_prefix(q: str) -> str:
+    return re.sub(r"^(web:|internet:|tavily:)\s*", "", (q or "").strip(), flags=re.IGNORECASE).strip()
+
+
+# ✅ CRITICAL FIX: detect DB commands so HF never returns fake SQL/Python answers
+def _is_db_command(text: str) -> bool:
+    t = _lc(text)
+    if not t:
+        return False
+
+    if t in RELATIONS:
+        return True
+
+    # strong DB commands
+    if _wants_list_members(t) or _wants_loans(t) or _wants_kpis(t) or _wants_tables_list(t):
+        return True
+    if _wants_show_table(t) or _wants_describe(t) or _wants_help(t):
+        return True
+
+    # other finance-ish db cues
+    finance_words = ["contribution", "contributions", "payout", "payouts", "attendance", "minutes", "fines", "interest"]
+    return any(w in t for w in finance_words)
 
 
 _MEMBER_ID_PATTERNS = [
@@ -322,7 +361,7 @@ def _load_members_truth(sb_anon, sb_service, schema: str, limit: int = 3000) -> 
     out = pd.DataFrame()
     out["member_id"] = df[id_col].astype(str)
 
-    # FIX: display_name may exist but be NULL -> fallback to name
+    # display_name may exist but be NULL -> fallback to name
     if display_col and display_col in df.columns:
         disp = df[display_col].astype(str)
         disp_clean = disp.replace(["None", "nan", "NaN", "NULL", "null"], "").fillna("").str.strip()
@@ -418,7 +457,7 @@ def _member_financial_totals(
 
     active = loans
     if status_col and status_col in loans.columns:
-        active = loans[loans[status_col].astype(str).str.lower().isin(["active", "open", "ongoing", "overdue"])]
+        active = loans[loans[status_col].astype(str).str.lower().isin(["active", "open", "ongoing", "overdue", "late"])]
 
     active_bal = _safe_sum(active, principal_current) if principal_current else _safe_sum(active, principal)
     unpaid_interest = _safe_sum(active, "unpaid_interest") if "unpaid_interest" in active.columns else 0.0
@@ -515,7 +554,7 @@ def _tavily_search(query: str) -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# HF Router (optional; only for general chat wording)
+# HF Router (optional; ONLY for general chat wording, never DB commands)
 # -----------------------------------------------------------------------------
 def _post_with_retries(url: str, headers: dict, payload: dict, timeout: int = 60) -> Tuple[bool, str]:
     last_err = ""
@@ -552,7 +591,7 @@ def _messages_to_prompt(messages: List[Dict[str, str]]) -> str:
 
 def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], timeout: int = 60) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "temperature": 0.3, "max_tokens": 450}
+    payload = {"model": model, "messages": messages, "temperature": 0.2, "max_tokens": 450}
     ok, raw = _post_with_retries(HF_ROUTER_CHAT_URL, headers, payload, timeout=timeout)
     if not ok:
         return False, raw
@@ -566,7 +605,7 @@ def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], time
 
 def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 60) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": model, "prompt": prompt, "temperature": 0.3, "max_tokens": 450}
+    payload = {"model": model, "prompt": prompt, "temperature": 0.2, "max_tokens": 450}
     ok, raw = _post_with_retries(HF_ROUTER_COMPLETIONS_URL, headers, payload, timeout=timeout)
     if not ok:
         return False, raw
@@ -638,7 +677,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         st.write("**HF_TOKEN present**:", "✅ Yes" if hf_token else "❌ No")
         st.write("**HF_FORCE_MODE**:", hf_force)
         st.write("**Internet**:", "✅ ON" if internet_on else "❌ OFF")
-        st.caption("Njangi numbers are ALWAYS answered from DB (tables/views). HF is only for general chat wording.")
+        st.caption("Njangi numbers are ALWAYS answered from DB. HF is only for general chat wording (never DB commands).")
 
     @st.cache_data(ttl=30, show_spinner=False)
     def _cached_members_truth(_ts: int) -> pd.DataFrame:
@@ -681,7 +720,36 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     df_show: Optional[pd.DataFrame] = None
     df_title: Optional[str] = None
 
-    if _wants_help(q):
+    # Internet forced (never for Njangi numbers)
+    if _wants_internet(q):
+        used_source = "tavily" if internet_on else "tavily:off"
+        if not internet_on:
+            answer = "Hello 👋🏽 Internet is OFF. Set TAVILY_API_KEY and INTERNET_MODE=on."
+        else:
+            query = _strip_web_prefix(q)
+            res = _tavily_search(query)
+            if not res.get("ok"):
+                answer = f"Hello 👋🏽 Internet error: {res.get('error')}"
+            else:
+                items = res.get("results") or []
+                if not items:
+                    answer = "Hello 👋🏽 No web results found."
+                else:
+                    lines = ["Hello 👋🏽 Here are the top web results:\n"]
+                    for it in items[:5]:
+                        title = it.get("title") or "Source"
+                        url = it.get("url") or ""
+                        snippet = (it.get("content") or "").strip()
+                        if url:
+                            lines.append(f"- [{title}]({url})")
+                        else:
+                            lines.append(f"- {title}")
+                        if snippet:
+                            lines.append(f"  - {snippet[:180]}…")
+                    answer = "\n".join(lines)
+
+    # DB-first commands
+    elif _wants_help(q):
         used_source = "help"
         answer = (
             "Hello 👋🏽 Commands:\n\n"
@@ -692,6 +760,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
             "- **tables**\n"
             "- **show <table>** (example: show contributions)\n"
             "- **describe <table>** (example: describe loans)\n"
+            "- **web: <topic>** (internet help)\n"
         )
 
     elif _wants_tables_list(q):
@@ -752,21 +821,42 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         answer, df_show, used_source = _show_relation(sb_anon, sb_service, schema, rel)
         df_title = f"Preview: {rel}"
 
+    # General chat: optional HF (NEVER DB commands)
     else:
-        if hf_token:
+        if hf_token and not _is_db_command(q):
             sys = (
-                "You are younchat. Salute with 'Hello'. Keep it modern.\n"
-                "Do NOT invent Njangi numbers. Suggest DB commands when needed.\n"
+                "You are younchat.\n"
+                "Rules:\n"
+                "- Start with 'Hello' if greeting.\n"
+                "- Do NOT output SQL or Python code.\n"
+                "- Do NOT invent Njangi numbers or member IDs.\n"
+                "- If user asks for database results, suggest commands: members / loans / finance kpis / tables / show <table> / describe <table>.\n"
             )
             messages = [{"role": "system", "content": sys}]
             for m in st.session_state["younchat_history"][-10:]:
                 if m.get("role") in ("user", "assistant"):
                     messages.append({"role": m["role"], "content": m.get("content", "")})
+
             ok, txt, mode = _hf_call(hf_model, hf_token, messages)
             used_source = f"hf:{mode}" if ok else "hf:failed"
             answer = txt if ok else f"Hello 👋🏽 HF is not reachable: {txt}"
         else:
-            answer = "Hello 👋🏽 Try: **help**, **members**, **loans**, **finance kpis**, **tables**, **show contributions**, **describe loans**."
+            # If user typed something DB-ish but didn't use exact commands, guide them (still no fake code)
+            if _is_db_command(q):
+                used_source = "db:first_guard"
+                answer = (
+                    "Hello 👋🏽 I can show the real data from your database.\n\n"
+                    "Use one of these:\n"
+                    "- **members**\n"
+                    "- **loans**\n"
+                    "- **finance kpis**\n"
+                    "- **tables**\n"
+                    "- **show contributions**\n"
+                    "- **describe loans**\n"
+                )
+            else:
+                used_source = "local:fallback"
+                answer = "Hello 👋🏽"
 
     st.session_state["younchat_history"].append({"role": "assistant", "content": answer})
     with st.chat_message("assistant"):
