@@ -1,5 +1,5 @@
 
-# dashboard_panel.py ✅ COMPLETE SINGLE FILE — Dashboard + 🤖 Young AI View + 🌐 Web Search (Tavily) + 🧠 LLM (OpenAI)
+# dashboard_panel.py ✅ COMPLETE SINGLE FILE — Dashboard + 🤖 Young AI View + 🌐 Web Search (Tavily) + 🧠 LLM (OpenAI) + ✅ LOCAL TIMEZONE GREETING
 # ---------------------------------------------------------------------------------------------------------------
 # ✅ NJANGI STANDARD (NO legacy)
 # ✅ Works with app.py calling: render_dashboard(sb_anon=..., sb_service=..., schema=...)
@@ -14,6 +14,9 @@
 #   - Use prefix:  web: <your query>
 #   - Requires env var: TAVILY_API_KEY
 #
+# ✅ FIX: Greeting uses LOCAL_TZ (Railway Variable) instead of server UTC:
+#   - Set Railway → Variables: LOCAL_TZ = America/New_York  (Maryland)  OR America/Chicago
+#
 # ✅ IMPORTANT FIXES (restores “good dashboard” behavior):
 #   1) AUTO-SELECT SESSION:
 #      - If app_state.current_session_id missing, auto-select latest sessions.id (or sessions.session_id fallback)
@@ -21,9 +24,14 @@
 #   2) FIXED BUG: removed accidental filter id=1 in app_state select (was breaking reads)
 #   3) Robust session id resolution supports sessions.id OR sessions.session_id
 #
-# NOTE:
-# - LLM is NEVER allowed to “invent” numbers; it must use snapshot values only.
-# - If LLM is missing or fails, system falls back to grounded rules.
+# Requirements (if missing):
+#   pip install openai requests
+#
+# Railway Variables you may set:
+#   TAVILY_API_KEY=<...>
+#   OPENAI_API_KEY=<...>
+#   OPENAI_MODEL=gpt-4o-mini   (optional)
+#   LOCAL_TZ=America/New_York  (recommended)
 
 from __future__ import annotations
 
@@ -37,7 +45,6 @@ import pandas as pd
 import streamlit as st
 from postgrest.exceptions import APIError
 
-
 # ============================================================
 # SETTINGS
 # ============================================================
@@ -45,14 +52,25 @@ AUTO_CREATE_SESSION_IF_NONE = False  # set True if you want the app to create a 
 
 
 # ============================================================
-# TIME + GREETING
+# LOCAL TIMEZONE (fix greeting)
 # ============================================================
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _local_now() -> datetime:
+    """
+    Uses LOCAL_TZ env var (Railway Variables) to show correct greeting for your location.
+    Example: LOCAL_TZ=America/New_York (Maryland)
+    """
+    tz_name = (os.getenv("LOCAL_TZ", "") or "America/New_York").strip()
+    try:
+        from zoneinfo import ZoneInfo  # py3.9+
+
+        return datetime.now(ZoneInfo(tz_name))
+    except Exception:
+        # fallback: UTC
+        return datetime.now(timezone.utc)
 
 
 def _greeting_of_day() -> str:
-    h = datetime.now().hour
+    h = _local_now().hour
     if h < 12:
         return "Good morning"
     if h < 18:
@@ -61,7 +79,7 @@ def _greeting_of_day() -> str:
 
 
 def _human_touch() -> str:
-    h = datetime.now().hour
+    h = _local_now().hour
     if 5 <= h <= 9:
         return "Hope your day starts strong."
     if 10 <= h <= 13:
@@ -71,6 +89,13 @@ def _human_touch() -> str:
     if 18 <= h <= 22:
         return "Hope your evening is peaceful."
     return "Hope everything is okay on your side."
+
+
+# ============================================================
+# TIME (UTC stamp for snapshot)
+# ============================================================
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ============================================================
@@ -244,7 +269,6 @@ def _ensure_current_session(sb_anon, sb_service, schema: str) -> Tuple[Optional[
     if latest_sid is None:
         if not AUTO_CREATE_SESSION_IF_NONE:
             return None, "No sessions found. Create a session to start a cycle."
-        # Auto-create a session (best effort)
         if sb_write is None:
             return None, "No sessions found and service key missing (cannot auto-create)."
         name = f"Cycle {pd.Timestamp.utcnow().strftime('%Y-%m-%d')}"
@@ -291,9 +315,6 @@ def _strip_web_prefix(q: str) -> str:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _tavily_search_cached(query: str, max_results: int = 5, search_depth: str = "basic") -> Dict[str, Any]:
-    """
-    Tavily search. Requires env var: TAVILY_API_KEY
-    """
     import requests
 
     api_key = os.getenv("TAVILY_API_KEY", "").strip()
@@ -352,8 +373,6 @@ def _has_openai_key() -> bool:
 
 
 def _openai_model() -> str:
-    # You can override in Railway Variables: OPENAI_MODEL
-    # Pick a lightweight model if you want cheaper/faster.
     return (os.getenv("OPENAI_MODEL", "") or "gpt-4o-mini").strip()
 
 
@@ -364,7 +383,6 @@ def _llm_answer_cached(question: str, snapshot: Dict[str, Any]) -> Dict[str, Any
     Requires:
       - OPENAI_API_KEY in env
       - openai python package installed
-    Returns dict: { "text": "...", "error": "...optional..." }
     """
     if not _has_openai_key():
         return {"error": "Missing OPENAI_API_KEY in environment variables."}
@@ -374,7 +392,6 @@ def _llm_answer_cached(question: str, snapshot: Dict[str, Any]) -> Dict[str, Any
     except Exception as e:
         return {"error": f"openai package not installed: {repr(e)}"}
 
-    # Guardrails: the model MUST only use snapshot data; no guessing.
     instructions = (
         "You are 'Young', a dashboard copilot for a community finance app.\n"
         "You MUST answer using ONLY the provided DASHBOARD_SNAPSHOT JSON.\n"
@@ -382,10 +399,9 @@ def _llm_answer_cached(question: str, snapshot: Dict[str, Any]) -> Dict[str, Any
         "- If the answer is not explicitly in the snapshot, say you don't have it.\n"
         "- Never invent numbers, names, totals, dates, or statuses.\n"
         "- Be concise. Use bullets when helpful.\n"
-        "- If user asks for 'who owes what' or per-member details and snapshot doesn't include it, say to open Loans/AI Risk panel.\n"
+        "- If user asks for per-member details not in snapshot, tell them to open Loans/AI Risk panel.\n"
     )
 
-    # Give snapshot as the only allowed context.
     user_input = (
         f"DASHBOARD_SNAPSHOT (JSON):\n{snapshot}\n\n"
         f"USER_QUESTION:\n{question}\n\n"
@@ -394,8 +410,6 @@ def _llm_answer_cached(question: str, snapshot: Dict[str, Any]) -> Dict[str, Any
 
     try:
         client = OpenAI()
-        # Prefer Responses API when available; fall back to chat.completions if not.
-        # (Both are supported by the official python client.)
         text_out = None
 
         # Try Responses API
@@ -519,7 +533,6 @@ def _render_young_ai_view(snapshot: Dict[str, Any]):
     st.write(f"{_greeting_of_day()} 👋🏾 I’m **Young** — your dashboard copilot for **theyoungshallgrow**.")
     st.caption(_human_touch())
 
-    # Mode selector
     use_llm = st.toggle(
         "Use LLM (OpenAI) for answers (still grounded on snapshot)",
         value=False,
@@ -527,7 +540,6 @@ def _render_young_ai_view(snapshot: Dict[str, Any]):
         key="young_use_llm",
     )
 
-    # Show config status
     cols_cfg = st.columns(2)
     with cols_cfg[0]:
         st.caption(f"🧠 LLM: {'READY' if _has_openai_key() else 'MISSING OPENAI_API_KEY'}")
@@ -535,15 +547,8 @@ def _render_young_ai_view(snapshot: Dict[str, Any]):
         st.caption(f"🌐 Tavily: {'READY' if _has_tavily_key() else 'MISSING TAVILY_API_KEY'}")
 
     st.write(
-        "Try:\n"
-        "• *pot this session*\n"
-        "• *loans summary*\n"
-        "• *fines total*\n"
-        "• *repayments total*\n"
-        "• *interest total*\n"
-        "• *attendance summary*\n\n"
-        "Internet (only if you force it):\n"
-        "• `web: Maryland cosmetology license requirements`"
+        "Try: • pot this session • loans summary • fines total • repayments total • interest total • attendance summary\n\n"
+        "Internet (only if you force it):  web: Maryland cosmetology license requirements"
     )
 
     q = st.text_input(
@@ -557,7 +562,6 @@ def _render_young_ai_view(snapshot: Dict[str, Any]):
         ask = st.button("Ask", key="young_dash_ask", width="stretch")
     with c2:
         if ask:
-            # Web query
             if _is_web_query(q):
                 if not _has_tavily_key():
                     st.session_state["young_dash_a"] = (
@@ -572,7 +576,6 @@ def _render_young_ai_view(snapshot: Dict[str, Any]):
                     st.session_state["young_dash_a"] = summary
                     st.session_state["young_dash_sources"] = sources
             else:
-                # Snapshot-only answers
                 if use_llm:
                     res = _llm_answer_cached(question=q, snapshot=snapshot)
                     if res.get("error"):
