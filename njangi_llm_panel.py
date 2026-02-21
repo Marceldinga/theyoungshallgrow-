@@ -13,20 +13,26 @@
 #   - NO hallucinations for Njangi numbers (all financial answers come from DB)
 #   - HF Router will NEVER answer DB / PDF commands
 #
-# Extra:
-#   - ✅ Can access and display ALL columns for your actual tables (select "*")
-#   - ✅ "health" + "counts" commands to assess all tables quickly
-#   - ✅ Optional "random model routing" for HF (general chat ONLY, never DB/PDF)
-#   - ✅ Supports ~40 model pool (random) for HF router general chat
-#   - ✅ HF "model_not_supported" / provider errors auto-skip to next model
+# ✅ UPDATE INCLUDED:
+#   - Random model routing is now STICKY:
+#       When Random routing is ON, younchat picks ONE HF model and keeps using it
+#       until you click Refresh / Clear Chat (no extra buttons added).
+#
+# ✅ Advanced LLM behavior included (general chat only):
+#   - Strong system prompt + safety rails (no SQL/Python output)
+#   - Better context packing (last N turns + lightweight memory)
+#   - Provider-qualified model ids support (model:provider) to reduce HF 404s
+#   - Auto-skip bad models/providers on common HF errors (404/429/5xx/provider mismatch)
 #
 # Railway env vars (optional):
 #   HF_TOKEN
 #   HF_MODEL
 #   HF_FORCE_MODE = auto | completions | chat
-#   HF_RANDOM_DEFAULT = on | off      (default random routing)
-#   HF_MODELS_CSV                    (comma separated pool, optional)
-#   HF_MODEL_DENYLIST_CSV            (comma separated denylist, optional)
+#   HF_RANDOM_DEFAULT = on | off
+#   HF_MODELS_CSV
+#   HF_MODEL_DENYLIST_CSV
+#   HF_PROVIDERS_CSV
+#   HF_PROVIDER_DEFAULT
 #   TAVILY_API_KEY
 #   INTERNET_MODE = on | off
 # =============================================================================
@@ -71,7 +77,7 @@ TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 
 
 # ---------------------------
-# HF model pool (curated ~40)
+# HF model pool (curated)
 # - Used ONLY for general chat (never DB/PDF)
 # - You can override with Railway env var HF_MODELS_CSV
 # ---------------------------
@@ -86,7 +92,7 @@ HF_FALLBACK_MODELS: List[str] = [
     "mistralai/Mistral-7B-Instruct-v0.3",
     "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "mistralai/Mixtral-8x22B-Instruct-v0.1",
-    # Nous Hermes (✅ removed bad model)
+    # Nous Hermes (remove the bad one that fails often)
     "NousResearch/Nous-Hermes-2-Yi-34B",
     "NousResearch/Nous-Hermes-2-Mistral-7B-DPO",
     # Qwen instruct
@@ -124,18 +130,17 @@ HF_FALLBACK_MODELS: List[str] = [
     # Command R family
     "CohereForAI/c4ai-command-r-v01",
     "CohereForAI/c4ai-command-r-plus-v01",
-    # Misc strong instruct
+    # Misc instruct
     "teknium/OpenHermes-2.5-Mistral-7B",
     "teknium/OpenHermes-2.5-Mixtral-8x7B",
     "allenai/tulu-2-dpo-7b",
     "allenai/tulu-2-dpo-13b",
 ]
 
-# ✅ Hard denylist (permanent) + optional env denylist
+# ✅ Hard denylist + optional env denylist
 HF_HARD_DENYLIST = {
     "NousResearch/Nous-Hermes-2-Mixtral-8x7B-DPO",
 }
-
 HF_MODEL_DENYLIST = set(
     m.strip() for m in (os.getenv("HF_MODEL_DENYLIST_CSV") or "").split(",") if m.strip()
 )
@@ -447,11 +452,9 @@ def _extract_relation_name(text: str) -> Optional[str]:
     if not t:
         return None
     toks = [x for x in t.split() if x]
-    # exact token match
     for tok in toks:
         if tok in RELATIONS:
             return tok
-    # fallback: sometimes user pastes relation with punctuation; try raw first token
     first = toks[0] if toks else None
     return first if first in RELATIONS else None
 
@@ -504,7 +507,6 @@ def _is_db_command(text: str) -> bool:
         return True
     if _is_pdf_command(t):
         return True
-
     finance_words = [
         "contribution", "contributions",
         "foundation", "foundation_contributions",
@@ -523,7 +525,7 @@ def _is_db_command(text: str) -> bool:
 # -----------------------------------------------------------------------------
 def _load_members_truth(sb_anon, sb_service, schema: str, limit: int = 3000) -> pd.DataFrame:
     df = _sb_select(sb_anon, sb_service, schema, "members", cols="*", limit=limit)
-    if isinstance(df, tuple):  # safety
+    if isinstance(df, tuple):
         df = df[0]
     if df.empty:
         return df
@@ -537,7 +539,6 @@ def _load_members_truth(sb_anon, sb_service, schema: str, limit: int = 3000) -> 
     out = pd.DataFrame()
     out["member_id"] = df[id_col].astype(str)
 
-    # prefer display_name, fallback to name
     disp = (
         df["display_name"].fillna("").astype(str).replace({"None": "", "nan": "", "NaN": ""}).str.strip()
         if "display_name" in df.columns
@@ -917,7 +918,7 @@ def _hf_router_chat(
     model: str, token: str, messages: List[Dict[str, str]], timeout: int = 60, temperature: float = 0.35
 ) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "temperature": float(temperature), "max_tokens": 500}
+    payload = {"model": model, "messages": messages, "temperature": float(temperature), "max_tokens": 650}
     ok, raw = _post_with_retries(HF_ROUTER_CHAT_URL, headers, payload, timeout=timeout)
     if not ok:
         return False, raw
@@ -933,7 +934,7 @@ def _hf_router_completions(
     model: str, token: str, prompt: str, timeout: int = 60, temperature: float = 0.35
 ) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": model, "prompt": prompt, "temperature": float(temperature), "max_tokens": 500}
+    payload = {"model": model, "prompt": prompt, "temperature": float(temperature), "max_tokens": 650}
     ok, raw = _post_with_retries(HF_ROUTER_COMPLETIONS_URL, headers, payload, timeout=timeout)
     if not ok:
         return False, raw
@@ -945,13 +946,72 @@ def _hf_router_completions(
         return False, f"Bad HF completions response: {raw[:600]}"
 
 
+# ---- Provider routing helpers (reduces HF 404) ----
+def _get_hf_providers() -> List[str]:
+    """
+    HF Router may require provider-qualified ids: model:provider
+    """
+    csv = (os.getenv("HF_PROVIDERS_CSV") or "").strip()
+    default = (os.getenv("HF_PROVIDER_DEFAULT") or "hf-inference").strip()
+    providers: List[str] = []
+    if csv:
+        providers.extend([p.strip() for p in csv.split(",") if p.strip()])
+    if default and default not in providers:
+        providers.insert(0, default)
+    if not providers:
+        providers = ["hf-inference"]
+
+    seen = set()
+    out: List[str] = []
+    for p in providers:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _qualify_model_with_provider(model: str, provider: str) -> str:
+    model = (model or "").strip()
+    provider = (provider or "").strip()
+    if not model:
+        return model
+    if ":" in model:
+        return model
+    if not provider:
+        return model
+    return f"{model}:{provider}"
+
+
+def _expand_models_with_providers(models: List[str]) -> List[str]:
+    providers = _get_hf_providers()
+    out: List[str] = []
+    for m in models:
+        m = (m or "").strip()
+        if not m:
+            continue
+        if ":" in m:
+            out.append(m)
+        else:
+            for p in providers:
+                out.append(_qualify_model_with_provider(m, p))
+
+    seen = set()
+    final: List[str] = []
+    for x in out:
+        if x and x not in seen:
+            seen.add(x)
+            final.append(x)
+    return final
+
+
 def _get_hf_model_pool(primary_model: str) -> List[str]:
     """
     Build model pool from:
-      1) HF_MODELS_CSV (Railway env var)
+      1) HF_MODELS_CSV
       2) HF_MODEL (primary)
-      3) HF_FALLBACK_MODELS (curated list)
-    Dedup while keeping order. Apply denylist.
+      3) HF_FALLBACK_MODELS
+    Expand to provider-qualified ids model:provider.
+    Apply denylist (base or qualified).
     """
     pool: List[str] = []
     csv = (os.getenv("HF_MODELS_CSV") or "").strip()
@@ -968,33 +1028,44 @@ def _get_hf_model_pool(primary_model: str) -> List[str]:
         if m:
             pool.append(m)
 
-    # dedupe preserve order
+    # dedupe base first
     seen = set()
-    out: List[str] = []
+    base: List[str] = []
     for m in pool:
         if m and m not in seen:
             seen.add(m)
-            out.append(m)
+            base.append(m)
 
-    # apply denylist (includes hard denylist)
-    out = [m for m in out if m not in HF_MODEL_DENYLIST]
-    return out
+    expanded = _expand_models_with_providers(base)
+
+    def _is_denylisted(m: str) -> bool:
+        if m in HF_MODEL_DENYLIST:
+            return True
+        base_name = m.split(":", 1)[0]
+        return base_name in HF_MODEL_DENYLIST
+
+    expanded = [m for m in expanded if not _is_denylisted(m)]
+    return expanded
 
 
 def _sanitize_primary_model(primary: str) -> str:
     """
-    If HF_MODEL is denylisted, pick the first safe model from the pool.
-    This prevents accidental use via env var.
+    If HF_MODEL is denylisted, pick first safe model from the pool.
     """
     p = (primary or "").strip()
     if not p or p in HF_MODEL_DENYLIST:
         pool = _get_hf_model_pool("")
-        return pool[0] if pool else "meta-llama/Meta-Llama-3-8B-Instruct"
+        return pool[0] if pool else "meta-llama/Meta-Llama-3-8B-Instruct:hf-inference"
     return p
 
 
 def _hf_call(
-    model: str, token: str, messages: List[Dict[str, str]], random_route: bool, temperature: float
+    model: str,
+    token: str,
+    messages: List[Dict[str, str]],
+    random_route: bool,
+    temperature: float,
+    preferred_first: Optional[str] = None,  # ✅ sticky model
 ) -> Tuple[bool, str, str, str]:
     """
     Returns: ok, text, mode_used, model_used
@@ -1006,25 +1077,32 @@ def _hf_call(
     if not model_pool:
         return False, "No HF models available (pool empty).", "failed", ""
 
-    # Random routing: choose one model but keep others as fallback
-    if random_route and model_pool:
-        chosen = random.choice(model_pool)
-        model_order = [chosen] + [m for m in model_pool if m != chosen]
+    # ✅ Sticky: use preferred model first
+    if preferred_first and preferred_first in model_pool:
+        model_order = [preferred_first] + [m for m in model_pool if m != preferred_first]
     else:
-        model_order = model_pool
+        # fallback to random or normal
+        if random_route and model_pool:
+            chosen = random.choice(model_pool)
+            model_order = [chosen] + [m for m in model_pool if m != chosen]
+        else:
+            model_order = model_pool
 
     def _looks_instruct(mname: str) -> bool:
         mlc = (mname or "").lower()
-        return any(x in mlc for x in ["instruct", "mistral", "llama-3", "llama-3.1", "qwen", "phi", "gemma", "tulu", "openhermes", "mixtral"])
+        return any(x in mlc for x in [
+            "instruct", "mistral", "llama-3", "llama-3.1", "qwen", "phi", "gemma",
+            "tulu", "openhermes", "mixtral"
+        ])
 
     last_err = ""
     last_mode = "failed"
     last_model = model_order[0] if model_order else ""
 
-    # Treat these as "try next model" errors (important for model_not_supported/provider mismatch)
     def _should_try_next(err_text: str) -> bool:
         e = (err_text or "").lower()
         return any(s in e for s in [
+            "404", "not found",
             "429", "500", "502", "503", "504", "timeout", "server error",
             "model_not_supported", "not supported by any provider", "invalid_request_error", "param\":\"model\"",
         ])
@@ -1051,11 +1129,46 @@ def _hf_call(
                     return True, txt, "chat", chosen
                 last_err = txt
 
-        # if model/provider mismatch etc -> try next model; otherwise stop
         if not _should_try_next(last_err):
             break
 
     return False, last_err or "Unknown HF error", last_mode, last_model
+
+
+# -----------------------------------------------------------------------------
+# Advanced LLM: context packing (HF only)
+# -----------------------------------------------------------------------------
+def _compact_history_for_hf(history: List[Dict[str, str]], max_turns: int = 12) -> List[Dict[str, str]]:
+    """
+    Keep last N user/assistant turns, drop the intro if present.
+    We do NOT include DB outputs as "ground truth" for future hallucinations;
+    but it's fine to include the assistant wording for conversation continuity.
+    """
+    if not history:
+        return []
+    # remove the fixed intro from context
+    filtered = [m for m in history if (m.get("content") or "") != _intro_only()]
+    # keep only user/assistant roles
+    filtered = [m for m in filtered if m.get("role") in ("user", "assistant")]
+    # take last max_turns*2 messages (approx)
+    return filtered[-max(2, int(max_turns) * 2):]
+
+
+def _hf_system_prompt() -> str:
+    # Advanced but strict. General chat only.
+    return (
+        "You are younchat, a helpful assistant for the Njangi app 'theyoungshallgrow'.\n"
+        "Core rules (MUST follow):\n"
+        "1) Always begin your response with 'Hello' (use 'Hello 👋🏽' when greeting).\n"
+        "2) Never output SQL, Python code, or database credentials.\n"
+        "3) Never invent Njangi numbers, member IDs, balances, payments, or totals.\n"
+        "4) If the user asks for database results, you must direct them to built-in commands:\n"
+        "   members / loans / finance kpis / tables / health / counts / show <table> / describe <table>.\n"
+        "5) If user asks for PDFs, direct them to: minutes pdf session <id>, attendance pdf session <id>.\n"
+        "Style:\n"
+        "- Be concise, accurate, and proactive.\n"
+        "- Ask for clarification ONLY if the user request is truly ambiguous.\n"
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -1065,11 +1178,8 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     st.subheader("💬 younchat", anchor=False)
 
     hf_token = (os.getenv("HF_TOKEN") or "").strip()
-
-    # ✅ sanitize primary model so denylisted ones never used even if set in env
     raw_primary = (os.getenv("HF_MODEL") or "").strip() or "meta-llama/Meta-Llama-3-8B-Instruct"
     hf_model = _sanitize_primary_model(raw_primary)
-
     hf_force = (os.getenv("HF_FORCE_MODE") or "auto").strip().lower()
 
     random_default = (os.getenv("HF_RANDOM_DEFAULT") or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -1079,7 +1189,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         random_route = st.checkbox(
             "🎲 Random model routing (HF only)",
             value=bool(st.session_state.get("younchat_random_route", random_default)),
-            help="Randomly picks one model from the HF pool for GENERAL chat. DB/PDF never uses HF.",
+            help="Picks ONE HF model and keeps it (sticky) until Refresh/Clear Chat. DB/PDF never uses HF.",
         )
         st.session_state["younchat_random_route"] = bool(random_route)
 
@@ -1093,11 +1203,28 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         st.session_state["younchat_temp"] = float(temp)
 
         pool = _get_hf_model_pool(hf_model)
+
+        # ✅ STICKY model selection (NO button)
+        sticky_key = "younchat_hf_sticky_model"
+        if random_route:
+            sticky = (st.session_state.get(sticky_key) or "").strip()
+            # if missing OR no longer in pool -> choose once again
+            if (not sticky) or (sticky not in pool):
+                st.session_state[sticky_key] = random.choice(pool) if pool else ""
+        else:
+            st.session_state.pop(sticky_key, None)
+
+        sticky_model = (st.session_state.get(sticky_key) or "").strip()
+
         st.write("**HF primary model**:", hf_model)
         st.write("**HF pool size**:", len(pool))
         st.write("**HF_TOKEN present**:", "✅ Yes" if hf_token else "❌ No")
         st.write("**HF_FORCE_MODE**:", hf_force)
         st.write("**Internet**:", "✅ ON" if internet_on else "❌ OFF")
+        st.write("**HF providers**:", ", ".join(_get_hf_providers()))
+        if random_route and sticky_model:
+            st.write("**HF sticky model (until refresh):**", sticky_model)
+
         st.caption("Njangi numbers are ALWAYS answered from DB. HF is only for general chat wording (never DB/PDF commands).")
 
         with st.expander("🔎 View HF model pool", expanded=False):
@@ -1132,6 +1259,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     colA, colB = st.columns([1, 1], gap="small")
     if colA.button("🔄 Refresh", use_container_width=True):
         st.session_state.pop("_younchat_members_truth_cache", None)
+        st.session_state.pop("younchat_hf_sticky_model", None)  # ✅ clears sticky on refresh
         st.rerun()
     if colB.button("🧹 Clear chat", use_container_width=True):
         st.session_state["younchat_history"] = [{"role": "assistant", "content": _intro_only()}]
@@ -1139,6 +1267,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         st.session_state.pop("_younchat_members_truth_cache", None)
         st.session_state.pop("younchat_last_pdf_bytes", None)
         st.session_state.pop("younchat_last_pdf_name", None)
+        st.session_state.pop("younchat_hf_sticky_model", None)  # ✅ clears sticky on clear chat
         st.rerun()
 
     q = st.chat_input("Type your message…")
@@ -1232,14 +1361,15 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
             "- **loans** / **loans for member 10**\n"
             "- **finance kpis**\n"
             "- **tables**\n"
-            "- **health** (readability check)\n"
-            "- **counts** (row counts, best-effort)\n"
+            "- **health**\n"
+            "- **counts**\n"
             "- **show <table>** (example: show contributions)\n"
             "- **describe <table>** (example: describe loans)\n\n"
             "PDF:\n"
             "- **minutes pdf session 12**\n"
             "- **attendance pdf session 12**\n\n"
-            "- **web: <topic>** (internet)\n"
+            "Internet:\n"
+            "- **web: <topic>**\n"
         )
 
     elif _wants_tables_list(q):
@@ -1265,7 +1395,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         rel = _extract_relation_name(q)
         if not rel:
             used_source = "describe"
-            answer = "Hello 👋🏽 Say: **describe loans** (or any table/view in the allowlist)."
+            answer = "Hello 👋🏽 Say: **describe loans** (or any allowlisted table/view)."
         else:
             answer, df_show, used_source = _describe_relation(sb_anon, sb_service, schema, rel)
             df_title = f"Columns: {rel}"
@@ -1274,7 +1404,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         rel = _extract_relation_name(q)
         if not rel:
             used_source = "show"
-            answer = "Hello 👋🏽 Say: **show contributions** (or any table/view in the allowlist)."
+            answer = "Hello 👋🏽 Say: **show contributions** (or any allowlisted table/view)."
         else:
             answer, df_show, used_source = _show_relation(sb_anon, sb_service, schema, rel)
             df_title = f"Preview: {rel} (all columns)"
@@ -1303,7 +1433,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         df_show, df_title = df, title
         answer = f"Hello 👋🏽 {title} (from `{src}`):" if not df.empty else f"Hello 👋🏽 {title}: no rows returned."
 
-    # Member summary (grounded) ✅ clearer trigger
+    # Member summary (grounded)
     elif q.strip().isdigit() or t.startswith("member ") or t.startswith("summary "):
         mid = _extract_member_id(q) or member_id_focus
         if mid:
@@ -1321,27 +1451,26 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     # General chat: optional HF (NEVER DB/PDF commands)
     else:
         if hf_token and not _is_db_command(q):
-            sys = (
-                "You are younchat.\n"
-                "Rules:\n"
-                "- Start with 'Hello' if greeting.\n"
-                "- Do NOT output SQL or Python code.\n"
-                "- Do NOT invent Njangi numbers or member IDs.\n"
-                "- If user asks for database results, suggest commands: members / loans / finance kpis / tables / health / counts / show <table> / describe <table>.\n"
-                "- If user asks for PDFs, suggest: minutes pdf session <id>, attendance pdf session <id>.\n"
-            )
-            messages = [{"role": "system", "content": sys}]
-            for m in st.session_state["younchat_history"][-10:]:
-                if m.get("role") in ("user", "assistant"):
-                    messages.append({"role": m["role"], "content": m.get("content", "")})
+            sys = _hf_system_prompt()
 
+            # Advanced context packing
+            recent = _compact_history_for_hf(st.session_state.get("younchat_history", []), max_turns=12)
+            messages: List[Dict[str, str]] = [{"role": "system", "content": sys}]
+            messages.extend(recent)
+            # Ensure current user prompt is present (it is, but keep robust)
+            if not messages or messages[-1].get("role") != "user":
+                messages.append({"role": "user", "content": q})
+
+            sticky = (st.session_state.get("younchat_hf_sticky_model") or "").strip()
             ok, txt, mode, model_used = _hf_call(
                 hf_model,
                 hf_token,
                 messages,
                 random_route=bool(st.session_state.get("younchat_random_route", random_default)),
                 temperature=float(st.session_state.get("younchat_temp", 0.35)),
+                preferred_first=sticky if sticky else None,
             )
+
             used_source = f"hf:{mode}:{model_used}" if ok else "hf:failed"
             answer = txt if ok else f"Hello 👋🏽 HF is not reachable: {txt}"
         else:
