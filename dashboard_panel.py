@@ -1,37 +1,36 @@
 
-# dashboard_panel.py ✅ COMPLETE SINGLE FILE — Dashboard + 🤖 Young AI View + 🧭 In-Dashboard Navigation + 🌐 Web Search (Tavily) + 🧠 LLM (OpenAI) + ✅ LOCAL TIMEZONE GREETING
+# dashboard_panel.py ✅ UPDATED COMPLETE SINGLE FILE
+# Dashboard + 🤖 Young AI View + 🧭 In-Dashboard Navigation + 🌐 Web Search (Tavily)
+# + 🧠 LLM (OpenAI) + ✅ LOCAL TIMEZONE GREETING + ✅ COMPATIBLE WITH YOUR NEW app.py
 # ---------------------------------------------------------------------------------------------------------------
 # ✅ NJANGI STANDARD (NO legacy)
 # ✅ Works with app.py calling: render_dashboard(sb_anon=..., sb_service=..., schema=...)
 #
-# ✅ NEW (NO DUPLICATE UI): "Quick actions (safe navigation)" INSIDE Dashboard AI
-#   - Buttons change: st.session_state["page"] then st.rerun()
-#   - Requires app.py to use st.session_state["page"] as the selected page
+# ✅ IMPORTANT UPDATE (to match your NEW app.py):
+#   - Navigation buttons now set: st.session_state["page"] = "<Menu Name>"
+#   - Menu names MUST match app.py pages exactly:
+#       "Dashboard", "🤖 AI Mode", "Contributions", "Minutes & Attendance",
+#       "Admin", "Audit", "Health"
+#
+# ✅ NO DUPLICATE UI:
+#   - Quick actions are inside the Dashboard AI section only.
 #
 # 🤖 Young AI Helper:
 #   - Answers ONLY from LIVE snapshot (no guessing)
-#   - Two modes:
-#       (A) Grounded Rules (always available)
-#       (B) LLM (OpenAI) grounded strictly on snapshot (requires OPENAI_API_KEY)
+#   - Grounded Rules always available
+#   - Optional LLM (OpenAI) grounded strictly on snapshot (requires OPENAI_API_KEY)
 #
 # 🌐 Web Search (Tavily):
-#   - Use prefix:  web: <your query>
+#   - Use prefix: web: <your query>
 #   - Requires env var: TAVILY_API_KEY
 #
-# ✅ FIX: Greeting uses LOCAL_TZ (Railway Variable) instead of server UTC:
-#   - Set Railway → Variables: LOCAL_TZ = America/New_York  (Maryland)  OR America/Chicago
+# ✅ Greeting uses LOCAL_TZ env var (Railway Variable) instead of server UTC:
+#   - Example: LOCAL_TZ=America/New_York (Maryland) OR America/Chicago
 #
-# ✅ IMPORTANT FIXES (restores “good dashboard” behavior):
-#   1) AUTO-SELECT SESSION:
-#      - If app_state.current_session_id missing, auto-select latest sessions.id (or sessions.session_id fallback)
-#      - Optional auto-create session if none exist (toggle below)
-#   2) FIXED BUG: removed accidental filter id=1 in app_state select (was breaking reads)
-#   3) Robust session id resolution supports sessions.id OR sessions.session_id
-#
-# Requirements (if missing):
+# Requirements (only if you enable features):
 #   pip install openai requests
 #
-# Railway Variables you may set:
+# Railway Variables (optional):
 #   TAVILY_API_KEY=<...>
 #   OPENAI_API_KEY=<...>
 #   OPENAI_MODEL=gpt-4o-mini   (optional)
@@ -52,7 +51,18 @@ from postgrest.exceptions import APIError
 # ============================================================
 # SETTINGS
 # ============================================================
-AUTO_CREATE_SESSION_IF_NONE = False  # set True if you want the app to create a session automatically when none exist
+AUTO_CREATE_SESSION_IF_NONE = False  # set True if you want the app to auto-create a session when none exist
+
+# ✅ Must match app.py pages exactly (NEW app.py list)
+APP_PAGES = [
+    "Dashboard",
+    "🤖 AI Mode",
+    "Contributions",
+    "Minutes & Attendance",
+    "Admin",
+    "Audit",
+    "Health",
+]
 
 
 # ============================================================
@@ -66,10 +76,8 @@ def _local_now() -> datetime:
     tz_name = (os.getenv("LOCAL_TZ", "") or "America/New_York").strip()
     try:
         from zoneinfo import ZoneInfo  # py3.9+
-
         return datetime.now(ZoneInfo(tz_name))
     except Exception:
-        # fallback: UTC
         return datetime.now(timezone.utc)
 
 
@@ -118,16 +126,18 @@ def _api_msg(e: Exception) -> str:
 # LIGHT THROTTLE (optional; uses app.py session_state if present)
 # ============================================================
 def _throttle_db():
-    slow = bool(st.session_state.get("_slow_mode_override", True))
-    min_wait = float(st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", 0.15))
+    # Your app.py uses _slow_mode_override + MIN_SECONDS_BETWEEN_DB_CALLS_UI
+    slow = bool(st.session_state.get("_slow_mode_override", st.session_state.get("_slow_mode", True)))
+    min_wait = float(st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", st.session_state.get("_min_wait", 0.15)))
     if not slow:
         return
-    last = float(st.session_state.get("_last_db_call_ts", 0.0))
+    last = float(st.session_state.get("_last_db_call_ts", st.session_state.get("_last_db_ts", 0.0)))
     now = time.time()
     wait = min_wait - (now - last)
     if wait > 0:
         time.sleep(wait)
     st.session_state["_last_db_call_ts"] = time.time()
+    st.session_state["_last_db_ts"] = st.session_state["_last_db_call_ts"]
 
 
 def _safe_select(
@@ -242,7 +252,7 @@ def _get_latest_session_id(sb_read, schema: str) -> Optional[int]:
         if sid is not None:
             return sid
 
-    # Fallback: some schemas have sessions.session_id
+    # Fallback: sessions.session_id
     rows = _safe_select(
         sb_read,
         schema,
@@ -268,7 +278,6 @@ def _ensure_current_session(sb_anon, sb_service, schema: str) -> Tuple[Optional[
     sb_read = sb_service if sb_service is not None else sb_anon
     sb_write = sb_service  # writes only if service provided
 
-    # Read app_state (NO BUG FILTERS)
     app_state_rows = _safe_select(sb_read, schema, "app_state", "id,current_session_id", limit=1, show_error=False)
     app_state = app_state_rows[0] if app_state_rows else {}
     app_state_id = app_state.get("id")
@@ -276,14 +285,14 @@ def _ensure_current_session(sb_anon, sb_service, schema: str) -> Tuple[Optional[
 
     latest_sid = _get_latest_session_id(sb_read, schema)
 
-    # If no sessions exist
+    # No sessions exist
     if latest_sid is None:
         if not AUTO_CREATE_SESSION_IF_NONE:
             return None, "No sessions found. Create a session to start a cycle."
         if sb_write is None:
             return None, "No sessions found and service key missing (cannot auto-create)."
         name = f"Cycle {pd.Timestamp.utcnow().strftime('%Y-%m-%d')}"
-        created = _safe_insert(sb_write, schema, "sessions", {"name": name, "is_active": True})
+        created = _safe_insert(sb_write, schema, "sessions", {"name": name, "is_active": True, "created_at": _now_iso()})
         if created and created[0].get("id") is not None:
             latest_sid = _resolve_session_id(created[0].get("id"))
         if latest_sid is None:
@@ -291,25 +300,24 @@ def _ensure_current_session(sb_anon, sb_service, schema: str) -> Tuple[Optional[
         if latest_sid is None:
             return None, "Tried to auto-create a session but failed. Create one manually in Supabase."
 
-    # If app_state missing entirely
+    # app_state missing entirely
     if not app_state_rows:
         if sb_write is None:
             return latest_sid, "Selected latest session (app_state missing; cannot write without service key)."
-        ins = _safe_insert(sb_write, schema, "app_state", {"current_session_id": latest_sid})
+        ins = _safe_insert(sb_write, schema, "app_state", {"current_session_id": latest_sid, "created_at": _now_iso(), "updated_at": _now_iso()})
         if ins:
             return latest_sid, "Selected latest session (app_state created)."
         return latest_sid, "Selected latest session (app_state create failed)."
 
-    # If app_state exists but current_session_id missing -> set it
+    # app_state exists but current_session_id missing
     if current_sid is None:
         if sb_write is None:
             return latest_sid, "Selected latest session (current_session_id missing; cannot write without service key)."
-        ok = _safe_update_eq(sb_write, schema, "app_state", {"current_session_id": latest_sid}, "id", app_state_id)
+        ok = _safe_update_eq(sb_write, schema, "app_state", {"current_session_id": latest_sid, "updated_at": _now_iso()}, "id", app_state_id)
         if ok:
             return latest_sid, "Selected latest session (app_state updated)."
         return latest_sid, "Selected latest session (app_state update failed)."
 
-    # Good
     return current_sid, "Using current session from app_state."
 
 
@@ -332,12 +340,13 @@ def _tavily_search_cached(query: str, max_results: int = 5, search_depth: str = 
     if not api_key:
         return {"error": "Missing TAVILY_API_KEY in environment variables."}
 
-    url = "https://api.tavily.com/search"
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-    payload = {"query": query, "max_results": int(max_results), "search_depth": str(search_depth)}
-
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=20)
+        r = requests.post(
+            "https://api.tavily.com/search",
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+            json={"query": query, "max_results": int(max_results), "search_depth": str(search_depth)},
+            timeout=20,
+        )
         if r.status_code != 200:
             return {"error": f"Tavily error {r.status_code}: {r.text[:400]}"}
         j = r.json()
@@ -389,12 +398,6 @@ def _openai_model() -> str:
 
 @st.cache_data(ttl=120, show_spinner=False)
 def _llm_answer_cached(question: str, snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Cached LLM call so repeated same question doesn't re-bill.
-    Requires:
-      - OPENAI_API_KEY in env
-      - openai python package installed
-    """
     if not _has_openai_key():
         return {"error": "Missing OPENAI_API_KEY in environment variables."}
 
@@ -410,7 +413,7 @@ def _llm_answer_cached(question: str, snapshot: Dict[str, Any]) -> Dict[str, Any
         "- If the answer is not explicitly in the snapshot, say you don't have it.\n"
         "- Never invent numbers, names, totals, dates, or statuses.\n"
         "- Be concise. Use bullets when helpful.\n"
-        "- If user asks for per-member details not in snapshot, tell them to open Loans/AI Risk panel.\n"
+        "- Never claim who built you.\n"
     )
 
     user_input = (
@@ -423,7 +426,7 @@ def _llm_answer_cached(question: str, snapshot: Dict[str, Any]) -> Dict[str, Any
         client = OpenAI()
         text_out = None
 
-        # Try Responses API
+        # Responses API
         try:
             resp = client.responses.create(
                 model=_openai_model(),
@@ -461,7 +464,6 @@ def _young_answer_rules(q: str, snap: Dict[str, Any]) -> str:
 
     session_id = snap.get("session_id")
     total_members = snap.get("total_members", 0)
-    pot = snap.get("current_pot", 0.0)
     cycle_total = snap.get("cycle_contributions_total", 0.0)
     members_paid = snap.get("members_paid", 0)
     attendance_present = snap.get("attendance_present", 0)
@@ -472,6 +474,9 @@ def _young_answer_rules(q: str, snap: Dict[str, Any]) -> str:
     repayments_total = snap.get("repayments_total", 0.0)
     interest_total = snap.get("interest_total", 0.0)
 
+    # Pot for this dashboard is same as cycle_total (you can later subtract payouts if you want)
+    current_pot = float(cycle_total)
+
     def fmt_money(x: float) -> str:
         try:
             return f"{float(x):,.0f}"
@@ -479,14 +484,14 @@ def _young_answer_rules(q: str, snap: Dict[str, Any]) -> str:
             return str(x)
 
     if not t:
-        return "Ask me: **pot this session**, **loans summary**, **fines total**, or **attendance summary**."
+        return "Ask: **pot this session**, **loans summary**, **fines total**, **attendance summary**."
 
     if "session" in t and ("id" in t or "which" in t):
         return f"Current **Session ID** is **{session_id}**."
 
     if "pot" in t:
         return (
-            f"**Pot (Session {session_id})** = **{fmt_money(pot)}**.\n\n"
+            f"**Pot (Session {session_id})** = **{fmt_money(current_pot)}**.\n\n"
             f"Members paid: **{members_paid}/{total_members}** • Cycle contributions total: **{fmt_money(cycle_total)}**."
         )
 
@@ -497,7 +502,7 @@ def _young_answer_rules(q: str, snap: Dict[str, Any]) -> str:
         )
 
     if "attendance" in t or "present" in t or "absent" in t:
-        if attendance_total == 0:
+        if int(attendance_total) == 0:
             return f"No attendance records yet for **Session {session_id}**."
         absent = max(int(attendance_total) - int(attendance_present), 0)
         return (
@@ -506,12 +511,12 @@ def _young_answer_rules(q: str, snap: Dict[str, Any]) -> str:
         )
 
     if "loan" in t:
-        if loans_active_count == 0:
+        if int(loans_active_count) == 0:
             return "I see **no active loans** in the current snapshot."
         return (
             f"**Loans summary**\n"
             f"Active loans: **{loans_active_count}** • Active principal total: **{fmt_money(loans_active_total)}**.\n\n"
-            "If you want *who owes what*, open **Loans** or **🤖 AI Risk Panel**."
+            "If you want *who owes what*, open the **Loans** module or your AI Risk panel."
         )
 
     if "fine" in t:
@@ -527,7 +532,7 @@ def _young_answer_rules(q: str, snap: Dict[str, Any]) -> str:
         return "Status: **LIVE** (reading from Supabase)."
 
     return (
-        "I can answer from the dashboard snapshot:\n"
+        "I answer from the dashboard snapshot:\n"
         "• **pot this session**\n"
         "• **cycle contributions**\n"
         "• **loans summary**\n"
@@ -538,34 +543,36 @@ def _young_answer_rules(q: str, snap: Dict[str, Any]) -> str:
 
 
 # ============================================================
-# 🧭 SAFE NAVIGATION (Dashboard AI → pages)
+# 🧭 SAFE NAVIGATION (Dashboard AI → app.py menu)
 # ============================================================
 def _nav_to(page_name: str):
-    # app.py must read st.session_state["page"] to decide which page to render
+    """
+    app.py bridge will convert st.session_state["page"] into nav_request BEFORE sidebar widget.
+    """
     st.session_state["page"] = str(page_name)
     st.rerun()
 
 
 def _safe_nav_buttons():
     st.markdown("#### Quick actions (safe navigation)")
-    st.caption("These buttons open pages by setting **st.session_state['page']**. (Your app.py must use it.)")
+    st.caption("Buttons set **st.session_state['page']**. Your app.py bridges this into the sidebar selection.")
+
+    # 2 columns (clean)
     c1, c2 = st.columns(2)
 
     with c1:
         if st.button("Open Dashboard", width="stretch"):
             _nav_to("Dashboard")
+        if st.button("Open 🤖 AI Mode", width="stretch"):
+            _nav_to("🤖 AI Mode")
         if st.button("Open Contributions", width="stretch"):
             _nav_to("Contributions")
-        if st.button("Open Loans", width="stretch"):
-            _nav_to("Loans")
-        if st.button("Open Payouts", width="stretch"):
-            _nav_to("Payouts")
-
-    with c2:
-        if st.button("Open 🤖 AI Risk Panel", width="stretch"):
-            _nav_to("AI Risk Panel")
         if st.button("Open Minutes & Attendance", width="stretch"):
             _nav_to("Minutes & Attendance")
+
+    with c2:
+        if st.button("Open Admin", width="stretch"):
+            _nav_to("Admin")
         if st.button("Open Audit", width="stretch"):
             _nav_to("Audit")
         if st.button("Open Health", width="stretch"):
@@ -575,7 +582,7 @@ def _safe_nav_buttons():
 def _render_young_ai_view(snapshot: Dict[str, Any]):
     st.markdown("### 🤖 Young — Dashboard AI Helper")
 
-    # ✅ NEW: navigation from dashboard through AI helper
+    # ✅ Navigation inside Dashboard AI (NO duplicate sidebar UI)
     _safe_nav_buttons()
 
     st.divider()
@@ -586,20 +593,20 @@ def _render_young_ai_view(snapshot: Dict[str, Any]):
 
     use_llm = st.toggle(
         "Use LLM (OpenAI) for answers (still grounded on snapshot)",
-        value=False,
-        help="Requires OPENAI_API_KEY in Railway Variables. If off, uses grounded rule-based answers.",
+        value=bool(st.session_state.get("young_use_llm", False)),
+        help="Requires OPENAI_API_KEY. If off, uses grounded rule-based answers.",
         key="young_use_llm",
     )
 
-    cols_cfg = st.columns(2)
-    with cols_cfg[0]:
+    cfg1, cfg2 = st.columns(2)
+    with cfg1:
         st.caption(f"🧠 LLM: {'READY' if _has_openai_key() else 'MISSING OPENAI_API_KEY'}")
-    with cols_cfg[1]:
+    with cfg2:
         st.caption(f"🌐 Tavily: {'READY' if _has_tavily_key() else 'MISSING TAVILY_API_KEY'}")
 
     st.write(
         "Try: • pot this session • loans summary • fines total • repayments total • interest total • attendance summary\n\n"
-        "Internet (only if you force it):  web: Maryland cosmetology license requirements"
+        "Internet: web: Maryland cosmetology license requirements"
     )
 
     q = st.text_input(
@@ -608,40 +615,42 @@ def _render_young_ai_view(snapshot: Dict[str, Any]):
         key="young_dash_q",
     )
 
-    c1, c2 = st.columns([0.25, 0.75])
-    with c1:
-        ask = st.button("Ask", key="young_dash_ask", width="stretch")
-    with c2:
-        if ask:
-            if _is_web_query(q):
-                if not _has_tavily_key():
-                    st.session_state["young_dash_a"] = (
-                        "Web search is not configured yet.\n\n"
-                        "Add **TAVILY_API_KEY** in Railway → Variables, then redeploy."
-                    )
-                    st.session_state["young_dash_sources"] = []
-                else:
-                    query = _strip_web_prefix(q)
-                    tav = _tavily_search_cached(query=query, max_results=5, search_depth="basic")
-                    summary, sources = _format_web_results(tav)
-                    st.session_state["young_dash_a"] = summary
-                    st.session_state["young_dash_sources"] = sources
+    if st.button("Ask", key="young_dash_ask", width="stretch"):
+        # --- WEB query path ---
+        if _is_web_query(q):
+            if not _has_tavily_key():
+                st.session_state["young_dash_a"] = (
+                    "Web search is not configured yet.\n\n"
+                    "Add **TAVILY_API_KEY** in Railway → Variables, then redeploy."
+                )
+                st.session_state["young_dash_sources"] = []
             else:
-                if use_llm:
-                    res = _llm_answer_cached(question=q, snapshot=snapshot)
-                    if res.get("error"):
-                        st.session_state["young_dash_a"] = (
-                            "LLM mode failed, so I used the grounded snapshot rules instead.\n\n"
-                            f"**LLM error:** {res['error']}\n\n"
-                            + _young_answer_rules(q, snapshot)
-                        )
-                    else:
-                        st.session_state["young_dash_a"] = res.get("text", "").strip() or _young_answer_rules(q, snapshot)
-                    st.session_state["young_dash_sources"] = []
-                else:
-                    st.session_state["young_dash_a"] = _young_answer_rules(q, snapshot)
-                    st.session_state["young_dash_sources"] = []
+                query = _strip_web_prefix(q)
+                tav = _tavily_search_cached(query=query, max_results=5, search_depth="basic")
+                summary, sources = _format_web_results(tav)
+                st.session_state["young_dash_a"] = summary
+                st.session_state["young_dash_sources"] = sources
 
+        # --- GROUNDED dashboard path ---
+        else:
+            if use_llm:
+                res = _llm_answer_cached(question=q, snapshot=snapshot)
+                if res.get("error"):
+                    st.session_state["young_dash_a"] = (
+                        "LLM mode failed, so I used grounded snapshot rules instead.\n\n"
+                        f"**LLM error:** {res['error']}\n\n"
+                        + _young_answer_rules(q, snapshot)
+                    )
+                else:
+                    st.session_state["young_dash_a"] = res.get("text", "").strip() or _young_answer_rules(q, snapshot)
+                st.session_state["young_dash_sources"] = []
+            else:
+                st.session_state["young_dash_a"] = _young_answer_rules(q, snapshot)
+                st.session_state["young_dash_sources"] = []
+
+        st.rerun()
+
+    # Answer + sources
     a = st.session_state.get("young_dash_a")
     if a:
         st.markdown(a)
@@ -826,6 +835,8 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
         "repayments_total": float(repayments_total),
         "interest_total": float(interest_total),
         "generated_at": _now_iso(),
+        "local_time": _local_now().strftime("%Y-%m-%d %H:%M"),
+        "greeting": _greeting_of_day(),
     }
 
     _render_young_ai_view(snapshot)
