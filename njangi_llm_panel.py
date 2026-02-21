@@ -12,33 +12,22 @@
 #   - NO hallucinations for Njangi numbers (all financial answers come from DB)
 #   - HF Router will NEVER answer DB / PDF commands
 #
-# Extra (your new request):
+# Extra:
 #   - ✅ Can access and display ALL columns for your actual tables (select "*")
 #   - ✅ "health" + "counts" commands to assess all tables quickly
 #   - ✅ Optional "random model routing" for HF (general chat ONLY, never DB/PDF)
-#
-# Works with app.py:
-#   from njangi_llm_panel import render_njangi_llm_panel
-#   render_njangi_llm_panel(sb_anon=..., sb_service=..., schema=...)
-#
-# Railway env vars (optional):
-#   HF_TOKEN
-#   HF_MODEL
-#   HF_FORCE_MODE = auto | completions | chat
-#   TAVILY_API_KEY
-#   INTERNET_MODE = on | off
 # =============================================================================
 
 from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import time
-import random
 from datetime import datetime, timezone
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 import requests
@@ -53,12 +42,10 @@ except Exception:
 try:
     from reportlab.lib.pagesizes import LETTER
     from reportlab.lib.units import inch
-    from reportlab.lib.utils import ImageReader
     from reportlab.pdfgen import canvas
 except Exception:
     LETTER = None  # type: ignore
     inch = None  # type: ignore
-    ImageReader = None  # type: ignore
     canvas = None  # type: ignore
 
 
@@ -76,7 +63,6 @@ HF_FALLBACK_MODELS = [
 ]
 
 # ✅ Allowlist relations (tables + views).
-# NOTE: Your listed real tables are included here.
 RELATIONS: Dict[str, Dict[str, Any]] = {
     # Core tables
     "members": {"type": "table", "truth": True},
@@ -95,13 +81,11 @@ RELATIONS: Dict[str, Dict[str, Any]] = {
     "attendance": {"type": "table"},
     "signatures": {"type": "table"},
     "audit_log": {"type": "table"},
-
-    # Optional/extra tables (safe if present)
+    # Optional/extra
     "profiles": {"type": "table"},
     "ml_training_data": {"type": "table"},
     "member_contribution_totals": {"type": "table"},
-
-    # Optional views (if you created them)
+    # Optional views
     "v_finance_kpis": {"type": "view"},
     "v_member_financial_totals": {"type": "view"},
     "v_loans_with_member": {"type": "view"},
@@ -125,7 +109,6 @@ RELATIONS: Dict[str, Dict[str, Any]] = {
 # Time helpers
 # -----------------------------------------------------------------------------
 def _intro_only() -> str:
-    # ✅ EXACT intro required by you (only line, no extra text)
     return "Hello 👋🏽 I’m younchat — your Njangi assistant."
 
 
@@ -148,6 +131,9 @@ def _api_msg(e: Exception) -> str:
 # -----------------------------------------------------------------------------
 # DB Read helpers (allowlist enforced)
 # -----------------------------------------------------------------------------
+_SBSelectReturn = Union[pd.DataFrame, Tuple[pd.DataFrame, bool, str]]
+
+
 def _sb_select(
     sb_anon,
     sb_service,
@@ -158,17 +144,19 @@ def _sb_select(
     filters: Optional[List[Tuple[str, str, Any]]] = None,
     order: Optional[Tuple[str, bool]] = None,
     prefer_service: bool = True,
-) -> pd.DataFrame:
+    return_meta: bool = False,
+) -> _SBSelectReturn:
     """
     filters: list of (column, op, value) where op in ["eq","gte","lte","ilike","in"]
     order: (column, asc)
+    If return_meta=True -> returns (df, ok, err_msg)
     """
     if relation not in RELATIONS:
-        return pd.DataFrame()
+        return (pd.DataFrame(), False, "relation not allowlisted") if return_meta else pd.DataFrame()
 
     sb = (sb_service if (prefer_service and sb_service is not None) else None) or sb_anon
     if sb is None:
-        return pd.DataFrame()
+        return (pd.DataFrame(), False, "supabase client missing") if return_meta else pd.DataFrame()
 
     def _apply_filters(q):
         if filters:
@@ -184,7 +172,6 @@ def _sb_select(
                 elif op == "ilike":
                     q = q.ilike(col, val)
                 elif op == "in":
-                    # supabase-py uses in_()
                     q = q.in_(col, val)  # type: ignore
         if order:
             col, asc = order
@@ -196,17 +183,21 @@ def _sb_select(
         q = sb.schema(schema).table(relation).select(cols).limit(int(limit))
         q = _apply_filters(q)
         res = q.execute()
-        return pd.DataFrame(getattr(res, "data", None) or [])
+        df = pd.DataFrame(getattr(res, "data", None) or [])
+        return (df, True, "") if return_meta else df
     except Exception:
-        # Fallback to default
+        # Fallback to default schema
         try:
             q = sb.table(relation).select(cols).limit(int(limit))
             q = _apply_filters(q)
             res = q.execute()
-            return pd.DataFrame(getattr(res, "data", None) or [])
+            df = pd.DataFrame(getattr(res, "data", None) or [])
+            return (df, True, "") if return_meta else df
         except Exception as e2:
-            st.warning(f"Could not read {schema}.{relation}: {_api_msg(e2)}")
-            return pd.DataFrame()
+            msg = _api_msg(e2)
+            # keep warning for interactive debugging
+            st.warning(f"Could not read {schema}.{relation}: {msg}")
+            return (pd.DataFrame(), False, msg) if return_meta else pd.DataFrame()
 
 
 def _sb_count(sb_anon, sb_service, schema: str, relation: str) -> Optional[int]:
@@ -217,28 +208,17 @@ def _sb_count(sb_anon, sb_service, schema: str, relation: str) -> Optional[int]:
     if sb is None:
         return None
     try:
-        # Many supabase-py versions set res.count when count="exact"
-        res = sb.schema(schema).table(relation).select("id", count="exact").limit(1).execute()
+        # Avoid assuming an 'id' column exists
+        res = sb.schema(schema).table(relation).select("*", count="exact").limit(1).execute()
         c = getattr(res, "count", None)
-        if c is None:
-            # some versions store count differently
-            try:
-                c = int(res.data and len(res.data))  # not exact, fallback
-            except Exception:
-                c = None
         return int(c) if c is not None else None
     except Exception:
         try:
-            res = sb.table(relation).select("id", count="exact").limit(1).execute()
+            res = sb.table(relation).select("*", count="exact").limit(1).execute()
             c = getattr(res, "count", None)
             return int(c) if c is not None else None
         except Exception:
             return None
-
-
-def _table_readable(sb_anon, sb_service, schema: str, relation: str) -> bool:
-    df = _sb_select(sb_anon, sb_service, schema, relation, cols="*", limit=1, prefer_service=True)
-    return df is not None and isinstance(df, pd.DataFrame)
 
 
 def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
@@ -296,13 +276,11 @@ def _wants_tables_list(text: str) -> bool:
 
 
 def _wants_health(text: str) -> bool:
-    t = _lc(text)
-    return t in {"health", "db health", "check db", "check tables"}
+    return _lc(text) in {"health", "db health", "check db", "check tables"}
 
 
 def _wants_counts(text: str) -> bool:
-    t = _lc(text)
-    return t in {"counts", "row counts", "table counts", "count tables"}
+    return _lc(text) in {"counts", "row counts", "table counts", "count tables"}
 
 
 def _wants_describe(text: str) -> bool:
@@ -354,17 +332,7 @@ def _strip_web_prefix(q: str) -> str:
     return re.sub(r"^(web:|internet:|tavily:)\s*", "", (q or "").strip(), flags=re.IGNORECASE).strip()
 
 
-# PDF commands
-def _wants_pdf_loan_statement(text: str) -> bool:
-    t = _lc(text)
-    return ("pdf" in t and "loan" in t) or t.startswith("loan statement") or t.startswith("pdf loan")
-
-
-def _wants_pdf_payout_receipt(text: str) -> bool:
-    t = _lc(text)
-    return ("pdf" in t and "payout" in t) or t.startswith("payout receipt") or t.startswith("pdf payout")
-
-
+# PDF commands (only minutes + attendance enabled here)
 def _wants_pdf_minutes(text: str) -> bool:
     t = _lc(text)
     return ("pdf" in t and "minutes" in t) or t.startswith("minutes pdf") or t.startswith("pdf minutes")
@@ -376,14 +344,7 @@ def _wants_pdf_attendance(text: str) -> bool:
 
 
 def _is_pdf_command(text: str) -> bool:
-    return any(
-        [
-            _wants_pdf_loan_statement(text),
-            _wants_pdf_payout_receipt(text),
-            _wants_pdf_minutes(text),
-            _wants_pdf_attendance(text),
-        ]
-    )
+    return _wants_pdf_minutes(text) or _wants_pdf_attendance(text)
 
 
 def _extract_relation_name(text: str) -> Optional[str]:
@@ -402,10 +363,6 @@ _MEMBER_ID_PATTERNS = [
     re.compile(r"\bmember\s*#?\s*(\d+)\b", re.IGNORECASE),
     re.compile(r"\bid\s*[:=#]?\s*(\d+)\b", re.IGNORECASE),
 ]
-_PAYOUT_ID_PATTERNS = [
-    re.compile(r"\bpayout[_\s-]?id\s*[:=#]?\s*(\d+)\b", re.IGNORECASE),
-    re.compile(r"\bpayout\s*#?\s*(\d+)\b", re.IGNORECASE),
-]
 _SESSION_ID_PATTERNS = [
     re.compile(r"\bsession[_\s-]?id\s*[:=#]?\s*(\d+)\b", re.IGNORECASE),
     re.compile(r"\bsession\s*#?\s*(\d+)\b", re.IGNORECASE),
@@ -419,15 +376,6 @@ def _extract_member_id(text: str) -> Optional[str]:
     if t.isdigit():
         return t
     for pat in _MEMBER_ID_PATTERNS:
-        m = pat.search(t)
-        if m:
-            return str(m.group(1))
-    return None
-
-
-def _extract_payout_id(text: str) -> Optional[str]:
-    t = _clean(text)
-    for pat in _PAYOUT_ID_PATTERNS:
         m = pat.search(t)
         if m:
             return str(m.group(1))
@@ -477,11 +425,12 @@ def _is_db_command(text: str) -> bool:
 # -----------------------------------------------------------------------------
 def _load_members_truth(sb_anon, sb_service, schema: str, limit: int = 3000) -> pd.DataFrame:
     df = _sb_select(sb_anon, sb_service, schema, "members", cols="*", limit=limit)
+    if isinstance(df, tuple):  # safety (shouldn't happen)
+        df = df[0]
     if df.empty:
         return df
 
     id_col = _pick_col(df, ["id", "member_id"])
-    name_col = _pick_col(df, ["display_name", "full_name", "name"])
     phone_col = _pick_col(df, ["phone"])
 
     if not id_col:
@@ -490,12 +439,20 @@ def _load_members_truth(sb_anon, sb_service, schema: str, limit: int = 3000) -> 
     out = pd.DataFrame()
     out["member_id"] = df[id_col].astype(str)
 
-    if name_col and name_col in df.columns:
-        nm = df[name_col].astype(str).replace({"None": "", "nan": "", "NaN": ""}).fillna("").str.strip()
-    else:
-        nm = pd.Series(["(no name)"] * len(df))
+    # ✅ FIX: prefer display_name but fall back to name if display_name is empty/NULL
+    disp = (
+        df["display_name"].fillna("").astype(str).replace({"None": "", "nan": "", "NaN": ""}).str.strip()
+        if "display_name" in df.columns
+        else pd.Series([""] * len(df))
+    )
+    nm = (
+        df["name"].fillna("").astype(str).replace({"None": "", "nan": "", "NaN": ""}).str.strip()
+        if "name" in df.columns
+        else pd.Series([""] * len(df))
+    )
+    member_name = disp.where(disp != "", nm).replace("", "(no name)")
+    out["member_name"] = member_name
 
-    out["member_name"] = nm.replace("", "(no name)")
     if phone_col and phone_col in df.columns:
         out["phone"] = df[phone_col].astype(str).replace({"None": "", "nan": "", "NaN": ""}).fillna("").str.strip()
     else:
@@ -508,6 +465,20 @@ def _load_members_truth(sb_anon, sb_service, schema: str, limit: int = 3000) -> 
         pass
 
     return out
+
+
+def _get_members_truth_cached(sb_anon, sb_service, schema: str, ttl_sec: int = 30) -> pd.DataFrame:
+    now = time.time()
+    cache = st.session_state.get("_younchat_members_truth_cache", None)
+    if isinstance(cache, dict):
+        ts = float(cache.get("ts", 0))
+        df = cache.get("df", None)
+        if (now - ts) < ttl_sec and isinstance(df, pd.DataFrame):
+            return df
+
+    df = _load_members_truth(sb_anon, sb_service, schema, limit=3000)
+    st.session_state["_younchat_members_truth_cache"] = {"ts": now, "df": df}
+    return df
 
 
 def _member_name_from_truth(members_truth: pd.DataFrame, member_id: str) -> str:
@@ -532,13 +503,6 @@ def _find_row_for_member(df: pd.DataFrame, member_id: str) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 # PDF helpers
 # -----------------------------------------------------------------------------
-def _money(x: Any, currency: str = "$") -> str:
-    try:
-        return f"{currency}{float(x):,.2f}"
-    except Exception:
-        return f"{currency}{x}"
-
-
 def _require_pdf() -> Optional[str]:
     if canvas is None or LETTER is None or inch is None:
         return "PDF libraries missing. Add `reportlab` to requirements.txt."
@@ -590,7 +554,14 @@ def _make_simple_pdf(title: str, lines: List[str]) -> bytes:
 
 
 def _pdf_minutes(sb_anon, sb_service, schema: str, session_id: str) -> Tuple[str, bytes, str]:
-    df = _sb_select(sb_anon, sb_service, schema, "minutes", cols="*", limit=1, filters=[("session_id", "eq", int(session_id))], order=("created_at", False))
+    df = _sb_select(
+        sb_anon, sb_service, schema, "minutes",
+        cols="*", limit=1,
+        filters=[("session_id", "eq", int(session_id))],
+        order=("created_at", False),
+    )
+    if isinstance(df, tuple):
+        df = df[0]
     if df.empty:
         raise Exception(f"No minutes found for session_id={session_id}.")
     row = df.iloc[0].to_dict()
@@ -601,7 +572,14 @@ def _pdf_minutes(sb_anon, sb_service, schema: str, session_id: str) -> Tuple[str
 
 
 def _pdf_attendance(sb_anon, sb_service, schema: str, session_id: str) -> Tuple[str, bytes, str]:
-    df = _sb_select(sb_anon, sb_service, schema, "attendance", cols="*", limit=5000, filters=[("session_id", "eq", int(session_id))], order=("member_id", True))
+    df = _sb_select(
+        sb_anon, sb_service, schema, "attendance",
+        cols="*", limit=5000,
+        filters=[("session_id", "eq", int(session_id))],
+        order=("member_id", True),
+    )
+    if isinstance(df, tuple):
+        df = df[0]
     lines = [f"Session ID: {session_id}", ""]
     if df.empty:
         lines.append("No attendance recorded.")
@@ -621,9 +599,11 @@ def _pdf_attendance(sb_anon, sb_service, schema: str, session_id: str) -> Tuple[
 def _member_financial_totals(sb_anon, sb_service, schema: str, member_id: str, members_truth: pd.DataFrame) -> Tuple[str, Dict[str, Any]]:
     name = _member_name_from_truth(members_truth, member_id)
 
-    # Prefer view if available
+    # Prefer view if available (and readable)
     if "v_member_financial_totals" in RELATIONS:
         v_all = _sb_select(sb_anon, sb_service, schema, "v_member_financial_totals", cols="*", limit=5000)
+        if isinstance(v_all, tuple):
+            v_all = v_all[0]
         hit = _find_row_for_member(v_all, member_id)
         if not hit.empty:
             row = hit.iloc[0].to_dict()
@@ -639,11 +619,19 @@ def _member_financial_totals(sb_anon, sb_service, schema: str, member_id: str, m
             return msg, {"source": "v_member_financial_totals", "row": row}
 
     # Fallback: compute from raw tables
-    contributions = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=20000, filters=[("member_id", "eq", int(member_id))])
-    foundation = _sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=20000, filters=[("member_id", "eq", int(member_id))])
-    fines = _sb_select(sb_anon, sb_service, schema, "fines", cols="*", limit=20000, filters=[("member_id", "eq", int(member_id))])
-    loans = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=10000, filters=[("member_id", "eq", int(member_id))])
-    interest_ledger = _sb_select(sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=20000, filters=[("member_id", "eq", int(member_id))])
+    mid_int = int(member_id)
+
+    contributions = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=20000, filters=[("member_id", "eq", mid_int)])
+    foundation = _sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=20000, filters=[("member_id", "eq", mid_int)])
+    fines = _sb_select(sb_anon, sb_service, schema, "fines", cols="*", limit=20000, filters=[("member_id", "eq", mid_int)])
+    loans = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=10000, filters=[("member_id", "eq", mid_int)])
+    interest_ledger = _sb_select(sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=20000, filters=[("member_id", "eq", mid_int)])
+
+    if isinstance(contributions, tuple): contributions = contributions[0]
+    if isinstance(foundation, tuple): foundation = foundation[0]
+    if isinstance(fines, tuple): fines = fines[0]
+    if isinstance(loans, tuple): loans = loans[0]
+    if isinstance(interest_ledger, tuple): interest_ledger = interest_ledger[0]
 
     contrib_amt = _pick_col(contributions, ["amount"])
     found_amt = _pick_col(foundation, ["amount"])
@@ -678,12 +666,13 @@ def _loans_with_member(sb_anon, sb_service, schema: str, member_id: Optional[str
     if "v_loans_with_member" in RELATIONS:
         filters = [("member_id", "eq", int(member_id))] if member_id else None
         df = _sb_select(sb_anon, sb_service, schema, "v_loans_with_member", cols="*", limit=5000, filters=filters)
+        if isinstance(df, tuple): df = df[0]
         src = "v_loans_with_member"
     else:
         filters = [("member_id", "eq", int(member_id))] if member_id else None
         df = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=5000, filters=filters)
+        if isinstance(df, tuple): df = df[0]
         if not df.empty and "member_id" in df.columns and not members_truth.empty:
-            # members_truth.member_id is str, convert
             mt = members_truth.copy()
             mt["member_id_num"] = pd.to_numeric(mt["member_id"], errors="coerce")
             df2 = df.copy()
@@ -701,12 +690,14 @@ def _loans_with_member(sb_anon, sb_service, schema: str, member_id: Optional[str
 def _kpis(sb_anon, sb_service, schema: str) -> Tuple[str, pd.DataFrame, str]:
     if "v_finance_kpis" in RELATIONS:
         df = _sb_select(sb_anon, sb_service, schema, "v_finance_kpis", cols="*", limit=2000)
+        if isinstance(df, tuple): df = df[0]
         return "Finance KPIs", df, "v_finance_kpis"
     return "Finance KPIs", pd.DataFrame([{"note": "v_finance_kpis not available"}]), "fallback"
 
 
 def _describe_relation(sb_anon, sb_service, schema: str, relation: str) -> Tuple[str, pd.DataFrame, str]:
     df = _sb_select(sb_anon, sb_service, schema, relation, cols="*", limit=1)
+    if isinstance(df, tuple): df = df[0]
     cols = list(df.columns) if df is not None else []
     out = pd.DataFrame({"column_name": cols})
     msg = f"Hello 👋🏽 Columns for **{relation}** ({RELATIONS[relation]['type']}):"
@@ -715,7 +706,16 @@ def _describe_relation(sb_anon, sb_service, schema: str, relation: str) -> Tuple
 
 def _show_relation(sb_anon, sb_service, schema: str, relation: str) -> Tuple[str, pd.DataFrame, str]:
     df = _sb_select(sb_anon, sb_service, schema, relation, cols="*", limit=2000)
+    if isinstance(df, tuple): df = df[0]
     df = _coalesce_note_cols(df)
+
+    # Nice preview: newest first if possible
+    if "created_at" in df.columns:
+        try:
+            df = df.sort_values("created_at", ascending=False)
+        except Exception:
+            pass
+
     msg = f"Hello 👋🏽 Preview of **{relation}** ({RELATIONS[relation]['type']}):"
     return msg, df, f"show:{relation}"
 
@@ -724,20 +724,13 @@ def _health_table(sb_anon, sb_service, schema: str) -> pd.DataFrame:
     rows = []
     for rel in sorted(RELATIONS.keys()):
         typ = RELATIONS[rel].get("type", "?")
-        readable = False
-        errtxt = ""
-        try:
-            _ = _sb_select(sb_anon, sb_service, schema, rel, cols="*", limit=1)
-            readable = True
-        except Exception as e:
-            readable = False
-            errtxt = _api_msg(e)
+        df, ok, err = _sb_select(sb_anon, sb_service, schema, rel, cols="*", limit=1, return_meta=True)  # type: ignore
         rows.append(
             {
                 "relation": rel,
                 "type": typ,
-                "readable": "✅" if readable else "❌",
-                "note": errtxt[:120] if errtxt else "",
+                "readable": "✅" if ok else "❌",
+                "note": (err or "")[:140],
             }
         )
     return pd.DataFrame(rows)
@@ -912,23 +905,6 @@ def _hf_call(model: str, token: str, messages: List[Dict[str, str]], random_rout
 
 
 # -----------------------------------------------------------------------------
-# Cached members truth (session_state avoids unhashable clients)
-# -----------------------------------------------------------------------------
-def _get_members_truth_cached(sb_anon, sb_service, schema: str, ttl_sec: int = 30) -> pd.DataFrame:
-    now = time.time()
-    cache = st.session_state.get("_younchat_members_truth_cache", None)
-    if isinstance(cache, dict):
-        ts = float(cache.get("ts", 0))
-        df = cache.get("df", None)
-        if (now - ts) < ttl_sec and isinstance(df, pd.DataFrame):
-            return df
-
-    df = _load_members_truth(sb_anon, sb_service, schema, limit=3000)
-    st.session_state["_younchat_members_truth_cache"] = {"ts": now, "df": df}
-    return df
-
-
-# -----------------------------------------------------------------------------
 # Main UI
 # -----------------------------------------------------------------------------
 def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
@@ -1005,14 +981,15 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     with st.chat_message("user"):
         st.markdown(q)
 
+    # ✅ FIX: set member focus ONLY when user clearly means member id (bare number OR explicit "member ...")
     detected_id = _extract_member_id(q)
+    t = _lc(q)
+    is_explicit_member = ("member" in t and "id" in t) or t.strip().startswith("member")
+    is_bare_number = q.strip().isdigit()
+    if detected_id and (is_bare_number or is_explicit_member):
+        st.session_state["younchat_last_member_id"] = detected_id
 
-t = _lc(q)
-is_explicit_member = ("member" in t and "id" in t) or t.strip().startswith("member")
-is_bare_number = q.strip().isdigit()
-
-if detected_id and (is_bare_number or is_explicit_member):
-    st.session_state["younchat_last_member_id"] = detected_id
+    member_id_focus = st.session_state.get("younchat_last_member_id")
 
     used_source = "local"
     answer = ""
@@ -1083,6 +1060,7 @@ if detected_id and (is_bare_number or is_explicit_member):
             "Hello 👋🏽 Commands:\n\n"
             "- **members**\n"
             "- type **10** (member summary)\n"
+            "- **member 10** (explicit)\n"
             "- **loans** / **loans for member 10**\n"
             "- **finance kpis**\n"
             "- **tables**\n"
@@ -1157,9 +1135,15 @@ if detected_id and (is_bare_number or is_explicit_member):
         df_show, df_title = df, title
         answer = f"Hello 👋🏽 {title} (from `{src}`):" if not df.empty else f"Hello 👋🏽 {title}: no rows returned."
 
-    elif member_id_focus and (q.strip().isdigit() or "member" in _lc(q) or "summary" in _lc(q) or "status" in _lc(q)):
-        answer, meta = _member_financial_totals(sb_anon, sb_service, schema, str(member_id_focus), members_truth)
-        used_source = meta.get("source", "member_summary_local")
+    # Member summary (grounded) — only when bare number OR explicit member request
+    elif (q.strip().isdigit() and member_id_focus) or t.startswith("member ") or t.startswith("summary "):
+        mid = _extract_member_id(q) or member_id_focus
+        if mid:
+            answer, meta = _member_financial_totals(sb_anon, sb_service, schema, str(mid), members_truth)
+            used_source = meta.get("source", "member_summary_local")
+        else:
+            used_source = "member_summary"
+            answer = "Hello 👋🏽 Say: **10** or **member 10**."
 
     elif _lc(q) in RELATIONS:
         rel = _lc(q)
@@ -1216,6 +1200,7 @@ if detected_id and (is_bare_number or is_explicit_member):
                 used_source = "local:fallback"
                 answer = "Hello 👋🏽"
 
+    # Write answer to chat
     st.session_state["younchat_history"].append({"role": "assistant", "content": answer})
     with st.chat_message("assistant"):
         st.markdown(answer)
