@@ -1006,9 +1006,13 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         st.markdown(q)
 
     detected_id = _extract_member_id(q)
-    if detected_id:
-        st.session_state["younchat_last_member_id"] = detected_id
-    member_id_focus = st.session_state.get("younchat_last_member_id")
+
+t = _lc(q)
+is_explicit_member = ("member" in t and "id" in t) or t.strip().startswith("member")
+is_bare_number = q.strip().isdigit()
+
+if detected_id and (is_bare_number or is_explicit_member):
+    st.session_state["younchat_last_member_id"] = detected_id
 
     used_source = "local"
     answer = ""
