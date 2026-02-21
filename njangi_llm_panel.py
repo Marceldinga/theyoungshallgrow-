@@ -16,6 +16,16 @@
 #   - ✅ Can access and display ALL columns for your actual tables (select "*")
 #   - ✅ "health" + "counts" commands to assess all tables quickly
 #   - ✅ Optional "random model routing" for HF (general chat ONLY, never DB/PDF)
+#   - ✅ Supports ~40 model pool (random) for HF router general chat
+#
+# Railway env vars (optional):
+#   HF_TOKEN
+#   HF_MODEL
+#   HF_FORCE_MODE = auto | completions | chat
+#   HF_RANDOM_DEFAULT = on | off      (default random routing)
+#   HF_MODELS_CSV                    (comma separated pool, optional)
+#   TAVILY_API_KEY
+#   INTERNET_MODE = on | off
 # =============================================================================
 
 from __future__ import annotations
@@ -56,11 +66,83 @@ HF_ROUTER_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
 HF_ROUTER_COMPLETIONS_URL = "https://router.huggingface.co/v1/completions"
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 
-HF_FALLBACK_MODELS = [
+
+# ---------------------------
+# HF model pool (curated ~40)
+# - Used ONLY for general chat (never DB/PDF)
+# - You can override with Railway env var HF_MODELS_CSV
+# ---------------------------
+HF_FALLBACK_MODELS: List[str] = [
+    # Llama 3 / 3.1 family
     "meta-llama/Meta-Llama-3-8B-Instruct",
+    "meta-llama/Meta-Llama-3-70B-Instruct",
     "meta-llama/Llama-3.1-8B-Instruct",
+    "meta-llama/Llama-3.1-70B-Instruct",
+
+    # Mistral family
     "mistralai/Mistral-7B-Instruct-v0.2",
+    "mistralai/Mistral-7B-Instruct-v0.3",
+    "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    "mistralai/Mixtral-8x22B-Instruct-v0.1",
+
+    # Nous Hermes
+    "NousResearch/Nous-Hermes-2-Mixtral-8x7B-DPO",
+    "NousResearch/Nous-Hermes-2-Yi-34B",
+    "NousResearch/Nous-Hermes-2-Mistral-7B-DPO",
+
+    # Qwen instruct
+    "Qwen/Qwen2-7B-Instruct",
+    "Qwen/Qwen2-14B-Instruct",
+    "Qwen/Qwen2-72B-Instruct",
+
+    # DeepSeek chat
+    "deepseek-ai/deepseek-llm-7b-chat",
+    "deepseek-ai/deepseek-llm-67b-chat",
+
+    # OpenChat
+    "openchat/openchat-3.5-0106",
+    "openchat/openchat-3.5-1210",
+
+    # Zephyr
+    "HuggingFaceH4/zephyr-7b-beta",
+    "HuggingFaceH4/zephyr-7b-alpha",
+
+    # Phi instruct
+    "microsoft/Phi-3-mini-4k-instruct",
+    "microsoft/Phi-3-small-8k-instruct",
+    "microsoft/Phi-3-medium-4k-instruct",
+
+    # Yi chat
+    "01-ai/Yi-6B-Chat",
+    "01-ai/Yi-34B-Chat",
+
+    # Gemma instruct
+    "google/gemma-2b-it",
+    "google/gemma-7b-it",
+
+    # Falcon instruct
+    "tiiuae/falcon-7b-instruct",
+    "tiiuae/falcon-40b-instruct",
+
+    # StableLM chat
+    "stabilityai/stablelm-2-1_6b-chat",
+    "stabilityai/stablelm-2-12b-chat",
+
+    # Orca style
+    "Open-Orca/Mistral-7B-OpenOrca",
+    "Open-Orca/Mixtral-8x7B-OpenOrca",
+
+    # Command R family
+    "CohereForAI/c4ai-command-r-v01",
+    "CohereForAI/c4ai-command-r-plus-v01",
+
+    # Misc strong instruct
+    "teknium/OpenHermes-2.5-Mistral-7B",
+    "teknium/OpenHermes-2.5-Mixtral-8x7B",
+    "allenai/tulu-2-dpo-7b",
+    "allenai/tulu-2-dpo-13b",
 ]
+
 
 # ✅ Allowlist relations (tables + views).
 RELATIONS: Dict[str, Dict[str, Any]] = {
@@ -195,7 +277,6 @@ def _sb_select(
             return (df, True, "") if return_meta else df
         except Exception as e2:
             msg = _api_msg(e2)
-            # keep warning for interactive debugging
             st.warning(f"Could not read {schema}.{relation}: {msg}")
             return (pd.DataFrame(), False, msg) if return_meta else pd.DataFrame()
 
@@ -208,7 +289,6 @@ def _sb_count(sb_anon, sb_service, schema: str, relation: str) -> Optional[int]:
     if sb is None:
         return None
     try:
-        # Avoid assuming an 'id' column exists
         res = sb.schema(schema).table(relation).select("*", count="exact").limit(1).execute()
         c = getattr(res, "count", None)
         return int(c) if c is not None else None
@@ -332,7 +412,7 @@ def _strip_web_prefix(q: str) -> str:
     return re.sub(r"^(web:|internet:|tavily:)\s*", "", (q or "").strip(), flags=re.IGNORECASE).strip()
 
 
-# PDF commands (only minutes + attendance enabled here)
+# PDF commands (only minutes + attendance enabled)
 def _wants_pdf_minutes(text: str) -> bool:
     t = _lc(text)
     return ("pdf" in t and "minutes" in t) or t.startswith("minutes pdf") or t.startswith("pdf minutes")
@@ -391,7 +471,7 @@ def _extract_session_id(text: str) -> Optional[str]:
     return None
 
 
-# ✅ CRITICAL FIX: detect DB commands so HF never returns fake answers
+# ✅ CRITICAL: detect DB commands so HF never answers DB/PDF with fake numbers
 def _is_db_command(text: str) -> bool:
     t = _lc(text)
     if not t:
@@ -425,7 +505,7 @@ def _is_db_command(text: str) -> bool:
 # -----------------------------------------------------------------------------
 def _load_members_truth(sb_anon, sb_service, schema: str, limit: int = 3000) -> pd.DataFrame:
     df = _sb_select(sb_anon, sb_service, schema, "members", cols="*", limit=limit)
-    if isinstance(df, tuple):  # safety (shouldn't happen)
+    if isinstance(df, tuple):  # safety
         df = df[0]
     if df.empty:
         return df
@@ -439,7 +519,7 @@ def _load_members_truth(sb_anon, sb_service, schema: str, limit: int = 3000) -> 
     out = pd.DataFrame()
     out["member_id"] = df[id_col].astype(str)
 
-    # ✅ FIX: prefer display_name but fall back to name if display_name is empty/NULL
+    # prefer display_name, fallback to name
     disp = (
         df["display_name"].fillna("").astype(str).replace({"None": "", "nan": "", "NaN": ""}).str.strip()
         if "display_name" in df.columns
@@ -450,8 +530,7 @@ def _load_members_truth(sb_anon, sb_service, schema: str, limit: int = 3000) -> 
         if "name" in df.columns
         else pd.Series([""] * len(df))
     )
-    member_name = disp.where(disp != "", nm).replace("", "(no name)")
-    out["member_name"] = member_name
+    out["member_name"] = disp.where(disp != "", nm).replace("", "(no name)")
 
     if phone_col and phone_col in df.columns:
         out["phone"] = df[phone_col].astype(str).replace({"None": "", "nan": "", "NaN": ""}).fillna("").str.strip()
@@ -599,7 +678,6 @@ def _pdf_attendance(sb_anon, sb_service, schema: str, session_id: str) -> Tuple[
 def _member_financial_totals(sb_anon, sb_service, schema: str, member_id: str, members_truth: pd.DataFrame) -> Tuple[str, Dict[str, Any]]:
     name = _member_name_from_truth(members_truth, member_id)
 
-    # Prefer view if available (and readable)
     if "v_member_financial_totals" in RELATIONS:
         v_all = _sb_select(sb_anon, sb_service, schema, "v_member_financial_totals", cols="*", limit=5000)
         if isinstance(v_all, tuple):
@@ -618,7 +696,6 @@ def _member_financial_totals(sb_anon, sb_service, schema: str, member_id: str, m
             )
             return msg, {"source": "v_member_financial_totals", "row": row}
 
-    # Fallback: compute from raw tables
     mid_int = int(member_id)
 
     contributions = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=20000, filters=[("member_id", "eq", mid_int)])
@@ -709,7 +786,6 @@ def _show_relation(sb_anon, sb_service, schema: str, relation: str) -> Tuple[str
     if isinstance(df, tuple): df = df[0]
     df = _coalesce_note_cols(df)
 
-    # Nice preview: newest first if possible
     if "created_at" in df.columns:
         try:
             df = df.sort_values("created_at", ascending=False)
@@ -725,14 +801,7 @@ def _health_table(sb_anon, sb_service, schema: str) -> pd.DataFrame:
     for rel in sorted(RELATIONS.keys()):
         typ = RELATIONS[rel].get("type", "?")
         df, ok, err = _sb_select(sb_anon, sb_service, schema, rel, cols="*", limit=1, return_meta=True)  # type: ignore
-        rows.append(
-            {
-                "relation": rel,
-                "type": typ,
-                "readable": "✅" if ok else "❌",
-                "note": (err or "")[:140],
-            }
-        )
+        rows.append({"relation": rel, "type": typ, "readable": "✅" if ok else "❌", "note": (err or "")[:140]})
     return pd.DataFrame(rows)
 
 
@@ -785,7 +854,7 @@ def _tavily_search(query: str) -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# HF Router (optional; ONLY for general chat wording, never DB commands)
+# HF Router (optional; ONLY for general chat, never DB commands)
 # -----------------------------------------------------------------------------
 def _post_with_retries(url: str, headers: dict, payload: dict, timeout: int = 60) -> Tuple[bool, str]:
     last_err = ""
@@ -848,6 +917,39 @@ def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 6
         return False, f"Bad HF completions response: {raw[:600]}"
 
 
+def _get_hf_model_pool(primary_model: str) -> List[str]:
+    """
+    Build model pool from:
+      1) HF_MODELS_CSV (Railway env var)
+      2) HF_MODEL (primary)
+      3) HF_FALLBACK_MODELS (curated list)
+    Dedup while keeping order.
+    """
+    pool: List[str] = []
+    csv = (os.getenv("HF_MODELS_CSV") or "").strip()
+    if csv:
+        for token in csv.split(","):
+            m = token.strip()
+            if m:
+                pool.append(m)
+
+    if primary_model:
+        pool.insert(0, primary_model.strip())
+
+    for m in HF_FALLBACK_MODELS:
+        if m:
+            pool.append(m)
+
+    # dedupe preserve order
+    seen = set()
+    out: List[str] = []
+    for m in pool:
+        if m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
 def _hf_call(model: str, token: str, messages: List[Dict[str, str]], random_route: bool, temperature: float) -> Tuple[bool, str, str, str]:
     """
     Returns: ok, text, mode_used, model_used
@@ -855,21 +957,18 @@ def _hf_call(model: str, token: str, messages: List[Dict[str, str]], random_rout
     force = (os.getenv("HF_FORCE_MODE", "") or "auto").strip().lower()
     prompt = _messages_to_prompt(messages)
 
-    model_order: List[str] = []
-    primary = (model or "").strip()
-    if primary:
-        model_order.append(primary)
-    for m in HF_FALLBACK_MODELS:
-        if m and m not in model_order:
-            model_order.append(m)
+    model_pool = _get_hf_model_pool(model)
 
-    if random_route and model_order:
-        chosen = random.choice(model_order)
-        model_order = [chosen]  # only one model when random routing is ON
+    # Random routing: choose one model but keep others as fallback
+    if random_route and model_pool:
+        chosen = random.choice(model_pool)
+        model_order = [chosen] + [m for m in model_pool if m != chosen]
+    else:
+        model_order = model_pool
 
     def _looks_instruct(mname: str) -> bool:
         mlc = (mname or "").lower()
-        return any(x in mlc for x in ["instruct", "mistral", "llama-3", "llama-3.1"])
+        return any(x in mlc for x in ["instruct", "mistral", "llama-3", "llama-3.1", "qwen", "phi", "gemma", "tulu", "openhermes", "mixtral"])
 
     last_err = ""
     last_mode = "failed"
@@ -913,13 +1012,15 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     hf_token = (os.getenv("HF_TOKEN") or "").strip()
     hf_model = (os.getenv("HF_MODEL") or "").strip() or "meta-llama/Meta-Llama-3-8B-Instruct"
     hf_force = (os.getenv("HF_FORCE_MODE") or "auto").strip().lower()
+
+    random_default = (os.getenv("HF_RANDOM_DEFAULT") or "").strip().lower() in {"1", "true", "yes", "on"}
     internet_on = _internet_enabled()
 
     with st.expander("⚙️ Chat Settings", expanded=False):
         random_route = st.checkbox(
             "🎲 Random model routing (HF only)",
-            value=bool(st.session_state.get("younchat_random_route", False)),
-            help="Randomly picks one HF model (from HF_MODEL + fallbacks) for general chat. DB/PDF never uses HF.",
+            value=bool(st.session_state.get("younchat_random_route", random_default)),
+            help="Randomly picks one model from the HF pool for GENERAL chat. DB/PDF never uses HF.",
         )
         st.session_state["younchat_random_route"] = bool(random_route)
 
@@ -932,11 +1033,16 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         )
         st.session_state["younchat_temp"] = float(temp)
 
-        st.write("**HF model**:", hf_model)
+        pool = _get_hf_model_pool(hf_model)
+        st.write("**HF primary model**:", hf_model)
+        st.write("**HF pool size**:", len(pool))
         st.write("**HF_TOKEN present**:", "✅ Yes" if hf_token else "❌ No")
         st.write("**HF_FORCE_MODE**:", hf_force)
         st.write("**Internet**:", "✅ ON" if internet_on else "❌ OFF")
         st.caption("Njangi numbers are ALWAYS answered from DB. HF is only for general chat wording (never DB/PDF commands).")
+
+        with st.expander("🔎 View HF model pool", expanded=False):
+            st.write(pool)
 
     # If a PDF was generated earlier, keep it visible
     if st.session_state.get("younchat_last_pdf_bytes") and st.session_state.get("younchat_last_pdf_name"):
@@ -981,7 +1087,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     with st.chat_message("user"):
         st.markdown(q)
 
-    # ✅ FIX: set member focus ONLY when user clearly means member id (bare number OR explicit "member ...")
+    # ✅ FIX: set member focus ONLY when user clearly means member id
     detected_id = _extract_member_id(q)
     t = _lc(q)
     is_explicit_member = ("member" in t and "id" in t) or t.strip().startswith("member")
@@ -1135,7 +1241,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         df_show, df_title = df, title
         answer = f"Hello 👋🏽 {title} (from `{src}`):" if not df.empty else f"Hello 👋🏽 {title}: no rows returned."
 
-    # Member summary (grounded) — only when bare number OR explicit member request
+    # Member summary (grounded)
     elif (q.strip().isdigit() and member_id_focus) or t.startswith("member ") or t.startswith("summary "):
         mid = _extract_member_id(q) or member_id_focus
         if mid:
@@ -1171,7 +1277,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                 hf_model,
                 hf_token,
                 messages,
-                random_route=bool(st.session_state.get("younchat_random_route", False)),
+                random_route=bool(st.session_state.get("younchat_random_route", random_default)),
                 temperature=float(st.session_state.get("younchat_temp", 0.35)),
             )
             used_source = f"hf:{mode}:{model_used}" if ok else "hf:failed"
@@ -1200,12 +1306,10 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                 used_source = "local:fallback"
                 answer = "Hello 👋🏽"
 
-    # Write answer to chat
     st.session_state["younchat_history"].append({"role": "assistant", "content": answer})
     with st.chat_message("assistant"):
         st.markdown(answer)
 
-        # If a PDF was created in this turn, show download immediately
         if st.session_state.get("younchat_last_pdf_bytes") and st.session_state.get("younchat_last_pdf_name"):
             st.download_button(
                 "⬇️ Download PDF",
@@ -1220,4 +1324,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
             with st.expander(df_title, expanded=False):
                 st.dataframe(df_show, use_container_width=True)
 
-    st.caption(f"Source used: {used_source} • member_id: {member_id_focus or '—'} • Internet: {'ON' if internet_on else 'OFF'}")
+    st.caption(
+        f"Source used: {used_source} • member_id: {member_id_focus or '—'} • "
+        f"Internet: {'ON' if internet_on else 'OFF'}"
+    )
