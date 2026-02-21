@@ -1,6 +1,10 @@
 
 # admin_panels.py ✅ COMPLETE SINGLE CODE (NO LEGACY) — UPDATED DESIGN (Fintech Glass + Better Layout)
 # ------------------------------------------------------------------------------
+# ✅ FIXES your crash:
+#   AttributeError("module 'admin_panels' has no attribute 'render_admin_panel'")
+#   -> This file now exposes: render_admin_panel(sb_anon, sb_service, schema)
+#
 # ✅ Uses NEW tables only:
 #   - members(id,name,phone,created_at)
 #   - app_state(id=1, current_session_id, next_member_id, updated_at, ...)
@@ -28,8 +32,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone, date
 import re
-import streamlit as st
+from typing import Any, Dict, List, Optional
+
 import pandas as pd
+import streamlit as st
 from postgrest.exceptions import APIError
 
 
@@ -69,7 +75,7 @@ def _api_error_payload(e: Exception) -> dict:
     return {"message": str(e)}
 
 
-def show_api_error(e: Exception, title: str = "Supabase error"):
+def show_api_error(e: Exception, title: str = "Supabase error") -> None:
     st.error(title)
     st.code(str(_api_error_payload(e)), language="text")
 
@@ -201,6 +207,7 @@ def audit_log(
         }
         sb_service.schema(schema).table("audit_log").insert(record).execute()
     except Exception:
+        # audit_log table is optional
         pass
 
 
@@ -237,6 +244,7 @@ def load_members(sb_service, schema: str) -> pd.DataFrame:
         df["id"] = pd.to_numeric(df["id"], errors="coerce").fillna(0).astype(int)
         df["name"] = df["name"].astype(str)
         if "phone" in df.columns:
+            # keep empty string for None
             df["phone"] = df["phone"].astype(str).replace({"None": "", "nan": ""})
     return df
 
@@ -244,7 +252,6 @@ def load_members(sb_service, schema: str) -> pd.DataFrame:
 def panel_members(sb_service, schema: str, actor_email: str):
     glass_open("Members", f"Table: {schema}.members • Add, list, and update phone numbers (E.164-style).")
 
-    # --- Add + Quick Edit in two columns
     col_add, col_edit = st.columns([1, 1], gap="large")
 
     with col_add:
@@ -560,7 +567,6 @@ def panel_contributions(sb_service, schema: str, actor_email: str):
     section_divider()
     st.markdown("#### Contributions for current session")
 
-    # Prefer view if exists; otherwise show raw contributions for that session
     rows = safe_select(
         sb_service,
         schema,
@@ -737,7 +743,7 @@ def panel_foundation(sb_service, schema: str, actor_email: str):
 
 
 # ============================================================
-# Main entry called from app router
+# Internal renderer (service-only)
 # ============================================================
 def render_admin(sb_service, schema: str, actor_email: str = ""):
     st.markdown("## 🛠️ Admin Console")
@@ -747,7 +753,6 @@ def render_admin(sb_service, schema: str, actor_email: str = ""):
         st.warning("Service key not configured.")
         return
 
-    # System init (ensure app_state.id=1 exists)
     glass_open("System initialization", "Creates app_state(id=1) if it does not exist.")
     if st.button("✅ Initialize app_state (id=1)", use_container_width=True, key="init_app_state"):
         ok = safe_upsert(sb_service, schema, "app_state", {"id": 1, "updated_at": now_iso()})
@@ -771,7 +776,6 @@ def render_admin(sb_service, schema: str, actor_email: str = ""):
 
     section_divider()
 
-    # ✅ Unique tab names (no duplicates)
     t_members, t_rot, t_contrib, t_fines, t_found = st.tabs(
         ["👥 Members", "🔁 Rotation", "💵 Contributions", "⚠️ Fines", "🏦 Foundation"]
     )
@@ -790,3 +794,30 @@ def render_admin(sb_service, schema: str, actor_email: str = ""):
 
     with t_found:
         panel_foundation(sb_service, schema, actor_email)
+
+
+# ============================================================
+# ✅ PUBLIC ENTRY POINT expected by app.py
+# ============================================================
+def render_admin_panel(sb_anon, sb_service, schema: str) -> None:
+    """
+    app.py expects:
+      admin_panels.render_admin_panel(sb_anon=..., sb_service=..., schema=...)
+    We use sb_service for writes; if missing, we show read-only warning.
+    """
+    actor_email = (st.session_state.get("actor_email") or st.session_state.get("user_email") or "").strip()
+
+    if not sb_service:
+        st.subheader("🛠️ Admin Console", anchor=False)
+        st.warning("Admin writes require SUPABASE_SERVICE_KEY. Add it in Railway Variables.")
+        st.caption("You can still view Members, but actions that write will fail without service access.")
+        # Best-effort read-only members view using anon if present
+        if sb_anon:
+            try:
+                rows = sb_anon.schema(schema).table("members").select("id,name,phone,created_at").limit(5000).execute().data or []
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            except Exception as e:
+                show_api_error(e, "Read-only members view failed")
+        return
+
+    render_admin(sb_service=sb_service, schema=schema, actor_email=actor_email)
