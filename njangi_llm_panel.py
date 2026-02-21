@@ -1,4 +1,3 @@
-
 # njangi_llm_panel.py ✅ SINGLE COMPLETE FILE — younchat reads your DB (members = source of truth)
 # =============================================================================
 # 💬 younchat — DB-TOOLS FIRST (tables + views) + ✅ PDF tools + Optional HF Router + Optional Tavily
@@ -11,7 +10,12 @@
 #   - younchat reads your DB from an allowlist (RELATIONS)
 #   - members table is the source of truth for identity (name display)
 #   - NO hallucinations for Njangi numbers (all financial answers come from DB)
-#   - IMPORTANT FIX: HF Router will NEVER answer DB / PDF commands
+#   - HF Router will NEVER answer DB / PDF commands
+#
+# Extra (your new request):
+#   - ✅ Can access and display ALL columns for your actual tables (select "*")
+#   - ✅ "health" + "counts" commands to assess all tables quickly
+#   - ✅ Optional "random model routing" for HF (general chat ONLY, never DB/PDF)
 #
 # Works with app.py:
 #   from njangi_llm_panel import render_njangi_llm_panel
@@ -31,7 +35,8 @@ import json
 import os
 import re
 import time
-from datetime import date, datetime, timezone
+import random
+from datetime import datetime, timezone
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -57,9 +62,9 @@ except Exception:
     canvas = None  # type: ignore
 
 
-W_STRETCH = "stretch"
-
-# ✅ IMPORTANT: define these constants (prevents NameError)
+# ---------------------------
+# External endpoints (optional)
+# ---------------------------
 HF_ROUTER_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
 HF_ROUTER_COMPLETIONS_URL = "https://router.huggingface.co/v1/completions"
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
@@ -71,28 +76,32 @@ HF_FALLBACK_MODELS = [
 ]
 
 # ✅ Allowlist relations (tables + views).
+# NOTE: Your listed real tables are included here.
 RELATIONS: Dict[str, Dict[str, Any]] = {
-    # Tables
+    # Core tables
     "members": {"type": "table", "truth": True},
+    "sessions": {"type": "table"},
+    "app_state": {"type": "table"},
     "contributions": {"type": "table"},
     "foundation_contributions": {"type": "table"},
+    "fines": {"type": "table"},
     "loans": {"type": "table"},
     "loan_payments": {"type": "table"},
-    "loan_repayments_pending": {"type": "table"},
     "loan_requests": {"type": "table"},
-    "fines": {"type": "table"},
+    "loan_repayments_pending": {"type": "table"},
+    "interest_ledger": {"type": "table"},
     "payouts": {"type": "table"},
-    "sessions": {"type": "table"},
     "minutes": {"type": "table"},
     "attendance": {"type": "table"},
     "signatures": {"type": "table"},
     "audit_log": {"type": "table"},
-    "app_state": {"type": "table"},
+
+    # Optional/extra tables (safe if present)
     "profiles": {"type": "table"},
     "ml_training_data": {"type": "table"},
     "member_contribution_totals": {"type": "table"},
-    "interest_ledger": {"type": "table"},
-    # Views (optional)
+
+    # Optional views (if you created them)
     "v_finance_kpis": {"type": "view"},
     "v_member_financial_totals": {"type": "view"},
     "v_loans_with_member": {"type": "view"},
@@ -115,10 +124,6 @@ RELATIONS: Dict[str, Dict[str, Any]] = {
 # -----------------------------------------------------------------------------
 # Time helpers
 # -----------------------------------------------------------------------------
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def _intro_only() -> str:
     # ✅ EXACT intro required by you (only line, no extra text)
     return "Hello 👋🏽 I’m younchat — your Njangi assistant."
@@ -152,15 +157,17 @@ def _sb_select(
     limit: int = 2000,
     filters: Optional[List[Tuple[str, str, Any]]] = None,
     order: Optional[Tuple[str, bool]] = None,
+    prefer_service: bool = True,
 ) -> pd.DataFrame:
     """
     filters: list of (column, op, value) where op in ["eq","gte","lte","ilike","in"]
     order: (column, asc)
     """
-    sb = sb_service or sb_anon
-    if sb is None:
-        return pd.DataFrame()
     if relation not in RELATIONS:
+        return pd.DataFrame()
+
+    sb = (sb_service if (prefer_service and sb_service is not None) else None) or sb_anon
+    if sb is None:
         return pd.DataFrame()
 
     def _apply_filters(q):
@@ -177,18 +184,21 @@ def _sb_select(
                 elif op == "ilike":
                     q = q.ilike(col, val)
                 elif op == "in":
+                    # supabase-py uses in_()
                     q = q.in_(col, val)  # type: ignore
         if order:
             col, asc = order
             q = q.order(col, desc=not asc)
         return q
 
+    # Try schema-qualified first
     try:
         q = sb.schema(schema).table(relation).select(cols).limit(int(limit))
         q = _apply_filters(q)
         res = q.execute()
         return pd.DataFrame(getattr(res, "data", None) or [])
     except Exception:
+        # Fallback to default
         try:
             q = sb.table(relation).select(cols).limit(int(limit))
             q = _apply_filters(q)
@@ -197,6 +207,38 @@ def _sb_select(
         except Exception as e2:
             st.warning(f"Could not read {schema}.{relation}: {_api_msg(e2)}")
             return pd.DataFrame()
+
+
+def _sb_count(sb_anon, sb_service, schema: str, relation: str) -> Optional[int]:
+    """Best-effort row count (may be blocked by RLS)."""
+    if relation not in RELATIONS:
+        return None
+    sb = sb_service or sb_anon
+    if sb is None:
+        return None
+    try:
+        # Many supabase-py versions set res.count when count="exact"
+        res = sb.schema(schema).table(relation).select("id", count="exact").limit(1).execute()
+        c = getattr(res, "count", None)
+        if c is None:
+            # some versions store count differently
+            try:
+                c = int(res.data and len(res.data))  # not exact, fallback
+            except Exception:
+                c = None
+        return int(c) if c is not None else None
+    except Exception:
+        try:
+            res = sb.table(relation).select("id", count="exact").limit(1).execute()
+            c = getattr(res, "count", None)
+            return int(c) if c is not None else None
+        except Exception:
+            return None
+
+
+def _table_readable(sb_anon, sb_service, schema: str, relation: str) -> bool:
+    df = _sb_select(sb_anon, sb_service, schema, relation, cols="*", limit=1, prefer_service=True)
+    return df is not None and isinstance(df, pd.DataFrame)
 
 
 def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
@@ -249,6 +291,30 @@ def _wants_help(text: str) -> bool:
     return _lc(text) in {"help", "/help", "commands", "options"}
 
 
+def _wants_tables_list(text: str) -> bool:
+    return _lc(text) in {"tables", "relations", "views", "list tables", "list views"}
+
+
+def _wants_health(text: str) -> bool:
+    t = _lc(text)
+    return t in {"health", "db health", "check db", "check tables"}
+
+
+def _wants_counts(text: str) -> bool:
+    t = _lc(text)
+    return t in {"counts", "row counts", "table counts", "count tables"}
+
+
+def _wants_describe(text: str) -> bool:
+    t = _lc(text)
+    return t.startswith("describe ") or t.startswith("columns ") or t.startswith("cols ") or t.startswith("schema ")
+
+
+def _wants_show_table(text: str) -> bool:
+    t = _lc(text)
+    return t.startswith("show ") or t.startswith("preview ") or t.startswith("open ")
+
+
 def _wants_list_members(text: str) -> bool:
     t = _lc(text)
     phrases = [
@@ -267,20 +333,6 @@ def _wants_list_members(text: str) -> bool:
         "member ids",
     ]
     return t in {"members", "member"} or any(p in t for p in phrases)
-
-
-def _wants_tables_list(text: str) -> bool:
-    return _lc(text) in {"tables", "relations", "views", "list tables", "list views"}
-
-
-def _wants_describe(text: str) -> bool:
-    t = _lc(text)
-    return t.startswith("describe ") or t.startswith("columns ") or t.startswith("cols ") or t.startswith("schema ")
-
-
-def _wants_show_table(text: str) -> bool:
-    t = _lc(text)
-    return t.startswith("show ") or t.startswith("preview ") or t.startswith("open ")
 
 
 def _wants_kpis(text: str) -> bool:
@@ -334,38 +386,15 @@ def _is_pdf_command(text: str) -> bool:
     )
 
 
-# ✅ CRITICAL FIX: detect DB commands so HF never returns fake answers
-def _is_db_command(text: str) -> bool:
+def _extract_relation_name(text: str) -> Optional[str]:
     t = _lc(text)
+    t = re.sub(r"^(show|preview|open|describe|columns|cols|schema)\s+", "", t).strip()
+    t = re.sub(r"^table\s+", "", t).strip()
+    t = re.sub(r"[^\w]+$", "", t)
     if not t:
-        return False
-    if t in RELATIONS:
-        return True
-    if _wants_list_members(t) or _wants_loans(t) or _wants_kpis(t) or _wants_tables_list(t):
-        return True
-    if _wants_show_table(t) or _wants_describe(t) or _wants_help(t):
-        return True
-    if _is_pdf_command(t):
-        return True
-
-    finance_words = [
-        "contribution",
-        "contributions",
-        "foundation",
-        "payout",
-        "payouts",
-        "attendance",
-        "minutes",
-        "fines",
-        "interest",
-        "repayments_pending",
-        "loan_requests",
-        "audit_log",
-        "app_state",
-        "receipt",
-        "statement",
-    ]
-    return any(w in t for w in finance_words)
+        return None
+    token = t.split()[0]
+    return token if token in RELATIONS else None
 
 
 _MEMBER_ID_PATTERNS = [
@@ -414,15 +443,33 @@ def _extract_session_id(text: str) -> Optional[str]:
     return None
 
 
-def _extract_relation_name(text: str) -> Optional[str]:
+# ✅ CRITICAL FIX: detect DB commands so HF never returns fake answers
+def _is_db_command(text: str) -> bool:
     t = _lc(text)
-    t = re.sub(r"^(show|preview|open|describe|columns|cols|schema)\s+", "", t).strip()
-    t = re.sub(r"^table\s+", "", t).strip()
-    t = re.sub(r"[^\w]+$", "", t)
     if not t:
-        return None
-    token = t.split()[0]
-    return token if token in RELATIONS else None
+        return False
+    if t in RELATIONS:
+        return True
+    if _wants_list_members(t) or _wants_loans(t) or _wants_kpis(t) or _wants_tables_list(t):
+        return True
+    if _wants_show_table(t) or _wants_describe(t) or _wants_help(t):
+        return True
+    if _wants_health(t) or _wants_counts(t):
+        return True
+    if _is_pdf_command(t):
+        return True
+
+    finance_words = [
+        "contribution", "contributions",
+        "foundation", "foundation_contributions",
+        "payout", "payouts",
+        "attendance", "minutes",
+        "fines", "audit_log", "app_state",
+        "loan_requests", "loan_repayments_pending",
+        "interest_ledger", "loan_payments",
+        "members", "sessions",
+    ]
+    return any(w in t for w in finance_words)
 
 
 # -----------------------------------------------------------------------------
@@ -434,29 +481,25 @@ def _load_members_truth(sb_anon, sb_service, schema: str, limit: int = 3000) -> 
         return df
 
     id_col = _pick_col(df, ["id", "member_id"])
-    name_col = _pick_col(df, ["name", "full_name"])
-    display_col = _pick_col(df, ["display_name"])
+    name_col = _pick_col(df, ["display_name", "full_name", "name"])
+    phone_col = _pick_col(df, ["phone"])
 
     if not id_col:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=["member_id", "member_name", "phone"])
 
     out = pd.DataFrame()
     out["member_id"] = df[id_col].astype(str)
 
-    if display_col and display_col in df.columns:
-        disp = df[display_col].astype(str)
-        disp_clean = disp.replace(["None", "nan", "NaN", "NULL", "null"], "").fillna("").str.strip()
-    else:
-        disp_clean = pd.Series([""] * len(df))
-
     if name_col and name_col in df.columns:
-        nm = df[name_col].astype(str)
-        nm_clean = nm.replace(["None", "nan", "NaN", "NULL", "null"], "").fillna("").str.strip()
+        nm = df[name_col].astype(str).replace({"None": "", "nan": "", "NaN": ""}).fillna("").str.strip()
     else:
-        nm_clean = pd.Series([""] * len(df))
+        nm = pd.Series(["(no name)"] * len(df))
 
-    out["member_name"] = disp_clean.where(disp_clean != "", nm_clean)
-    out["member_name"] = out["member_name"].fillna("").replace("", "(no name)")
+    out["member_name"] = nm.replace("", "(no name)")
+    if phone_col and phone_col in df.columns:
+        out["phone"] = df[phone_col].astype(str).replace({"None": "", "nan": "", "NaN": ""}).fillna("").str.strip()
+    else:
+        out["phone"] = ""
 
     try:
         out["_id_num"] = pd.to_numeric(out["member_id"], errors="coerce")
@@ -479,16 +522,15 @@ def _member_name_from_truth(members_truth: pd.DataFrame, member_id: str) -> str:
 def _find_row_for_member(df: pd.DataFrame, member_id: str) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
-    candidates = [c for c in ["member_id", "memberid", "id"] if c in df.columns]
-    for c in candidates:
-        hit = df[df[c].astype(str) == str(member_id)]
+    if "member_id" in df.columns:
+        hit = df[df["member_id"].astype(str) == str(member_id)]
         if not hit.empty:
             return hit
     return pd.DataFrame()
 
 
 # -----------------------------------------------------------------------------
-# PDF helpers (in-file)
+# PDF helpers
 # -----------------------------------------------------------------------------
 def _money(x: Any, currency: str = "$") -> str:
     try:
@@ -503,167 +545,11 @@ def _require_pdf() -> Optional[str]:
     return None
 
 
-def _make_member_loan_statement_pdf(
-    brand: str,
-    member: dict,
-    cycle_info: dict,
-    loans: List[dict],
-    payments: List[dict],
-    currency: str = "$",
-    logo_path: str = "assets/logo.png",
-) -> bytes:
+def _make_simple_pdf(title: str, lines: List[str]) -> bytes:
     err = _require_pdf()
     if err:
         raise Exception(err)
 
-    buf = BytesIO()
-    pdf = canvas.Canvas(buf, pagesize=LETTER)
-    width, height = LETTER
-    left = 1 * inch
-
-    # Logo
-    if logo_path and ImageReader is not None and os.path.exists(logo_path):
-        try:
-            logo = ImageReader(logo_path)
-            pdf.drawImage(logo, 0.7 * inch, height - 1.2 * inch, width=1.0 * inch, preserveAspectRatio=True, mask="auto")
-        except Exception:
-            pass
-
-    pdf.setFont("Helvetica-Bold", 15)
-    pdf.drawString(2.0 * inch, height - 0.9 * inch, f"{brand} — Loan Statement")
-    pdf.setFont("Helvetica", 9)
-    pdf.drawRightString(width - 1 * inch, height - 0.9 * inch, _utc_now_str())
-
-    y = height - 1.5 * inch
-    pdf.setFont("Helvetica-Bold", 11)
-    pdf.drawString(left, y, "Member")
-    y -= 0.22 * inch
-    pdf.setFont("Helvetica", 10)
-    pdf.drawString(left, y, f"ID: {member.get('member_id','—')}    Name: {member.get('member_name','Unknown')}")
-    y -= 0.26 * inch
-
-    pdf.setFont("Helvetica-Bold", 11)
-    pdf.drawString(left, y, "Cycle")
-    y -= 0.22 * inch
-    pdf.setFont("Helvetica", 10)
-    pdf.drawString(left, y, f"Session ID: {cycle_info.get('session_id','—')}")
-    y -= 0.18 * inch
-    pdf.drawString(left, y, f"Payout Date: {cycle_info.get('payout_date','N/A')}")
-    y -= 0.26 * inch
-
-    pdf.setFont("Helvetica-Bold", 11)
-    pdf.drawString(left, y, "Loans Summary")
-    y -= 0.22 * inch
-
-    if not loans:
-        pdf.setFont("Helvetica", 10)
-        pdf.drawString(left, y, "No loans on record for this member.")
-        y -= 0.18 * inch
-    else:
-        pdf.setFont("Helvetica-Bold", 9)
-        pdf.drawString(left, y, "Loan ID")
-        pdf.drawString(left + 0.9 * inch, y, "Status")
-        pdf.drawRightString(left + 3.2 * inch, y, "Principal")
-        pdf.drawRightString(left + 4.5 * inch, y, "Interest")
-        pdf.drawRightString(left + 5.8 * inch, y, "Total Due")
-        y -= 0.18 * inch
-        pdf.setFont("Helvetica", 9)
-
-        total_principal = total_interest = total_due_all = 0.0
-
-        for ln in loans:
-            if y < 1.5 * inch:
-                pdf.showPage()
-                y = height - 1.0 * inch
-                pdf.setFont("Helvetica-Bold", 9)
-                pdf.drawString(left, y, "Loan ID")
-                pdf.drawString(left + 0.9 * inch, y, "Status")
-                pdf.drawRightString(left + 3.2 * inch, y, "Principal")
-                pdf.drawRightString(left + 4.5 * inch, y, "Interest")
-                pdf.drawRightString(left + 5.8 * inch, y, "Total Due")
-                y -= 0.18 * inch
-                pdf.setFont("Helvetica", 9)
-
-            loan_id = ln.get("id") or ln.get("loan_id") or ""
-            status = str(ln.get("status") or "")[:12]
-            principal = float(ln.get("principal_current") or ln.get("principal") or 0)
-
-            unpaid_interest = float(ln.get("unpaid_interest") or 0)
-            accrued_interest = float(ln.get("accrued_interest") or ln.get("accrued") or 0)
-            interest_val = unpaid_interest if unpaid_interest > 0 else accrued_interest
-
-            total_due = ln.get("total_due")
-            if total_due is None:
-                total_due = principal + interest_val
-            total_due = float(total_due or 0)
-
-            total_principal += principal
-            total_interest += interest_val
-            total_due_all += total_due
-
-            pdf.drawString(left, y, str(loan_id))
-            pdf.drawString(left + 0.9 * inch, y, status)
-            pdf.drawRightString(left + 3.2 * inch, y, _money(principal, currency))
-            pdf.drawRightString(left + 4.5 * inch, y, _money(interest_val, currency))
-            pdf.drawRightString(left + 5.8 * inch, y, _money(total_due, currency))
-            y -= 0.16 * inch
-
-        y -= 0.06 * inch
-        pdf.setFont("Helvetica-Bold", 9)
-        pdf.drawString(left, y, "Totals")
-        pdf.drawRightString(left + 3.2 * inch, y, _money(total_principal, currency))
-        pdf.drawRightString(left + 4.5 * inch, y, _money(total_interest, currency))
-        pdf.drawRightString(left + 5.8 * inch, y, _money(total_due_all, currency))
-        pdf.setFont("Helvetica", 9)
-        y -= 0.18 * inch
-
-    y -= 0.20 * inch
-    pdf.setFont("Helvetica-Bold", 11)
-    pdf.drawString(left, y, "Payments (Recent)")
-    y -= 0.22 * inch
-
-    if not payments:
-        pdf.setFont("Helvetica", 10)
-        pdf.drawString(left, y, "No payments recorded.")
-        y -= 0.18 * inch
-    else:
-        pdf.setFont("Helvetica-Bold", 9)
-        pdf.drawString(left, y, "Date")
-        pdf.drawString(left + 1.2 * inch, y, "Loan")
-        pdf.drawRightString(left + 5.8 * inch, y, "Amount")
-        y -= 0.18 * inch
-        pdf.setFont("Helvetica", 9)
-
-        for p in payments[:40]:
-            if y < 1.3 * inch:
-                pdf.showPage()
-                y = height - 1.0 * inch
-                pdf.setFont("Helvetica-Bold", 9)
-                pdf.drawString(left, y, "Date")
-                pdf.drawString(left + 1.2 * inch, y, "Loan")
-                pdf.drawRightString(left + 5.8 * inch, y, "Amount")
-                y -= 0.18 * inch
-                pdf.setFont("Helvetica", 9)
-
-            dt = str(p.get("paid_at") or p.get("paid_on") or p.get("created_at") or "")[:10] or "—"
-            loan_id = p.get("loan_id") or p.get("id") or "—"
-            amt = p.get("amount") or 0
-
-            pdf.drawString(left, y, dt)
-            pdf.drawString(left + 1.2 * inch, y, str(loan_id))
-            pdf.drawRightString(left + 5.8 * inch, y, _money(amt, currency))
-            y -= 0.16 * inch
-
-    pdf.showPage()
-    pdf.save()
-    buf.seek(0)
-    return buf.getvalue()
-
-
-def _make_minutes_pdf(brand: str, minutes_row: dict) -> bytes:
-    err = _require_pdf()
-    if err:
-        raise Exception(err)
     buf = BytesIO()
     pdf = canvas.Canvas(buf, pagesize=LETTER)
     width, height = LETTER
@@ -671,292 +557,31 @@ def _make_minutes_pdf(brand: str, minutes_row: dict) -> bytes:
     y = height - 0.9 * inch
 
     pdf.setFont("Helvetica-Bold", 15)
-    pdf.drawString(left, y, f"{brand} — Meeting Minutes")
-    pdf.setFont("Helvetica", 9)
-    pdf.drawRightString(width - left, y, _utc_now_str())
-    y -= 0.35 * inch
-
-    session_id = minutes_row.get("session_id")
-    title = str(minutes_row.get("title") or "")
-    body = str(minutes_row.get("body") or "")
-    created_by = str(minutes_row.get("created_by") or "")
-    created_at = str(minutes_row.get("created_at") or "")[:19]
-
-    pdf.setFont("Helvetica-Bold", 10)
-    pdf.drawString(left, y, "Meeting Info")
-    y -= 0.20 * inch
-
-    pdf.setFont("Helvetica", 10)
-    pdf.drawString(left, y, f"Session ID: {session_id if session_id is not None else '—'}"); y -= 0.16 * inch
-    pdf.drawString(left, y, f"Title: {title or '—'}"); y -= 0.16 * inch
-    if created_by or created_at:
-        pdf.drawString(left, y, f"Recorded by: {created_by or '—'}    At: {created_at or '—'}"); y -= 0.16 * inch
-
-    y -= 0.10 * inch
-    pdf.setFont("Helvetica-Bold", 10)
-    pdf.drawString(left, y, "Minutes / Documentation")
-    y -= 0.20 * inch
-
-    pdf.setFont("Helvetica", 10)
-    content = body.strip()
-    if not content:
-        pdf.drawString(left, y, "—")
-    else:
-        for raw_line in content.splitlines():
-            line = raw_line.rstrip()
-            if line == "":
-                y -= 0.14 * inch
-                continue
-            while len(line) > 110:
-                pdf.drawString(left, y, line[:110])
-                line = line[110:]
-                y -= 0.14 * inch
-                if y < 1.0 * inch:
-                    pdf.showPage()
-                    y = height - 1.0 * inch
-                    pdf.setFont("Helvetica", 10)
-            pdf.drawString(left, y, line)
-            y -= 0.14 * inch
-            if y < 1.0 * inch:
-                pdf.showPage()
-                y = height - 1.0 * inch
-                pdf.setFont("Helvetica", 10)
-
-    pdf.showPage()
-    pdf.save()
-    buf.seek(0)
-    return buf.getvalue()
-
-
-def _make_attendance_pdf(brand: str, session_id: int | None, attendance_rows: list[dict] | None = None) -> bytes:
-    err = _require_pdf()
-    if err:
-        raise Exception(err)
-    buf = BytesIO()
-    pdf = canvas.Canvas(buf, pagesize=LETTER)
-    width, height = LETTER
-    left = 1 * inch
-    y = height - 0.9 * inch
-
-    pdf.setFont("Helvetica-Bold", 15)
-    pdf.drawString(left, y, f"{brand} — Attendance Sheet")
+    pdf.drawString(left, y, title)
     pdf.setFont("Helvetica", 9)
     pdf.drawRightString(width - left, y, _utc_now_str())
     y -= 0.35 * inch
 
     pdf.setFont("Helvetica", 10)
-    pdf.drawString(left, y, f"Session ID: {session_id if session_id is not None else '—'}"); y -= 0.25 * inch
-
-    pdf.setFont("Helvetica-Bold", 9)
-    pdf.drawString(left, y, "Member ID")
-    pdf.drawString(left + 1.2 * inch, y, "Status")
-    pdf.drawString(left + 2.3 * inch, y, "Note")
-    y -= 0.16 * inch
-    pdf.setFont("Helvetica", 9)
-
-    rows = attendance_rows or []
-    if not rows:
-        pdf.drawString(left, y, "No attendance recorded.")
-    else:
-        def _mid(r):
-            try:
-                return int(r.get("member_id") or 0)
-            except Exception:
-                return 0
-
-        for r in sorted(rows, key=_mid):
-            if y < 1.0 * inch:
-                pdf.showPage()
-                y = height - 1.0 * inch
-                pdf.setFont("Helvetica", 9)
-
-            mid = str(r.get("member_id") or "")
-            status = "present" if bool(r.get("present")) else "absent"
-            note = str(r.get("note") or r.get("notes") or "")[:70]
-            pdf.drawString(left, y, mid)
-            pdf.drawString(left + 1.2 * inch, y, status)
-            pdf.drawString(left + 2.3 * inch, y, note)
+    for raw in lines:
+        line = str(raw or "")
+        if not line.strip():
             y -= 0.14 * inch
-
-    pdf.showPage()
-    pdf.save()
-    buf.seek(0)
-    return buf.getvalue()
-
-
-def _make_payout_receipt_pdf(
-    brand: str,
-    beneficiary: dict,
-    payout_info: dict,
-    contributions_breakdown: list[dict] | None = None,
-    signatures: list[dict] | None = None,
-    currency: str = "$",
-    logo_path: str = "assets/logo.png",
-) -> bytes:
-    err = _require_pdf()
-    if err:
-        raise Exception(err)
-
-    buf = BytesIO()
-    pdf = canvas.Canvas(buf, pagesize=LETTER)
-    width, height = LETTER
-    left = 1 * inch
-
-    if logo_path and ImageReader is not None and os.path.exists(logo_path):
-        try:
-            logo = ImageReader(logo_path)
-            pdf.drawImage(logo, 0.7 * inch, height - 1.2 * inch, width=1.0 * inch, preserveAspectRatio=True, mask="auto")
-        except Exception:
-            pass
-
-    pdf.setFont("Helvetica-Bold", 15)
-    pdf.drawString(2.0 * inch, height - 0.9 * inch, f"{brand} — Payout Receipt")
-    pdf.setFont("Helvetica", 9)
-    pdf.drawRightString(width - 1 * inch, height - 0.9 * inch, _utc_now_str())
-
-    y = height - 1.5 * inch
-
-    session_id = payout_info.get("session_id")
-    payout_date = payout_info.get("payout_date") or payout_info.get("date") or ""
-    amount_paid = payout_info.get("payout_amount", payout_info.get("amount"))
-    pot_amount = payout_info.get("pot_amount")
-    notes = payout_info.get("notes") or ""
-
-    bid = beneficiary.get("member_id") or beneficiary.get("id") or ""
-    bname = beneficiary.get("member_name") or beneficiary.get("name") or ""
-
-    rows = contributions_breakdown or []
-
-    def _amt(r):
-        try:
-            return float(r.get("amount") or 0)
-        except Exception:
-            return 0.0
-
-    computed_total = sum(_amt(r) for r in rows)
-    if pot_amount is None:
-        pot_amount = computed_total
-    if amount_paid is None:
-        amount_paid = pot_amount
-
-    pdf.setFont("Helvetica-Bold", 11)
-    pdf.drawString(left, y, "Beneficiary")
-    y -= 0.22 * inch
-    pdf.setFont("Helvetica", 10)
-    pdf.drawString(left, y, f"ID: {bid}    Name: {bname}")
-    y -= 0.30 * inch
-
-    pdf.setFont("Helvetica-Bold", 11)
-    pdf.drawString(left, y, "Payout Details")
-    y -= 0.22 * inch
-    pdf.setFont("Helvetica", 10)
-    pdf.drawString(left, y, f"Session ID: {session_id if session_id is not None else '—'}"); y -= 0.16 * inch
-    pdf.drawString(left, y, f"Payout Date: {str(payout_date)[:10] if payout_date else '—'}"); y -= 0.22 * inch
-
-    pdf.setFont("Helvetica-Bold", 10)
-    pdf.drawString(left, y, "Totals")
-    y -= 0.18 * inch
-    pdf.setFont("Helvetica", 10)
-    pdf.drawString(left, y, f"Total amount received (pot): {_money(pot_amount, currency)}"); y -= 0.16 * inch
-    pdf.drawString(left, y, f"Total amount paid to beneficiary: {_money(amount_paid, currency)}"); y -= 0.24 * inch
-
-    pdf.setFont("Helvetica-Bold", 11)
-    pdf.drawString(left, y, "Member Contributions")
-    y -= 0.20 * inch
-
-    if not rows:
-        pdf.setFont("Helvetica", 10)
-        pdf.drawString(left, y, "No contribution breakdown provided.")
-        y -= 0.18 * inch
-    else:
-        pdf.setFont("Helvetica-Bold", 9)
-        pdf.drawString(left, y, "#")
-        pdf.drawString(left + 0.35 * inch, y, "ID")
-        pdf.drawString(left + 1.05 * inch, y, "Member Name")
-        pdf.drawRightString(left + 5.8 * inch, y, "Amount")
-        y -= 0.16 * inch
-        pdf.setFont("Helvetica", 9)
-
-        def _mid(r):
-            try:
-                return int(r.get("member_id") or r.get("id") or 0)
-            except Exception:
-                return 0
-
-        for i, r in enumerate(sorted(rows, key=_mid), start=1):
-            if y < 1.2 * inch:
-                pdf.showPage()
-                y = height - 1.0 * inch
-                pdf.setFont("Helvetica-Bold", 9)
-                pdf.drawString(left, y, "#")
-                pdf.drawString(left + 0.35 * inch, y, "ID")
-                pdf.drawString(left + 1.05 * inch, y, "Member Name")
-                pdf.drawRightString(left + 5.8 * inch, y, "Amount")
-                y -= 0.16 * inch
-                pdf.setFont("Helvetica", 9)
-
-            mid = r.get("member_id") or r.get("id") or ""
-            mname = str(r.get("member_name") or r.get("name") or "")[:40]
-            amt = _amt(r)
-
-            pdf.drawString(left, y, str(i))
-            pdf.drawString(left + 0.35 * inch, y, str(mid))
-            pdf.drawString(left + 1.05 * inch, y, mname)
-            pdf.drawRightString(left + 5.8 * inch, y, _money(amt, currency))
-            y -= 0.14 * inch
-
-        y -= 0.06 * inch
-        pdf.setFont("Helvetica-Bold", 9)
-        pdf.drawString(left + 1.05 * inch, y, "TOTAL")
-        pdf.drawRightString(left + 5.8 * inch, y, _money(computed_total, currency))
-        pdf.setFont("Helvetica", 9)
-        y -= 0.22 * inch
-
-    if notes:
-        pdf.setFont("Helvetica-Bold", 10)
-        pdf.drawString(left, y, "Notes")
-        y -= 0.18 * inch
-        pdf.setFont("Helvetica", 10)
-        for line in str(notes).splitlines():
+            continue
+        while len(line) > 110:
             pdf.drawString(left, y, line[:110])
+            line = line[110:]
             y -= 0.14 * inch
-            if y < 1.1 * inch:
+            if y < 1.0 * inch:
                 pdf.showPage()
                 y = height - 1.0 * inch
                 pdf.setFont("Helvetica", 10)
-
-    y -= 0.10 * inch
-    pdf.setFont("Helvetica-Bold", 11)
-    pdf.drawString(left, y, "Signatures")
-    y -= 0.20 * inch
-
-    sigs = signatures or []
-    if not sigs:
-        pdf.setFont("Helvetica", 10)
-        pdf.drawString(left, y, "No signatures attached.")
-        y -= 0.16 * inch
-    else:
-        pdf.setFont("Helvetica-Bold", 9)
-        pdf.drawString(left, y, "Role")
-        pdf.drawString(left + 1.3 * inch, y, "Signer")
-        pdf.drawString(left + 4.3 * inch, y, "Signed At")
-        y -= 0.16 * inch
-        pdf.setFont("Helvetica", 9)
-
-        for s in sigs[:25]:
-            if y < 1.1 * inch:
-                pdf.showPage()
-                y = height - 1.0 * inch
-                pdf.setFont("Helvetica", 9)
-
-            role = str(s.get("role") or "")[:18]
-            signer = str(s.get("signer_name") or "")[:35]
-            signed_at = str(s.get("signed_at") or "")[:19]
-
-            pdf.drawString(left, y, role)
-            pdf.drawString(left + 1.3 * inch, y, signer)
-            pdf.drawString(left + 4.3 * inch, y, signed_at)
-            y -= 0.14 * inch
+        pdf.drawString(left, y, line)
+        y -= 0.14 * inch
+        if y < 1.0 * inch:
+            pdf.showPage()
+            y = height - 1.0 * inch
+            pdf.setFont("Helvetica", 10)
 
     pdf.showPage()
     pdf.save()
@@ -964,52 +589,61 @@ def _make_payout_receipt_pdf(
     return buf.getvalue()
 
 
+def _pdf_minutes(sb_anon, sb_service, schema: str, session_id: str) -> Tuple[str, bytes, str]:
+    df = _sb_select(sb_anon, sb_service, schema, "minutes", cols="*", limit=1, filters=[("session_id", "eq", int(session_id))], order=("created_at", False))
+    if df.empty:
+        raise Exception(f"No minutes found for session_id={session_id}.")
+    row = df.iloc[0].to_dict()
+    title = f"theyoungshallgrow — Minutes (session {session_id})"
+    body = str(row.get("body") or "")
+    pdf_bytes = _make_simple_pdf(title, [str(row.get("title") or ""), "", body])
+    return f"Hello 👋🏽 Minutes PDF is ready for session_id={session_id}.", pdf_bytes, f"minutes_session_{int(session_id)}.pdf"
+
+
+def _pdf_attendance(sb_anon, sb_service, schema: str, session_id: str) -> Tuple[str, bytes, str]:
+    df = _sb_select(sb_anon, sb_service, schema, "attendance", cols="*", limit=5000, filters=[("session_id", "eq", int(session_id))], order=("member_id", True))
+    lines = [f"Session ID: {session_id}", ""]
+    if df.empty:
+        lines.append("No attendance recorded.")
+    else:
+        for r in df.to_dict("records"):
+            mid = r.get("member_id")
+            present = "present" if bool(r.get("present")) else "absent"
+            note = r.get("note") or ""
+            lines.append(f"{mid}  •  {present}  •  {note}")
+    pdf_bytes = _make_simple_pdf(f"theyoungshallgrow — Attendance (session {session_id})", lines)
+    return f"Hello 👋🏽 Attendance PDF is ready for session_id={session_id}.", pdf_bytes, f"attendance_session_{int(session_id)}.pdf"
+
+
 # -----------------------------------------------------------------------------
-# Local answers (DB truth)
+# Local DB answers (grounded)
 # -----------------------------------------------------------------------------
-def _member_financial_totals(
-    sb_anon,
-    sb_service,
-    schema: str,
-    member_id: str,
-    members_truth: pd.DataFrame,
-) -> Tuple[str, Dict[str, Any]]:
+def _member_financial_totals(sb_anon, sb_service, schema: str, member_id: str, members_truth: pd.DataFrame) -> Tuple[str, Dict[str, Any]]:
     name = _member_name_from_truth(members_truth, member_id)
 
+    # Prefer view if available
     if "v_member_financial_totals" in RELATIONS:
         v_all = _sb_select(sb_anon, sb_service, schema, "v_member_financial_totals", cols="*", limit=5000)
         hit = _find_row_for_member(v_all, member_id)
         if not hit.empty:
             row = hit.iloc[0].to_dict()
-
-            contrib = row.get("contributions_total", row.get("contribution_total", row.get("contributions", 0)))
-            found = row.get("foundation_total", row.get("foundation_contributions_total", row.get("foundation", 0)))
-            fines = row.get("fines_total", row.get("fines", 0))
-            active_bal = row.get("active_loan_balance", row.get("loan_balance", row.get("principal_current_total", 0)))
-            unpaid_int = row.get("active_unpaid_interest", row.get("unpaid_interest_total", row.get("unpaid_interest", 0)))
-            interest = row.get("interest_total", row.get("interest_ledger_total", row.get("interest", 0)))
-
             msg = (
                 f"Hello 👋🏽 Here’s the grounded summary for **{name}** (member_id={member_id}):\n\n"
-                f"- Contributions total: **{_fmt(contrib)}**\n"
-                f"- Foundation total: **{_fmt(found)}**\n"
-                f"- Fines total: **{_fmt(fines)}**\n"
-                f"- Active loan balance: **{_fmt(active_bal)}**\n"
-                f"- Active unpaid interest: **{_fmt(unpaid_int)}**\n"
-                f"- Interest ledger total: **{_fmt(interest)}**\n"
+                f"- Contributions total: **{_fmt(row.get('contributions_total', row.get('contribution_total', 0)))}**\n"
+                f"- Foundation total: **{_fmt(row.get('foundation_total', row.get('foundation_contributions_total', 0)))}**\n"
+                f"- Fines total: **{_fmt(row.get('fines_total', 0))}**\n"
+                f"- Active loan balance: **{_fmt(row.get('active_loan_balance', row.get('principal_current_total', 0)))}**\n"
+                f"- Active unpaid interest: **{_fmt(row.get('active_unpaid_interest', row.get('unpaid_interest_total', 0)))}**\n"
+                f"- Interest ledger total: **{_fmt(row.get('interest_total', row.get('interest_ledger_total', 0)))}**\n"
             )
-            return msg, {"source": "v_member_financial_totals", "row": row, "member_name": name}
+            return msg, {"source": "v_member_financial_totals", "row": row}
 
-        return (
-            f"Hello 👋🏽 I don’t see member_id={member_id} in `v_member_financial_totals` (view rows: {len(v_all)}).",
-            {"source": "v_member_financial_totals:no_row"},
-        )
-
-    contributions = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=20000, filters=[("member_id", "eq", member_id)])
-    foundation = _sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=20000, filters=[("member_id", "eq", member_id)])
-    fines = _sb_select(sb_anon, sb_service, schema, "fines", cols="*", limit=20000, filters=[("member_id", "eq", member_id)])
-    loans = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=10000, filters=[("member_id", "eq", member_id)])
-    interest_ledger = _sb_select(sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=20000, filters=[("member_id", "eq", member_id)])
+    # Fallback: compute from raw tables
+    contributions = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=20000, filters=[("member_id", "eq", int(member_id))])
+    foundation = _sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=20000, filters=[("member_id", "eq", int(member_id))])
+    fines = _sb_select(sb_anon, sb_service, schema, "fines", cols="*", limit=20000, filters=[("member_id", "eq", int(member_id))])
+    loans = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=10000, filters=[("member_id", "eq", int(member_id))])
+    interest_ledger = _sb_select(sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=20000, filters=[("member_id", "eq", int(member_id))])
 
     contrib_amt = _pick_col(contributions, ["amount"])
     found_amt = _pick_col(foundation, ["amount"])
@@ -1018,7 +652,7 @@ def _member_financial_totals(
 
     status_col = _pick_col(loans, ["status"])
     principal_current = _pick_col(loans, ["principal_current"])
-    principal = _pick_col(loans, ["principal", "amount"])
+    principal = _pick_col(loans, ["principal"])
 
     active = loans
     if status_col and status_col in loans.columns:
@@ -1037,25 +671,27 @@ def _member_financial_totals(
         f"- Active unpaid interest: **{_fmt(unpaid_interest)}**\n"
         f"- Interest ledger total: **{_fmt(_safe_sum(interest_ledger, int_amt))}**\n"
     )
-    return msg, {"source": "tables_fallback", "member_name": name}
+    return msg, {"source": "tables_fallback"}
 
 
-def _loans_with_member(
-    sb_anon, sb_service, schema: str, member_id: Optional[str], members_truth: pd.DataFrame
-) -> Tuple[str, pd.DataFrame, str]:
+def _loans_with_member(sb_anon, sb_service, schema: str, member_id: Optional[str], members_truth: pd.DataFrame) -> Tuple[str, pd.DataFrame, str]:
     if "v_loans_with_member" in RELATIONS:
-        filters = [("member_id", "eq", member_id)] if member_id else None
+        filters = [("member_id", "eq", int(member_id))] if member_id else None
         df = _sb_select(sb_anon, sb_service, schema, "v_loans_with_member", cols="*", limit=5000, filters=filters)
         src = "v_loans_with_member"
     else:
-        filters = [("member_id", "eq", member_id)] if member_id else None
+        filters = [("member_id", "eq", int(member_id))] if member_id else None
         df = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=5000, filters=filters)
         if not df.empty and "member_id" in df.columns and not members_truth.empty:
-            df = df.merge(members_truth, how="left", on="member_id")
+            # members_truth.member_id is str, convert
+            mt = members_truth.copy()
+            mt["member_id_num"] = pd.to_numeric(mt["member_id"], errors="coerce")
+            df2 = df.copy()
+            df2["member_id_num"] = pd.to_numeric(df2["member_id"], errors="coerce")
+            df = df2.merge(mt[["member_id_num", "member_name"]], on="member_id_num", how="left").drop(columns=["member_id_num"])
         src = "loans (+ members join)"
 
     df = _coalesce_note_cols(df)
-
     title = "Loans"
     if member_id:
         title = f"Loans for {_member_name_from_truth(members_truth, member_id)} (member_id={member_id})"
@@ -1084,124 +720,36 @@ def _show_relation(sb_anon, sb_service, schema: str, relation: str) -> Tuple[str
     return msg, df, f"show:{relation}"
 
 
-# -----------------------------------------------------------------------------
-# PDF actions (DB grounded)
-# -----------------------------------------------------------------------------
-def _pdf_loan_statement(sb_anon, sb_service, schema: str, member_id: str, members_truth: pd.DataFrame) -> Tuple[str, bytes, str]:
-    brand = "theyoungshallgrow"
-    mname = _member_name_from_truth(members_truth, member_id)
-    member = {"member_id": member_id, "member_name": mname}
-
-    loans_df = _sb_select(sb_anon, sb_service, schema, "v_loans_with_member" if "v_loans_with_member" in RELATIONS else "loans",
-                          cols="*", limit=5000, filters=[("member_id", "eq", member_id)])
-    pays_df = _sb_select(sb_anon, sb_service, schema,
-                         "v_loan_payments_with_member" if "v_loan_payments_with_member" in RELATIONS else "loan_payments",
-                         cols="*", limit=8000, filters=[("member_id", "eq", member_id)]) if "member_id" in (pays_df_cols := []) else pd.DataFrame()
-
-    # If loan_payments doesn't have member_id, try via loan_id join (safe)
-    if pays_df.empty:
-        lp = _sb_select(sb_anon, sb_service, schema, "loan_payments", cols="*", limit=20000)
-        if not lp.empty and not loans_df.empty:
-            if "loan_id" in lp.columns and ("id" in loans_df.columns):
-                tmp = lp.merge(loans_df[["id", "member_id"]].rename(columns={"id": "loan_id"}), on="loan_id", how="left")
-                pays_df = tmp[tmp["member_id"].astype(str) == str(member_id)].copy()
-            else:
-                pays_df = pd.DataFrame()
-
-    loans = (loans_df.to_dict("records") if loans_df is not None and not loans_df.empty else [])
-    payments = (pays_df.to_dict("records") if pays_df is not None and not pays_df.empty else [])
-
-    cycle_info = {"session_id": "—", "payout_date": "N/A"}
-    pdf_bytes = _make_member_loan_statement_pdf(
-        brand=brand,
-        member=member,
-        cycle_info=cycle_info,
-        loans=loans,
-        payments=payments,
-        currency="$",
-        logo_path="assets/logo.png",
-    )
-    filename = f"loan_statement_member_{int(member_id):02d}.pdf"
-    msg = f"Hello 👋🏽 Loan statement PDF is ready for **{mname}** (member_id={member_id}). Use the download button below."
-    return msg, pdf_bytes, filename
-
-
-def _pdf_payout_receipt(sb_anon, sb_service, schema: str, payout_id: str, members_truth: pd.DataFrame) -> Tuple[str, bytes, str]:
-    brand = "theyoungshallgrow"
-    payouts = _sb_select(sb_anon, sb_service, schema, "payouts", cols="*", limit=1, filters=[("id", "eq", int(payout_id))])
-    if payouts.empty:
-        raise Exception(f"payout_id={payout_id} not found in payouts table.")
-    p = payouts.iloc[0].to_dict()
-    session_id = p.get("session_id")
-    beneficiary_id = str(p.get("member_id") or "")
-    beneficiary_name = _member_name_from_truth(members_truth, beneficiary_id)
-
-    # contributions breakdown for that session
-    contrib = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=20000, filters=[("session_id", "eq", session_id)])
+def _health_table(sb_anon, sb_service, schema: str) -> pd.DataFrame:
     rows = []
-    if not contrib.empty:
-        amt_col = _pick_col(contrib, ["amount"])
-        mid_col = _pick_col(contrib, ["member_id"])
-        if amt_col and mid_col:
-            contrib2 = contrib.copy()
-            contrib2[mid_col] = pd.to_numeric(contrib2[mid_col], errors="coerce").fillna(0).astype(int)
-            contrib2[amt_col] = pd.to_numeric(contrib2[amt_col], errors="coerce").fillna(0.0).astype(float)
-            gb = contrib2.groupby(mid_col, as_index=False)[amt_col].sum().rename(columns={mid_col: "member_id", amt_col: "amount"})
-            for r in gb.to_dict("records"):
-                r["member_name"] = _member_name_from_truth(members_truth, str(r.get("member_id")))
-                rows.append(r)
-
-    # signatures (optional)
-    sigs = []
-    if "signatures" in RELATIONS:
-        sig_df = _sb_select(sb_anon, sb_service, schema, "signatures", cols="*", limit=500,
-                            filters=[("entity_type", "eq", "payout"), ("entity_id", "eq", int(session_id))])
-        if sig_df is not None and not sig_df.empty:
-            sigs = sig_df.to_dict("records")
-
-    beneficiary = {"member_id": beneficiary_id, "member_name": beneficiary_name}
-    payout_info = {
-        "session_id": session_id,
-        "payout_date": p.get("payout_date") or p.get("created_at") or "",
-        "payout_amount": p.get("payout_amount"),
-        "pot_amount": sum(float(x.get("amount") or 0) for x in rows) if rows else None,
-        "notes": p.get("notes") or p.get("note") or "",
-    }
-
-    pdf_bytes = _make_payout_receipt_pdf(
-        brand=brand,
-        beneficiary=beneficiary,
-        payout_info=payout_info,
-        contributions_breakdown=rows,
-        signatures=sigs,
-        currency="$",
-        logo_path="assets/logo.png",
-    )
-    filename = f"payout_receipt_payout_{int(payout_id)}_session_{int(session_id)}.pdf"
-    msg = f"Hello 👋🏽 Payout receipt PDF is ready for session_id={session_id} (payout_id={payout_id}). Use the download button below."
-    return msg, pdf_bytes, filename
+    for rel in sorted(RELATIONS.keys()):
+        typ = RELATIONS[rel].get("type", "?")
+        readable = False
+        errtxt = ""
+        try:
+            _ = _sb_select(sb_anon, sb_service, schema, rel, cols="*", limit=1)
+            readable = True
+        except Exception as e:
+            readable = False
+            errtxt = _api_msg(e)
+        rows.append(
+            {
+                "relation": rel,
+                "type": typ,
+                "readable": "✅" if readable else "❌",
+                "note": errtxt[:120] if errtxt else "",
+            }
+        )
+    return pd.DataFrame(rows)
 
 
-def _pdf_minutes(sb_anon, sb_service, schema: str, session_id: str) -> Tuple[str, bytes, str]:
-    brand = "theyoungshallgrow"
-    mins = _sb_select(sb_anon, sb_service, schema, "minutes", cols="*", limit=1, filters=[("session_id", "eq", int(session_id))], order=("created_at", False))
-    if mins.empty:
-        raise Exception(f"No minutes found for session_id={session_id}.")
-    row = mins.iloc[0].to_dict()
-    pdf_bytes = _make_minutes_pdf(brand, row)
-    filename = f"minutes_session_{int(session_id)}.pdf"
-    msg = f"Hello 👋🏽 Minutes PDF is ready for session_id={session_id}. Use the download button below."
-    return msg, pdf_bytes, filename
-
-
-def _pdf_attendance(sb_anon, sb_service, schema: str, session_id: str) -> Tuple[str, bytes, str]:
-    brand = "theyoungshallgrow"
-    att = _sb_select(sb_anon, sb_service, schema, "attendance", cols="*", limit=5000, filters=[("session_id", "eq", int(session_id))])
-    rows = att.to_dict("records") if att is not None and not att.empty else []
-    pdf_bytes = _make_attendance_pdf(brand, int(session_id), rows)
-    filename = f"attendance_session_{int(session_id)}.pdf"
-    msg = f"Hello 👋🏽 Attendance PDF is ready for session_id={session_id}. Use the download button below."
-    return msg, pdf_bytes, filename
+def _counts_table(sb_anon, sb_service, schema: str) -> pd.DataFrame:
+    rows = []
+    for rel in sorted(RELATIONS.keys()):
+        typ = RELATIONS[rel].get("type", "?")
+        c = _sb_count(sb_anon, sb_service, schema, rel)
+        rows.append({"relation": rel, "type": typ, "count_exact": c})
+    return pd.DataFrame(rows)
 
 
 # -----------------------------------------------------------------------------
@@ -1279,9 +827,9 @@ def _messages_to_prompt(messages: List[Dict[str, str]]) -> str:
     return "\n".join(out)
 
 
-def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], timeout: int = 60) -> Tuple[bool, str]:
+def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], timeout: int = 60, temperature: float = 0.35) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "temperature": 0.2, "max_tokens": 450}
+    payload = {"model": model, "messages": messages, "temperature": float(temperature), "max_tokens": 500}
     ok, raw = _post_with_retries(HF_ROUTER_CHAT_URL, headers, payload, timeout=timeout)
     if not ok:
         return False, raw
@@ -1293,9 +841,9 @@ def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], time
         return False, f"Bad HF chat response: {raw[:600]}"
 
 
-def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 60) -> Tuple[bool, str]:
+def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 60, temperature: float = 0.35) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": model, "prompt": prompt, "temperature": 0.2, "max_tokens": 450}
+    payload = {"model": model, "prompt": prompt, "temperature": float(temperature), "max_tokens": 500}
     ok, raw = _post_with_retries(HF_ROUTER_COMPLETIONS_URL, headers, payload, timeout=timeout)
     if not ok:
         return False, raw
@@ -1307,7 +855,10 @@ def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 6
         return False, f"Bad HF completions response: {raw[:600]}"
 
 
-def _hf_call(model: str, token: str, messages: List[Dict[str, str]]) -> Tuple[bool, str, str]:
+def _hf_call(model: str, token: str, messages: List[Dict[str, str]], random_route: bool, temperature: float) -> Tuple[bool, str, str, str]:
+    """
+    Returns: ok, text, mode_used, model_used
+    """
     force = (os.getenv("HF_FORCE_MODE", "") or "auto").strip().lower()
     prompt = _messages_to_prompt(messages)
 
@@ -1319,12 +870,20 @@ def _hf_call(model: str, token: str, messages: List[Dict[str, str]]) -> Tuple[bo
         if m and m not in model_order:
             model_order.append(m)
 
+    if random_route and model_order:
+        chosen = random.choice(model_order)
+        model_order = [chosen]  # only one model when random routing is ON
+
     def _looks_instruct(mname: str) -> bool:
         mlc = (mname or "").lower()
         return any(x in mlc for x in ["instruct", "mistral", "llama-3", "llama-3.1"])
 
     last_err = ""
+    last_mode = "failed"
+    last_model = model_order[0] if model_order else ""
+
     for chosen in model_order:
+        last_model = chosen
         if force == "chat":
             order = ["chat"]
         elif force == "completions":
@@ -1333,26 +892,27 @@ def _hf_call(model: str, token: str, messages: List[Dict[str, str]]) -> Tuple[bo
             order = ["completions", "chat"] if _looks_instruct(chosen) else ["chat", "completions"]
 
         for mode in order:
+            last_mode = mode
             if mode == "completions":
-                ok, txt = _hf_router_completions(chosen, token, prompt)
+                ok, txt = _hf_router_completions(chosen, token, prompt, temperature=temperature)
                 if ok and txt:
-                    return True, txt, "completions"
+                    return True, txt, "completions", chosen
                 last_err = txt
             else:
-                ok, txt = _hf_router_chat(chosen, token, messages)
+                ok, txt = _hf_router_chat(chosen, token, messages, temperature=temperature)
                 if ok and txt:
-                    return True, txt, "chat"
+                    return True, txt, "chat", chosen
                 last_err = txt
 
         err = (last_err or "").lower()
         if not any(s in err for s in ["429", "500", "502", "503", "504", "timeout", "server error"]):
             break
 
-    return False, last_err or "Unknown HF error", "failed"
+    return False, last_err or "Unknown HF error", last_mode, last_model
 
 
 # -----------------------------------------------------------------------------
-# Members truth cache (session_state to avoid unhashable supabase clients)
+# Cached members truth (session_state avoids unhashable clients)
 # -----------------------------------------------------------------------------
 def _get_members_truth_cached(sb_anon, sb_service, schema: str, ttl_sec: int = 30) -> pd.DataFrame:
     now = time.time()
@@ -1379,6 +939,29 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     hf_force = (os.getenv("HF_FORCE_MODE") or "auto").strip().lower()
     internet_on = _internet_enabled()
 
+    with st.expander("⚙️ Chat Settings", expanded=False):
+        random_route = st.checkbox(
+            "🎲 Random model routing (HF only)",
+            value=bool(st.session_state.get("younchat_random_route", False)),
+            help="Randomly picks one HF model (from HF_MODEL + fallbacks) for general chat. DB/PDF never uses HF.",
+        )
+        st.session_state["younchat_random_route"] = bool(random_route)
+
+        temp = st.slider(
+            "HF temperature (general chat only)",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(st.session_state.get("younchat_temp", 0.35)),
+            step=0.05,
+        )
+        st.session_state["younchat_temp"] = float(temp)
+
+        st.write("**HF model**:", hf_model)
+        st.write("**HF_TOKEN present**:", "✅ Yes" if hf_token else "❌ No")
+        st.write("**HF_FORCE_MODE**:", hf_force)
+        st.write("**Internet**:", "✅ ON" if internet_on else "❌ OFF")
+        st.caption("Njangi numbers are ALWAYS answered from DB. HF is only for general chat wording (never DB/PDF commands).")
+
     # If a PDF was generated earlier, keep it visible
     if st.session_state.get("younchat_last_pdf_bytes") and st.session_state.get("younchat_last_pdf_name"):
         st.success("✅ Last PDF is ready.")
@@ -1391,13 +974,6 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
             key="younchat_dl_last_pdf",
         )
         st.divider()
-
-    with st.expander("⚙️ Chat Settings", expanded=False):
-        st.write("**HF model**:", hf_model)
-        st.write("**HF_TOKEN present**:", "✅ Yes" if hf_token else "❌ No")
-        st.write("**HF_FORCE_MODE**:", hf_force)
-        st.write("**Internet**:", "✅ ON" if internet_on else "❌ OFF")
-        st.caption("Njangi numbers are ALWAYS answered from DB. HF is only for general chat wording (never DB/PDF commands).")
 
     members_truth = _get_members_truth_cached(sb_anon, sb_service, schema, ttl_sec=30)
 
@@ -1468,39 +1044,11 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                     answer = "\n".join(lines)
 
     # PDF commands (DB-grounded)
-    elif _wants_pdf_loan_statement(q):
-        used_source = "pdf:loan_statement"
-        mid = _extract_member_id(q) or member_id_focus
-        if not mid:
-            answer = "Hello 👋🏽 Say: **loan statement 10** (or **pdf loan 10**)."
-        else:
-            try:
-                msg, pdf_bytes, filename = _pdf_loan_statement(sb_anon, sb_service, schema, str(mid), members_truth)
-                st.session_state["younchat_last_pdf_bytes"] = pdf_bytes
-                st.session_state["younchat_last_pdf_name"] = filename
-                answer = msg
-            except Exception as e:
-                answer = f"Hello 👋🏽 Could not generate loan statement PDF: {_api_msg(e)}"
-
-    elif _wants_pdf_payout_receipt(q):
-        used_source = "pdf:payout_receipt"
-        pid = _extract_payout_id(q)
-        if not pid:
-            answer = "Hello 👋🏽 Say: **payout receipt payout_id 3** (or **pdf payout 3**)."
-        else:
-            try:
-                msg, pdf_bytes, filename = _pdf_payout_receipt(sb_anon, sb_service, schema, str(pid), members_truth)
-                st.session_state["younchat_last_pdf_bytes"] = pdf_bytes
-                st.session_state["younchat_last_pdf_name"] = filename
-                answer = msg
-            except Exception as e:
-                answer = f"Hello 👋🏽 Could not generate payout receipt PDF: {_api_msg(e)}"
-
     elif _wants_pdf_minutes(q):
         used_source = "pdf:minutes"
         sid = _extract_session_id(q)
         if not sid:
-            answer = "Hello 👋🏽 Say: **minutes pdf session 12** (or **pdf minutes session_id 12**)."
+            answer = "Hello 👋🏽 Say: **minutes pdf session 12**."
         else:
             try:
                 msg, pdf_bytes, filename = _pdf_minutes(sb_anon, sb_service, schema, str(sid))
@@ -1514,7 +1062,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         used_source = "pdf:attendance"
         sid = _extract_session_id(q)
         if not sid:
-            answer = "Hello 👋🏽 Say: **attendance pdf session 12** (or **pdf attendance session_id 12**)."
+            answer = "Hello 👋🏽 Say: **attendance pdf session 12**."
         else:
             try:
                 msg, pdf_bytes, filename = _pdf_attendance(sb_anon, sb_service, schema, str(sid))
@@ -1534,11 +1082,11 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
             "- **loans** / **loans for member 10**\n"
             "- **finance kpis**\n"
             "- **tables**\n"
+            "- **health** (readability check)\n"
+            "- **counts** (row counts, best-effort)\n"
             "- **show <table>** (example: show contributions)\n"
             "- **describe <table>** (example: describe loans)\n\n"
             "PDF:\n"
-            "- **loan statement 10** (or **pdf loan 10**)\n"
-            "- **payout receipt payout_id 3** (or **pdf payout 3**)\n"
             "- **minutes pdf session 12**\n"
             "- **attendance pdf session 12**\n\n"
             "- **web: <topic>** (internet)\n"
@@ -1550,6 +1098,18 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         df_show = pd.DataFrame(rows)
         df_title = "Readable relations (allowlist)"
         answer = "Hello 👋🏽 Here are the tables/views younchat can read:"
+
+    elif _wants_health(q):
+        used_source = "health"
+        df_show = _health_table(sb_anon, sb_service, schema)
+        df_title = "DB Health (read test)"
+        answer = "Hello 👋🏽 Here is the DB health check (✅ readable / ❌ blocked):"
+
+    elif _wants_counts(q):
+        used_source = "counts"
+        df_show = _counts_table(sb_anon, sb_service, schema)
+        df_title = "DB Row Counts (best-effort)"
+        answer = "Hello 👋🏽 Here are table row counts (may be NULL if RLS blocks count):"
 
     elif _wants_describe(q):
         rel = _extract_relation_name(q)
@@ -1567,7 +1127,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
             answer = "Hello 👋🏽 Say: **show contributions** (or any table/view in the allowlist)."
         else:
             answer, df_show, used_source = _show_relation(sb_anon, sb_service, schema, rel)
-            df_title = f"Preview: {rel}"
+            df_title = f"Preview: {rel} (all columns)"
 
     elif _wants_list_members(q):
         used_source = "members"
@@ -1600,7 +1160,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     elif _lc(q) in RELATIONS:
         rel = _lc(q)
         answer, df_show, used_source = _show_relation(sb_anon, sb_service, schema, rel)
-        df_title = f"Preview: {rel}"
+        df_title = f"Preview: {rel} (all columns)"
 
     # General chat: optional HF (NEVER DB/PDF commands)
     else:
@@ -1611,16 +1171,22 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                 "- Start with 'Hello' if greeting.\n"
                 "- Do NOT output SQL or Python code.\n"
                 "- Do NOT invent Njangi numbers or member IDs.\n"
-                "- If user asks for database results, suggest commands: members / loans / finance kpis / tables / show <table> / describe <table>.\n"
-                "- If user asks for PDFs, suggest: loan statement <member_id>, payout receipt payout_id <id>, minutes pdf session <id>, attendance pdf session <id>.\n"
+                "- If user asks for database results, suggest commands: members / loans / finance kpis / tables / health / counts / show <table> / describe <table>.\n"
+                "- If user asks for PDFs, suggest: minutes pdf session <id>, attendance pdf session <id>.\n"
             )
             messages = [{"role": "system", "content": sys}]
             for m in st.session_state["younchat_history"][-10:]:
                 if m.get("role") in ("user", "assistant"):
                     messages.append({"role": m["role"], "content": m.get("content", "")})
 
-            ok, txt, mode = _hf_call(hf_model, hf_token, messages)
-            used_source = f"hf:{mode}" if ok else "hf:failed"
+            ok, txt, mode, model_used = _hf_call(
+                hf_model,
+                hf_token,
+                messages,
+                random_route=bool(st.session_state.get("younchat_random_route", False)),
+                temperature=float(st.session_state.get("younchat_temp", 0.35)),
+            )
+            used_source = f"hf:{mode}:{model_used}" if ok else "hf:failed"
             answer = txt if ok else f"Hello 👋🏽 HF is not reachable: {txt}"
         else:
             if _is_db_command(q):
@@ -1632,13 +1198,13 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                     "- **loans**\n"
                     "- **finance kpis**\n"
                     "- **tables**\n"
+                    "- **health**\n"
+                    "- **counts**\n"
                     "- **show contributions**\n"
                     "- **show loan_requests**\n"
                     "- **show loan_repayments_pending**\n"
                     "- **describe loans**\n\n"
                     "PDF:\n"
-                    "- **loan statement 10**\n"
-                    "- **payout receipt payout_id 3**\n"
                     "- **minutes pdf session 12**\n"
                     "- **attendance pdf session 12**\n"
                 )
@@ -1665,6 +1231,4 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
             with st.expander(df_title, expanded=False):
                 st.dataframe(df_show, use_container_width=True)
 
-    st.caption(
-        f"Source used: {used_source} • member_id: {member_id_focus or '—'} • Internet: {'ON' if internet_on else 'OFF'}"
-                        )
+    st.caption(f"Source used: {used_source} • member_id: {member_id_focus or '—'} • Internet: {'ON' if internet_on else 'OFF'}")
