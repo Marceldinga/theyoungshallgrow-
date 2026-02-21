@@ -1,28 +1,34 @@
 
-# dashboard_panel.py ✅ COMPLETE SINGLE FILE — CLEAN DASHBOARD (NO EXTRA TEXT) + 💬 younchat (Snapshot Copilot)
-# ----------------------------------------------------------------------------------------------------------
+# dashboard_panel.py ✅ COMPLETE SINGLE FILE (FIXED + CLEAN)
+# --------------------------------------------------------
 # ✅ NJANGI STANDARD (NO legacy)
-# ✅ Clean UI: dashboard shows ONLY full information (KPIs + sections). No marketing lines.
-# ✅ younchat on dashboard:
-#    - Minimal header (no extra paragraphs)
-#    - Answers ONLY from LIVE snapshot (no guessing)
-#    - Optional web search ONLY if user types "web:" (Tavily)
-#    - Optional HF wording (does NOT invent numbers; still grounded on snapshot)
+# ✅ CLEAN DASHBOARD (your request):
+#   - NO extra text at top (no status lines, no "modern analytics" banner)
+#   - Only: KPIs + Attendance + younchat Dashboard AI box
 #
-# Works with app.py calling:
-#   render_dashboard(sb_anon=..., sb_service=..., schema=...)
+# ✅ Dashboard AI = younchat (your style):
+#   - Salute is always: "Hello"
+#   - Modern intro (short)
+#   - Grounded answers ONLY from LIVE snapshot (no guessing)
+#   - Optional: HF Router for nicer wording (still grounded on snapshot)
+#   - Optional: Tavily web search ONLY when query starts with "web:"
 #
-# Railway env vars (optional):
-#   LOCAL_TZ=America/New_York   (or America/Chicago)
-#   TAVILY_API_KEY=<...>
-#   HF_TOKEN=<...>
+# ✅ Safe navigation buttons:
+#   - Buttons set st.session_state["page"] then st.rerun()
+#   - Make sure your app.py uses EXACT page labels (match your sidebar labels)
+#
+# ✅ SAFE IMPORT FIX:
+#   - APIError import is wrapped (prevents crashes if postgrest differs)
+#
+# Optional Railway Variables:
+#   LOCAL_TZ=America/Chicago (or America/New_York)
+#   TAVILY_API_KEY=...
+#   HF_TOKEN=...
 #   HF_MODEL=meta-llama/Meta-Llama-3-8B-Instruct
 #   HF_FORCE_MODE=auto|chat|completions
 #
-# NOTE:
-# - "Quick actions (safe navigation)" can be ENABLED by setting ENABLE_DASH_NAV=True
-# - Requires app.py to bridge st.session_state["page"] to the page selector.
-# ----------------------------------------------------------------------------------------------------------
+# Requirements (optional):
+#   pip install requests
 
 from __future__ import annotations
 
@@ -34,38 +40,55 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
-import requests
 import streamlit as st
 
+# ✅ SAFE import (fix)
 try:
     from postgrest.exceptions import APIError
 except Exception:
     APIError = Exception  # type: ignore
 
+# ✅ requests optional
+try:
+    import requests
+except Exception:
+    requests = None  # type: ignore
+
 
 # ============================================================
 # SETTINGS
 # ============================================================
-AUTO_CREATE_SESSION_IF_NONE = False
-ENABLE_DASH_NAV = False  # ✅ CLEAN: default OFF (no extra UI)
-W_STRETCH = "stretch"
+AUTO_CREATE_SESSION_IF_NONE = False  # set True only if you want to auto-create sessions
 
 
 # ============================================================
-# LOCAL TIMEZONE (optional, for greeting only)
+# LOCAL TIMEZONE (for human-touch line only)
 # ============================================================
 def _local_now() -> datetime:
     tz_name = (os.getenv("LOCAL_TZ", "") or "America/Chicago").strip()
     try:
-        from zoneinfo import ZoneInfo
-
+        from zoneinfo import ZoneInfo  # py3.9+
         return datetime.now(ZoneInfo(tz_name))
     except Exception:
         return datetime.now(timezone.utc)
 
 
-def _hello() -> str:
+def _greeting_of_day() -> str:
+    # Your requirement: salute must ALWAYS be Hello
     return "Hello"
+
+
+def _human_touch() -> str:
+    h = _local_now().hour
+    if 5 <= h <= 9:
+        return "Hope your day starts strong."
+    if 10 <= h <= 13:
+        return "Hope your day is going well."
+    if 14 <= h <= 17:
+        return "Hope your afternoon is going smoothly."
+    if 18 <= h <= 22:
+        return "Hope your evening is peaceful."
+    return "Hope everything is okay on your side."
 
 
 # ============================================================
@@ -82,9 +105,9 @@ def _api_msg(e: Exception) -> str:
     if isinstance(e, APIError):
         payload = e.args[0] if getattr(e, "args", None) else {}
         if isinstance(payload, dict):
-            return str(payload.get("message") or payload.get("details") or payload.get("hint") or "APIError")
-        return str(e)
-    return repr(e)
+            return str(payload.get("message") or payload.get("details") or payload.get("hint") or payload)
+        return str(payload)
+    return str(e)
 
 
 # ============================================================
@@ -208,21 +231,16 @@ def _get_latest_session_id(sb_read, schema: str) -> Optional[int]:
     if sb_read is None:
         return None
 
+    # sessions.id
     rows = _safe_select(sb_read, schema, "sessions", "id,created_at", order_by="id", desc=True, limit=1, show_error=False)
     if rows and rows[0].get("id") is not None:
         sid = _resolve_session_id(rows[0].get("id"))
         if sid is not None:
             return sid
 
+    # fallback sessions.session_id
     rows = _safe_select(
-        sb_read,
-        schema,
-        "sessions",
-        "session_id,created_at",
-        order_by="session_id",
-        desc=True,
-        limit=1,
-        show_error=False,
+        sb_read, schema, "sessions", "session_id,created_at", order_by="session_id", desc=True, limit=1, show_error=False
     )
     if rows and rows[0].get("session_id") is not None:
         sid = _resolve_session_id(rows[0].get("session_id"))
@@ -240,13 +258,14 @@ def _ensure_current_session(sb_anon, sb_service, schema: str) -> Tuple[Optional[
     app_state = app_state_rows[0] if app_state_rows else {}
     app_state_id = app_state.get("id")
     current_sid = _resolve_session_id(app_state.get("current_session_id"))
+
     latest_sid = _get_latest_session_id(sb_read, schema)
 
     if latest_sid is None:
         if not AUTO_CREATE_SESSION_IF_NONE:
             return None, "No sessions found."
         if sb_write is None:
-            return None, "No sessions found (service key missing; cannot auto-create)."
+            return None, "No sessions found and service key missing."
         name = f"Cycle {pd.Timestamp.utcnow().strftime('%Y-%m-%d')}"
         created = _safe_insert(sb_write, schema, "sessions", {"name": name, "is_active": True})
         if created and created[0].get("id") is not None:
@@ -258,60 +277,70 @@ def _ensure_current_session(sb_anon, sb_service, schema: str) -> Tuple[Optional[
 
     if not app_state_rows:
         if sb_write is None:
-            return latest_sid, "Selected latest session (app_state missing; read-only)."
+            return latest_sid, "Selected latest session (app_state missing; cannot write)."
         ins = _safe_insert(sb_write, schema, "app_state", {"current_session_id": latest_sid})
-        return latest_sid, "Selected latest session."
+        if ins:
+            return latest_sid, "Selected latest session (app_state created)."
+        return latest_sid, "Selected latest session (app_state create failed)."
 
     if current_sid is None:
         if sb_write is None:
-            return latest_sid, "Selected latest session (current_session_id missing; read-only)."
-        _safe_update_eq(sb_write, schema, "app_state", {"current_session_id": latest_sid}, "id", app_state_id)
-        return latest_sid, "Selected latest session."
+            return latest_sid, "Selected latest session (current_session_id missing; cannot write)."
+        ok = _safe_update_eq(sb_write, schema, "app_state", {"current_session_id": latest_sid}, "id", app_state_id)
+        if ok:
+            return latest_sid, "Selected latest session (app_state updated)."
+        return latest_sid, "Selected latest session (app_state update failed)."
 
-    return current_sid, "Using current session."
+    return current_sid, "Using current session from app_state."
 
 
 # ============================================================
-# Tavily Web Search (only when user types "web:")
+# WEB SEARCH (Tavily)
 # ============================================================
 def _has_tavily_key() -> bool:
     return bool(os.getenv("TAVILY_API_KEY", "").strip())
 
 
 def _is_web_query(text: str) -> bool:
-    return (text or "").strip().lower().startswith("web:")
+    t = (text or "").strip().lower()
+    return t.startswith("web:") or t.startswith("internet:") or t.startswith("tavily:")
 
 
 def _strip_web_prefix(q: str) -> str:
-    return re.sub(r"^web:\s*", "", (q or "").strip(), flags=re.IGNORECASE).strip()
+    return re.sub(r"^(web:|internet:|tavily:)\s*", "", (q or "").strip(), flags=re.IGNORECASE).strip()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _tavily_search_cached(query: str, max_results: int = 5) -> Dict[str, Any]:
+def _tavily_search_cached(query: str, max_results: int = 5, search_depth: str = "basic") -> Dict[str, Any]:
+    if requests is None:
+        return {"error": "requests is not installed. Add it to requirements.txt."}
     api_key = os.getenv("TAVILY_API_KEY", "").strip()
     if not api_key:
-        return {"error": "Missing TAVILY_API_KEY."}
+        return {"error": "Missing TAVILY_API_KEY in environment variables."}
+
+    url = "https://api.tavily.com/search"
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-    payload = {"query": query, "max_results": int(max_results), "search_depth": "basic"}
+    payload = {"query": query, "max_results": int(max_results), "search_depth": str(search_depth)}
+
     try:
-        r = requests.post("https://api.tavily.com/search", headers=headers, json=payload, timeout=20)
+        r = requests.post(url, headers=headers, json=payload, timeout=20)
         if r.status_code != 200:
-            return {"error": f"Tavily error {r.status_code}: {r.text[:300]}"}
+            return {"error": f"Tavily error {r.status_code}: {r.text[:400]}"}
         j = r.json()
         return j if isinstance(j, dict) else {"raw": r.text}
     except Exception as e:
-        return {"error": repr(e)}
+        return {"error": f"Request failed: {repr(e)}"}
 
 
 def _format_web_results(tav: Dict[str, Any]) -> Tuple[str, List[Dict[str, str]]]:
     if not isinstance(tav, dict):
-        return ("Hello 👋🏽 I couldn’t read the web results.", [])
+        return ("I couldn’t read the web results.", [])
     if "error" in tav:
-        return (f"Hello 👋🏽 Web search failed: {tav['error']}", [])
+        return (f"Internet search failed: {tav['error']}", [])
 
     results = tav.get("results", []) or []
     if not results:
-        return ("Hello 👋🏽 I searched the web but didn’t find clear results.", [])
+        return ("I searched the web but didn’t find clear results. Try rephrasing.", [])
 
     bullets = []
     sources: List[Dict[str, str]] = []
@@ -320,36 +349,46 @@ def _format_web_results(tav: Dict[str, Any]) -> Tuple[str, List[Dict[str, str]]]
         url = str(r.get("url") or "").strip()
         content = str(r.get("content") or "").strip()
         if content:
-            bullets.append(f"- {content[:240].rstrip()}…")
+            bullets.append(f"• {content[:240].rstrip()}…")
         if url:
             sources.append({"title": title, "url": url})
 
-    summary = "Hello 👋🏽 Web results (top):\n" + ("\n".join(bullets[:3]) if bullets else "- (No snippets)")
+    summary = "Here’s what I found online (top results):\n" + ("\n".join(bullets[:3]) if bullets else "• (No snippets returned)")
     return (summary, sources)
 
 
 # ============================================================
-# HF Router (optional; only for phrasing, NOT for numbers)
+# HF ROUTER (optional) — better wording, STILL grounded on snapshot
 # ============================================================
-def _hf_enabled() -> bool:
-    return bool(os.getenv("HF_TOKEN", "").strip())
+HF_ROUTER_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
+HF_ROUTER_COMPLETIONS_URL = "https://router.huggingface.co/v1/completions"
+
+
+def _has_hf_token() -> bool:
+    return bool((os.getenv("HF_TOKEN") or "").strip())
 
 
 def _hf_model() -> str:
-    return (os.getenv("HF_MODEL", "") or "meta-llama/Meta-Llama-3-8B-Instruct").strip()
+    return (os.getenv("HF_MODEL") or "meta-llama/Meta-Llama-3-8B-Instruct").strip()
+
+
+def _hf_force_mode() -> str:
+    return (os.getenv("HF_FORCE_MODE") or "auto").strip().lower()
 
 
 def _post_with_retries(url: str, headers: dict, payload: dict, timeout: int = 60) -> Tuple[bool, str]:
+    if requests is None:
+        return False, "requests not installed"
     last_err = ""
     for attempt in range(4):
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=timeout)
             if r.status_code in (429, 500, 502, 503, 504):
-                last_err = f"HF error {r.status_code}: {r.text[:400]}"
+                last_err = f"HF error {r.status_code}: {r.text[:600]}"
                 time.sleep(1.0 + attempt * 1.5)
                 continue
             if r.status_code >= 400:
-                return False, f"HF error {r.status_code}: {r.text[:400]}"
+                return False, f"HF error {r.status_code}: {r.text[:600]}"
             return True, r.text
         except Exception as e:
             last_err = str(e)
@@ -357,172 +396,315 @@ def _post_with_retries(url: str, headers: dict, payload: dict, timeout: int = 60
     return False, last_err or "HF transient error"
 
 
-def _hf_router_chat(messages: List[Dict[str, str]]) -> Tuple[bool, str]:
-    token = os.getenv("HF_TOKEN", "").strip()
+def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], timeout: int = 60) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": _hf_model(), "messages": messages, "temperature": 0.2, "max_tokens": 250}
-    ok, raw = _post_with_retries(HF_ROUTER_CHAT_URL, headers, payload, timeout=60)
+    payload = {"model": model, "messages": messages, "temperature": 0.2, "max_tokens": 400}
+    ok, raw = _post_with_retries(HF_ROUTER_CHAT_URL, headers, payload, timeout=timeout)
     if not ok:
         return False, raw
     try:
         data = json.loads(raw)
-        txt = (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
-        return True, str(txt).strip()
+        text = (((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+        return True, str(text).strip()
     except Exception:
-        return False, f"Bad HF response: {raw[:400]}"
+        return False, f"Bad HF chat response: {raw[:600]}"
+
+
+def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 60) -> Tuple[bool, str]:
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload = {"model": model, "prompt": prompt, "temperature": 0.2, "max_tokens": 400}
+    ok, raw = _post_with_retries(HF_ROUTER_COMPLETIONS_URL, headers, payload, timeout=timeout)
+    if not ok:
+        return False, raw
+    try:
+        data = json.loads(raw)
+        text = ((data.get("choices") or [{}])[0].get("text") or "")
+        return True, str(text).strip()
+    except Exception:
+        return False, f"Bad HF completions response: {raw[:600]}"
+
+
+def _snapshot_prompt(snapshot: Dict[str, Any], question: str) -> str:
+    return (
+        "You are younchat inside a dashboard.\n"
+        "You MUST answer using ONLY the provided DASHBOARD_SNAPSHOT JSON.\n"
+        "If missing, say what is missing.\n"
+        "Never invent numbers.\n\n"
+        f"DASHBOARD_SNAPSHOT:\n{json.dumps(snapshot, ensure_ascii=False)}\n\n"
+        f"USER_QUESTION:\n{question}\n\n"
+        "Answer now, grounded on the snapshot:"
+    )
+
+
+def _hf_grounded_answer(question: str, snapshot: Dict[str, Any]) -> Tuple[bool, str, str]:
+    token = (os.getenv("HF_TOKEN") or "").strip()
+    model = _hf_model()
+    force = _hf_force_mode()
+    if not token:
+        return False, "HF_TOKEN missing", "hf:missing"
+
+    sys = (
+        "You are younchat.\n"
+        "Start with 'Hello 👋🏽'. Keep it modern.\n"
+        "Answer ONLY from DASHBOARD_SNAPSHOT. No guessing.\n"
+    )
+    messages = [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": _snapshot_prompt(snapshot, question)},
+    ]
+
+    if force == "completions":
+        ok, txt = _hf_router_completions(model, token, _snapshot_prompt(snapshot, question))
+        return (ok, txt, "hf:completions") if ok else (False, txt, "hf:completions_failed")
+    if force == "chat":
+        ok, txt = _hf_router_chat(model, token, messages)
+        return (ok, txt, "hf:chat") if ok else (False, txt, "hf:chat_failed")
+
+    ok, txt = _hf_router_completions(model, token, _snapshot_prompt(snapshot, question))
+    if ok and txt:
+        return True, txt, "hf:completions"
+    ok2, txt2 = _hf_router_chat(model, token, messages)
+    if ok2 and txt2:
+        return True, txt2, "hf:chat"
+    return False, (txt2 or txt or "HF failed"), "hf:failed"
 
 
 # ============================================================
-# younchat (dashboard) — STRICTLY SNAPSHOT GROUNDED
+# younchat — grounded rules (always available)
 # ============================================================
-def _younchat_rules(q: str, snap: Dict[str, Any]) -> str:
+def _youn_answer_rules(q: str, snap: Dict[str, Any]) -> str:
     t = (q or "").strip().lower()
 
     session_id = snap.get("session_id")
-    total_members = snap.get("total_members", 0)
-    pot = snap.get("current_pot", 0.0)
-    cycle_total = snap.get("cycle_contributions_total", 0.0)
-    members_paid = snap.get("members_paid", 0)
-    attendance_present = snap.get("attendance_present", 0)
-    attendance_total = snap.get("attendance_total", 0)
-    loans_active_total = snap.get("loans_active_total", 0.0)
-    loans_active_count = snap.get("loans_active_count", 0)
-    fines_total = snap.get("fines_total", 0.0)
-    repayments_total = snap.get("repayments_total", 0.0)
-    interest_total = snap.get("interest_total", 0.0)
+    total_members = int(snap.get("total_members", 0) or 0)
+    pot = float(snap.get("current_pot", 0.0) or 0.0)
+    cycle_total = float(snap.get("cycle_contributions_total", 0.0) or 0.0)
+    members_paid = int(snap.get("members_paid", 0) or 0)
 
-    def fmt0(x: float) -> str:
+    attendance_present = int(snap.get("attendance_present", 0) or 0)
+    attendance_total = int(snap.get("attendance_total", 0) or 0)
+
+    loans_active_total = float(snap.get("loans_active_total", 0.0) or 0.0)
+    loans_active_count = int(snap.get("loans_active_count", 0) or 0)
+
+    fines_total = float(snap.get("fines_total", 0.0) or 0.0)
+    repayments_total = float(snap.get("repayments_total", 0.0) or 0.0)
+    interest_total = float(snap.get("interest_total", 0.0) or 0.0)
+
+    def money(x: float) -> str:
         try:
             return f"{float(x):,.0f}"
         except Exception:
             return str(x)
 
     if not t:
-        return "Hello 👋🏽 Ask: pot • contributions • loans • fines • repayments • interest • attendance"
+        return "Hello 👋🏽 Ask me: **pot this session**, **loans summary**, **fines total**, or **attendance summary**."
+
+    if "session" in t and ("id" in t or "which" in t):
+        return f"Hello 👋🏽 Current **Session ID** is **{session_id}**."
 
     if "pot" in t:
-        return f"Hello 👋🏽 Pot (Session {session_id}): **{fmt0(pot)}** • Paid: **{members_paid}/{total_members}** • Cycle: **{fmt0(cycle_total)}**"
+        return (
+            f"Hello 👋🏽 Here’s your snapshot:\n\n"
+            f"- **Pot (Session {session_id})**: **{money(pot)}**\n"
+            f"- **Members paid**: **{members_paid}/{total_members}**\n"
+            f"- **Cycle contributions total**: **{money(cycle_total)}**"
+        )
+
     if "contribution" in t or "cycle" in t:
-        return f"Hello 👋🏽 Cycle contributions (Session {session_id}): **{fmt0(cycle_total)}** • Paid: **{members_paid}/{total_members}**"
+        return (
+            f"Hello 👋🏽 Cycle contributions (Session {session_id}) = **{money(cycle_total)}**.\n\n"
+            f"Members paid: **{members_paid}/{total_members}**."
+        )
+
     if "attendance" in t or "present" in t or "absent" in t:
         if attendance_total == 0:
-            return f"Hello 👋🏽 Attendance (Session {session_id}): **no records yet**"
-        absent = max(int(attendance_total) - int(attendance_present), 0)
-        return f"Hello 👋🏽 Attendance (Session {session_id}): Present **{attendance_present}**, Absent **{absent}**, Marked **{attendance_total}**"
+            return f"Hello 👋🏽 No attendance records yet for **Session {session_id}**."
+        absent = max(attendance_total - attendance_present, 0)
+        return (
+            f"Hello 👋🏽 Attendance (Session {session_id}):\n\n"
+            f"- Present: **{attendance_present}**\n"
+            f"- Absent: **{absent}**\n"
+            f"- Total marked: **{attendance_total}**"
+        )
+
     if "loan" in t:
         if loans_active_count == 0:
-            return "Hello 👋🏽 Loans: **no active loans** in the snapshot."
-        return f"Hello 👋🏽 Loans: Active **{loans_active_count}** • Active principal total **{fmt0(loans_active_total)}**"
+            return "Hello 👋🏽 I see **no active loans** in the current snapshot."
+        return (
+            "Hello 👋🏽 Loans snapshot:\n\n"
+            f"- Active loans: **{loans_active_count}**\n"
+            f"- Active principal total: **{money(loans_active_total)}**\n\n"
+            "If you want *who owes what*, open **Loans** or **🤖 AI Risk Panel**."
+        )
+
     if "fine" in t:
-        return f"Hello 👋🏽 Fines total (snapshot): **{fmt0(fines_total)}**"
+        return f"Hello 👋🏽 Fines total (snapshot) = **{money(fines_total)}**."
+
     if "repay" in t or "payment" in t:
-        return f"Hello 👋🏽 Repayments total (snapshot): **{fmt0(repayments_total)}**"
+        return f"Hello 👋🏽 Repayments total (snapshot) = **{money(repayments_total)}**."
+
     if "interest" in t:
-        return f"Hello 👋🏽 Interest total (snapshot): **{fmt0(interest_total)}**"
+        return f"Hello 👋🏽 Interest total (snapshot) = **{money(interest_total)}**."
 
-    return "Hello 👋🏽 Ask: pot • contributions • loans • fines • repayments • interest • attendance"
+    if "status" in t or "live" in t:
+        return "Hello 👋🏽 Status: **LIVE** (reading from Supabase)."
+
+    return (
+        "Hello 👋🏽 I can answer from the dashboard snapshot:\n"
+        "- **pot this session**\n"
+        "- **cycle contributions**\n"
+        "- **loans summary**\n"
+        "- **fines total** / **repayments total** / **interest total**\n"
+        "- **attendance summary**\n\n"
+        "For web help, start with **web:** (example: `web: Maryland cosmetology license requirements`)."
+    )
 
 
+# ============================================================
+# 🧭 SAFE NAVIGATION
+# ============================================================
 def _nav_to(page_name: str):
     st.session_state["page"] = str(page_name)
     st.rerun()
 
 
-def _render_dashboard_younchat(snapshot: Dict[str, Any]):
-    st.subheader("💬 younchat — Dashboard AI", anchor=False)
+def _safe_nav_buttons():
+    st.markdown("#### Quick actions")
+    st.caption("Opens pages by setting **st.session_state['page']** (must match your app.py menu labels).")
 
-    # ✅ CLEAN: no paragraphs, no “Try…” wall of text, no debug snapshot by default
-    # Optional nav
-    if ENABLE_DASH_NAV:
-        with st.expander("Quick actions", expanded=False):
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("Dashboard", use_container_width=True):
-                    _nav_to("Dashboard")
-                if st.button("Contributions", use_container_width=True):
-                    _nav_to("Contributions")
-                if st.button("Loans", use_container_width=True):
-                    _nav_to("Loans")
-            with c2:
-                if st.button("Payouts", use_container_width=True):
-                    _nav_to("Payouts")
-                if st.button("AI Risk Panel", use_container_width=True):
-                    _nav_to("AI Risk Panel")
-                if st.button("Minutes & Attendance", use_container_width=True):
-                    _nav_to("Minutes & Attendance")
+    # ✅ IMPORTANT:
+    # These labels MUST match your sidebar labels exactly.
+    # If your app.py uses "AI Risk Panel" (no emoji), change it here too.
+    c1, c2 = st.columns(2)
 
-    q = st.text_input("Ask younchat…", placeholder="e.g., pot • loans • fines • web: your question", key="dash_youn_q")
-    ask = st.button("Ask", key="dash_youn_ask", use_container_width=True)
+    with c1:
+        if st.button("Dashboard", use_container_width=True):
+            _nav_to("Dashboard")
+        if st.button("Contributions", use_container_width=True):
+            _nav_to("Contributions")
+        if st.button("Loans", use_container_width=True):
+            _nav_to("Loans")
+        if st.button("Payouts", use_container_width=True):
+            _nav_to("Payouts")
+
+    with c2:
+        if st.button("AI Risk Panel", use_container_width=True):
+            _nav_to("AI Risk Panel")
+        if st.button("Minutes & Attendance", use_container_width=True):
+            _nav_to("Minutes & Attendance")
+        if st.button("Audit", use_container_width=True):
+            _nav_to("Audit")
+        if st.button("Health", use_container_width=True):
+            _nav_to("Health")
+
+
+def _render_youn_ai_view(snapshot: Dict[str, Any]):
+    st.markdown("### 💬 younchat — Dashboard AI")
+
+    _safe_nav_buttons()
+    st.divider()
+
+    # ✅ YOUR REQUEST: short, clean intro
+    st.write(f"{_greeting_of_day()} 👋🏽 I’m **younchat** — your dashboard assistant.")
+    st.caption(_human_touch())
+
+    use_hf = st.toggle(
+        "Use HF for nicer wording (still grounded)",
+        value=False,
+        help="Requires HF_TOKEN. If off, I use local grounded rules.",
+        key="youn_use_hf",
+    )
+
+    colA, colB = st.columns(2)
+    with colA:
+        st.caption(f"🧠 HF: {'READY' if _has_hf_token() else 'OFF'}")
+    with colB:
+        st.caption(f"🌐 Tavily: {'READY' if _has_tavily_key() else 'OFF'}")
+
+    q = st.text_input(
+        "Ask younchat…",
+        placeholder="e.g., pot this session  |  loans summary  |  web: Maryland cosmetology license requirements",
+        key="youn_dash_q",
+    )
+    ask = st.button("Ask", key="youn_dash_ask", use_container_width=True)
 
     if ask:
         if _is_web_query(q):
             if not _has_tavily_key():
-                st.session_state["dash_youn_a"] = "Hello 👋🏽 Web search is not configured (missing TAVILY_API_KEY)."
-                st.session_state["dash_youn_sources"] = []
+                st.session_state["youn_dash_a"] = "Hello 👋🏽 Web search is OFF. Add **TAVILY_API_KEY** in Railway Variables."
+                st.session_state["youn_dash_sources"] = []
+                st.session_state["youn_dash_used"] = "web:off"
             else:
-                tav = _tavily_search_cached(_strip_web_prefix(q), max_results=5)
+                query = _strip_web_prefix(q)
+                tav = _tavily_search_cached(query=query, max_results=5, search_depth="basic")
                 summary, sources = _format_web_results(tav)
-                st.session_state["dash_youn_a"] = summary
-                st.session_state["dash_youn_sources"] = sources
+                st.session_state["youn_dash_a"] = "Hello 👋🏽 " + summary
+                st.session_state["youn_dash_sources"] = sources
+                st.session_state["youn_dash_used"] = "web:tavily"
         else:
-            # Strictly grounded answer
-            grounded = _younchat_rules(q, snapshot)
-
-            # Optional HF to rewrite style ONLY (still grounded)
-            if _hf_enabled() and q and not _is_web_query(q):
-                try:
-                    messages = [
-                        {
-                            "role": "system",
-                            "content": (
-                                "Rewrite the assistant answer to sound modern and friendly, but keep ALL numbers and facts exactly the same. "
-                                "Do not add any new facts."
-                            ),
-                        },
-                        {"role": "user", "content": f"ANSWER:\n{grounded}"},
-                    ]
-                    ok, txt = _hf_router_chat(messages)
-                    st.session_state["dash_youn_a"] = txt if ok and txt else grounded
-                except Exception:
-                    st.session_state["dash_youn_a"] = grounded
+            if use_hf and _has_hf_token():
+                ok, txt, used = _hf_grounded_answer(q, snapshot)
+                if ok and txt:
+                    st.session_state["youn_dash_a"] = txt if txt.lower().startswith("hello") else ("Hello 👋🏽 " + txt)
+                    st.session_state["youn_dash_sources"] = []
+                    st.session_state["youn_dash_used"] = used
+                else:
+                    st.session_state["youn_dash_a"] = (
+                        "Hello 👋🏽 HF failed — using local grounded rules.\n\n"
+                        f"**HF error:** {txt}\n\n"
+                        + _youn_answer_rules(q, snapshot)
+                    )
+                    st.session_state["youn_dash_sources"] = []
+                    st.session_state["youn_dash_used"] = used
             else:
-                st.session_state["dash_youn_a"] = grounded
+                st.session_state["youn_dash_a"] = _youn_answer_rules(q, snapshot)
+                st.session_state["youn_dash_sources"] = []
+                st.session_state["youn_dash_used"] = "local"
 
-            st.session_state["dash_youn_sources"] = []
-
-    a = st.session_state.get("dash_youn_a")
+    a = st.session_state.get("youn_dash_a")
     if a:
         st.markdown(a)
 
-    sources = st.session_state.get("dash_youn_sources") or []
+    sources = st.session_state.get("youn_dash_sources") or []
     if sources:
-        with st.expander("Sources", expanded=False):
-            for s in sources[:5]:
-                title = s.get("title") or "Source"
-                url = s.get("url") or ""
-                if url:
-                    st.markdown(f"- [{title}]({url})")
-                else:
-                    st.markdown(f"- {title}")
+        st.markdown("**Sources:**")
+        for s in sources[:5]:
+            title = s.get("title") or "Source"
+            url = s.get("url") or ""
+            if url:
+                st.markdown(f"- [{title}]({url})")
+            else:
+                st.markdown(f"- {title}")
 
-    st.caption(f"Snapshot time (UTC): {snapshot.get('generated_at', '—')}")
+    used = st.session_state.get("youn_dash_used", "—")
+    st.caption(f"Source used: {used} • Snapshot time (UTC): {snapshot.get('generated_at','—')}")
+
+    # Keep debug hidden by default (clean)
+    with st.expander("🔎 Debug snapshot", expanded=False):
+        st.json(snapshot)
 
 
 # ============================================================
 # MAIN DASHBOARD (CLEAN)
 # ============================================================
 def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
-    # ✅ CLEAN: no extra “marketing” text
+    """
+    CLEAN dashboard:
+      - KPIs
+      - Attendance
+      - younchat AI
+    """
     sb_read = sb_service if sb_service is not None else sb_anon
 
-    session_id, session_msg = _ensure_current_session(sb_anon=sb_anon, sb_service=sb_service, schema=schema)
-    st.caption(f"📌 Session: {session_msg}")
+    # Ensure current session (we do NOT print the verbose message on the dashboard)
+    session_id, _session_msg = _ensure_current_session(sb_anon=sb_anon, sb_service=sb_service, schema=schema)
 
-    # Members
+    # Members count
     members_rows = _safe_select(sb_read, schema, "members", "id", limit=5000, show_error=False)
     total_members = len(members_rows) if members_rows else 0
 
-    # Contributions (session)
+    # Contributions for current session
     contrib_rows: List[Dict[str, Any]] = []
     if session_id is not None:
         contrib_rows = _safe_select(
@@ -531,14 +713,15 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
             "contributions",
             "id,member_id,amount,session_id,created_at",
             session_id=int(session_id),
-            limit=20000,
+            limit=10000,
             show_error=False,
         )
+
     cycle_total = _sum_amount(contrib_rows, "amount")
     members_paid = _count_distinct(contrib_rows, "member_id")
     current_pot = float(cycle_total)
 
-    # Attendance (session)
+    # Attendance for current session
     attendance_rows: List[Dict[str, Any]] = []
     if session_id is not None and _table_readable(sb_read, schema, "attendance"):
         attendance_rows = _safe_select(
@@ -547,9 +730,10 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
             "attendance",
             "member_id,present,session_id,created_at",
             session_id=int(session_id),
-            limit=10000,
+            limit=5000,
             show_error=False,
         )
+
     attendance_total = len(attendance_rows) if attendance_rows else 0
     attendance_present = 0
     for r in attendance_rows:
@@ -567,11 +751,13 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
             schema,
             "loans",
             "id,member_id,status,principal,principal_current,total_due,created_at",
-            limit=30000,
+            limit=20000,
             show_error=False,
         )
+
     active_status = {"active", "overdue", "late", "open"}
     loans_active = [r for r in loans_rows if str(r.get("status") or "").strip().lower() in active_status]
+
     loans_active_count = len(loans_active)
     loans_active_total = 0.0
     for r in loans_active:
@@ -586,22 +772,22 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
     # Fines
     fines_total = 0.0
     if _table_readable(sb_read, schema, "fines"):
-        fines_rows = _safe_select(sb_read, schema, "fines", "amount,created_at", limit=30000, show_error=False)
+        fines_rows = _safe_select(sb_read, schema, "fines", "amount,created_at", limit=20000, show_error=False)
         fines_total = _sum_amount(fines_rows, "amount")
 
     # Repayments
     repayments_total = 0.0
     if _table_readable(sb_read, schema, "loan_payments"):
-        pay_rows = _safe_select(sb_read, schema, "loan_payments", "amount,created_at", limit=30000, show_error=False)
+        pay_rows = _safe_select(sb_read, schema, "loan_payments", "amount,created_at", limit=20000, show_error=False)
         repayments_total = _sum_amount(pay_rows, "amount")
 
-    # Interest ledger
+    # Interest
     interest_total = 0.0
     if _table_readable(sb_read, schema, "interest_ledger"):
-        i_rows = _safe_select(sb_read, schema, "interest_ledger", "amount,created_at", limit=30000, show_error=False)
+        i_rows = _safe_select(sb_read, schema, "interest_ledger", "amount,created_at", limit=20000, show_error=False)
         interest_total = _sum_amount(i_rows, "amount")
 
-    # KPI display
+    # KPIs
     c1, c2, c3, c4, c5 = st.columns([0.9, 0.9, 0.9, 0.9, 1.2])
     with c1:
         st.metric("Session ID", session_id if session_id is not None else "—")
@@ -616,7 +802,8 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
 
     st.divider()
 
-    st.subheader("🧾 Attendance (session)", anchor=False)
+    # Attendance block
+    st.subheader("🧾 Attendance (session)")
     if session_id is None:
         st.info("No session selected.")
     else:
@@ -628,7 +815,7 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
 
     st.divider()
 
-    # Snapshot for younchat
+    # Snapshot for younchat AI
     snapshot = {
         "schema": schema,
         "session_id": session_id,
@@ -646,4 +833,4 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
         "generated_at": _now_iso(),
     }
 
-    _render_dashboard_younchat(snapshot)
+    _render_youn_ai_view(snapshot)
