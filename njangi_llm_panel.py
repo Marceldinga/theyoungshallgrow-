@@ -1,24 +1,23 @@
 
-# njangi_llm_panel.py ✅ UPDATED — FIX “List all members” (NO more “not in snapshot”)
+# njangi_llm_panel.py ✅ SINGLE COMPLETE FILE — younchat reads ALL your tables/views (members is source of truth)
 # =============================================================================
-# 💬 younchat — Hugging Face Router + Optional Internet Search ✅ SINGLE COMPLETE FILE (HARDENED)
+# 💬 younchat — DB-TOOLS FIRST (views + tables) + Optional HF Router + Optional Tavily
 #
-# ✅ FIXED (your exact issue):
-#   - When user asks: “list all the members” / “show members” / “members list”
-#     → younchat answers LOCALLY from LIVE members table (already loaded in snapshot)
-#     → It prints the full names (and IDs), NOT “I don’t have that in the snapshot.”
-#
-# ✅ Keeps your existing behavior:
-#   - ONLY name shown: "younchat"
-#   - Good morning/afternoon/evening greeting
-#   - Streamlit chat memory
-#   - member_id context selection & persistence
-#   - Internet is ON only if TAVILY_API_KEY exists (and INTERNET_MODE not off)
-#   - Grounded on live Njangi snapshot for Njangi numbers (no guessing)
-#   - HF reliability (retries + model failover)
+# ✅ Key design (your request):
+#   - Source of truth for identity = members table
+#   - Reporting reads from your views when available (fast, joined, consistent)
+#   - Member totals prefer v_member_financial_totals (if exists), else local compute
+#   - NO hallucinations for Njangi numbers: member/loans/contributions are answered locally from DB
 #
 # Works with app.py:
 #   render_njangi_llm_panel(sb_anon=..., sb_service=..., schema=...)
+#
+# Railway env vars:
+#   HF_TOKEN (optional)
+#   HF_MODEL (optional)
+#   HF_FORCE_MODE = auto | completions | chat
+#   TAVILY_API_KEY (optional)
+#   INTERNET_MODE = on | off
 # =============================================================================
 
 from __future__ import annotations
@@ -33,7 +32,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import requests
 import streamlit as st
-from postgrest.exceptions import APIError
+
+try:
+    from postgrest.exceptions import APIError
+except Exception:
+    APIError = Exception  # type: ignore
+
 
 W_STRETCH = "stretch"
 
@@ -41,12 +45,52 @@ HF_ROUTER_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
 HF_ROUTER_COMPLETIONS_URL = "https://router.huggingface.co/v1/completions"
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 
-# If HF has a transient outage (500s), younchat will try these automatically.
 HF_FALLBACK_MODELS = [
     "meta-llama/Meta-Llama-3-8B-Instruct",
     "meta-llama/Llama-3.1-8B-Instruct",
     "mistralai/Mistral-7B-Instruct-v0.2",
 ]
+
+# ✅ Allowlist the relations you showed in Supabase (tables + views)
+# (We don't "discover" schema at runtime because information_schema is often blocked by RLS.)
+RELATIONS = {
+    # Tables
+    "members": {"type": "table", "truth": True},
+    "contributions": {"type": "table"},
+    "foundation_contributions": {"type": "table"},
+    "loans": {"type": "table"},
+    "loan_payments": {"type": "table"},
+    "fines": {"type": "table"},
+    "payouts": {"type": "table"},
+    "sessions": {"type": "table"},
+    "minutes": {"type": "table"},
+    "attendance": {"type": "table"},
+    "signatures": {"type": "table"},
+    "audit_log": {"type": "table"},
+    "app_state": {"type": "table"},
+    "loan_requests": {"type": "table"},
+    "loan_repayments_pending": {"type": "table"},
+    "profiles": {"type": "table"},
+    "ml_training_data": {"type": "table"},
+    "member_contribution_totals": {"type": "table"},
+    # Views (you showed these)
+    "v_finance_kpis": {"type": "view"},
+    "v_member_financial_totals": {"type": "view"},
+    "v_loans_with_member": {"type": "view"},
+    "v_loan_payments_with_member": {"type": "view"},
+    "v_contributions_with_member": {"type": "view"},
+    "v_foundation_contributions_with_member": {"type": "view"},
+    "v_payouts_with_member": {"type": "view"},
+    "v_next_beneficiary": {"type": "view"},
+    "v_loans_dpd": {"type": "view"},
+    "v_loans_next_interest": {"type": "view"},
+    "v_loans_next_interest_with_member": {"type": "view"},
+    "v_loan_power_status": {"type": "view"},
+    "v_attendance_all_time_per_member": {"type": "view"},
+    "v_attendance_by_member_session": {"type": "view"},
+    "v_attendance_member_totals": {"type": "view"},
+    "v_attendance_with_member": {"type": "view"},
+}
 
 
 # -----------------------------------------------------------------------------
@@ -57,10 +101,6 @@ def _now_iso() -> str:
 
 
 def _tod_greeting() -> str:
-    """
-    Uses server local time. If you want it to match your timezone,
-    set Railway Variable: TZ=America/Chicago (or your timezone).
-    """
     h = datetime.now().hour
     if 5 <= h < 12:
         return "Good morning"
@@ -72,54 +112,79 @@ def _tod_greeting() -> str:
 
 
 # -----------------------------------------------------------------------------
-# Safe errors
+# Errors
 # -----------------------------------------------------------------------------
 def _api_msg(e: Exception) -> str:
     if isinstance(e, APIError):
         payload = e.args[0] if getattr(e, "args", None) else {}
         if isinstance(payload, dict):
-            return str(payload.get("message") or payload.get("hint") or payload)
+            return str(payload.get("message") or payload.get("details") or payload)
         return str(payload)
     return str(e)
 
 
 # -----------------------------------------------------------------------------
-# Safe Supabase read (schema-safe)
+# DB Read helpers
 # -----------------------------------------------------------------------------
 def _sb_select(
     sb_anon,
     sb_service,
     schema: str,
-    table: str,
+    relation: str,
     cols: str = "*",
-    limit: int = 1000,
+    limit: int = 2000,
+    filters: Optional[List[Tuple[str, str, Any]]] = None,
+    order: Optional[Tuple[str, bool]] = None,
 ) -> pd.DataFrame:
+    """
+    filters: list of (column, op, value) where op in ["eq","gte","lte","ilike"]
+    order: (column, asc)
+    """
     sb = sb_service or sb_anon
     if sb is None:
         return pd.DataFrame()
 
     try:
-        res = sb.schema(schema).table(table).select(cols).limit(limit).execute()
-        data = getattr(res, "data", None) or []
-        return pd.DataFrame(data)
+        q = sb.schema(schema).table(relation).select(cols).limit(limit)
+        if filters:
+            for col, op, val in filters:
+                if op == "eq":
+                    q = q.eq(col, val)
+                elif op == "gte":
+                    q = q.gte(col, val)
+                elif op == "lte":
+                    q = q.lte(col, val)
+                elif op == "ilike":
+                    q = q.ilike(col, val)
+        if order:
+            col, asc = order
+            q = q.order(col, desc=not asc)
+
+        res = q.execute()
+        return pd.DataFrame(getattr(res, "data", None) or [])
     except Exception:
+        # fallback without schema() if needed
         try:
-            res = sb.table(table).select(cols).limit(limit).execute()
-            data = getattr(res, "data", None) or []
-            return pd.DataFrame(data)
+            q = sb.table(relation).select(cols).limit(limit)
+            if filters:
+                for col, op, val in filters:
+                    if op == "eq":
+                        q = q.eq(col, val)
+                    elif op == "gte":
+                        q = q.gte(col, val)
+                    elif op == "lte":
+                        q = q.lte(col, val)
+                    elif op == "ilike":
+                        q = q.ilike(col, val)
+            if order:
+                col, asc = order
+                q = q.order(col, desc=not asc)
+
+            res = q.execute()
+            return pd.DataFrame(getattr(res, "data", None) or [])
         except Exception as e2:
-            st.warning(f"Could not read {schema}.{table}: {_api_msg(e2)}")
+            st.warning(f"Could not read {schema}.{relation}: {_api_msg(e2)}")
             return pd.DataFrame()
-
-
-def _safe_sum(df: pd.DataFrame, col: Optional[str]) -> float:
-    if df is None or df.empty or not col or col not in df.columns:
-        return 0.0
-    return float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
-
-
-def _safe_count(df: pd.DataFrame) -> int:
-    return int(len(df)) if df is not None and not df.empty else 0
 
 
 def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
@@ -131,132 +196,22 @@ def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return None
 
 
-# -----------------------------------------------------------------------------
-# Snapshot builder (GROUNDING)
-# -----------------------------------------------------------------------------
-def _build_snapshot(sb_anon, sb_service, schema: str) -> Dict[str, Any]:
-    # NOTE: members is FULL table (limit 3000) — we use it locally for "list members"
-    members = _sb_select(sb_anon, sb_service, schema, "members", cols="*", limit=3000)
-    sessions = _sb_select(sb_anon, sb_service, schema, "sessions", cols="*", limit=3000)
-    contributions = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=10000)
-    foundation = _sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=10000)
-    loans = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=4000)
-    loan_payments = _sb_select(sb_anon, sb_service, schema, "loan_payments", cols="*", limit=10000)
-    fines = _sb_select(sb_anon, sb_service, schema, "fines", cols="*", limit=10000)
-    payouts = _sb_select(sb_anon, sb_service, schema, "payouts", cols="*", limit=4000)
-    interest_ledger = _sb_select(sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=10000)
+def _safe_sum(df: pd.DataFrame, col: Optional[str]) -> float:
+    if df is None or df.empty or not col or col not in df.columns:
+        return 0.0
+    return float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
 
-    name_col = _pick_col(members, ["display_name", "name", "full_name"])
-    member_id_col = _pick_col(members, ["id", "member_id"])
 
-    contrib_amt_col = _pick_col(contributions, ["amount", "contribution_amount", "paid_amount"])
-    foundation_amt_col = _pick_col(foundation, ["amount", "base_amount", "foundation_amount"])
-    fines_amt_col = _pick_col(fines, ["amount", "fine_amount"])
-    payout_amt_col = _pick_col(payouts, ["amount", "payout_amount"])
-    interest_amt_col = _pick_col(interest_ledger, ["amount", "interest_amount", "interest"])
-
-    loans_principal_col = _pick_col(loans, ["principal", "principal_amount", "amount"])
-    loans_principal_current_col = _pick_col(loans, ["principal_current", "balance", "outstanding_principal"])
-    loans_status_col = _pick_col(loans, ["status"])
-    loans_member_col = _pick_col(loans, ["member_id", "borrower_id"])
-
-    snapshot = {
-        "generated_at_utc": _now_iso(),
-        "counts": {
-            "members": _safe_count(members),
-            "sessions": _safe_count(sessions),
-            "contributions": _safe_count(contributions),
-            "foundation_contributions": _safe_count(foundation),
-            "loans": _safe_count(loans),
-            "loan_payments": _safe_count(loan_payments),
-            "fines": _safe_count(fines),
-            "payouts": _safe_count(payouts),
-            "interest_ledger": _safe_count(interest_ledger),
-        },
-        "totals": {
-            "contributions_total": _safe_sum(contributions, contrib_amt_col),
-            "foundation_total": _safe_sum(foundation, foundation_amt_col),
-            "fines_total": _safe_sum(fines, fines_amt_col),
-            "payouts_total": _safe_sum(payouts, payout_amt_col),
-            "interest_total": _safe_sum(interest_ledger, interest_amt_col),
-        },
-        "columns": {
-            "members_name_col": name_col,
-            "members_id_col": member_id_col,
-            "contributions_amount_col": contrib_amt_col,
-            "foundation_amount_col": foundation_amt_col,
-            "fines_amount_col": fines_amt_col,
-            "payouts_amount_col": payout_amt_col,
-            "interest_amount_col": interest_amt_col,
-            "loans_principal_col": loans_principal_col,
-            "loans_principal_current_col": loans_principal_current_col,
-            "loans_status_col": loans_status_col,
-            "loans_member_col": loans_member_col,
-        },
-        # For the selectbox only (keep it light)
-        "members_preview": (
-            members[[c for c in [member_id_col, name_col] if c and c in members.columns]]
-            .head(200)
-            .to_dict("records")
-            if not members.empty and member_id_col and name_col
-            else []
-        ),
-        # Raw tables stay local-only (not shown to HF). Used for computations & "list members".
-        "_raw": {
-            "members": members,
-            "sessions": sessions,
-            "contributions": contributions,
-            "foundation": foundation,
-            "loans": loans,
-            "loan_payments": loan_payments,
-            "fines": fines,
-            "payouts": payouts,
-            "interest_ledger": interest_ledger,
-        },
-    }
-    return snapshot
+def _fmt(x: Any) -> str:
+    try:
+        v = float(pd.to_numeric(x, errors="coerce"))
+    except Exception:
+        v = 0.0
+    return f"{v:,.2f}"
 
 
 # -----------------------------------------------------------------------------
-# Member_id extraction & persistence
-# -----------------------------------------------------------------------------
-_MEMBER_ID_PATTERNS = [
-    re.compile(r"\bmember[_\s-]?id\s*[:=#]?\s*(\d+)\b", re.IGNORECASE),
-    re.compile(r"\bid\s*[:=#]?\s*(\d+)\b", re.IGNORECASE),
-    re.compile(r"\bmember\s*#?\s*(\d+)\b", re.IGNORECASE),
-]
-_ANY_NUM = re.compile(r"\b(\d{1,6})\b")
-
-
-def _extract_member_id_from_text(snapshot: Dict[str, Any], text: str) -> Optional[str]:
-    txt = (text or "").strip()
-    if not txt:
-        return None
-
-    mem_id_col = snapshot.get("columns", {}).get("members_id_col")
-    members = snapshot.get("_raw", {}).get("members", pd.DataFrame())
-    if members is None or members.empty or not mem_id_col or mem_id_col not in members.columns:
-        return None
-
-    valid_ids = set(members[mem_id_col].astype(str).tolist())
-
-    for pat in _MEMBER_ID_PATTERNS:
-        m = pat.search(txt)
-        if m:
-            cand = str(m.group(1))
-            if cand in valid_ids:
-                return cand
-
-    for nm in _ANY_NUM.findall(txt):
-        cand = str(nm)
-        if cand in valid_ids:
-            return cand
-
-    return None
-
-
-# -----------------------------------------------------------------------------
-# INTENT: list members (LOCAL ANSWER)
+# Intent
 # -----------------------------------------------------------------------------
 def _wants_list_members(text: str) -> bool:
     t = (text or "").strip().lower()
@@ -268,164 +223,222 @@ def _wants_list_members(text: str) -> bool:
         "show all members",
         "show members",
         "members list",
-        "all the members",
         "all members",
         "member list",
-        "display members",
         "who are the members",
     ]
-    if any(p in t for p in phrases):
-        return True
-    # short commands like: "members"
-    if t in {"members", "member"}:
-        return True
-    return False
+    return t in {"members", "member"} or any(p in t for p in phrases)
 
 
-def _local_list_members_answer(snapshot: Dict[str, Any]) -> Tuple[str, pd.DataFrame]:
-    raw_members = snapshot.get("_raw", {}).get("members", pd.DataFrame())
-    cols = snapshot.get("columns", {})
-    id_col = cols.get("members_id_col") or "id"
-    name_col = cols.get("members_name_col") or "name"
+def _wants_kpis(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return any(k in t for k in ["kpi", "kpis", "finance kpi", "finance kpis", "dashboard kpi"])
 
-    if raw_members is None or raw_members.empty:
-        return "I couldn’t load **members** from the database snapshot.", pd.DataFrame()
 
-    df = raw_members.copy()
-    if name_col not in df.columns:
-        # try fallback
-        for alt in ["display_name", "name", "full_name"]:
-            if alt in df.columns:
-                name_col = alt
-                break
-    if id_col not in df.columns:
-        for alt in ["id", "member_id"]:
-            if alt in df.columns:
-                id_col = alt
-                break
+def _wants_loans(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return any(k in t for k in ["loan", "loans", "borrow", "repay", "overdue", "dpd", "interest due"])
 
-    show_cols = [c for c in [id_col, name_col] if c in df.columns]
-    if not show_cols:
-        return "Members table loaded, but I can’t find name/id columns to display.", pd.DataFrame()
 
-    out = df[show_cols].copy()
-    out.columns = ["member_id", "member_name"] if len(show_cols) == 2 else ["member_value"]
-    if "member_id" in out.columns:
-        out["member_id"] = out["member_id"].astype(str)
-    if "member_name" in out.columns:
-        out["member_name"] = out["member_name"].astype(str)
+def _wants_contributions(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return any(k in t for k in ["contribution", "contributions"])
 
-    # sort nicely by id if numeric-like
-    if "member_id" in out.columns:
-        try:
-            out["_id_num"] = pd.to_numeric(out["member_id"], errors="coerce")
-            out = out.sort_values(["_id_num", "member_id"], ascending=True).drop(columns=["_id_num"])
-        except Exception:
-            pass
 
-    lines = ["Here are all members:"]
-    if "member_id" in out.columns and "member_name" in out.columns:
-        for i, r in enumerate(out.itertuples(index=False), start=1):
-            lines.append(f"{i}. {r.member_id} • {r.member_name}")
+def _wants_foundation(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return any(k in t for k in ["foundation"])
+
+
+def _wants_payouts(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return any(k in t for k in ["payout", "payouts", "beneficiary"])
+
+
+def _wants_attendance(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return any(k in t for k in ["attendance", "present", "absent"])
+
+
+_MEMBER_ID_PATTERNS = [
+    re.compile(r"\bmember[_\s-]?id\s*[:=#]?\s*(\d+)\b", re.IGNORECASE),
+    re.compile(r"\bmember\s*#?\s*(\d+)\b", re.IGNORECASE),
+    re.compile(r"\bid\s*[:=#]?\s*(\d+)\b", re.IGNORECASE),
+]
+
+
+def _extract_member_id(text: str) -> Optional[str]:
+    t = (text or "").strip()
+    if not t:
+        return None
+    if t.isdigit():
+        return t
+    for pat in _MEMBER_ID_PATTERNS:
+        m = pat.search(t)
+        if m:
+            return str(m.group(1))
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Local answers (DB truth)
+# -----------------------------------------------------------------------------
+def _load_members_truth(sb_anon, sb_service, schema: str, limit: int = 3000) -> pd.DataFrame:
+    df = _sb_select(sb_anon, sb_service, schema, "members", cols="*", limit=limit)
+    if df.empty:
+        return df
+    id_col = _pick_col(df, ["id", "member_id"])
+    name_col = _pick_col(df, ["display_name", "name", "full_name"])
+    if not id_col or not name_col:
+        return df
+    out = df[[id_col, name_col]].copy()
+    out.columns = ["member_id", "member_name"]
+    out["member_id"] = out["member_id"].astype(str)
+    out["member_name"] = out["member_name"].astype(str)
+    try:
+        out["_id_num"] = pd.to_numeric(out["member_id"], errors="coerce")
+        out = out.sort_values(["_id_num", "member_id"], ascending=True).drop(columns=["_id_num"])
+    except Exception:
+        pass
+    return out
+
+
+def _member_name_from_truth(members_truth: pd.DataFrame, member_id: str) -> str:
+    if members_truth is None or members_truth.empty:
+        return "(unknown)"
+    hit = members_truth[members_truth["member_id"].astype(str) == str(member_id)]
+    if hit.empty:
+        return "(unknown)"
+    return str(hit.iloc[0]["member_name"])
+
+
+def _member_financial_totals(
+    sb_anon,
+    sb_service,
+    schema: str,
+    member_id: str,
+    members_truth: pd.DataFrame,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Prefer v_member_financial_totals view.
+    If view returns nothing, compute from tables.
+    Always use members table for name.
+    """
+    name = _member_name_from_truth(members_truth, member_id)
+
+    # 1) Preferred: view
+    if "v_member_financial_totals" in RELATIONS:
+        v = _sb_select(
+            sb_anon,
+            sb_service,
+            schema,
+            "v_member_financial_totals",
+            cols="*",
+            limit=50,
+            filters=[("member_id", "eq", member_id)],
+        )
+        if not v.empty:
+            row = v.iloc[0].to_dict()
+            # try common columns; tolerate differences
+            contrib = row.get("contributions_total", row.get("contribution_total", row.get("contributions", 0)))
+            found = row.get("foundation_total", row.get("foundation_contributions_total", row.get("foundation", 0)))
+            fines = row.get("fines_total", row.get("fines", 0))
+            active_bal = row.get("active_loan_balance", row.get("loan_balance", row.get("principal_current_total", 0)))
+            unpaid_int = row.get("active_unpaid_interest", row.get("unpaid_interest_total", row.get("unpaid_interest", 0)))
+            interest = row.get("interest_total", row.get("interest_ledger_total", row.get("interest", 0)))
+            loans_count = row.get("loans_count", row.get("loan_count", None))
+
+            msg = (
+                f"{_tod_greeting()} 👋🏽 Here’s the grounded summary for **{name}** (member_id={member_id}):\n"
+                f"- Contributions total: **{_fmt(contrib)}**\n"
+                f"- Foundation total: **{_fmt(found)}**\n"
+                f"- Fines total: **{_fmt(fines)}**\n"
+                f"- Active loan balance: **{_fmt(active_bal)}**\n"
+                f"- Active unpaid interest: **{_fmt(unpaid_int)}**\n"
+                f"- Interest ledger total: **{_fmt(interest)}**\n"
+            )
+            if loans_count is not None:
+                msg += f"- Loans count: **{loans_count}**\n"
+            msg += "\nWant the loan rows for this member?"
+            return msg, {"source": "v_member_financial_totals", "row": row, "member_name": name}
+
+    # 2) Fallback compute from tables (still grounded)
+    contributions = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=20000, filters=[("member_id", "eq", member_id)])
+    foundation = _sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=20000, filters=[("member_id", "eq", member_id)])
+    fines = _sb_select(sb_anon, sb_service, schema, "fines", cols="*", limit=20000, filters=[("member_id", "eq", member_id)])
+    loans = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=10000, filters=[("member_id", "eq", member_id)])
+
+    interest_ledger = _sb_select(sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=20000, filters=[("member_id", "eq", member_id)])
+
+    contrib_amt = _pick_col(contributions, ["amount", "contribution_amount", "paid_amount"])
+    found_amt = _pick_col(foundation, ["amount", "base_amount", "foundation_amount"])
+    fines_amt = _pick_col(fines, ["amount", "fine_amount"])
+    int_amt = _pick_col(interest_ledger, ["amount", "interest_amount", "interest"])
+
+    principal_current = _pick_col(loans, ["principal_current", "balance", "outstanding_principal"])
+    principal = _pick_col(loans, ["principal", "amount"])
+
+    status_col = _pick_col(loans, ["status"])
+    active = loans
+    if status_col and status_col in loans.columns:
+        active = loans[loans[status_col].astype(str).str.lower().isin(["active", "open", "ongoing", "overdue"])]
+
+    active_bal = _safe_sum(active, principal_current) if principal_current else _safe_sum(active, principal)
+
+    unpaid_interest = _safe_sum(active, "unpaid_interest") if "unpaid_interest" in active.columns else 0.0
+
+    msg = (
+        f"{_tod_greeting()} 👋🏽 Here’s the grounded summary for **{name}** (member_id={member_id}):\n"
+        f"- Contributions total: **{_fmt(_safe_sum(contributions, contrib_amt))}**\n"
+        f"- Foundation total: **{_fmt(_safe_sum(foundation, found_amt))}**\n"
+        f"- Fines total: **{_fmt(_safe_sum(fines, fines_amt))}**\n"
+        f"- Loans count: **{len(loans)}**\n"
+        f"- Active loan balance: **{_fmt(active_bal)}**\n"
+        f"- Active unpaid interest: **{_fmt(unpaid_interest)}**\n"
+        f"- Interest ledger total: **{_fmt(_safe_sum(interest_ledger, int_amt))}**\n\n"
+        "Want the loan rows for this member?"
+    )
+    return msg, {"source": "tables_fallback", "member_name": name}
+
+
+def _loans_with_member(
+    sb_anon,
+    sb_service,
+    schema: str,
+    member_id: Optional[str],
+    members_truth: pd.DataFrame,
+) -> Tuple[str, pd.DataFrame, str]:
+    """
+    Prefer v_loans_with_member; fallback to loans + members.
+    """
+    if "v_loans_with_member" in RELATIONS:
+        filters = [("member_id", "eq", member_id)] if member_id else None
+        df = _sb_select(sb_anon, sb_service, schema, "v_loans_with_member", cols="*", limit=5000, filters=filters)
+        src = "v_loans_with_member"
     else:
-        for i, v in enumerate(out.iloc[:, 0].tolist(), start=1):
-            lines.append(f"{i}. {v}")
+        filters = [("member_id", "eq", member_id)] if member_id else None
+        loans = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=5000, filters=filters)
+        df = loans
+        if not df.empty and "member_id" in df.columns and not members_truth.empty:
+            df = df.merge(members_truth, how="left", on="member_id")
+        src = "loans (+ members join)"
 
-    return "\n".join(lines), out
+    title = "Loans"
+    if member_id:
+        title = f"Loans for {_member_name_from_truth(members_truth, member_id)} (member_id={member_id})"
+    return title, df, src
 
 
-# -----------------------------------------------------------------------------
-# Member financial summary (local compute)
-# -----------------------------------------------------------------------------
-def _compute_member_financials(snapshot: Dict[str, Any], member_id: str) -> Dict[str, Any]:
-    raw = snapshot.get("_raw", {})
-    members = raw.get("members", pd.DataFrame())
-    contributions = raw.get("contributions", pd.DataFrame())
-    foundation = raw.get("foundation", pd.DataFrame())
-    loans = raw.get("loans", pd.DataFrame())
-    fines = raw.get("fines", pd.DataFrame())
-    interest_ledger = raw.get("interest_ledger", pd.DataFrame())
-
-    cols = snapshot.get("columns", {})
-    mem_name_col = cols.get("members_name_col")
-    mem_id_col = cols.get("members_id_col")
-
-    contrib_amt_col = cols.get("contributions_amount_col")
-    found_amt_col = cols.get("foundation_amount_col")
-    fines_amt_col = cols.get("fines_amount_col")
-
-    loans_principal_col = cols.get("loans_principal_col")
-    loans_principal_current_col = cols.get("loans_principal_current_col")
-    loans_status_col = cols.get("loans_status_col")
-    loans_member_col = cols.get("loans_member_col")
-
-    interest_amt_col = cols.get("interest_amount_col")
-
-    member_row = None
-    if not members.empty and mem_id_col and mem_id_col in members.columns:
-        mm = members[members[mem_id_col].astype(str) == str(member_id)]
-        if not mm.empty:
-            member_row = mm.iloc[0].to_dict()
-
-    contrib_total = 0.0
-    if not contributions.empty and "member_id" in contributions.columns:
-        df = contributions[contributions["member_id"].astype(str) == str(member_id)]
-        contrib_total = _safe_sum(df, contrib_amt_col)
-
-    foundation_total = 0.0
-    if not foundation.empty and "member_id" in foundation.columns:
-        df = foundation[foundation["member_id"].astype(str) == str(member_id)]
-        foundation_total = _safe_sum(df, found_amt_col)
-
-    fines_total = 0.0
-    if not fines.empty and "member_id" in fines.columns:
-        df = fines[fines["member_id"].astype(str) == str(member_id)]
-        fines_total = _safe_sum(df, fines_amt_col)
-
-    loans_count = 0
-    active_balance = 0.0
-    active_unpaid_interest = 0.0
-    if not loans.empty and loans_member_col and loans_member_col in loans.columns:
-        ldf = loans[loans[loans_member_col].astype(str) == str(member_id)]
-        loans_count = int(len(ldf))
-
-        if loans_status_col and loans_status_col in ldf.columns:
-            active = ldf[ldf[loans_status_col].astype(str).str.lower().isin(["active", "open", "ongoing", "overdue"])]
-        else:
-            active = ldf
-
-        if loans_principal_current_col and loans_principal_current_col in active.columns:
-            active_balance = _safe_sum(active, loans_principal_current_col)
-        elif loans_principal_col and loans_principal_col in active.columns:
-            active_balance = _safe_sum(active, loans_principal_col)
-
-        if "unpaid_interest" in active.columns:
-            active_unpaid_interest = _safe_sum(active, "unpaid_interest")
-
-    interest_total = 0.0
-    if not interest_ledger.empty and "member_id" in interest_ledger.columns:
-        df = interest_ledger[interest_ledger["member_id"].astype(str) == str(member_id)]
-        interest_total = _safe_sum(df, interest_amt_col)
-
-    member_name = None
-    if member_row and mem_name_col and mem_name_col in member_row:
-        member_name = str(member_row.get(mem_name_col))
-
-    return {
-        "member_id": str(member_id),
-        "member_name": member_name or "(unknown)",
-        "contributions_total": round(contrib_total, 2),
-        "foundation_total": round(foundation_total, 2),
-        "fines_total": round(fines_total, 2),
-        "loans_count": loans_count,
-        "active_loan_balance": round(active_balance, 2),
-        "active_unpaid_interest": round(active_unpaid_interest, 2),
-        "interest_total": round(interest_total, 2),
-    }
+def _kpis(sb_anon, sb_service, schema: str) -> Tuple[str, pd.DataFrame, str]:
+    if "v_finance_kpis" in RELATIONS:
+        df = _sb_select(sb_anon, sb_service, schema, "v_finance_kpis", cols="*", limit=200)
+        return "Finance KPIs", df, "v_finance_kpis"
+    # fallback: tiny computed
+    return "Finance KPIs", pd.DataFrame([{"note": "v_finance_kpis not available"}]), "fallback"
 
 
 # -----------------------------------------------------------------------------
-# Optional Internet search (Tavily)
+# Optional Internet (Tavily) — NOT used for Njangi numbers
 # -----------------------------------------------------------------------------
 def _internet_enabled() -> bool:
     key = (os.getenv("TAVILY_API_KEY") or "").strip()
@@ -457,92 +470,18 @@ def _tavily_search(query: str) -> Dict[str, Any]:
         results = data.get("results") or []
         clean = []
         for it in results:
-            clean.append(
-                {
-                    "title": it.get("title"),
-                    "url": it.get("url"),
-                    "content": (it.get("content") or "")[:500],
-                }
-            )
+            clean.append({"title": it.get("title"), "url": it.get("url"), "content": (it.get("content") or "")[:300]})
         return {"ok": True, "results": clean}
     except Exception as e:
         return {"ok": False, "error": str(e), "results": []}
 
 
 # -----------------------------------------------------------------------------
-# Prompt builders (human chat + grounded Njangi + optional internet)
-# -----------------------------------------------------------------------------
-def _build_grounded_messages(
-    snapshot: Dict[str, Any],
-    question: str,
-    member_fin: Optional[Dict[str, Any]],
-    internet_pack: Optional[Dict[str, Any]],
-    chat_history: List[Dict[str, str]],
-    member_id_focus: Optional[str],
-) -> List[Dict[str, str]]:
-    sys = (
-        "You are **younchat**, a friendly, human-like assistant for a Njangi finance app.\n"
-        "CRITICAL RULES:\n"
-        "1) For ANY Njangi totals, counts, loans, payouts, contributions, interest, fines — use ONLY SNAPSHOT_FACTS and SELECTED_MEMBER_FACTS.\n"
-        "2) If something is missing in the snapshot facts provided, say exactly: 'I don’t have that in the snapshot.'\n"
-        "3) You MAY use INTERNET_SOURCES only for general questions (definitions, laws, how-to), NOT for Njangi numbers.\n"
-        "4) Speak naturally like a real person. Short paragraphs.\n"
-        "5) Ask ONE helpful follow-up question when it makes sense.\n"
-    )
-
-    facts = {
-        "generated_at_utc": snapshot.get("generated_at_utc"),
-        "counts": snapshot.get("counts", {}),
-        "totals": snapshot.get("totals", {}),
-        "member_id_focus": member_id_focus,
-    }
-
-    content = "SNAPSHOT_FACTS:\n" + json.dumps(facts, indent=2)
-    if member_fin:
-        content += "\n\nSELECTED_MEMBER_FACTS:\n" + json.dumps(member_fin, indent=2)
-
-    if internet_pack and internet_pack.get("ok") and internet_pack.get("results"):
-        content += "\n\nINTERNET_SOURCES:\n" + json.dumps(internet_pack.get("results"), indent=2)
-
-    msgs: List[Dict[str, str]] = [{"role": "system", "content": sys}]
-    for m in chat_history[-16:]:
-        if m.get("role") in ("user", "assistant"):
-            msgs.append({"role": m["role"], "content": m.get("content", "")})
-
-    user = (
-        f"{content}\n\n"
-        f"User message: {question}\n\n"
-        "Respond as younchat."
-    )
-    msgs.append({"role": "user", "content": user})
-    return msgs
-
-
-def _messages_to_prompt(messages: List[Dict[str, str]]) -> str:
-    out: List[str] = []
-    for m in messages:
-        role = m.get("role", "user")
-        content = m.get("content", "")
-        if role == "system":
-            out.append(f"[SYSTEM]\n{content}\n")
-        elif role == "assistant":
-            out.append(f"[ASSISTANT]\n{content}\n")
-        else:
-            out.append(f"[USER]\n{content}\n")
-    out.append("[ASSISTANT]\n")
-    return "\n".join(out)
-
-
-# -----------------------------------------------------------------------------
-# Hugging Face Router (retries + failover)
+# HF Router (optional; only for general chat phrasing)
 # -----------------------------------------------------------------------------
 def _post_with_retries(url: str, headers: dict, payload: dict, timeout: int = 60) -> Tuple[bool, str]:
-    """
-    Retries transient HF errors (429/5xx/network/timeouts) with backoff.
-    Returns (ok, response_text_or_error).
-    """
     last_err = ""
-    for attempt in range(4):  # 0..3
+    for attempt in range(4):
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=timeout)
 
@@ -562,9 +501,24 @@ def _post_with_retries(url: str, headers: dict, payload: dict, timeout: int = 60
     return False, last_err or "HF transient error"
 
 
+def _messages_to_prompt(messages: List[Dict[str, str]]) -> str:
+    out: List[str] = []
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if role == "system":
+            out.append(f"[SYSTEM]\n{content}\n")
+        elif role == "assistant":
+            out.append(f"[ASSISTANT]\n{content}\n")
+        else:
+            out.append(f"[USER]\n{content}\n")
+    out.append("[ASSISTANT]\n")
+    return "\n".join(out)
+
+
 def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], timeout: int = 60) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "temperature": 0.4, "max_tokens": 650}
+    payload = {"model": model, "messages": messages, "temperature": 0.3, "max_tokens": 450}
 
     ok, raw = _post_with_retries(HF_ROUTER_CHAT_URL, headers, payload, timeout=timeout)
     if not ok:
@@ -580,7 +534,7 @@ def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], time
 
 def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 60) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": model, "prompt": prompt, "temperature": 0.4, "max_tokens": 650}
+    payload = {"model": model, "prompt": prompt, "temperature": 0.3, "max_tokens": 450}
 
     ok, raw = _post_with_retries(HF_ROUTER_COMPLETIONS_URL, headers, payload, timeout=timeout)
     if not ok:
@@ -595,10 +549,6 @@ def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 6
 
 
 def _hf_call(model: str, token: str, messages: List[Dict[str, str]]) -> Tuple[bool, str, str]:
-    """
-    Returns (ok, text_or_error, mode_used)
-    mode_used: "completions" | "chat" | "failed"
-    """
     force = (os.getenv("HF_FORCE_MODE", "") or "auto").strip().lower()
     prompt = _messages_to_prompt(messages)
 
@@ -612,144 +562,62 @@ def _hf_call(model: str, token: str, messages: List[Dict[str, str]]) -> Tuple[bo
 
     def _looks_instruct(mname: str) -> bool:
         mlc = (mname or "").lower()
-        return any(x in mlc for x in ["instruct", "instruction", "mistral-7b-instruct", "llama-3", "llama-3.1"])
+        return any(x in mlc for x in ["instruct", "mistral", "llama-3", "llama-3.1"])
 
     last_err = ""
-    for chosen_model in model_order:
+    for chosen in model_order:
         if force == "chat":
             order = ["chat"]
         elif force == "completions":
             order = ["completions"]
         else:
-            order = ["completions", "chat"] if _looks_instruct(chosen_model) else ["chat", "completions"]
+            order = ["completions", "chat"] if _looks_instruct(chosen) else ["chat", "completions"]
 
         for mode in order:
             if mode == "completions":
-                ok, txt = _hf_router_completions(chosen_model, token, prompt)
+                ok, txt = _hf_router_completions(chosen, token, prompt)
                 if ok and txt:
                     return True, txt, "completions"
                 last_err = txt
             else:
-                ok, txt = _hf_router_chat(chosen_model, token, messages)
+                ok, txt = _hf_router_chat(chosen, token, messages)
                 if ok and txt:
                     return True, txt, "chat"
                 last_err = txt
 
-        err_lc = (last_err or "").lower()
-        transient = any(
-            s in err_lc
-            for s in [
-                "hf error 500",
-                "hf error 502",
-                "hf error 503",
-                "hf error 504",
-                "hf error 429",
-                "timeout",
-                "server error",
-                "transient",
-            ]
-        )
-        if not transient:
+        err = (last_err or "").lower()
+        if not any(s in err for s in ["429", "500", "502", "503", "504", "timeout", "server error"]):
             break
 
     return False, last_err or "Unknown HF error", "failed"
 
 
 # -----------------------------------------------------------------------------
-# Local fallback (still grounded)
-# -----------------------------------------------------------------------------
-def _local_fallback_answer(snapshot: Dict[str, Any], question: str, member_id: Optional[str]) -> str:
-    greet = _tod_greeting()
-    q = (question or "").lower().strip()
-
-    if _wants_list_members(question):
-        txt, _ = _local_list_members_answer(snapshot)
-        return txt
-
-    if any(x in q for x in ["hi", "hello", "hey"]):
-        return f"{greet} 👋🏽 I’m **younchat**. Ask me: **members**, **loans**, **totals**, or give a **member_id**."
-
-    if "total" in q and "contribution" in q:
-        return f"{greet} 👋🏽 Total contributions (all members): **{snapshot['totals']['contributions_total']:.2f}**. Want totals for foundation too?"
-
-    if "total" in q and "foundation" in q:
-        return f"{greet} 👋🏽 Total foundation contributions (all members): **{snapshot['totals']['foundation_total']:.2f}**. Want totals for contributions too?"
-
-    if member_id:
-        fin = _compute_member_financials(snapshot, member_id)
-        return (
-            f"{greet} 👋🏽 Here’s what I have for **{fin['member_name']}** (member_id={fin['member_id']}):\n"
-            f"- Contributions: **{fin['contributions_total']:.2f}**\n"
-            f"- Foundation: **{fin['foundation_total']:.2f}**\n"
-            f"- Fines: **{fin['fines_total']:.2f}**\n"
-            f"- Loans: **{fin['loans_count']}** • Active balance: **{fin['active_loan_balance']:.2f}**\n"
-            f"- Unpaid interest: **{fin['active_unpaid_interest']:.2f}**\n"
-            f"- Interest ledger total: **{fin['interest_total']:.2f}**\n"
-            "\nWant me to check another member_id?"
-        )
-
-    return (
-        f"{greet} 👋🏽 I can answer from your LIVE Njangi snapshot.\n"
-        "Try:\n"
-        "- **Members** (lists everyone)\n"
-        "- Total contributions?\n"
-        "- Total foundation money?\n"
-        "- Show member_id 10 status\n"
-    )
-
-
-# -----------------------------------------------------------------------------
-# UI entry point (CHAT UI)
+# Main UI
 # -----------------------------------------------------------------------------
 def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     st.subheader("💬 younchat", anchor=False)
 
     hf_token = (os.getenv("HF_TOKEN") or "").strip()
-    hf_model = (os.getenv("HF_MODEL") or "").strip() or "mistralai/Mistral-7B-Instruct-v0.2"
+    hf_model = (os.getenv("HF_MODEL") or "").strip() or "meta-llama/Meta-Llama-3-8B-Instruct"
     hf_force = (os.getenv("HF_FORCE_MODE") or "auto").strip().lower()
-
-    tavily_key = (os.getenv("TAVILY_API_KEY") or "").strip()
     internet_on = _internet_enabled()
 
     with st.expander("⚙️ Chat Settings", expanded=False):
         st.write("**HF model**:", hf_model)
-        st.write("**HF_TOKEN present**:", "✅ Yes" if hf_token else "❌ No (set HF_TOKEN in Railway Variables)")
+        st.write("**HF_TOKEN present**:", "✅ Yes" if hf_token else "❌ No")
         st.write("**HF_FORCE_MODE**:", hf_force)
         st.write("**Internet**:", "✅ ON" if internet_on else "❌ OFF")
-        if not tavily_key:
-            st.caption("To enable Internet: set TAVILY_API_KEY in Railway. (INTERNET_MODE=off disables it.)")
-        st.caption("Tip: For fewer HF failures, set HF_FORCE_MODE=completions and HF_MODEL=meta-llama/Meta-Llama-3-8B-Instruct.")
+        st.caption("Njangi numbers are ALWAYS answered from DB (tables/views). HF is only for general chat wording.")
 
+    # Load members truth (cache)
     @st.cache_data(ttl=30, show_spinner=False)
-    def _cached_snapshot(_ts: int) -> Dict[str, Any]:
-        return _build_snapshot(sb_anon, sb_service, schema)
+    def _cached_members_truth(_ts: int) -> pd.DataFrame:
+        return _load_members_truth(sb_anon, sb_service, schema, limit=3000)
 
-    snapshot = _cached_snapshot(int(time.time() // 10))
+    members_truth = _cached_members_truth(int(time.time() // 10))
 
-    # Member select (optional)
-    members_preview = snapshot.get("members_preview", [])
-    id_col = snapshot.get("columns", {}).get("members_id_col") or "id"
-    name_col = snapshot.get("columns", {}).get("members_name_col") or "name"
-
-    member_options: List[Tuple[str, str]] = []
-    for r in members_preview:
-        rid = r.get(id_col)
-        rname = r.get(name_col)
-        if rid is not None and rname is not None:
-            member_options.append((str(rid), f"{rid} • {rname}"))
-
-    selected_member_id: Optional[str] = None
-    if member_options:
-        label_map = {lbl: mid for (mid, lbl) in member_options}
-        chosen = st.selectbox(
-            "Optional: choose a member (member_id focus)",
-            ["(None)"] + [lbl for _, lbl in member_options],
-            index=0,
-        )
-        if chosen != "(None)":
-            selected_member_id = label_map.get(chosen)
-
-    # Initialize chat history
+    # Chat init
     if "younchat_history" not in st.session_state:
         greet = _tod_greeting()
         st.session_state["younchat_history"] = [
@@ -757,116 +625,116 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                 "role": "assistant",
                 "content": (
                     f"{greet} 👋🏽 I’m **younchat**.\n\n"
-                    "Try: **members**, **loans**, **total contributions**, or give a **member_id** (like `10`)."
+                    "Try:\n"
+                    "- **members** (lists everyone)\n"
+                    "- type **10** (member summary)\n"
+                    "- **loans** / **loans for member 10**\n"
+                    "- **finance kpis**\n"
                 ),
             }
         ]
 
-    # Show chat
+    # show chat
     for m in st.session_state["younchat_history"]:
-        role = m.get("role", "assistant")
-        with st.chat_message("assistant" if role == "assistant" else "user"):
+        with st.chat_message("assistant" if m.get("role") == "assistant" else "user"):
             st.markdown(m.get("content", ""))
 
     colA, colB = st.columns([1, 1], gap="small")
-    if colA.button("🔄 Refresh snapshot", use_container_width=True):
+    if colA.button("🔄 Refresh", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
     if colB.button("🧹 Clear chat", use_container_width=True):
-        greet = _tod_greeting()
-        st.session_state["younchat_history"] = [
-            {"role": "assistant", "content": f"{greet} 👋🏽 I’m **younchat**. What do you want to check right now?"}
-        ]
+        st.session_state["younchat_history"] = [{"role": "assistant", "content": f"{_tod_greeting()} 👋🏽 I’m **younchat**. What do you want to check right now?"}]
         st.session_state.pop("younchat_last_member_id", None)
         st.rerun()
 
-    # Chat input
-    question = st.chat_input("Type your message…")
-    if not question:
+    q = st.chat_input("Type your message…")
+    if not q:
         return
 
-    # Add user message
-    st.session_state["younchat_history"].append({"role": "user", "content": question})
+    st.session_state["younchat_history"].append({"role": "user", "content": q})
     with st.chat_message("user"):
-        st.markdown(question)
+        st.markdown(q)
 
-    # ✅ LOCAL SHORT-CIRCUIT: list members (no HF, no internet, 100% grounded)
-    if _wants_list_members(question):
-        answer, members_df = _local_list_members_answer(snapshot)
-        st.session_state["younchat_history"].append({"role": "assistant", "content": answer})
-        with st.chat_message("assistant"):
-            st.markdown(answer)
-            with st.expander("Members table (ground truth)", expanded=False):
-                if not members_df.empty:
-                    st.dataframe(members_df, use_container_width=True)
-        st.caption("HF mode used: local • Internet: OFF • member_id: —")
-        return
+    # Persist member id focus
+    detected_id = _extract_member_id(q)
+    if detected_id:
+        st.session_state["younchat_last_member_id"] = detected_id
+    member_id_focus = st.session_state.get("younchat_last_member_id")
 
-    # Resolve member_id context:
-    detected_from_text = _extract_member_id_from_text(snapshot, question)
-    member_id_focus = selected_member_id or detected_from_text or st.session_state.get("younchat_last_member_id")
-    if member_id_focus:
-        st.session_state["younchat_last_member_id"] = member_id_focus
+    # -------------------------
+    # LOCAL ROUTER (DB TRUTH)
+    # -------------------------
+    used_source = "local"
+    answer = ""
+    df_show: Optional[pd.DataFrame] = None
+    df_title: Optional[str] = None
 
-    member_fin = _compute_member_financials(snapshot, member_id_focus) if member_id_focus else None
+    # Members list
+    if _wants_list_members(q):
+        if members_truth is None or members_truth.empty:
+            answer = "I couldn’t read **members** (source of truth). Check RLS / permissions."
+        else:
+            lines = ["Here are all members (source of truth = members):"]
+            for i, r in enumerate(members_truth.itertuples(index=False), start=1):
+                lines.append(f"{i}. {r.member_id} • {r.member_name}")
+            answer = "\n".join(lines)
+            df_show, df_title = members_truth, "members (truth)"
+        used_source = "members"
 
-    # Optional internet pack: ONLY when enabled AND question is general web question (not Njangi)
-    internet_pack: Optional[Dict[str, Any]] = None
-    if internet_on:
-        ql = question.lower()
-        is_njangi = any(k in ql for k in ["contribution", "foundation", "loan", "payout", "interest", "fine", "member", "session", "njangi"])
-        needs_web = any(k in ql for k in ["requirements", "steps", "permit", "license", "llc", "zoning", "tax", "law", "maryland"])
-        # ✅ IMPORTANT: we do NOT treat plain "how" as a web request anymore (avoids dictionary spam)
-        if needs_web and not is_njangi:
-            with st.spinner("🌐 Searching the internet…"):
-                internet_pack = _tavily_search(question)
+    # KPIs
+    elif _wants_kpis(q):
+        title, df, src = _kpis(sb_anon, sb_service, schema)
+        used_source = src
+        df_show, df_title = df, title
+        if df.empty:
+            answer = "No KPI rows returned."
+        else:
+            answer = f"Here are your **{title}** (from `{src}`):"
 
-    messages = _build_grounded_messages(
-        snapshot=snapshot,
-        question=question,
-        member_fin=member_fin,
-        internet_pack=internet_pack,
-        chat_history=st.session_state["younchat_history"],
-        member_id_focus=member_id_focus,
-    )
+    # Loans
+    elif _wants_loans(q):
+        # If user included a member id, use it
+        mid = _extract_member_id(q) or member_id_focus
+        title, df, src = _loans_with_member(sb_anon, sb_service, schema, mid, members_truth)
+        used_source = src
+        df_show, df_title = df, title
+        if df.empty:
+            answer = f"{title}: no rows returned."
+        else:
+            answer = f"{title} (from `{src}`): showing latest rows."
 
-    # If no HF token -> local grounded fallback
-    if not hf_token:
-        answer = _local_fallback_answer(snapshot, question, member_id_focus)
-        st.session_state["younchat_history"].append({"role": "assistant", "content": answer})
-        with st.chat_message("assistant"):
-            st.markdown(answer)
-        st.caption(f"HF mode used: local • Internet: {'ON' if internet_on else 'OFF'} • member_id: {member_id_focus or '—'}")
-        return
+    # Member summary (numbers)
+    elif member_id_focus and (q.strip().isdigit() or "member" in q.lower() or "summary" in q.lower() or "status" in q.lower()):
+        answer, meta = _member_financial_totals(sb_anon, sb_service, schema, str(member_id_focus), members_truth)
+        used_source = meta.get("source", "member_summary_local")
+        # show no dataframe by default
 
-    # Call HF
-    with st.spinner("🤖 younchat is thinking…"):
-        ok, text_or_err, mode = _hf_call(hf_model, hf_token, messages)
+    # If nothing matched: optionally HF for general wording (but no DB numbers)
+    else:
+        if hf_token:
+            sys = (
+                "You are younchat. If the user asks for Njangi data, tell them to ask: "
+                "'members', 'finance kpis', 'loans', or type a member_id like '10'. "
+                "Do NOT invent numbers."
+            )
+            messages = [{"role": "system", "content": sys}]
+            # keep small history
+            for m in st.session_state["younchat_history"][-10:]:
+                if m.get("role") in ("user", "assistant"):
+                    messages.append({"role": m["role"], "content": m.get("content", "")})
+            ok, txt, mode = _hf_call(hf_model, hf_token, messages)
+            used_source = f"hf:{mode}" if ok else "hf:failed"
+            answer = txt if ok else f"I can’t reach HF right now: {txt}\n\nTry: **members**, **loans**, **finance kpis**, or type a member_id like **10**."
+        else:
+            answer = "Try: **members**, **loans**, **finance kpis**, or type a member_id like **10**."
 
-    if not ok:
-        fallback = _local_fallback_answer(snapshot, question, member_id_focus)
-        answer = f"{fallback}\n\n<small>⚠️ HF failed: {text_or_err}</small>"
-        st.session_state["younchat_history"].append({"role": "assistant", "content": answer})
-        with st.chat_message("assistant"):
-            st.markdown(answer, unsafe_allow_html=True)
-        st.caption(f"HF mode used: failed • Internet: {'ON' if internet_on else 'OFF'} • member_id: {member_id_focus or '—'}")
-        return
-
-    final = (text_or_err or "").strip()
-
-    # Optional: attach sources at bottom (only if internet was used)
-    if internet_pack and internet_pack.get("ok") and internet_pack.get("results"):
-        src_lines = []
-        for i, it in enumerate(internet_pack["results"], start=1):
-            title = it.get("title") or "source"
-            url = it.get("url") or ""
-            if url:
-                src_lines.append(f"{i}. [{title}]({url})")
-        if src_lines:
-            final += "\n\n---\n**Sources:**\n" + "\n".join(src_lines)
-
-    st.session_state["younchat_history"].append({"role": "assistant", "content": final})
+    # Output
+    st.session_state["younchat_history"].append({"role": "assistant", "content": answer})
     with st.chat_message("assistant"):
-        st.markdown(final)
+        st.markdown(answer)
+        if df_show is not None and df_title:
+            with st.expander(df_title, expanded=False):
+                st.dataframe(df_show, use_container_width=True)
 
-    st.caption(f"HF mode used: {mode} • Internet: {'ON' if internet_on else 'OFF'} • member_id: {member_id_focus or '—'}")
+    st.caption(f"Source used: {used_source} • member_id: {member_id_focus or '—'} • Internet: {'ON' if internet_on else 'OFF'}")
