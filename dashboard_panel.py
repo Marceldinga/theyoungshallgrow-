@@ -9,7 +9,7 @@
 # ✅ Young AI behavior:
 #   - Uses name: "Young"
 #   - Responses MUST match the question asked (no random answers)
-#   - ChatGPT-standard style: short + direct + grounded
+#   - Short + direct + grounded
 #   - Grounded ONLY on LIVE snapshot (no guessing)
 #   - Optional HF Router for nicer wording (still grounded)
 #   - Optional Tavily web search ONLY when query starts with "web:"
@@ -25,8 +25,8 @@
 #   HF_FORCE_MODE=auto|chat|completions
 #   TAVILY_API_KEY=...
 #
-# Optional requirements:
-#   pip install requests
+# requirements.txt (optional):
+#   requests
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ except Exception:
 
 
 # ============================================================
-# ✅ FIX: HF ROUTER ENDPOINTS (prevents NameError)
+# ✅ HF ROUTER ENDPOINTS (fixes NameError)
 # ============================================================
 HF_ROUTER_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
 HF_ROUTER_COMPLETIONS_URL = "https://router.huggingface.co/v1/completions"
@@ -144,6 +144,9 @@ def _safe_select(
     show_error: bool = False,
     **filters,
 ) -> List[Dict[str, Any]]:
+    """
+    Usage: _safe_select(sb, "public", "contributions", "id,amount", session_id=5, limit=1000)
+    """
     if client is None:
         return []
     try:
@@ -198,10 +201,8 @@ def _table_readable(client, schema: str, table: str) -> bool:
 
 
 def _sum_amount(rows: List[Dict[str, Any]], col: str = "amount") -> float:
-    if not rows:
-        return 0.0
     s = 0.0
-    for r in rows:
+    for r in rows or []:
         try:
             s += float(r.get(col) or 0)
         except Exception:
@@ -210,13 +211,12 @@ def _sum_amount(rows: List[Dict[str, Any]], col: str = "amount") -> float:
 
 
 def _count_distinct(rows: List[Dict[str, Any]], key: str) -> int:
-    if not rows:
-        return 0
     s = set()
-    for r in rows:
-        if r.get(key) is not None:
-            s.add(str(r.get(key)))
-    return len(s)
+    for r in rows or []:
+        v = r.get(key)
+        if v is not None:
+            s.add(str(v))
+    return int(len(s))
 
 
 # ============================================================
@@ -238,12 +238,14 @@ def _get_latest_session_id(sb_read, schema: str) -> Optional[int]:
     if sb_read is None:
         return None
 
+    # prefer "id"
     rows = _safe_select(sb_read, schema, "sessions", "id,created_at", order_by="id", desc=True, limit=1)
     if rows and rows[0].get("id") is not None:
         sid = _resolve_session_id(rows[0].get("id"))
         if sid is not None:
             return sid
 
+    # fallback "session_id"
     rows = _safe_select(sb_read, schema, "sessions", "session_id,created_at", order_by="session_id", desc=True, limit=1)
     if rows and rows[0].get("session_id") is not None:
         sid = _resolve_session_id(rows[0].get("session_id"))
@@ -271,8 +273,7 @@ def _ensure_current_session(sb_anon, sb_service, schema: str) -> Tuple[Optional[
             return None, "No sessions found and service key missing."
         name = f"Cycle {pd.Timestamp.utcnow().strftime('%Y-%m-%d')}"
         created = _safe_insert(sb_write, schema, "sessions", {"name": name, "is_active": True})
-        if created and created[0].get("id") is not None:
-            latest_sid = _resolve_session_id(created[0].get("id"))
+        latest_sid = _resolve_session_id((created[0] or {}).get("id")) if created else None
         if latest_sid is None:
             latest_sid = _resolve_session_id((created[0] or {}).get("session_id")) if created else None
         if latest_sid is None:
@@ -669,13 +670,22 @@ def _render_young_ai_view(snapshot: Dict[str, Any]):
 # MAIN DASHBOARD (CLEAN)
 # ============================================================
 def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
+    """
+    CLEAN dashboard:
+      - KPIs
+      - Attendance
+      - Young AI
+    """
     sb_read = sb_service if sb_service is not None else sb_anon
 
+    # Ensure current session (do not print the verbose message)
     session_id, _ = _ensure_current_session(sb_anon=sb_anon, sb_service=sb_service, schema=schema)
 
+    # Members count
     members_rows = _safe_select(sb_read, schema, "members", "id", limit=5000, show_error=False)
     total_members = len(members_rows) if members_rows else 0
 
+    # Contributions (current session)
     contrib_rows: List[Dict[str, Any]] = []
     if session_id is not None:
         contrib_rows = _safe_select(
@@ -692,6 +702,7 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
     members_paid = _count_distinct(contrib_rows, "member_id")
     current_pot = float(cycle_total)
 
+    # Attendance (current session)
     attendance_rows: List[Dict[str, Any]] = []
     if session_id is not None and _table_readable(sb_read, schema, "attendance"):
         attendance_rows = _safe_select(
@@ -713,6 +724,7 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
         except Exception:
             pass
 
+    # Loans (active)
     loans_rows: List[Dict[str, Any]] = []
     if _table_readable(sb_read, schema, "loans"):
         loans_rows = _safe_select(
@@ -738,21 +750,25 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
                 except Exception:
                     pass
 
+    # Fines
     fines_total = 0.0
     if _table_readable(sb_read, schema, "fines"):
         fines_rows = _safe_select(sb_read, schema, "fines", "amount,created_at", limit=20000, show_error=False)
         fines_total = _sum_amount(fines_rows, "amount")
 
+    # Repayments
     repayments_total = 0.0
     if _table_readable(sb_read, schema, "loan_payments"):
         pay_rows = _safe_select(sb_read, schema, "loan_payments", "amount,created_at", limit=20000, show_error=False)
         repayments_total = _sum_amount(pay_rows, "amount")
 
+    # Interest
     interest_total = 0.0
     if _table_readable(sb_read, schema, "interest_ledger"):
         i_rows = _safe_select(sb_read, schema, "interest_ledger", "amount,created_at", limit=20000, show_error=False)
         interest_total = _sum_amount(i_rows, "amount")
 
+    # KPIs
     c1, c2, c3, c4, c5 = st.columns([0.9, 0.9, 0.9, 0.9, 1.2])
     with c1:
         st.metric("Session ID", session_id if session_id is not None else "—")
@@ -767,6 +783,7 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
 
     st.divider()
 
+    # Attendance
     st.subheader("🧾 Attendance (session)")
     if session_id is None:
         st.info("No session selected.")
@@ -779,6 +796,7 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
 
     st.divider()
 
+    # Snapshot for Young AI
     snapshot = {
         "schema": schema,
         "session_id": session_id,
