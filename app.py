@@ -1,19 +1,19 @@
 
 # app.py ✅ COMPLETE SINGLE FILE — NJANGI STANDARD (NO legacy)
-# FAST VERSION + SLOW/GENTLE MODE + 🤖 AI MODE (Young) + SAFE NAV FIX + ✅ DASHBOARD-AI NAV BRIDGE
+# FAST VERSION + SLOW/GENTLE MODE + ✅ younchat (replaces "Young") + SAFE NAV FIX + ✅ DASHBOARD-AI NAV BRIDGE
 # ------------------------------------------------------------------------------
-# ✅ Fixes ModuleNotFoundError:
-#   Your repo has: admin_panels.py  (plural)
-#   So we import: "admin_panels" NOT "admin_panel"
+# ✅ What changed (as you requested):
+#   1) "🤖 AI Mode (Young)" page REMOVED
+#   2) Added "💬 younchat" page that loads njangi_llm_panel.render_njangi_llm_panel()
+#   3) Renamed "🧠 Njangi LLM" menu item to "🧠 Njangi LLM (younchat)" to avoid confusion
+#      (so you can keep both if you want — they both open younchat)
 #
-# ✅ Fixes Streamlit param issues:
-#   - st.button(..., use_container_width=True)  (NOT width="stretch")
-#   - st.dataframe(..., use_container_width=True) (NOT width="stretch")
-#
-# ✅ Safe navigation:
-#   - Never sets st.session_state["main_menu"] after the radio exists
-#   - Uses nav_request + st.rerun()
-#   - Bridges dashboard AI -> app nav via st.session_state["page"]
+# ✅ Keeps:
+#   - Safe navigation + nav bridge
+#   - Fast/Slow mode throttling
+#   - Cache-safe loaders
+#   - Admin import fix (admin_panels.py)
+#   - Streamlit params use_container_width=True
 # ------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -372,37 +372,6 @@ def apply_nav_before_widget(default_page: str, allowed_pages: List[str]):
 
 
 # =========================
-# 🤖 AI MODE (Young) — lightweight helper
-# =========================
-def _young_reply(user_text: str) -> str:
-    t = (user_text or "").strip().lower()
-
-    if not t:
-        return "Tell me what you want to do: Dashboard, Contributions, Loans, Payouts, Audit, or a Risk check."
-
-    if any(k in t for k in ["risk", "ai risk", "default", "probability", "score"]):
-        return "Open **🤖 AI Risk Panel**. If it says 'single class', you need loans.status with both good/bad labels."
-    if any(k in t for k in ["llm", "assistant", "njangi llm", "chat with data"]):
-        return "Open **🧠 Njangi LLM** — ask: *'Total foundation money?'*"
-    if any(k in t for k in ["audit", "logs", "who did", "history"]):
-        return "Open **Audit** page — it shows recent actions and errors if audit_log is enabled."
-    if any(k in t for k in ["dashboard", "kpi", "pot", "cash"]):
-        return "Dashboard shows KPIs. If something is 0, check sessions + app_state.current_session_id + contributions.session_id."
-    if "rls" in t or "policy" in t:
-        return "If reads fail, it is usually **RLS**. Use **Health** page to see what’s blocked for anon vs service."
-    if "cache" in t and "unhashable" in t:
-        return "That error happens when a Supabase client is passed into @st.cache_data. This app avoids that."
-
-    return (
-        "I can help with:\n"
-        "• Paste an error traceback\n"
-        "• Explain dashboard numbers (pot/cycle/paid)\n"
-        "• Guide actions (attendance, session, loans)\n\n"
-        "Ask: *'Why is Cash Available 0?'*"
-    )
-
-
-# =========================
 # TOP BAR
 # =========================
 left, right = st.columns([1, 0.30])
@@ -628,12 +597,12 @@ if SAFE_MODE_UI:
 else:
     PAGES = [
         "Dashboard",
-        "🤖 AI Mode",
+        "💬 younchat",
         "Contributions",
         "Payouts",
         "Loans",
         "🤖 AI Risk Panel",
-        "🧠 Njangi LLM",
+        "🧠 Njangi LLM (younchat)",
         "Minutes & Attendance",
         "Admin",
         "Audit",
@@ -650,47 +619,13 @@ page = st.sidebar.radio("Menu", PAGES, key="main_menu")
 if page == "Dashboard":
     render_dashboard(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
 
-elif page == "🤖 AI Mode":
-    st.markdown(glass_open(), unsafe_allow_html=True)
-    st.subheader("🤖 AI Mode (Young)")
-    st.caption("Your Njangi assistant — routing + troubleshooting + guidance (no external LLM).")
-
-    if "young_chat" not in st.session_state:
-        st.session_state["young_chat"] = []
-
-    c1, c2 = st.columns([0.72, 0.28])
-    with c2:
-        st.markdown("### Quick guidance")
-        st.write("• If a page is blank → enable **Safe Mode**")
-        st.write("• If reads fail → check **Health** page for RLS blocks")
-        st.write("• If cache error → never pass `sb_*` into cache")
-        st.divider()
-        st.markdown("### Navigate (safe)")
-        if st.button("Go Dashboard", use_container_width=True):
-            request_nav("Dashboard")
-        if st.button("Go 🤖 AI Risk Panel", use_container_width=True):
-            request_nav("🤖 AI Risk Panel")
-        if st.button("Go 🧠 Njangi LLM", use_container_width=True):
-            request_nav("🧠 Njangi LLM")
-        if st.button("Go Audit", use_container_width=True):
-            request_nav("Audit")
-
-    with c1:
-        st.markdown("### Chat")
-        for m in st.session_state["young_chat"]:
-            if m["role"] == "user":
-                st.markdown(f"**You:** {m['text']}")
-            else:
-                st.markdown(f"**Young:** {m['text']}")
-
-        user_q = st.text_input("Ask Young", placeholder="e.g., Why is Cash Available 0?", key="young_page_q")
-        if st.button("Send", use_container_width=True):
-            ans = _young_reply(user_q)
-            st.session_state["young_chat"].append({"role": "user", "text": user_q})
-            st.session_state["young_chat"].append({"role": "assistant", "text": ans})
-            st.rerun()
-
-    st.markdown(glass_close(), unsafe_allow_html=True)
+elif page == "💬 younchat":
+    fn, err = lazy_import("njangi_llm_panel", "render_njangi_llm_panel")
+    if fn is None:
+        st.error("younchat failed to load.")
+        st.code(err or "", language="text")
+    else:
+        fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
 
 elif page == "Contributions":
     st.markdown(glass_open(), unsafe_allow_html=True)
@@ -767,10 +702,10 @@ elif page == "🤖 AI Risk Panel":
     else:
         fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
 
-elif page == "🧠 Njangi LLM":
+elif page == "🧠 Njangi LLM (younchat)":
     fn, err = lazy_import("njangi_llm_panel", "render_njangi_llm_panel")
     if fn is None:
-        st.error("Njangi LLM panel failed to load.")
+        st.error("Njangi LLM panel (younchat) failed to load.")
         st.code(err or "", language="text")
     else:
         fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
@@ -1169,5 +1104,3 @@ elif page == "Health":
 
 else:
     st.info("Select a page from the sidebar menu.")
-
-
