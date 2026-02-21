@@ -1,20 +1,30 @@
 
-# dashboard_panel.py ✅ COMPLETE SINGLE FILE — Dashboard + 🤖 Young AI View + 🌐 Web Search (Tavily)
-# ------------------------------------------------------------------------------
+# dashboard_panel.py ✅ COMPLETE SINGLE FILE — Dashboard + 🤖 Young AI View + 🌐 Web Search (Tavily) + 🧠 LLM (OpenAI)
+# ---------------------------------------------------------------------------------------------------------------
 # ✅ NJANGI STANDARD (NO legacy)
 # ✅ Works with app.py calling: render_dashboard(sb_anon=..., sb_service=..., schema=...)
-# ✅ Young AI Helper answers ONLY from LIVE snapshot (no guessing)
-# ✅ Web Search: use "web:" prefix (example: web: Maryland cosmetology license requirements)
-# ✅ Web search uses TAVILY_API_KEY from environment (Railway Variables)
 #
-# ✅ IMPORTANT FIXES (restores your “good dashboard” behavior):
+# 🤖 Young AI Helper:
+#   - Answers ONLY from LIVE snapshot (no guessing)
+#   - Two modes:
+#       (A) Grounded Rules (always available)
+#       (B) LLM (OpenAI) grounded strictly on snapshot (requires OPENAI_API_KEY)
+#
+# 🌐 Web Search (Tavily):
+#   - Use prefix:  web: <your query>
+#   - Requires env var: TAVILY_API_KEY
+#
+# ✅ IMPORTANT FIXES (restores “good dashboard” behavior):
 #   1) AUTO-SELECT SESSION:
-#      - If app_state.current_session_id is missing, it auto-selects latest sessions.id
-#      - (Optional) Can auto-create a session if none exist (toggle below)
+#      - If app_state.current_session_id missing, auto-select latest sessions.id (or sessions.session_id fallback)
+#      - Optional auto-create session if none exist (toggle below)
 #   2) FIXED BUG: removed accidental filter id=1 in app_state select (was breaking reads)
-#   3) Robust session id resolution:
-#      - supports sessions.id OR sessions.session_id
-# ------------------------------------------------------------------------------
+#   3) Robust session id resolution supports sessions.id OR sessions.session_id
+#
+# NOTE:
+# - LLM is NEVER allowed to “invent” numbers; it must use snapshot values only.
+# - If LLM is missing or fails, system falls back to grounded rules.
+
 from __future__ import annotations
 
 import os
@@ -27,10 +37,12 @@ import pandas as pd
 import streamlit as st
 from postgrest.exceptions import APIError
 
+
 # ============================================================
 # SETTINGS
 # ============================================================
-AUTO_CREATE_SESSION_IF_NONE = False  # set True if you want the app to create Cycle 1 automatically
+AUTO_CREATE_SESSION_IF_NONE = False  # set True if you want the app to create a session automatically when none exist
+
 
 # ============================================================
 # TIME + GREETING
@@ -74,7 +86,7 @@ def _api_msg(e: Exception) -> str:
 
 
 # ============================================================
-# LIGHT THROTTLE (optional, uses app.py session_state if present)
+# LIGHT THROTTLE (optional; uses app.py session_state if present)
 # ============================================================
 def _throttle_db():
     slow = bool(st.session_state.get("_slow_mode_override", True))
@@ -202,7 +214,9 @@ def _get_latest_session_id(sb_read, schema: str) -> Optional[int]:
             return sid
 
     # Fallback: some schemas have sessions.session_id
-    rows = _safe_select(sb_read, schema, "sessions", "session_id,created_at", order_by="session_id", desc=True, limit=1, show_error=False)
+    rows = _safe_select(
+        sb_read, schema, "sessions", "session_id,created_at", order_by="session_id", desc=True, limit=1, show_error=False
+    )
     if rows and rows[0].get("session_id") is not None:
         sid = _resolve_session_id(rows[0].get("session_id"))
         if sid is not None:
@@ -238,7 +252,6 @@ def _ensure_current_session(sb_anon, sb_service, schema: str) -> Tuple[Optional[
         if created and created[0].get("id") is not None:
             latest_sid = _resolve_session_id(created[0].get("id"))
         if latest_sid is None:
-            # maybe created returned session_id instead
             latest_sid = _resolve_session_id((created[0] or {}).get("session_id")) if created else None
         if latest_sid is None:
             return None, "Tried to auto-create a session but failed. Create one manually in Supabase."
@@ -332,9 +345,93 @@ def _is_web_query(text: str) -> bool:
 
 
 # ============================================================
-# DASHBOARD AI (Young) — grounded on snapshot only
+# LLM (OpenAI) — STRICTLY GROUNDED ON SNAPSHOT
 # ============================================================
-def _young_answer(q: str, snap: Dict[str, Any]) -> str:
+def _has_openai_key() -> bool:
+    return bool(os.getenv("OPENAI_API_KEY", "").strip())
+
+
+def _openai_model() -> str:
+    # You can override in Railway Variables: OPENAI_MODEL
+    # Pick a lightweight model if you want cheaper/faster.
+    return (os.getenv("OPENAI_MODEL", "") or "gpt-4o-mini").strip()
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _llm_answer_cached(question: str, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Cached LLM call so repeated same question doesn't re-bill.
+    Requires:
+      - OPENAI_API_KEY in env
+      - openai python package installed
+    Returns dict: { "text": "...", "error": "...optional..." }
+    """
+    if not _has_openai_key():
+        return {"error": "Missing OPENAI_API_KEY in environment variables."}
+
+    try:
+        from openai import OpenAI  # type: ignore
+    except Exception as e:
+        return {"error": f"openai package not installed: {repr(e)}"}
+
+    # Guardrails: the model MUST only use snapshot data; no guessing.
+    instructions = (
+        "You are 'Young', a dashboard copilot for a community finance app.\n"
+        "You MUST answer using ONLY the provided DASHBOARD_SNAPSHOT JSON.\n"
+        "Rules:\n"
+        "- If the answer is not explicitly in the snapshot, say you don't have it.\n"
+        "- Never invent numbers, names, totals, dates, or statuses.\n"
+        "- Be concise. Use bullets when helpful.\n"
+        "- If user asks for 'who owes what' or per-member details and snapshot doesn't include it, say to open Loans/AI Risk panel.\n"
+    )
+
+    # Give snapshot as the only allowed context.
+    user_input = (
+        f"DASHBOARD_SNAPSHOT (JSON):\n{snapshot}\n\n"
+        f"USER_QUESTION:\n{question}\n\n"
+        "Answer now, strictly grounded on the snapshot."
+    )
+
+    try:
+        client = OpenAI()
+        # Prefer Responses API when available; fall back to chat.completions if not.
+        # (Both are supported by the official python client.)
+        text_out = None
+
+        # Try Responses API
+        try:
+            resp = client.responses.create(
+                model=_openai_model(),
+                instructions=instructions,
+                input=user_input,
+            )
+            text_out = getattr(resp, "output_text", None) or None
+        except Exception:
+            text_out = None
+
+        # Fallback: Chat Completions
+        if not text_out:
+            chat = client.chat.completions.create(
+                model=_openai_model(),
+                messages=[
+                    {"role": "system", "content": instructions},
+                    {"role": "user", "content": user_input},
+                ],
+            )
+            text_out = (chat.choices[0].message.content or "").strip()
+
+        if not text_out:
+            return {"error": "LLM returned empty response."}
+
+        return {"text": text_out.strip()}
+    except Exception as e:
+        return {"error": f"LLM request failed: {repr(e)}"}
+
+
+# ============================================================
+# DASHBOARD AI (Young) — grounded rules (always available)
+# ============================================================
+def _young_answer_rules(q: str, snap: Dict[str, Any]) -> str:
     t = (q or "").strip().lower()
 
     session_id = snap.get("session_id")
@@ -422,6 +519,21 @@ def _render_young_ai_view(snapshot: Dict[str, Any]):
     st.write(f"{_greeting_of_day()} 👋🏾 I’m **Young** — your dashboard copilot for **theyoungshallgrow**.")
     st.caption(_human_touch())
 
+    # Mode selector
+    use_llm = st.toggle(
+        "Use LLM (OpenAI) for answers (still grounded on snapshot)",
+        value=False,
+        help="Requires OPENAI_API_KEY in Railway Variables. If off, uses grounded rule-based answers.",
+        key="young_use_llm",
+    )
+
+    # Show config status
+    cols_cfg = st.columns(2)
+    with cols_cfg[0]:
+        st.caption(f"🧠 LLM: {'READY' if _has_openai_key() else 'MISSING OPENAI_API_KEY'}")
+    with cols_cfg[1]:
+        st.caption(f"🌐 Tavily: {'READY' if _has_tavily_key() else 'MISSING TAVILY_API_KEY'}")
+
     st.write(
         "Try:\n"
         "• *pot this session*\n"
@@ -440,17 +552,19 @@ def _render_young_ai_view(snapshot: Dict[str, Any]):
         key="young_dash_q",
     )
 
-    cols = st.columns([0.22, 0.78])
-    with cols[0]:
+    c1, c2 = st.columns([0.25, 0.75])
+    with c1:
         ask = st.button("Ask", key="young_dash_ask", width="stretch")
-    with cols[1]:
+    with c2:
         if ask:
+            # Web query
             if _is_web_query(q):
                 if not _has_tavily_key():
                     st.session_state["young_dash_a"] = (
                         "Web search is not configured yet.\n\n"
                         "Add **TAVILY_API_KEY** in Railway → Variables, then redeploy."
                     )
+                    st.session_state["young_dash_sources"] = []
                 else:
                     query = _strip_web_prefix(q)
                     tav = _tavily_search_cached(query=query, max_results=5, search_depth="basic")
@@ -458,8 +572,21 @@ def _render_young_ai_view(snapshot: Dict[str, Any]):
                     st.session_state["young_dash_a"] = summary
                     st.session_state["young_dash_sources"] = sources
             else:
-                st.session_state["young_dash_a"] = _young_answer(q, snapshot)
-                st.session_state["young_dash_sources"] = []
+                # Snapshot-only answers
+                if use_llm:
+                    res = _llm_answer_cached(question=q, snapshot=snapshot)
+                    if res.get("error"):
+                        st.session_state["young_dash_a"] = (
+                            "LLM mode failed, so I used the grounded snapshot rules instead.\n\n"
+                            f"**LLM error:** {res['error']}\n\n"
+                            + _young_answer_rules(q, snapshot)
+                        )
+                    else:
+                        st.session_state["young_dash_a"] = res.get("text", "").strip() or _young_answer_rules(q, snapshot)
+                    st.session_state["young_dash_sources"] = []
+                else:
+                    st.session_state["young_dash_a"] = _young_answer_rules(q, snapshot)
+                    st.session_state["young_dash_sources"] = []
 
     a = st.session_state.get("young_dash_a")
     if a:
@@ -507,7 +634,6 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
     # --------------------------------------------------------
     contrib_rows: List[Dict[str, Any]] = []
     if session_id is not None:
-        # Works when contributions.session_id matches sessions.id
         contrib_rows = _safe_select(
             sb_read,
             schema,
@@ -647,4 +773,5 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
         "interest_total": float(interest_total),
         "generated_at": _now_iso(),
     }
+
     _render_young_ai_view(snapshot)
