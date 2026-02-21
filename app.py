@@ -2,26 +2,18 @@
 # app.py ✅ COMPLETE SINGLE FILE — NJANGI STANDARD (NO legacy)
 # FAST VERSION + SLOW/GENTLE MODE + 🤖 AI MODE (Young) + SAFE NAV FIX + ✅ DASHBOARD-AI NAV BRIDGE
 # ------------------------------------------------------------------------------
-# ✅ Fixes crash:
-#   streamlit.errors.StreamlitAPIException:
-#   st.session_state.main_menu cannot be modified after the widget with key main_menu is instantiated.
+# ✅ Fixes ModuleNotFoundError:
+#   Your repo has: admin_panels.py  (plural)
+#   So we import: "admin_panels" NOT "admin_panel"
 #
-# ✅ How fixed:
-#   - We NEVER set st.session_state["main_menu"] after the sidebar radio exists.
-#   - We use st.session_state["nav_request"] + st.rerun() for navigation.
-#   - We apply nav_request BEFORE the menu widget is created.
+# ✅ Fixes Streamlit param issues:
+#   - st.button(..., use_container_width=True)  (NOT width="stretch")
+#   - st.dataframe(..., use_container_width=True) (NOT width="stretch")
 #
-# ✅ NEW (IMPORTANT):
-#   - Dashboard AI can navigate by setting: st.session_state["page"] = "<Menu Name>" then st.rerun()
-#   - This app bridges session_state["page"] -> nav_request BEFORE the sidebar menu widget
-#
-# ✅ No duplicates:
-#   - Removed the extra sidebar “Quick actions” block (only the main Menu remains)
-#   - Dashboard can still navigate via AI buttons (no extra duplicate menu)
-#
-# ✅ Also fixes earlier bug patterns:
-#   - Removed accidental "id=1" filter in app_state reads.
-#   - Cache-safe loaders: no Supabase client passed into @st.cache_data args.
+# ✅ Safe navigation:
+#   - Never sets st.session_state["main_menu"] after the radio exists
+#   - Uses nav_request + st.rerun()
+#   - Bridges dashboard AI -> app nav via st.session_state["page"]
 # ------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -38,7 +30,7 @@ import streamlit as st
 from postgrest.exceptions import APIError
 from supabase import create_client
 
-# Dashboard is required
+# Required module
 from dashboard_panel import render_dashboard
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -54,20 +46,15 @@ st.set_page_config(
 )
 
 # =========================
-# UI CONSTANTS
-# =========================
-W_STRETCH = "stretch"
-
-# ============================================================
 # TIME
-# ============================================================
+# =========================
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# ============================================================
-# GLOBAL THEME (Midnight Navy + Emerald)
-# ============================================================
+# =========================
+# THEME
+# =========================
 def inject_global_theme():
     st.markdown(
         """
@@ -183,9 +170,10 @@ def glass_close() -> str:
 
 inject_global_theme()
 
-# ============================================================
+
+# =========================
 # SECRETS / ENV
-# ============================================================
+# =========================
 def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     v = os.getenv(key)
     if v not in (None, ""):
@@ -206,18 +194,18 @@ FAST_MODE_DEFAULT = str(get_secret("FAST_MODE", "1")).strip() not in ("0", "fals
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
     st.error(
         "Missing SUPABASE_URL or SUPABASE_ANON_KEY.\n\n"
-        "Streamlit Cloud: Manage app → Settings → Secrets\n\n"
-        "Add:\n"
-        "SUPABASE_URL\nSUPABASE_ANON_KEY\n(optional) SUPABASE_SERVICE_KEY\nSUPABASE_SCHEMA\n(optional) FAST_MODE"
+        "Railway: Variables → set SUPABASE_URL and SUPABASE_ANON_KEY\n"
+        "(optional) SUPABASE_SERVICE_KEY, SUPABASE_SCHEMA, FAST_MODE, SLOW_MODE"
     )
     st.stop()
 
 if not SUPABASE_SERVICE_KEY:
     st.warning("SUPABASE_SERVICE_KEY not set. Writes (Admin/Loans/Payouts/Minutes/Attendance) may be disabled.")
 
-# ============================================================
+
+# =========================
 # CLIENTS
-# ============================================================
+# =========================
 @st.cache_resource
 def get_anon_client(url: str, anon_key: str):
     return create_client(url.strip(), anon_key.strip())
@@ -231,9 +219,10 @@ def get_service_client(url: str, service_key: str):
 sb_anon = get_anon_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 sb_service = get_service_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_SERVICE_KEY else None
 
-# ============================================================
-# SLOW MODE (THROTTLE DB CALLS) + FAST MODE OVERRIDE
-# ============================================================
+
+# =========================
+# SLOW MODE / THROTTLE
+# =========================
 SLOW_MODE_DEFAULT = str(get_secret("SLOW_MODE", "1")).strip() not in ("0", "false", "False", "no", "NO")
 MIN_SECONDS_BETWEEN_DB_CALLS_DEFAULT = float(get_secret("MIN_SECONDS_BETWEEN_DB_CALLS", "0.35") or "0.35")
 
@@ -249,9 +238,9 @@ def throttle_db():
     st.session_state["_last_db_call_ts"] = time.time()
 
 
-# ============================================================
+# =========================
 # SAFE ERROR TEXT
-# ============================================================
+# =========================
 def _api_msg(e: Exception) -> str:
     if isinstance(e, APIError):
         payload = e.args[0] if getattr(e, "args", None) else {}
@@ -304,9 +293,9 @@ def safe_select(
         return []
 
 
-# ============================================================
-# LAZY IMPORT HELPER ✅ Railway-safe
-# ============================================================
+# =========================
+# LAZY IMPORT (Railway-safe)
+# =========================
 def lazy_import(path: str, attr: Optional[str] = None) -> Tuple[Any, Optional[str]]:
     try:
         mod = importlib.import_module(path)
@@ -317,9 +306,9 @@ def lazy_import(path: str, attr: Optional[str] = None) -> Tuple[Any, Optional[st
         return None, repr(e)
 
 
-# ============================================================
-# CONNECTED DB CHECK (KEY FIX FOR “COMPETITION DATA”)
-# ============================================================
+# =========================
+# CONNECTED DB CHECK
+# =========================
 def project_ref_from_url(url: str) -> str:
     try:
         host = url.split("//", 1)[-1].split("/", 1)[0]
@@ -348,16 +337,16 @@ def show_connected_db_banner():
         st.success("Anon read test: ✅ can read members")
         st.write("Sample:", r.data)
     except Exception as e:
-        st.error("Anon read test: ❌ cannot read members (likely RLS policy or wrong schema)")
+        st.error("Anon read test: ❌ cannot read members (RLS policy or wrong schema)")
         st.code(_api_msg(e), language="text")
 
-    st.caption("If this shows the WRONG project ref, fix Streamlit secrets / Railway variables.")
+    st.caption("If this shows the WRONG project ref, fix Railway Variables / Streamlit secrets.")
     st.markdown(glass_close(), unsafe_allow_html=True)
 
 
-# ============================================================
-# ✅ SAFE NAVIGATION (FIXES main_menu crash) + ✅ Dashboard-AI bridge
-# ============================================================
+# =========================
+# SAFE NAVIGATION + Dashboard-AI bridge
+# =========================
 def request_nav(target: str):
     st.session_state["nav_request"] = target
     st.rerun()
@@ -369,11 +358,11 @@ def apply_nav_before_widget(default_page: str, allowed_pages: List[str]):
     if "nav_request" not in st.session_state:
         st.session_state["nav_request"] = None
 
-    # ✅ BRIDGE: dashboard_panel.py can set st.session_state["page"] = "<page>"
+    # Bridge: dashboard_panel.py may set st.session_state["page"] = "<Menu Name>"
     dash_req = st.session_state.get("page")
     if isinstance(dash_req, str) and dash_req.strip():
         st.session_state["nav_request"] = dash_req.strip()
-        st.session_state["page"] = None  # clear to avoid loops
+        st.session_state["page"] = None
 
     req = st.session_state.get("nav_request")
     if req:
@@ -382,9 +371,9 @@ def apply_nav_before_widget(default_page: str, allowed_pages: List[str]):
         st.session_state["nav_request"] = None
 
 
-# ============================================================
-# 🤖 AI MODE (Young) — lightweight helper (no external LLM)
-# ============================================================
+# =========================
+# 🤖 AI MODE (Young) — lightweight helper
+# =========================
 def _young_reply(user_text: str) -> str:
     t = (user_text or "").strip().lower()
 
@@ -392,16 +381,15 @@ def _young_reply(user_text: str) -> str:
         return "Tell me what you want to do: Dashboard, Contributions, Loans, Payouts, Audit, or a Risk check."
 
     if any(k in t for k in ["risk", "ai risk", "default", "probability", "score"]):
-        return "Open **🤖 AI Risk Panel** from the left menu. If it says 'single class', you need loans.status with both good/bad labels."
+        return "Open **🤖 AI Risk Panel**. If it says 'single class', you need loans.status with both good/bad labels."
     if any(k in t for k in ["llm", "assistant", "njangi llm", "chat with data"]):
-        return "Open **🧠 Njangi LLM** from the left menu — ask: *'How much did we collect this session?'*"
+        return "Open **🧠 Njangi LLM** — ask: *'Total foundation money?'*"
     if any(k in t for k in ["audit", "logs", "who did", "history"]):
         return "Open **Audit** page — it shows recent actions and errors if audit_log is enabled."
-    if any(k in t for k in ["dashboard", "kpi", "pot"]):
-        return "Dashboard shows KPIs. If something is 0, check: sessions + app_state.current_session_id + contributions.session_id."
-
+    if any(k in t for k in ["dashboard", "kpi", "pot", "cash"]):
+        return "Dashboard shows KPIs. If something is 0, check sessions + app_state.current_session_id + contributions.session_id."
     if "rls" in t or "policy" in t:
-        return "If reads fail, it is usually **RLS**. Use **Health** page to see which tables are blocked for anon vs service."
+        return "If reads fail, it is usually **RLS**. Use **Health** page to see what’s blocked for anon vs service."
     if "cache" in t and "unhashable" in t:
         return "That error happens when a Supabase client is passed into @st.cache_data. This app avoids that."
 
@@ -410,13 +398,13 @@ def _young_reply(user_text: str) -> str:
         "• Paste an error traceback\n"
         "• Explain dashboard numbers (pot/cycle/paid)\n"
         "• Guide actions (attendance, session, loans)\n\n"
-        "Ask: *'Why is pot 0?'*"
+        "Ask: *'Why is Cash Available 0?'*"
     )
 
 
-# ============================================================
+# =========================
 # TOP BAR
-# ============================================================
+# =========================
 left, right = st.columns([1, 0.30])
 with left:
     st.markdown(f"## 🏦 {APP_BRAND} • Bank Dashboard")
@@ -425,16 +413,17 @@ with left:
     else:
         st.caption("⚡ Fast Mode ON (minimal throttling)")
 with right:
-    if st.button("🔄 Refresh data", width=W_STRETCH):
+    if st.button("🔄 Refresh data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
 with st.expander("🔎 Show connected database details", expanded=False):
     show_connected_db_banner()
 
-# ============================================================
-# SIDEBAR SAFE MODE / FAST/SLOW MODE
-# ============================================================
+
+# =========================
+# SIDEBAR: SAFE MODE + FAST/SLOW MODE
+# =========================
 with st.sidebar.expander("🛟 Safe Mode", expanded=False):
     SAFE_MODE_UI = st.checkbox(
         "Run Dashboard only (disable optional pages)",
@@ -461,13 +450,11 @@ with st.sidebar.expander("⚡ Fast / 🐢 Slow Mode", expanded=False):
         )
 
 SLOW_MODE = bool(st.session_state.get("_slow_mode_override", SLOW_MODE_DEFAULT))
-MIN_SECONDS_BETWEEN_DB_CALLS = float(
-    st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", MIN_SECONDS_BETWEEN_DB_CALLS_DEFAULT)
-)
 
-# ============================================================
-# CACHED LOADERS — IMPORTANT: NO Supabase client in cache args
-# ============================================================
+
+# =========================
+# CACHED LOADERS (NO supabase client in args)
+# =========================
 MEMBERS_TTL = 120 if not SLOW_MODE else 300
 VIEW_TTL = 90 if not SLOW_MODE else 240
 
@@ -577,9 +564,9 @@ def load_attendance_view(url: str, anon_key: str, schema: str, session_id: int) 
         return pd.DataFrame()
 
 
-# ============================================================
+# =========================
 # SESSION HELPERS
-# ============================================================
+# =========================
 def get_app_state(sb, schema: str) -> dict:
     rows = safe_select(sb, "app_state", "id,current_session_id,updated_at,created_at", schema=schema, limit=1, show_error=False)
     return rows[0] if rows else {}
@@ -633,9 +620,9 @@ def get_effective_session_id(sb_read, schema: str) -> Tuple[Optional[int], str]:
     return None, "no sessions"
 
 
-# ============================================================
+# =========================
 # NAVIGATION (SAFE)
-# ============================================================
+# =========================
 if SAFE_MODE_UI:
     PAGES = ["Dashboard"]
 else:
@@ -653,14 +640,13 @@ else:
         "Health",
     ]
 
-# ✅ apply nav BEFORE widget is instantiated (and bridge dashboard "page")
 apply_nav_before_widget(default_page="Dashboard", allowed_pages=PAGES)
-
 page = st.sidebar.radio("Menu", PAGES, key="main_menu")
 
-# ============================================================
+
+# =========================
 # PAGES
-# ============================================================
+# =========================
 if page == "Dashboard":
     render_dashboard(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
 
@@ -678,16 +664,15 @@ elif page == "🤖 AI Mode":
         st.write("• If a page is blank → enable **Safe Mode**")
         st.write("• If reads fail → check **Health** page for RLS blocks")
         st.write("• If cache error → never pass `sb_*` into cache")
-
         st.divider()
         st.markdown("### Navigate (safe)")
-        if st.button("Go Dashboard", width=W_STRETCH):
+        if st.button("Go Dashboard", use_container_width=True):
             request_nav("Dashboard")
-        if st.button("Go 🤖 AI Risk Panel", width=W_STRETCH):
+        if st.button("Go 🤖 AI Risk Panel", use_container_width=True):
             request_nav("🤖 AI Risk Panel")
-        if st.button("Go 🧠 Njangi LLM", width=W_STRETCH):
+        if st.button("Go 🧠 Njangi LLM", use_container_width=True):
             request_nav("🧠 Njangi LLM")
-        if st.button("Go Audit", width=W_STRETCH):
+        if st.button("Go Audit", use_container_width=True):
             request_nav("Audit")
 
     with c1:
@@ -699,7 +684,7 @@ elif page == "🤖 AI Mode":
                 st.markdown(f"**Young:** {m['text']}")
 
         user_q = st.text_input("Ask Young", placeholder="e.g., Why is Cash Available 0?", key="young_page_q")
-        if st.button("Send", width=W_STRETCH):
+        if st.button("Send", use_container_width=True):
             ans = _young_reply(user_q)
             st.session_state["young_chat"].append({"role": "user", "text": user_q})
             st.session_state["young_chat"].append({"role": "assistant", "text": ans})
@@ -733,9 +718,9 @@ elif page == "Contributions":
             st.info("No contributions found (or RLS blocked). Check DB details at top.")
         else:
             st.warning("Showing raw contributions (view not available or not readable).")
-            st.dataframe(df2, width=W_STRETCH, hide_index=True)
+            st.dataframe(df2, use_container_width=True, hide_index=True)
     else:
-        st.dataframe(df, width=W_STRETCH, hide_index=True)
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.markdown(glass_close(), unsafe_allow_html=True)
 
@@ -831,7 +816,7 @@ elif page == "Minutes & Attendance":
             with st.form("minutes_form", clear_on_submit=False):
                 title = st.text_input("Title", key="minutes_title")
                 body = st.text_area("Minutes / Documentation", height=260, key="minutes_body")
-                ok = st.form_submit_button("💾 Save minutes", width=W_STRETCH)
+                ok = st.form_submit_button("💾 Save minutes", use_container_width=True)
 
             if ok:
                 if not title.strip() or not body.strip():
@@ -891,7 +876,7 @@ elif page == "Minutes & Attendance":
         if dfm.empty:
             st.info("No minutes recorded yet.")
         else:
-            st.dataframe(dfm, width=W_STRETCH, hide_index=True)
+            st.dataframe(dfm, use_container_width=True, hide_index=True)
         st.markdown(glass_close(), unsafe_allow_html=True)
 
     with tab2:
@@ -944,7 +929,7 @@ elif page == "Minutes & Attendance":
 
                 attendance_rows.append({"member_id": mid, "present": (status == "present"), "note": note.strip() or None})
 
-            save = st.form_submit_button("💾 Save attendance (ALL members)", width=W_STRETCH)
+            save = st.form_submit_button("💾 Save attendance (ALL members)", use_container_width=True)
 
         if save:
             if not can_write:
@@ -987,7 +972,7 @@ elif page == "Minutes & Attendance":
             if dfa.empty:
                 st.info("No attendance recorded for this session yet.")
             else:
-                st.dataframe(dfa, width=W_STRETCH, hide_index=True)
+                st.dataframe(dfa, use_container_width=True, hide_index=True)
         else:
             dfa = pd.DataFrame(arows_existing)
             if dfa.empty:
@@ -998,7 +983,7 @@ elif page == "Minutes & Attendance":
                 dfa = dfa.merge(dm, on="member_id", how="left")
                 dfa = dfa[["member_id", "member_name", "present", "note", "created_at"]]
                 st.warning("View v_attendance_with_member not readable. Showing attendance joined in Python.")
-                st.dataframe(dfa, width=W_STRETCH, hide_index=True)
+                st.dataframe(dfa, use_container_width=True, hide_index=True)
 
         st.markdown(glass_close(), unsafe_allow_html=True)
 
@@ -1073,7 +1058,7 @@ elif page == "Minutes & Attendance":
                     .reset_index()
                     .rename(columns={"amount": "total_amount"})
                 )
-                st.dataframe(by, width=W_STRETCH, hide_index=True)
+                st.dataframe(by, use_container_width=True, hide_index=True)
             elif "member_id" in dfc.columns:
                 by = (
                     dfc.groupby("member_id", dropna=False)["amount"]
@@ -1082,9 +1067,9 @@ elif page == "Minutes & Attendance":
                     .reset_index()
                     .rename(columns={"amount": "total_amount"})
                 )
-                st.dataframe(by, width=W_STRETCH, hide_index=True)
+                st.dataframe(by, use_container_width=True, hide_index=True)
             else:
-                st.dataframe(dfc, width=W_STRETCH, hide_index=True)
+                st.dataframe(dfc, use_container_width=True, hide_index=True)
 
         st.markdown(glass_close(), unsafe_allow_html=True)
 
@@ -1098,14 +1083,16 @@ elif page == "Admin":
         st.markdown(glass_close(), unsafe_allow_html=True)
         st.stop()
 
-    admin_fn, admin_err = lazy_import("admin_panel", "render_admin_panel")
+    # ✅ IMPORTANT FIX: your repo shows admin_panels.py (plural)
+    admin_fn, admin_err = lazy_import("admin_panels", "render_admin_panel")
     if admin_fn is not None:
         admin_fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
-        st.markdown(glass_close(), unsafe_allow_html=True)
     else:
-        st.caption("Optional admin_panel not found; using built-in admin tools.")
-        st.code(admin_err or "admin_panel missing", language="text")
-        st.markdown(glass_close(), unsafe_allow_html=True)
+        st.caption("Optional admin_panels not found; using built-in admin placeholder.")
+        st.code(admin_err or "admin_panels missing", language="text")
+        st.info("To enable Admin, ensure admin_panels.py defines: render_admin_panel(sb_anon, sb_service, schema)")
+
+    st.markdown(glass_close(), unsafe_allow_html=True)
 
 elif page == "Audit":
     st.markdown(glass_open(), unsafe_allow_html=True)
@@ -1127,7 +1114,7 @@ elif page == "Audit":
         if dfa.empty:
             st.info("audit_log is readable but has no rows.")
         else:
-            st.dataframe(dfa, width=W_STRETCH, hide_index=True)
+            st.dataframe(dfa, use_container_width=True, hide_index=True)
     else:
         st.warning(f"{SUPABASE_SCHEMA}.audit_log not readable (missing table or RLS).")
 
@@ -1177,8 +1164,10 @@ elif page == "Health":
             }
         )
 
-    st.dataframe(pd.DataFrame(rows), width=W_STRETCH, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     st.markdown(glass_close(), unsafe_allow_html=True)
 
 else:
     st.info("Select a page from the sidebar menu.")
+
+
