@@ -1,8 +1,8 @@
 
 # app.py ✅ COMPLETE SINGLE FILE — NJANGI STANDARD (NO legacy)
-# FAST VERSION + SLOW/GENTLE MODE + 🤖 AI MODE (Young) + SAFE NAV FIX
+# FAST VERSION + SLOW/GENTLE MODE + 🤖 AI MODE (Young) + SAFE NAV FIX + ✅ DASHBOARD-AI NAV BRIDGE
 # ------------------------------------------------------------------------------
-# ✅ FIXES your crash:
+# ✅ Fixes crash:
 #   streamlit.errors.StreamlitAPIException:
 #   st.session_state.main_menu cannot be modified after the widget with key main_menu is instantiated.
 #
@@ -10,6 +10,14 @@
 #   - We NEVER set st.session_state["main_menu"] after the sidebar radio exists.
 #   - We use st.session_state["nav_request"] + st.rerun() for navigation.
 #   - We apply nav_request BEFORE the menu widget is created.
+#
+# ✅ NEW (IMPORTANT):
+#   - Dashboard AI can navigate by setting: st.session_state["page"] = "<Menu Name>" then st.rerun()
+#   - This app bridges session_state["page"] -> nav_request BEFORE the sidebar menu widget
+#
+# ✅ No duplicates:
+#   - Removed the extra sidebar “Quick actions” block (only the main Menu remains)
+#   - Dashboard can still navigate via AI buttons (no extra duplicate menu)
 #
 # ✅ Also fixes earlier bug patterns:
 #   - Removed accidental "id=1" filter in app_state reads.
@@ -20,11 +28,6 @@ from __future__ import annotations
 
 import os
 import sys
-
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-if APP_DIR not in sys.path:
-    sys.path.insert(0, APP_DIR)
-
 import time
 import importlib
 from datetime import datetime, timezone
@@ -37,6 +40,10 @@ from supabase import create_client
 
 # Dashboard is required
 from dashboard_panel import render_dashboard
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if APP_DIR not in sys.path:
+    sys.path.insert(0, APP_DIR)
 
 APP_BRAND = "theyoungshallgrow"
 
@@ -349,22 +356,29 @@ def show_connected_db_banner():
 
 
 # ============================================================
-# ✅ SAFE NAVIGATION (FIXES main_menu crash)
+# ✅ SAFE NAVIGATION (FIXES main_menu crash) + ✅ Dashboard-AI bridge
 # ============================================================
 def request_nav(target: str):
     st.session_state["nav_request"] = target
     st.rerun()
 
 
-def apply_nav_before_widget(default_page: str):
+def apply_nav_before_widget(default_page: str, allowed_pages: List[str]):
     if "main_menu" not in st.session_state:
         st.session_state["main_menu"] = default_page
     if "nav_request" not in st.session_state:
         st.session_state["nav_request"] = None
 
+    # ✅ BRIDGE: dashboard_panel.py can set st.session_state["page"] = "<page>"
+    dash_req = st.session_state.get("page")
+    if isinstance(dash_req, str) and dash_req.strip():
+        st.session_state["nav_request"] = dash_req.strip()
+        st.session_state["page"] = None  # clear to avoid loops
+
     req = st.session_state.get("nav_request")
     if req:
-        st.session_state["main_menu"] = req
+        if req in allowed_pages:
+            st.session_state["main_menu"] = req
         st.session_state["nav_request"] = None
 
 
@@ -398,29 +412,6 @@ def _young_reply(user_text: str) -> str:
         "• Guide actions (attendance, session, loans)\n\n"
         "Ask: *'Why is pot 0?'*"
     )
-
-
-def ai_sidebar_assistant():
-    with st.sidebar.expander("🤖 AI Mode (Young)", expanded=False):
-        st.caption("Ask Young anything about your Njangi system (lightweight, no OpenAI).")
-        q = st.text_input("Ask Young", key="young_sidebar_q", placeholder="e.g., Why is Cash Available 0?")
-        if st.button("Ask", key="young_sidebar_btn", width=W_STRETCH):
-            st.session_state["young_last_answer"] = _young_reply(q)
-
-        ans = st.session_state.get("young_last_answer")
-        if ans:
-            st.markdown(ans)
-
-        st.divider()
-        st.caption("Quick actions (safe navigation)")
-        if st.button("Open Dashboard", key="qa_dash", width=W_STRETCH):
-            request_nav("Dashboard")
-        if st.button("Open 🤖 AI Risk Panel", key="qa_risk", width=W_STRETCH):
-            request_nav("🤖 AI Risk Panel")
-        if st.button("Open 🧠 Njangi LLM", key="qa_llm", width=W_STRETCH):
-            request_nav("🧠 Njangi LLM")
-        if st.button("Open Audit", key="qa_audit", width=W_STRETCH):
-            request_nav("Audit")
 
 
 # ============================================================
@@ -468,8 +459,6 @@ with st.sidebar.expander("⚡ Fast / 🐢 Slow Mode", expanded=False):
             value=float(get_secret("MIN_SECONDS_BETWEEN_DB_CALLS", "0.35") or "0.35"),
             step=0.05,
         )
-
-ai_sidebar_assistant()
 
 SLOW_MODE = bool(st.session_state.get("_slow_mode_override", SLOW_MODE_DEFAULT))
 MIN_SECONDS_BETWEEN_DB_CALLS = float(
@@ -592,7 +581,6 @@ def load_attendance_view(url: str, anon_key: str, schema: str, session_id: int) 
 # SESSION HELPERS
 # ============================================================
 def get_app_state(sb, schema: str) -> dict:
-    # ✅ fixed: no accidental id=1 filter
     rows = safe_select(sb, "app_state", "id,current_session_id,updated_at,created_at", schema=schema, limit=1, show_error=False)
     return rows[0] if rows else {}
 
@@ -608,7 +596,6 @@ def get_effective_session_id(sb_read, schema: str) -> Tuple[Optional[int], str]:
     if cs is not None:
         return cs, "from app_state"
 
-    # Try latest sessions.id
     srows = safe_select(
         sb_read,
         "sessions",
@@ -626,7 +613,6 @@ def get_effective_session_id(sb_read, schema: str) -> Tuple[Optional[int], str]:
         except Exception:
             pass
 
-    # Try sessions.session_id
     srows2 = safe_select(
         sb_read,
         "sessions",
@@ -667,8 +653,8 @@ else:
         "Health",
     ]
 
-# ✅ apply nav before widget is instantiated
-apply_nav_before_widget(default_page="Dashboard")
+# ✅ apply nav BEFORE widget is instantiated (and bridge dashboard "page")
+apply_nav_before_widget(default_page="Dashboard", allowed_pages=PAGES)
 
 page = st.sidebar.radio("Menu", PAGES, key="main_menu")
 
@@ -688,21 +674,21 @@ elif page == "🤖 AI Mode":
 
     c1, c2 = st.columns([0.72, 0.28])
     with c2:
-        st.markdown("### Quick actions (safe)")
-        if st.button("Open Dashboard", width=W_STRETCH):
-            request_nav("Dashboard")
-        if st.button("Open 🤖 AI Risk Panel", width=W_STRETCH):
-            request_nav("🤖 AI Risk Panel")
-        if st.button("Open 🧠 Njangi LLM", width=W_STRETCH):
-            request_nav("🧠 Njangi LLM")
-        if st.button("Open Audit", width=W_STRETCH):
-            request_nav("Audit")
-
-        st.divider()
-        st.markdown("### Health tips")
+        st.markdown("### Quick guidance")
         st.write("• If a page is blank → enable **Safe Mode**")
         st.write("• If reads fail → check **Health** page for RLS blocks")
         st.write("• If cache error → never pass `sb_*` into cache")
+
+        st.divider()
+        st.markdown("### Navigate (safe)")
+        if st.button("Go Dashboard", width=W_STRETCH):
+            request_nav("Dashboard")
+        if st.button("Go 🤖 AI Risk Panel", width=W_STRETCH):
+            request_nav("🤖 AI Risk Panel")
+        if st.button("Go 🧠 Njangi LLM", width=W_STRETCH):
+            request_nav("🧠 Njangi LLM")
+        if st.button("Go Audit", width=W_STRETCH):
+            request_nav("Audit")
 
     with c1:
         st.markdown("### Chat")
@@ -712,7 +698,7 @@ elif page == "🤖 AI Mode":
             else:
                 st.markdown(f"**Young:** {m['text']}")
 
-        user_q = st.text_input("Ask Young", placeholder="e.g., Why is Cash Available negative?", key="young_page_q")
+        user_q = st.text_input("Ask Young", placeholder="e.g., Why is Cash Available 0?", key="young_page_q")
         if st.button("Send", width=W_STRETCH):
             ans = _young_reply(user_q)
             st.session_state["young_chat"].append({"role": "user", "text": user_q})
@@ -1118,6 +1104,7 @@ elif page == "Admin":
         st.markdown(glass_close(), unsafe_allow_html=True)
     else:
         st.caption("Optional admin_panel not found; using built-in admin tools.")
+        st.code(admin_err or "admin_panel missing", language="text")
         st.markdown(glass_close(), unsafe_allow_html=True)
 
 elif page == "Audit":
