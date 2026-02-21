@@ -1,3 +1,4 @@
+
 # njangi_llm_panel.py ✅ SINGLE COMPLETE FILE — younchat reads your DB (members = source of truth)
 # =============================================================================
 # 💬 younchat — DB-TOOLS FIRST (tables + views) + ✅ PDF tools + Optional HF Router + Optional Tavily
@@ -25,6 +26,7 @@
 #   HF_FORCE_MODE = auto | completions | chat
 #   HF_RANDOM_DEFAULT = on | off      (default random routing)
 #   HF_MODELS_CSV                    (comma separated pool, optional)
+#   HF_MODEL_DENYLIST_CSV            (comma separated denylist, optional)
 #   TAVILY_API_KEY
 #   INTERNET_MODE = on | off
 # =============================================================================
@@ -84,8 +86,7 @@ HF_FALLBACK_MODELS: List[str] = [
     "mistralai/Mistral-7B-Instruct-v0.3",
     "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "mistralai/Mixtral-8x22B-Instruct-v0.1",
-    # Nous Hermes
-    "NousResearch/Nous-Hermes-2-Mixtral-8x7B-DPO",
+    # Nous Hermes (✅ removed bad model)
     "NousResearch/Nous-Hermes-2-Yi-34B",
     "NousResearch/Nous-Hermes-2-Mistral-7B-DPO",
     # Qwen instruct
@@ -130,10 +131,15 @@ HF_FALLBACK_MODELS: List[str] = [
     "allenai/tulu-2-dpo-13b",
 ]
 
-# Optional hard denylist (you can add models that repeatedly fail for your account/providers)
+# ✅ Hard denylist (permanent) + optional env denylist
+HF_HARD_DENYLIST = {
+    "NousResearch/Nous-Hermes-2-Mixtral-8x7B-DPO",
+}
+
 HF_MODEL_DENYLIST = set(
     m.strip() for m in (os.getenv("HF_MODEL_DENYLIST_CSV") or "").split(",") if m.strip()
 )
+HF_MODEL_DENYLIST |= HF_HARD_DENYLIST
 
 # ✅ Allowlist relations (tables + views).
 RELATIONS: Dict[str, Dict[str, Any]] = {
@@ -970,9 +976,21 @@ def _get_hf_model_pool(primary_model: str) -> List[str]:
             seen.add(m)
             out.append(m)
 
-    # apply denylist
+    # apply denylist (includes hard denylist)
     out = [m for m in out if m not in HF_MODEL_DENYLIST]
     return out
+
+
+def _sanitize_primary_model(primary: str) -> str:
+    """
+    If HF_MODEL is denylisted, pick the first safe model from the pool.
+    This prevents accidental use via env var.
+    """
+    p = (primary or "").strip()
+    if not p or p in HF_MODEL_DENYLIST:
+        pool = _get_hf_model_pool("")
+        return pool[0] if pool else "meta-llama/Meta-Llama-3-8B-Instruct"
+    return p
 
 
 def _hf_call(
@@ -1047,7 +1065,11 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     st.subheader("💬 younchat", anchor=False)
 
     hf_token = (os.getenv("HF_TOKEN") or "").strip()
-    hf_model = (os.getenv("HF_MODEL") or "").strip() or "meta-llama/Meta-Llama-3-8B-Instruct"
+
+    # ✅ sanitize primary model so denylisted ones never used even if set in env
+    raw_primary = (os.getenv("HF_MODEL") or "").strip() or "meta-llama/Meta-Llama-3-8B-Instruct"
+    hf_model = _sanitize_primary_model(raw_primary)
+
     hf_force = (os.getenv("HF_FORCE_MODE") or "auto").strip().lower()
 
     random_default = (os.getenv("HF_RANDOM_DEFAULT") or "").strip().lower() in {"1", "true", "yes", "on"}
