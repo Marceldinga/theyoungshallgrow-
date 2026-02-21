@@ -1,8 +1,12 @@
 
-# dashboard_panel.py ✅ COMPLETE SINGLE FILE — Dashboard + 🤖 Young AI View + 🌐 Web Search (Tavily) + 🧠 LLM (OpenAI) + ✅ LOCAL TIMEZONE GREETING
+# dashboard_panel.py ✅ COMPLETE SINGLE FILE — Dashboard + 🤖 Young AI View + 🧭 In-Dashboard Navigation + 🌐 Web Search (Tavily) + 🧠 LLM (OpenAI) + ✅ LOCAL TIMEZONE GREETING
 # ---------------------------------------------------------------------------------------------------------------
 # ✅ NJANGI STANDARD (NO legacy)
 # ✅ Works with app.py calling: render_dashboard(sb_anon=..., sb_service=..., schema=...)
+#
+# ✅ NEW (NO DUPLICATE UI): "Quick actions (safe navigation)" INSIDE Dashboard AI
+#   - Buttons change: st.session_state["page"] then st.rerun()
+#   - Requires app.py to use st.session_state["page"] as the selected page
 #
 # 🤖 Young AI Helper:
 #   - Answers ONLY from LIVE snapshot (no guessing)
@@ -240,7 +244,14 @@ def _get_latest_session_id(sb_read, schema: str) -> Optional[int]:
 
     # Fallback: some schemas have sessions.session_id
     rows = _safe_select(
-        sb_read, schema, "sessions", "session_id,created_at", order_by="session_id", desc=True, limit=1, show_error=False
+        sb_read,
+        schema,
+        "sessions",
+        "session_id,created_at",
+        order_by="session_id",
+        desc=True,
+        limit=1,
+        show_error=False,
     )
     if rows and rows[0].get("session_id") is not None:
         sid = _resolve_session_id(rows[0].get("session_id"))
@@ -526,8 +537,48 @@ def _young_answer_rules(q: str, snap: Dict[str, Any]) -> str:
     )
 
 
+# ============================================================
+# 🧭 SAFE NAVIGATION (Dashboard AI → pages)
+# ============================================================
+def _nav_to(page_name: str):
+    # app.py must read st.session_state["page"] to decide which page to render
+    st.session_state["page"] = str(page_name)
+    st.rerun()
+
+
+def _safe_nav_buttons():
+    st.markdown("#### Quick actions (safe navigation)")
+    st.caption("These buttons open pages by setting **st.session_state['page']**. (Your app.py must use it.)")
+    c1, c2 = st.columns(2)
+
+    with c1:
+        if st.button("Open Dashboard", width="stretch"):
+            _nav_to("Dashboard")
+        if st.button("Open Contributions", width="stretch"):
+            _nav_to("Contributions")
+        if st.button("Open Loans", width="stretch"):
+            _nav_to("Loans")
+        if st.button("Open Payouts", width="stretch"):
+            _nav_to("Payouts")
+
+    with c2:
+        if st.button("Open 🤖 AI Risk Panel", width="stretch"):
+            _nav_to("AI Risk Panel")
+        if st.button("Open Minutes & Attendance", width="stretch"):
+            _nav_to("Minutes & Attendance")
+        if st.button("Open Audit", width="stretch"):
+            _nav_to("Audit")
+        if st.button("Open Health", width="stretch"):
+            _nav_to("Health")
+
+
 def _render_young_ai_view(snapshot: Dict[str, Any]):
     st.markdown("### 🤖 Young — Dashboard AI Helper")
+
+    # ✅ NEW: navigation from dashboard through AI helper
+    _safe_nav_buttons()
+
+    st.divider()
     st.caption("Grounded on your LIVE dashboard snapshot. Internet only when you type **web:**")
 
     st.write(f"{_greeting_of_day()} 👋🏾 I’m **Young** — your dashboard copilot for **theyoungshallgrow**.")
