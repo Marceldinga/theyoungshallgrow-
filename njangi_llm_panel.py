@@ -1,4 +1,3 @@
-
 # njangi_llm_panel.py ✅ SINGLE COMPLETE FILE — younchat reads your DB (members = source of truth)
 # =============================================================================
 # 💬 younchat — DB-TOOLS FIRST (tables + views) + Optional HF Router + Optional Tavily
@@ -6,18 +5,32 @@
 # ✅ YOUR REQUEST (IMPORTANT):
 #   - The ONLY intro message must be EXACTLY:
 #       "Hello 👋🏽 I’m younchat — your Njangi assistant."
-#   - No extra intro text, no “Try this”, no command list in the intro.
+#   - No extra intro text, no command list in the intro.
 #   - Salute must be "Hello"
 #   - younchat reads ALL your tables/views (based on RELATIONS allowlist you control)
 #   - members table is the source of truth for identity (name display)
 #   - NO hallucinations for Njangi numbers (all financial answers come from DB)
 #   - IMPORTANT FIX: HF Router will NEVER answer DB commands (members/loans/kpis/show/describe/etc.)
 #
-# ✅ UPDATE YOU ASKED:
-#   - Use ONLY these 3 HF models (the ones you gave):
-#       1) meta-llama/Meta-Llama-3-8B-Instruct
-#       2) meta-llama/Llama-3.1-8B-Instruct
-#       3) mistralai/Mistral-7B-Instruct-v0.2
+# ✅ UPDATE YOU ASKED (NEW "FINANCIAL CONTROL TOWER" ENGINE):
+#   - younchat is NOT a chatbot inside Njangi: it behaves as a cooperative
+#     financial risk system, liquidity monitor, credit evaluator, policy advisor.
+#   - It NEVER invents numbers: it ONLY computes from DB rows in your schema.
+#   - It NEVER outputs SQL or Python to the user (this file is code, but chat outputs are not code).
+#   - If data is missing, it explicitly says what’s missing and guides to:
+#       members / loans / finance kpis / tables / show <table> / describe <table> / type member_id
+#   - Financial intelligence responses ALWAYS follow:
+#       1) Current Situation
+#       2) Risk Assessment
+#       3) Financial Impact
+#       4) Strategic Recommendation
+#     with Risk classification: Low / Moderate / Elevated / High / Critical
+#   - Health Score (0–100) is produced ONLY if sufficient context exists.
+#
+# ✅ HF Models locked to ONLY these 3:
+#   1) meta-llama/Meta-Llama-3-8B-Instruct
+#   2) meta-llama/Llama-3.1-8B-Instruct
+#   3) mistralai/Mistral-7B-Instruct-v0.2
 #
 # Works with app.py:
 #   render_njangi_llm_panel(sb_anon=..., sb_service=..., schema=...)
@@ -199,18 +212,49 @@ def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return None
 
 
+def _to_num_series(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").fillna(0)
+
+
 def _safe_sum(df: pd.DataFrame, col: Optional[str]) -> float:
     if df is None or df.empty or not col or col not in df.columns:
         return 0.0
-    return float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
+    return float(_to_num_series(df[col]).sum())
 
 
 def _fmt(x: Any) -> str:
     try:
         v = float(pd.to_numeric(x, errors="coerce"))
+        if pd.isna(v):
+            v = 0.0
     except Exception:
         v = 0.0
     return f"{v:,.2f}"
+
+
+def _pct(x: Optional[float]) -> str:
+    if x is None:
+        return "—"
+    try:
+        return f"{x*100:.1f}%"
+    except Exception:
+        return "—"
+
+
+def _ratio(n: Optional[float], d: Optional[float]) -> Optional[float]:
+    if n is None or d is None or d == 0:
+        return None
+    return n / d
+
+
+def _parse_dt(df: pd.DataFrame, col: str) -> Optional[pd.Series]:
+    if df is None or df.empty or col not in df.columns:
+        return None
+    try:
+        s = pd.to_datetime(df[col], errors="coerce", utc=True)
+        return s
+    except Exception:
+        return None
 
 
 # -----------------------------------------------------------------------------
@@ -272,6 +316,32 @@ def _wants_loans(text: str) -> bool:
     return any(k in t for k in ["loan", "loans", "borrow", "repay", "overdue", "dpd", "interest due"])
 
 
+def _wants_financial_review(text: str) -> bool:
+    t = _lc(text)
+    triggers = [
+        "how are we doing",
+        "are we stable",
+        "is njangi healthy",
+        "njangi health",
+        "health score",
+        "financial condition",
+        "risk review",
+        "any risk",
+        "liquidity",
+        "credit risk",
+        "executive summary",
+        "summary",
+        "control tower",
+        "financial intelligence",
+    ]
+    return any(x in t for x in triggers)
+
+
+def _wants_member_risk(text: str) -> bool:
+    t = _lc(text)
+    return any(x in t for x in ["member risk", "risk grade", "credit grade", "member health"])
+
+
 def _wants_internet(text: str) -> bool:
     t = _lc(text)
     return t.startswith("web:") or t.startswith("internet:") or t.startswith("tavily:")
@@ -312,7 +382,7 @@ def _extract_member_id(text: str) -> Optional[str]:
     return None
 
 
-# ✅ CRITICAL FIX: detect DB commands so HF never returns fake SQL/Python answers
+# ✅ CRITICAL FIX: detect DB commands so HF never returns fake answers
 def _is_db_command(text: str) -> bool:
     t = _lc(text)
     if not t:
@@ -392,6 +462,485 @@ def _member_name_from_truth(members_truth: pd.DataFrame, member_id: str) -> str:
 
 
 # -----------------------------------------------------------------------------
+# Njangi Financial Intelligence Engine (DB-only computations)
+# -----------------------------------------------------------------------------
+def _active_loan_filter(loans: pd.DataFrame) -> pd.DataFrame:
+    if loans is None or loans.empty:
+        return loans
+    status_col = _pick_col(loans, ["status"])
+    if not status_col:
+        return loans
+    s = loans[status_col].astype(str).str.lower().fillna("")
+    active_status = {"active", "open", "ongoing", "overdue", "late"}
+    return loans[s.isin(active_status)]
+
+
+def _overdue_loan_filter(loans: pd.DataFrame) -> pd.DataFrame:
+    if loans is None or loans.empty:
+        return loans
+    status_col = _pick_col(loans, ["status"])
+    if status_col:
+        s = loans[status_col].astype(str).str.lower().fillna("")
+        return loans[s.isin({"overdue", "late"})]
+    # If no status col, try dpd-like columns to infer overdue (non-zero)
+    dpd_col = _pick_col(loans, ["dpd", "days_past_due", "overdue_days"])
+    if dpd_col:
+        dpd = _to_num_series(loans[dpd_col])
+        return loans[dpd > 0]
+    return loans.iloc[0:0]
+
+
+def _loan_balance_col(loans: pd.DataFrame) -> Optional[str]:
+    return _pick_col(loans, ["principal_current", "balance", "outstanding_principal", "principal_remaining", "principal"])
+
+
+def _unpaid_interest_col(loans: pd.DataFrame) -> Optional[str]:
+    return _pick_col(loans, ["unpaid_interest", "interest_unpaid", "interest_due", "interest_balance"])
+
+
+def _collect_global_finance_context(
+    sb_anon,
+    sb_service,
+    schema: str,
+) -> Dict[str, Any]:
+    """
+    Pulls global tables needed for a control-tower review.
+    Returns dict with dfs + notes about missing columns.
+    """
+    out: Dict[str, Any] = {
+        "ok": True,
+        "notes": [],
+        "df": {},
+    }
+
+    # Prefer view if present (but we still may need tables for deeper metrics like concentration)
+    if "v_finance_kpis" in RELATIONS:
+        k = _sb_select(sb_anon, sb_service, schema, "v_finance_kpis", cols="*", limit=200)
+        out["df"]["v_finance_kpis"] = k
+
+    # Tables for truth-based computations
+    out["df"]["contributions"] = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=200000)
+    out["df"]["foundation_contributions"] = _sb_select(
+        sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=200000
+    )
+    out["df"]["loans"] = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=200000)
+    out["df"]["interest_ledger"] = _sb_select(sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=200000)
+    out["df"]["fines"] = _sb_select(sb_anon, sb_service, schema, "fines", cols="*", limit=200000)
+
+    return out
+
+
+def _compute_global_metrics(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Computes core metrics strictly from DB rows.
+    If columns are missing, returns None for that metric and records missing details.
+    """
+    dfc = (ctx.get("df") or {}).get("contributions", pd.DataFrame())
+    dff = (ctx.get("df") or {}).get("foundation_contributions", pd.DataFrame())
+    dfl = (ctx.get("df") or {}).get("loans", pd.DataFrame())
+    dfi = (ctx.get("df") or {}).get("interest_ledger", pd.DataFrame())
+    dffines = (ctx.get("df") or {}).get("fines", pd.DataFrame())
+
+    notes: List[str] = []
+
+    # Totals
+    contrib_col = _pick_col(dfc, ["amount", "contribution_amount", "paid_amount"])
+    if not contrib_col:
+        notes.append("Missing contributions amount column (expected: amount/contribution_amount/paid_amount).")
+    total_contributions = _safe_sum(dfc, contrib_col) if contrib_col else None
+
+    foundation_col = _pick_col(dff, ["amount", "base_amount", "foundation_amount"])
+    if not foundation_col:
+        notes.append("Missing foundation_contributions amount column (expected: amount/base_amount/foundation_amount).")
+    foundation_total = _safe_sum(dff, foundation_col) if foundation_col else None
+
+    fines_col = _pick_col(dffines, ["amount", "fine_amount"])
+    total_fines = _safe_sum(dffines, fines_col) if fines_col else None
+
+    # Loans
+    active_loans = _active_loan_filter(dfl)
+    overdue_loans = _overdue_loan_filter(active_loans)
+
+    bal_col = _loan_balance_col(active_loans)
+    if not bal_col and not active_loans.empty:
+        notes.append("Missing loans balance column (expected: principal_current/balance/outstanding_principal/principal).")
+    active_loan_exposure = _safe_sum(active_loans, bal_col) if bal_col else (0.0 if active_loans.empty else None)
+
+    unpaid_col = _unpaid_interest_col(active_loans)
+    unpaid_interest = _safe_sum(active_loans, unpaid_col) if unpaid_col else None
+    if unpaid_col is None and not active_loans.empty:
+        notes.append("Missing loans unpaid interest column (expected: unpaid_interest/interest_due/etc.).")
+
+    active_count = int(len(active_loans)) if active_loans is not None else 0
+    overdue_count = int(len(overdue_loans)) if overdue_loans is not None else 0
+    overdue_ratio = (overdue_count / active_count) if active_count > 0 else (0.0 if overdue_count == 0 else None)
+
+    # Concentration risk (top borrower share of active exposure)
+    concentration_share: Optional[float] = None
+    top_borrower_member_id: Optional[str] = None
+    if active_loans is not None and not active_loans.empty and bal_col and "member_id" in active_loans.columns:
+        try:
+            g = active_loans.copy()
+            g["_bal"] = _to_num_series(g[bal_col])
+            bym = g.groupby(g["member_id"].astype(str))["_bal"].sum().sort_values(ascending=False)
+            if len(bym) > 0:
+                top_borrower_member_id = str(bym.index[0])
+                total = float(bym.sum())
+                top = float(bym.iloc[0])
+                concentration_share = (top / total) if total > 0 else None
+        except Exception:
+            concentration_share = None
+
+    # Interest income (ledger) — best-effort trend if date exists
+    interest_col = _pick_col(dfi, ["amount", "interest_amount", "interest"])
+    interest_total = _safe_sum(dfi, interest_col) if interest_col else None
+    if interest_col is None and not dfi.empty:
+        notes.append("Missing interest_ledger amount column (expected: amount/interest_amount/interest).")
+
+    # Trend: last 90 days vs previous 90 days (directional only)
+    interest_trend: Optional[str] = None
+    date_col = _pick_col(dfi, ["created_at", "date", "paid_at", "posted_at", "timestamp"])
+    if interest_col and date_col:
+        sdt = _parse_dt(dfi, date_col)
+        if sdt is not None:
+            now = datetime.now(timezone.utc)
+            cut1 = now - pd.Timedelta(days=90)
+            cut2 = now - pd.Timedelta(days=180)
+            last = dfi[sdt >= cut1]
+            prev = dfi[(sdt >= cut2) & (sdt < cut1)]
+            last_sum = float(_to_num_series(last[interest_col]).sum()) if not last.empty else 0.0
+            prev_sum = float(_to_num_series(prev[interest_col]).sum()) if not prev.empty else 0.0
+            if last_sum > prev_sum:
+                interest_trend = "Rising"
+            elif last_sum < prev_sum:
+                interest_trend = "Declining"
+            else:
+                interest_trend = "Flat"
+    elif interest_col and not date_col and not dfi.empty:
+        notes.append("Cannot compute interest trend (missing interest_ledger date column).")
+
+    # Liquidity pressure ratio
+    liquidity_pressure = _ratio(active_loan_exposure, total_contributions) if active_loan_exposure is not None else None
+
+    return {
+        "notes": notes,
+        "total_contributions": total_contributions,
+        "foundation_total": foundation_total,
+        "total_fines": total_fines,
+        "active_loan_exposure": active_loan_exposure,
+        "active_loan_count": active_count,
+        "overdue_loan_count": overdue_count,
+        "overdue_ratio": overdue_ratio,
+        "unpaid_interest": unpaid_interest,
+        "interest_total": interest_total,
+        "interest_trend": interest_trend,
+        "liquidity_pressure_ratio": liquidity_pressure,
+        "concentration_share": concentration_share,
+        "top_borrower_member_id": top_borrower_member_id,
+    }
+
+
+def _risk_classification(metrics: Dict[str, Any]) -> Tuple[str, List[str]]:
+    """
+    DB-based rule classification (no invented thresholds beyond qualitative guidance).
+    Returns (risk_label, signals).
+    """
+    signals: List[str] = []
+
+    lpr = metrics.get("liquidity_pressure_ratio")
+    overdue_ratio = metrics.get("overdue_ratio")
+    unpaid_interest = metrics.get("unpaid_interest")
+    conc = metrics.get("concentration_share")
+
+    # Early warning signals (only if metric exists)
+    if lpr is not None and lpr > 0.75:
+        signals.append("Liquidity pressure > 75% (Active Loan Exposure ÷ Total Contributions).")
+    if overdue_ratio is not None and overdue_ratio > 0.20:
+        signals.append("Overdue ratio is elevated (over 20% of active loans).")
+    if unpaid_interest is not None and unpaid_interest > 0:
+        signals.append("Unpaid interest exists on active loans.")
+    if conc is not None and conc > 0.40:
+        signals.append("Concentration risk: top borrower > 40% of active exposure.")
+
+    # Determine classification
+    # If we lack most metrics, keep it Moderate (uncertain) but say context insufficient elsewhere.
+    score = 0
+    if lpr is not None:
+        score += 2 if lpr > 0.75 else (1 if lpr > 0.50 else 0)
+    if overdue_ratio is not None:
+        score += 2 if overdue_ratio > 0.30 else (1 if overdue_ratio > 0.10 else 0)
+    if unpaid_interest is not None:
+        score += 1 if unpaid_interest > 0 else 0
+    if conc is not None:
+        score += 2 if conc > 0.50 else (1 if conc > 0.35 else 0)
+
+    if score >= 6:
+        return "Critical", signals
+    if score >= 4:
+        return "High", signals
+    if score >= 2:
+        return "Elevated", signals
+    if score >= 1:
+        return "Moderate", signals
+    return "Low", signals
+
+
+def _health_score(metrics: Dict[str, Any]) -> Tuple[Optional[int], List[str]]:
+    """
+    Returns (score 0-100 or None, reasons).
+    Score only if sufficient context exists.
+    """
+    reasons: List[str] = []
+
+    total_contributions = metrics.get("total_contributions")
+    foundation_total = metrics.get("foundation_total")
+    active_exposure = metrics.get("active_loan_exposure")
+    overdue_ratio = metrics.get("overdue_ratio")
+
+    # Minimum required to avoid hallucination:
+    if total_contributions is None or foundation_total is None or active_exposure is None or overdue_ratio is None:
+        return None, [
+            "Health Score not generated: insufficient DB context (need totals for contributions, foundation, active loan exposure, and overdue ratio)."
+        ]
+
+    # Components (weighting per your spec)
+    # Liquidity Strength (30%): lower liquidity pressure is better
+    lpr = _ratio(active_exposure, total_contributions)
+    if lpr is None:
+        return None, ["Health Score not generated: cannot compute Liquidity Pressure Ratio (division by zero or missing)."]
+
+    # Map lpr to 0..100 subscore (qualitative curve)
+    if lpr <= 0.25:
+        liq = 95
+    elif lpr <= 0.50:
+        liq = 80
+    elif lpr <= 0.75:
+        liq = 60
+    else:
+        liq = 35
+
+    # Credit Risk Stability (30%): lower overdue ratio is better
+    if overdue_ratio <= 0.05:
+        cred = 95
+    elif overdue_ratio <= 0.10:
+        cred = 85
+    elif overdue_ratio <= 0.20:
+        cred = 65
+    else:
+        cred = 40
+
+    # Contribution Strength (20%): proxy = capital scale vs exposure (avoid guessing frequency)
+    # If total_contributions comfortably larger than exposure, better
+    coverage = _ratio(total_contributions, max(active_exposure, 1e-9))
+    if coverage is None:
+        contrib_strength = 60
+    else:
+        if coverage >= 4:
+            contrib_strength = 90
+        elif coverage >= 2:
+            contrib_strength = 75
+        elif coverage >= 1:
+            contrib_strength = 60
+        else:
+            contrib_strength = 40
+
+    # Foundation Stability (20%): foundation relative to exposure
+    fcover = _ratio(foundation_total, max(active_exposure, 1e-9))
+    if fcover is None:
+        foundation_strength = 60
+    else:
+        if fcover >= 1:
+            foundation_strength = 90
+        elif fcover >= 0.5:
+            foundation_strength = 75
+        elif fcover >= 0.25:
+            foundation_strength = 60
+        else:
+            foundation_strength = 40
+
+    score = round(0.30 * liq + 0.30 * cred + 0.20 * contrib_strength + 0.20 * foundation_strength)
+
+    reasons.append(f"Liquidity Strength component based on Liquidity Pressure Ratio = {_pct(lpr)}.")
+    reasons.append(f"Credit Risk Stability component based on overdue ratio = {_pct(overdue_ratio)}.")
+    reasons.append("Contribution Strength uses contribution-to-exposure coverage (capital coverage proxy).")
+    reasons.append("Foundation Stability uses foundation-to-exposure coverage (reserve adequacy proxy).")
+    return int(score), reasons
+
+
+def _score_level(score: int) -> str:
+    if score >= 90:
+        return "Excellent"
+    if score >= 75:
+        return "Strong"
+    if score >= 60:
+        return "Stable"
+    if score >= 40:
+        return "Elevated Risk"
+    return "High Risk"
+
+
+def _build_control_tower_report(
+    metrics: Dict[str, Any],
+    members_truth: pd.DataFrame,
+) -> str:
+    risk_label, signals = _risk_classification(metrics)
+    hs, hs_reasons = _health_score(metrics)
+
+    top_borrower = metrics.get("top_borrower_member_id")
+    top_borrower_name = _member_name_from_truth(members_truth, str(top_borrower)) if top_borrower else None
+
+    # Current Situation (DB grounded)
+    lines: List[str] = []
+    lines.append("Hello 👋🏽 Njangi Financial Intelligence Review (DB-grounded)\n")
+
+    lines.append("1️⃣ Current Situation")
+    lines.append(f"- Total contributions: **{_fmt(metrics.get('total_contributions'))}**" if metrics.get("total_contributions") is not None else "- Total contributions: **Not available**")
+    lines.append(f"- Foundation reserves (total): **{_fmt(metrics.get('foundation_total'))}**" if metrics.get("foundation_total") is not None else "- Foundation reserves (total): **Not available**")
+    lines.append(f"- Active loan exposure: **{_fmt(metrics.get('active_loan_exposure'))}**" if metrics.get("active_loan_exposure") is not None else "- Active loan exposure: **Not available**")
+    lines.append(f"- Active loans (count): **{metrics.get('active_loan_count', 0)}**")
+    lines.append(f"- Overdue loans (count): **{metrics.get('overdue_loan_count', 0)}**")
+    if metrics.get("overdue_ratio") is not None:
+        lines.append(f"- Overdue ratio: **{_pct(metrics.get('overdue_ratio'))}**")
+    else:
+        lines.append("- Overdue ratio: **Not available**")
+
+    if metrics.get("unpaid_interest") is not None:
+        lines.append(f"- Unpaid interest (active): **{_fmt(metrics.get('unpaid_interest'))}**")
+    else:
+        lines.append("- Unpaid interest (active): **Not available**")
+
+    if metrics.get("liquidity_pressure_ratio") is not None:
+        lines.append(f"- Liquidity Pressure Ratio (Exposure ÷ Contributions): **{_pct(metrics.get('liquidity_pressure_ratio'))}**")
+    else:
+        lines.append("- Liquidity Pressure Ratio: **Not available**")
+
+    if metrics.get("concentration_share") is not None and top_borrower:
+        lines.append(
+            f"- Concentration (top borrower share): **{_pct(metrics.get('concentration_share'))}** "
+            f"(Top borrower: **{top_borrower_name}** • member_id={top_borrower})"
+        )
+    else:
+        lines.append("- Concentration risk: **Not available**")
+
+    if metrics.get("interest_total") is not None:
+        trend = metrics.get("interest_trend") or "—"
+        lines.append(f"- Interest ledger total: **{_fmt(metrics.get('interest_total'))}** (Trend: **{trend}**)")
+    else:
+        lines.append("- Interest ledger total: **Not available**")
+
+    # Risk Assessment
+    lines.append("\n2️⃣ Risk Assessment")
+    lines.append(f"- Risk classification: **{risk_label}**")
+    if signals:
+        lines.append("- Early warning signals:")
+        for s in signals:
+            lines.append(f"  - {s}")
+    else:
+        lines.append("- Early warning signals: **None detected from available metrics**")
+
+    # Financial Impact (directional unless totals exist)
+    lines.append("\n3️⃣ Financial Impact")
+    # We can state directional impacts without inventing values
+    if metrics.get("liquidity_pressure_ratio") is not None and metrics.get("liquidity_pressure_ratio") > 0.75:
+        lines.append("- Liquidity is under stress: a high share of contributed capital is locked in active loans, increasing payout/rotation risk.")
+    else:
+        lines.append("- Liquidity impact: based on available data, no severe liquidity lock-up signal is confirmed.")
+
+    if metrics.get("overdue_ratio") is not None and metrics.get("overdue_ratio") > 0.20:
+        lines.append("- Credit impact: overdue levels can slow recycling of capital and reduce reliability of the foundation loan feature.")
+    else:
+        lines.append("- Credit impact: overdue levels are not confirmed as high from available data (or overdue ratio unavailable).")
+
+    if metrics.get("unpaid_interest") is not None and metrics.get("unpaid_interest") > 0:
+        lines.append("- Income impact: unpaid interest indicates leakage in expected interest capture and weak enforcement/collection.")
+    else:
+        lines.append("- Income impact: unpaid interest not confirmed (or metric unavailable).")
+
+    # Strategic Recommendation
+    lines.append("\n4️⃣ Strategic Recommendation")
+    recs: List[str] = []
+
+    # Policies based on detected signals
+    lpr = metrics.get("liquidity_pressure_ratio")
+    if lpr is not None and lpr > 0.75:
+        recs.append("Set a liquidity buffer policy: pause new loans (or tighten approvals) until Liquidity Pressure falls below your target threshold.")
+        recs.append("Introduce loan caps tied to contributed capital (risk-based lending control).")
+
+    overdue_ratio = metrics.get("overdue_ratio")
+    if overdue_ratio is not None and overdue_ratio > 0.20:
+        recs.append("Tighten loan approval rules: require stronger contribution history and enforce repayment schedules before approving new loans.")
+        recs.append("Add escalation for late accounts (structured reminders + penalties + temporary borrowing freeze).")
+
+    conc = metrics.get("concentration_share")
+    if conc is not None and conc > 0.40:
+        recs.append("Reduce concentration risk: cap exposure per member as a percentage of total active exposure or total contributions.")
+
+    unpaid_interest = metrics.get("unpaid_interest")
+    if unpaid_interest is not None and unpaid_interest > 0:
+        recs.append("Strengthen interest enforcement: monthly interest settlement, automated tracking, and hard blocks on new borrowing when unpaid interest exists.")
+
+    # Always include practical next step
+    recs.append("Operational discipline: review loans weekly, and track (Exposure, Overdue, Interest Due) as core control-tower KPIs.")
+
+    for r in recs:
+        lines.append(f"- {r}")
+
+    # Health Score (only if sufficient)
+    lines.append("\n🏆 NJANGI HEALTH SCORE (0–100)")
+    if hs is None:
+        lines.append(f"- {hs_reasons[0]}")
+    else:
+        lines.append(f"- Score: **{hs}/100** → **{_score_level(hs)}**")
+        for rr in hs_reasons:
+            lines.append(f"- {rr}")
+
+    # Missing data notes (strict integrity)
+    notes = metrics.get("notes") or []
+    if notes:
+        lines.append("\n🔒 Data Integrity Notes (what’s missing / limits)")
+        for n in notes:
+            lines.append(f"- {n}")
+        lines.append("\nTo fill gaps, use: **describe <table>** or **show <table>**, or run **finance kpis** if you maintain `v_finance_kpis`.")
+
+    return "\n".join(lines)
+
+
+def _member_risk_grade(member_meta: Dict[str, Any]) -> str:
+    """
+    Simple grade based strictly on available member totals (no guessing).
+    A: no active exposure + no unpaid interest
+    B: exposure exists but no unpaid interest
+    C: exposure + unpaid interest OR overdue indicators
+    D: strong negative (overdue / large exposure ratio if contributions exist)
+    """
+    active_bal = member_meta.get("active_loan_balance")
+    unpaid = member_meta.get("active_unpaid_interest")
+    contrib = member_meta.get("contributions_total")
+
+    # if missing, default to conservative (C) but we will disclose missing in output text
+    if active_bal is None or unpaid is None:
+        return "C"
+
+    if active_bal <= 0 and unpaid <= 0:
+        return "A"
+    if active_bal > 0 and unpaid <= 0:
+        return "B"
+    if active_bal > 0 and unpaid > 0:
+        return "C"
+
+    # if exposure is unknown but unpaid exists
+    if unpaid > 0:
+        return "C"
+
+    # Contribution coverage: if known and very low, D
+    if contrib is not None and active_bal is not None and contrib > 0:
+        lpr = active_bal / contrib
+        if lpr > 0.90:
+            return "D"
+    return "C"
+
+
+# -----------------------------------------------------------------------------
 # Local answers (DB truth)
 # -----------------------------------------------------------------------------
 def _member_financial_totals(
@@ -403,6 +952,7 @@ def _member_financial_totals(
 ) -> Tuple[str, Dict[str, Any]]:
     name = _member_name_from_truth(members_truth, member_id)
 
+    # Prefer view if present
     if "v_member_financial_totals" in RELATIONS:
         v = _sb_select(
             sb_anon,
@@ -415,57 +965,113 @@ def _member_financial_totals(
         )
         if not v.empty:
             row = v.iloc[0].to_dict()
-            contrib = row.get("contributions_total", row.get("contribution_total", row.get("contributions", 0)))
-            found = row.get("foundation_total", row.get("foundation_contributions_total", row.get("foundation", 0)))
-            fines = row.get("fines_total", row.get("fines", 0))
-            active_bal = row.get("active_loan_balance", row.get("loan_balance", row.get("principal_current_total", 0)))
-            unpaid_int = row.get("active_unpaid_interest", row.get("unpaid_interest_total", row.get("unpaid_interest", 0)))
-            interest = row.get("interest_total", row.get("interest_ledger_total", row.get("interest", 0)))
+            contrib = row.get("contributions_total", row.get("contribution_total", row.get("contributions")))
+            found = row.get("foundation_total", row.get("foundation_contributions_total", row.get("foundation")))
+            fines = row.get("fines_total", row.get("fines"))
+            active_bal = row.get("active_loan_balance", row.get("loan_balance", row.get("principal_current_total")))
+            unpaid_int = row.get("active_unpaid_interest", row.get("unpaid_interest_total", row.get("unpaid_interest")))
+            interest = row.get("interest_total", row.get("interest_ledger_total", row.get("interest")))
+
+            meta = {
+                "source": "v_member_financial_totals",
+                "member_name": name,
+                "member_id": member_id,
+                "contributions_total": float(pd.to_numeric(contrib, errors="coerce")) if contrib is not None else None,
+                "foundation_total": float(pd.to_numeric(found, errors="coerce")) if found is not None else None,
+                "fines_total": float(pd.to_numeric(fines, errors="coerce")) if fines is not None else None,
+                "active_loan_balance": float(pd.to_numeric(active_bal, errors="coerce")) if active_bal is not None else None,
+                "active_unpaid_interest": float(pd.to_numeric(unpaid_int, errors="coerce")) if unpaid_int is not None else None,
+                "interest_total": float(pd.to_numeric(interest, errors="coerce")) if interest is not None else None,
+            }
+
+            grade = _member_risk_grade(meta)
 
             msg = (
-                f"Hello 👋🏽 Here’s the grounded summary for **{name}** (member_id={member_id}):\n\n"
+                f"Hello 👋🏽 Member Financial Health (DB-grounded)\n\n"
+                f"1️⃣ Current Situation\n"
+                f"- Member: **{name}** (member_id={member_id})\n"
                 f"- Contributions total: **{_fmt(contrib)}**\n"
                 f"- Foundation total: **{_fmt(found)}**\n"
                 f"- Fines total: **{_fmt(fines)}**\n"
                 f"- Active loan balance: **{_fmt(active_bal)}**\n"
                 f"- Active unpaid interest: **{_fmt(unpaid_int)}**\n"
-                f"- Interest ledger total: **{_fmt(interest)}**\n"
+                f"- Interest ledger total: **{_fmt(interest)}**\n\n"
+                f"2️⃣ Risk Assessment\n"
+                f"- Member Risk Grade: **{grade}** (A/B/C/D)\n\n"
+                f"3️⃣ Financial Impact\n"
+                f"- If active balance or unpaid interest is present, liquidity recycling slows and enforcement risk rises.\n\n"
+                f"4️⃣ Strategic Recommendation\n"
+                f"- If unpaid interest > 0: enforce monthly interest settlement before new borrowing.\n"
+                f"- If loan balance is high vs contributions: apply tighter caps and repayment discipline.\n"
             )
-            return msg, {"source": "v_member_financial_totals", "row": row, "member_name": name}
+            return msg, meta
 
-    contributions = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=20000, filters=[("member_id", "eq", member_id)])
-    foundation = _sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=20000, filters=[("member_id", "eq", member_id)])
-    fines = _sb_select(sb_anon, sb_service, schema, "fines", cols="*", limit=20000, filters=[("member_id", "eq", member_id)])
-    loans = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=10000, filters=[("member_id", "eq", member_id)])
-    interest_ledger = _sb_select(sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=20000, filters=[("member_id", "eq", member_id)])
+    # Table fallback
+    contributions = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
+    foundation = _sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
+    fines = _sb_select(sb_anon, sb_service, schema, "fines", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
+    loans = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
+    interest_ledger = _sb_select(sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
 
     contrib_amt = _pick_col(contributions, ["amount", "contribution_amount", "paid_amount"])
     found_amt = _pick_col(foundation, ["amount", "base_amount", "foundation_amount"])
     fines_amt = _pick_col(fines, ["amount", "fine_amount"])
     int_amt = _pick_col(interest_ledger, ["amount", "interest_amount", "interest"])
 
-    status_col = _pick_col(loans, ["status"])
-    principal_current = _pick_col(loans, ["principal_current", "balance", "outstanding_principal"])
-    principal = _pick_col(loans, ["principal", "amount"])
+    active = _active_loan_filter(loans)
+    bal_col = _loan_balance_col(active)
+    unpaid_col = _unpaid_interest_col(active)
 
-    active = loans
-    if status_col and status_col in loans.columns:
-        active = loans[loans[status_col].astype(str).str.lower().isin(["active", "open", "ongoing", "overdue", "late"])]
+    active_bal = _safe_sum(active, bal_col) if bal_col else (0.0 if active.empty else None)
+    unpaid_interest = _safe_sum(active, unpaid_col) if unpaid_col else None
 
-    active_bal = _safe_sum(active, principal_current) if principal_current else _safe_sum(active, principal)
-    unpaid_interest = _safe_sum(active, "unpaid_interest") if "unpaid_interest" in active.columns else 0.0
+    meta = {
+        "source": "tables_fallback",
+        "member_name": name,
+        "member_id": member_id,
+        "contributions_total": _safe_sum(contributions, contrib_amt) if contrib_amt else None,
+        "foundation_total": _safe_sum(foundation, found_amt) if found_amt else None,
+        "fines_total": _safe_sum(fines, fines_amt) if fines_amt else None,
+        "active_loan_balance": active_bal,
+        "active_unpaid_interest": unpaid_interest,
+        "interest_total": _safe_sum(interest_ledger, int_amt) if int_amt else None,
+    }
+
+    grade = _member_risk_grade(meta)
+
+    notes: List[str] = []
+    if contrib_amt is None:
+        notes.append("Missing contributions amount column (amount/contribution_amount/paid_amount).")
+    if found_amt is None:
+        notes.append("Missing foundation_contributions amount column (amount/base_amount/foundation_amount).")
+    if bal_col is None and not active.empty:
+        notes.append("Missing loans balance column (principal_current/balance/outstanding_principal/principal).")
+    if unpaid_col is None and not active.empty:
+        notes.append("Missing loans unpaid interest column (unpaid_interest/interest_due/etc.).")
 
     msg = (
-        f"Hello 👋🏽 Here’s the grounded summary for **{name}** (member_id={member_id}):\n\n"
-        f"- Contributions total: **{_fmt(_safe_sum(contributions, contrib_amt))}**\n"
-        f"- Foundation total: **{_fmt(_safe_sum(foundation, found_amt))}**\n"
-        f"- Fines total: **{_fmt(_safe_sum(fines, fines_amt))}**\n"
+        f"Hello 👋🏽 Member Financial Health (DB-grounded)\n\n"
+        f"1️⃣ Current Situation\n"
+        f"- Member: **{name}** (member_id={member_id})\n"
+        f"- Contributions total: **{_fmt(meta.get('contributions_total'))}**\n"
+        f"- Foundation total: **{_fmt(meta.get('foundation_total'))}**\n"
+        f"- Fines total: **{_fmt(meta.get('fines_total'))}**\n"
         f"- Loans count: **{len(loans)}**\n"
         f"- Active loan balance: **{_fmt(active_bal)}**\n"
         f"- Active unpaid interest: **{_fmt(unpaid_interest)}**\n"
-        f"- Interest ledger total: **{_fmt(_safe_sum(interest_ledger, int_amt))}**\n"
+        f"- Interest ledger total: **{_fmt(meta.get('interest_total'))}**\n\n"
+        f"2️⃣ Risk Assessment\n"
+        f"- Member Risk Grade: **{grade}** (A/B/C/D)\n\n"
+        f"3️⃣ Financial Impact\n"
+        f"- Any active exposure ties up liquidity; unpaid interest signals enforcement weakness.\n\n"
+        f"4️⃣ Strategic Recommendation\n"
+        f"- If unpaid interest exists: require settlement before additional borrowing.\n"
+        f"- If exposure is high vs contributions: apply caps and structured repayment monitoring.\n"
     )
-    return msg, {"source": "tables_fallback", "member_name": name}
+    if notes:
+        msg += "\n🔒 Data Integrity Notes\n" + "\n".join([f"- {n}" for n in notes])
+
+    return msg, meta
 
 
 def _loans_with_member(
@@ -549,7 +1155,7 @@ def _tavily_search(query: str) -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# HF Router (optional; ONLY for general chat wording, never DB commands)
+# HF Router (optional; ONLY for general wording, never DB commands)
 # -----------------------------------------------------------------------------
 def _post_with_retries(url: str, headers: dict, payload: dict, timeout: int = 60) -> Tuple[bool, str]:
     last_err = ""
@@ -633,11 +1239,23 @@ def _hf_call(model: str, token: str, messages: List[Dict[str, str]]) -> Tuple[bo
 
     def _should_try_next(err_text: str) -> bool:
         e = (err_text or "").lower()
-        return any(s in e for s in [
-            "404", "not found",
-            "429", "500", "502", "503", "504", "timeout", "server error",
-            "model_not_supported", "not supported", "invalid_request_error"
-        ])
+        return any(
+            s in e
+            for s in [
+                "404",
+                "not found",
+                "429",
+                "500",
+                "502",
+                "503",
+                "504",
+                "timeout",
+                "server error",
+                "model_not_supported",
+                "not supported",
+                "invalid_request_error",
+            ]
+        )
 
     for chosen in model_order:
         last_model = chosen
@@ -683,7 +1301,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         st.write("**HF_TOKEN present**:", "✅ Yes" if hf_token else "❌ No")
         st.write("**HF_FORCE_MODE**:", hf_force)
         st.write("**Internet**:", "✅ ON" if internet_on else "❌ OFF")
-        st.caption("Njangi numbers are ALWAYS answered from DB. HF is only for general chat wording (never DB commands).")
+        st.caption("Njangi numbers are ALWAYS answered from DB. HF is only for general wording (never DB commands).")
 
     @st.cache_data(ttl=30, show_spinner=False)
     def _cached_members_truth(_ts: int) -> pd.DataFrame:
@@ -760,12 +1378,13 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         answer = (
             "Hello 👋🏽 Commands:\n\n"
             "- **members**\n"
-            "- type **10** (member summary)\n"
+            "- type **10** (member financial health)\n"
             "- **loans** / **loans for member 10**\n"
             "- **finance kpis**\n"
             "- **tables**\n"
             "- **show <table>** (example: show contributions)\n"
             "- **describe <table>** (example: describe loans)\n"
+            "- Ask: **How are we doing?** (Financial Intelligence Review)\n"
             "- **web: <topic>** (internet help)\n"
         )
 
@@ -818,7 +1437,21 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         df_show, df_title = df, title
         answer = f"Hello 👋🏽 {title} (from `{src}`):" if not df.empty else f"Hello 👋🏽 {title}: no rows returned."
 
-    elif member_id_focus and (q.strip().isdigit() or "member" in _lc(q) or "summary" in _lc(q) or "status" in _lc(q)):
+    # ✅ Financial Intelligence Review (global control tower)
+    elif _wants_financial_review(q):
+        used_source = "finance_intel"
+        ctx = _collect_global_finance_context(sb_anon, sb_service, schema)
+        metrics = _compute_global_metrics(ctx)
+        answer = _build_control_tower_report(metrics, members_truth)
+
+    # ✅ Member-focused health (by member_id)
+    elif member_id_focus and (
+        q.strip().isdigit()
+        or "member" in _lc(q)
+        or "summary" in _lc(q)
+        or "status" in _lc(q)
+        or _wants_member_risk(q)
+    ):
         answer, meta = _member_financial_totals(sb_anon, sb_service, schema, str(member_id_focus), members_truth)
         used_source = meta.get("source", "member_summary_local")
 
@@ -827,16 +1460,17 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         answer, df_show, used_source = _show_relation(sb_anon, sb_service, schema, rel)
         df_title = f"Preview: {rel}"
 
-    # General chat: optional HF (NEVER DB commands)
+    # General wording: optional HF (NEVER DB commands)
     else:
         if hf_token and not _is_db_command(q):
             sys = (
-                "You are younchat.\n"
+                "You are younchat for the Njangi platform 'theyoungshallgrow'.\n"
                 "Rules:\n"
-                "- Start with 'Hello' if greeting.\n"
-                "- Do NOT output SQL or Python code.\n"
-                "- Do NOT invent Njangi numbers or member IDs.\n"
-                "- If user asks for database results, suggest commands: members / loans / finance kpis / tables / show <table> / describe <table>.\n"
+                "- Start with 'Hello' when appropriate.\n"
+                "- Do NOT output SQL or Python.\n"
+                "- Do NOT invent Njangi numbers, totals, balances, dates, counts, or member IDs.\n"
+                "- If the user asks for financial status, suggest: 'How are we doing?' or commands: members / loans / finance kpis / tables / show <table> / describe <table>.\n"
+                "- Keep responses professional, analytical, and grounded.\n"
             )
             messages = [{"role": "system", "content": sys}]
             for m in st.session_state["younchat_history"][-10:]:
@@ -850,7 +1484,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
             if _is_db_command(q):
                 used_source = "db:first_guard"
                 answer = (
-                    "Hello 👋🏽 I can show the real data from your database.\n\n"
+                    "Hello 👋🏽 I can answer using your real Njangi database only.\n\n"
                     "Use one of these:\n"
                     "- **members**\n"
                     "- **loans**\n"
@@ -858,6 +1492,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                     "- **tables**\n"
                     "- **show contributions**\n"
                     "- **describe loans**\n"
+                    "- Ask: **How are we doing?** (Financial Intelligence Review)\n"
                 )
             else:
                 used_source = "local:fallback"
@@ -875,4 +1510,3 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                 st.dataframe(df_show, use_container_width=True)
 
     st.caption(f"Source used: {used_source} • member_id: {member_id_focus or '—'} • Internet: {'ON' if internet_on else 'OFF'}")
-
