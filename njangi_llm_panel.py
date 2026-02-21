@@ -3,10 +3,12 @@
 # =============================================================================
 # 💬 younchat — DB-TOOLS FIRST (views + tables) + Optional HF Router + Optional Tavily
 #
-# ✅ Your request (IMPORTANT):
-#   - Salute must be: "Hello"
-#   - Then a modern introduction
-#   - younchat MUST read ALL your tables/views (based on an allowlist you control)
+# ✅ YOUR REQUEST (IMPORTANT):
+#   - The ONLY intro message must be EXACTLY:
+#       "Hello 👋🏽 I’m younchat — your Njangi assistant."
+#   - No extra intro text, no “Try this”, no command list in the intro.
+#   - Salute must be "Hello"
+#   - younchat reads ALL your tables/views (based on RELATIONS allowlist you control)
 #   - members table is the source of truth for identity (name display)
 #   - NO hallucinations for Njangi numbers (all financial answers come from DB)
 #
@@ -74,6 +76,7 @@ RELATIONS: Dict[str, Dict[str, Any]] = {
     "profiles": {"type": "table"},
     "ml_training_data": {"type": "table"},
     "member_contribution_totals": {"type": "table"},
+    "interest_ledger": {"type": "table"},
     # Views (optional)
     "v_finance_kpis": {"type": "view"},
     "v_member_financial_totals": {"type": "view"},
@@ -93,7 +96,6 @@ RELATIONS: Dict[str, Dict[str, Any]] = {
     "v_attendance_with_member": {"type": "view"},
 }
 
-
 # -----------------------------------------------------------------------------
 # Time helpers
 # -----------------------------------------------------------------------------
@@ -101,21 +103,13 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _hello_intro() -> str:
-    # Your request: salute must be "Hello", then intro.
-    return (
-        "Hello 👋🏽 I’m **younchat** — your modern Njangi AI assistant.\n\n"
-        "I answer Njangi questions using **your database as the source of truth** (no guessing).\n\n"
-        "**Try this:**\n"
-        "- **help** (commands)\n"
-        "- **members** (lists everyone)\n"
-        "- type **10** (member summary)\n"
-        "- **loans** / **loans for member 10**\n"
-        "- **finance kpis**\n"
-        "- **tables** (list all readable tables/views)\n"
-        "- **show contributions** (preview a table)\n"
-        "- **describe loans** (list columns from DB)\n"
-    )
+def _hello() -> str:
+    return "Hello"
+
+
+def _intro_only() -> str:
+    # EXACT intro required by you (only line, no extra text)
+    return "Hello 👋🏽 I’m younchat — your Njangi assistant."
 
 
 # -----------------------------------------------------------------------------
@@ -151,7 +145,6 @@ def _sb_select(
     if sb is None:
         return pd.DataFrame()
 
-    # Guard: only allowed relations
     if relation not in RELATIONS:
         return pd.DataFrame()
 
@@ -176,7 +169,6 @@ def _sb_select(
         res = q.execute()
         return pd.DataFrame(getattr(res, "data", None) or [])
     except Exception:
-        # fallback without schema()
         try:
             q = sb.table(relation).select(cols).limit(limit)
             if filters:
@@ -238,7 +230,7 @@ def _lc(text: str) -> str:
 
 def _wants_help(text: str) -> bool:
     t = _lc(text)
-    return t in {"help", "/help", "commands", "menu", "what can you do", "options"}
+    return t in {"help", "/help", "commands", "options"}
 
 
 def _wants_list_members(text: str) -> bool:
@@ -258,7 +250,7 @@ def _wants_list_members(text: str) -> bool:
 
 def _wants_tables_list(text: str) -> bool:
     t = _lc(text)
-    return t in {"tables", "table", "relations", "views", "list tables", "list views"}
+    return t in {"tables", "relations", "views", "list tables", "list views"}
 
 
 def _wants_describe(text: str) -> bool:
@@ -279,26 +271,6 @@ def _wants_kpis(text: str) -> bool:
 def _wants_loans(text: str) -> bool:
     t = _lc(text)
     return any(k in t for k in ["loan", "loans", "borrow", "repay", "overdue", "dpd", "interest due"])
-
-
-def _wants_contributions(text: str) -> bool:
-    t = _lc(text)
-    return any(k in t for k in ["contribution", "contributions"])
-
-
-def _wants_foundation(text: str) -> bool:
-    t = _lc(text)
-    return "foundation" in t
-
-
-def _wants_payouts(text: str) -> bool:
-    t = _lc(text)
-    return any(k in t for k in ["payout", "payouts", "beneficiary"])
-
-
-def _wants_attendance(text: str) -> bool:
-    t = _lc(text)
-    return any(k in t for k in ["attendance", "present", "absent"])
 
 
 _MEMBER_ID_PATTERNS = [
@@ -322,22 +294,12 @@ def _extract_member_id(text: str) -> Optional[str]:
 
 
 def _extract_relation_name(text: str) -> Optional[str]:
-    """
-    Accept:
-      - "show contributions"
-      - "describe loans"
-      - "columns v_finance_kpis"
-      - "open loan_requests"
-    """
     t = _lc(text)
     t = re.sub(r"^(show|preview|open|describe|columns|cols|schema)\s+", "", t).strip()
-    # allow "table X"
     t = re.sub(r"^table\s+", "", t).strip()
-    # remove trailing punctuation
     t = re.sub(r"[^\w]+$", "", t)
     if not t:
         return None
-    # if user included many words, take first token
     token = t.split()[0]
     return token if token in RELATIONS else None
 
@@ -360,11 +322,9 @@ def _load_members_truth(sb_anon, sb_service, schema: str, limit: int = 3000) -> 
     out = pd.DataFrame()
     out["member_id"] = df[id_col].astype(str)
 
-    # IMPORTANT FIX (your issue):
-    # If display_name exists but is NULL, we must fallback to name.
+    # FIX: display_name may exist but be NULL -> fallback to name
     if display_col and display_col in df.columns:
         disp = df[display_col].astype(str)
-        # treat "None"/"nan" and empty as missing
         disp_clean = disp.replace(["None", "nan", "NaN", "NULL", "null"], "").fillna("").str.strip()
     else:
         disp_clean = pd.Series([""] * len(df))
@@ -378,7 +338,6 @@ def _load_members_truth(sb_anon, sb_service, schema: str, limit: int = 3000) -> 
     out["member_name"] = disp_clean.where(disp_clean != "", nm_clean)
     out["member_name"] = out["member_name"].fillna("").replace("", "(no name)")
 
-    # sort by id numeric
     try:
         out["_id_num"] = pd.to_numeric(out["member_id"], errors="coerce")
         out = out.sort_values(["_id_num", "member_id"], ascending=True).drop(columns=["_id_num"])
@@ -407,14 +366,9 @@ def _member_financial_totals(
     member_id: str,
     members_truth: pd.DataFrame,
 ) -> Tuple[str, Dict[str, Any]]:
-    """
-    Prefer v_member_financial_totals view.
-    If view returns nothing, compute from tables.
-    Always use members table for name.
-    """
     name = _member_name_from_truth(members_truth, member_id)
 
-    # 1) Preferred: view
+    # Preferred: view
     if "v_member_financial_totals" in RELATIONS:
         v = _sb_select(
             sb_anon,
@@ -431,16 +385,9 @@ def _member_financial_totals(
             contrib = row.get("contributions_total", row.get("contribution_total", row.get("contributions", 0)))
             found = row.get("foundation_total", row.get("foundation_contributions_total", row.get("foundation", 0)))
             fines = row.get("fines_total", row.get("fines", 0))
-            active_bal = row.get(
-                "active_loan_balance",
-                row.get("loan_balance", row.get("principal_current_total", 0)),
-            )
-            unpaid_int = row.get(
-                "active_unpaid_interest",
-                row.get("unpaid_interest_total", row.get("unpaid_interest", 0)),
-            )
+            active_bal = row.get("active_loan_balance", row.get("loan_balance", row.get("principal_current_total", 0)))
+            unpaid_int = row.get("active_unpaid_interest", row.get("unpaid_interest_total", row.get("unpaid_interest", 0)))
             interest = row.get("interest_total", row.get("interest_ledger_total", row.get("interest", 0)))
-            loans_count = row.get("loans_count", row.get("loan_count", None))
 
             msg = (
                 f"Hello 👋🏽 Here’s the grounded summary for **{name}** (member_id={member_id}):\n\n"
@@ -451,39 +398,24 @@ def _member_financial_totals(
                 f"- Active unpaid interest: **{_fmt(unpaid_int)}**\n"
                 f"- Interest ledger total: **{_fmt(interest)}**\n"
             )
-            if loans_count is not None:
-                msg += f"- Loans count: **{loans_count}**\n"
-
-            msg += "\nWant the loan rows for this member? (Say: **loans for member "
-            msg += f"{member_id}**)"
             return msg, {"source": "v_member_financial_totals", "row": row, "member_name": name}
 
-    # 2) Fallback compute from tables
-    contributions = _sb_select(
-        sb_anon, sb_service, schema, "contributions", cols="*", limit=20000, filters=[("member_id", "eq", member_id)]
-    )
-    foundation = _sb_select(
-        sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=20000, filters=[("member_id", "eq", member_id)]
-    )
-    fines = _sb_select(
-        sb_anon, sb_service, schema, "fines", cols="*", limit=20000, filters=[("member_id", "eq", member_id)]
-    )
-    loans = _sb_select(
-        sb_anon, sb_service, schema, "loans", cols="*", limit=10000, filters=[("member_id", "eq", member_id)]
-    )
-    interest_ledger = _sb_select(
-        sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=20000, filters=[("member_id", "eq", member_id)]
-    )
+    # Fallback: compute from tables
+    contributions = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=20000, filters=[("member_id", "eq", member_id)])
+    foundation = _sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=20000, filters=[("member_id", "eq", member_id)])
+    fines = _sb_select(sb_anon, sb_service, schema, "fines", cols="*", limit=20000, filters=[("member_id", "eq", member_id)])
+    loans = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=10000, filters=[("member_id", "eq", member_id)])
+    interest_ledger = _sb_select(sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=20000, filters=[("member_id", "eq", member_id)])
 
     contrib_amt = _pick_col(contributions, ["amount", "contribution_amount", "paid_amount"])
     found_amt = _pick_col(foundation, ["amount", "base_amount", "foundation_amount"])
     fines_amt = _pick_col(fines, ["amount", "fine_amount"])
     int_amt = _pick_col(interest_ledger, ["amount", "interest_amount", "interest"])
 
+    status_col = _pick_col(loans, ["status"])
     principal_current = _pick_col(loans, ["principal_current", "balance", "outstanding_principal"])
     principal = _pick_col(loans, ["principal", "amount"])
 
-    status_col = _pick_col(loans, ["status"])
     active = loans
     if status_col and status_col in loans.columns:
         active = loans[loans[status_col].astype(str).str.lower().isin(["active", "open", "ongoing", "overdue"])]
@@ -499,27 +431,19 @@ def _member_financial_totals(
         f"- Loans count: **{len(loans)}**\n"
         f"- Active loan balance: **{_fmt(active_bal)}**\n"
         f"- Active unpaid interest: **{_fmt(unpaid_interest)}**\n"
-        f"- Interest ledger total: **{_fmt(_safe_sum(interest_ledger, int_amt))}**\n\n"
-        f"Want the loan rows for this member? (Say: **loans for member {member_id}**)"
+        f"- Interest ledger total: **{_fmt(_safe_sum(interest_ledger, int_amt))}**\n"
     )
     return msg, {"source": "tables_fallback", "member_name": name}
 
 
-def _loans_with_member(
-    sb_anon,
-    sb_service,
-    schema: str,
-    member_id: Optional[str],
-    members_truth: pd.DataFrame,
-) -> Tuple[str, pd.DataFrame, str]:
+def _loans_with_member(sb_anon, sb_service, schema: str, member_id: Optional[str], members_truth: pd.DataFrame) -> Tuple[str, pd.DataFrame, str]:
     if "v_loans_with_member" in RELATIONS:
         filters = [("member_id", "eq", member_id)] if member_id else None
         df = _sb_select(sb_anon, sb_service, schema, "v_loans_with_member", cols="*", limit=5000, filters=filters)
         src = "v_loans_with_member"
     else:
         filters = [("member_id", "eq", member_id)] if member_id else None
-        loans = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=5000, filters=filters)
-        df = loans
+        df = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=5000, filters=filters)
         if not df.empty and "member_id" in df.columns and not members_truth.empty:
             df = df.merge(members_truth, how="left", on="member_id")
         src = "loans (+ members join)"
@@ -538,7 +462,6 @@ def _kpis(sb_anon, sb_service, schema: str) -> Tuple[str, pd.DataFrame, str]:
 
 
 def _describe_relation(sb_anon, sb_service, schema: str, relation: str) -> Tuple[str, pd.DataFrame, str]:
-    # Use a 1-row select and list columns (works even when information_schema is blocked)
     df = _sb_select(sb_anon, sb_service, schema, relation, cols="*", limit=1)
     cols = list(df.columns) if df is not None else []
     out = pd.DataFrame({"column_name": cols})
@@ -553,7 +476,7 @@ def _show_relation(sb_anon, sb_service, schema: str, relation: str) -> Tuple[str
 
 
 # -----------------------------------------------------------------------------
-# Optional Internet (Tavily) — NEVER used for Njangi numbers
+# Internet (Tavily) — NEVER used for Njangi numbers
 # -----------------------------------------------------------------------------
 def _internet_enabled() -> bool:
     key = (os.getenv("TAVILY_API_KEY") or "").strip()
@@ -592,7 +515,7 @@ def _tavily_search(query: str) -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# HF Router (optional; only for general chat phrasing)
+# HF Router (optional; only for general chat wording)
 # -----------------------------------------------------------------------------
 def _post_with_retries(url: str, headers: dict, payload: dict, timeout: int = 60) -> Tuple[bool, str]:
     last_err = ""
@@ -717,18 +640,16 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         st.write("**Internet**:", "✅ ON" if internet_on else "❌ OFF")
         st.caption("Njangi numbers are ALWAYS answered from DB (tables/views). HF is only for general chat wording.")
 
-    # Cache members truth
     @st.cache_data(ttl=30, show_spinner=False)
     def _cached_members_truth(_ts: int) -> pd.DataFrame:
         return _load_members_truth(sb_anon, sb_service, schema, limit=3000)
 
     members_truth = _cached_members_truth(int(time.time() // 10))
 
-    # Chat init
+    # ✅ ONLY INTRO LINE
     if "younchat_history" not in st.session_state:
-        st.session_state["younchat_history"] = [{"role": "assistant", "content": _hello_intro()}]
+        st.session_state["younchat_history"] = [{"role": "assistant", "content": _intro_only()}]
 
-    # show chat
     for m in st.session_state["younchat_history"]:
         with st.chat_message("assistant" if m.get("role") == "assistant" else "user"):
             st.markdown(m.get("content", ""))
@@ -738,7 +659,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         st.cache_data.clear()
         st.rerun()
     if colB.button("🧹 Clear chat", use_container_width=True):
-        st.session_state["younchat_history"] = [{"role": "assistant", "content": _hello_intro()}]
+        st.session_state["younchat_history"] = [{"role": "assistant", "content": _intro_only()}]
         st.session_state.pop("younchat_last_member_id", None)
         st.rerun()
 
@@ -750,113 +671,92 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     with st.chat_message("user"):
         st.markdown(q)
 
-    # Persist member focus
     detected_id = _extract_member_id(q)
     if detected_id:
         st.session_state["younchat_last_member_id"] = detected_id
     member_id_focus = st.session_state.get("younchat_last_member_id")
 
-    # -------------------------
-    # LOCAL ROUTER (DB TRUTH)
-    # -------------------------
     used_source = "local"
     answer = ""
     df_show: Optional[pd.DataFrame] = None
     df_title: Optional[str] = None
 
-    # Help
     if _wants_help(q):
         used_source = "help"
         answer = (
-            "Hello 👋🏽 Here’s what I can do (DB-first):\n\n"
-            "**Core commands:**\n"
-            "- **members** → list all members (from `members`)\n"
-            "- type **10** → summary for member_id 10\n"
+            "Hello 👋🏽 Commands:\n\n"
+            "- **members**\n"
+            "- type **10** (member summary)\n"
             "- **loans** / **loans for member 10**\n"
-            "- **finance kpis**\n\n"
-            "**Read ANY table/view (from allowlist):**\n"
-            "- **tables** → list all readable relations\n"
-            "- **show contributions** → preview rows\n"
-            "- **describe loans** → list columns\n\n"
-            "Tip: If a table exists but you don’t see it here, add it to `RELATIONS`."
+            "- **finance kpis**\n"
+            "- **tables**\n"
+            "- **show <table>** (example: show contributions)\n"
+            "- **describe <table>** (example: describe loans)\n"
         )
 
-    # List relations
     elif _wants_tables_list(q):
         used_source = "relations"
-        rows = []
-        for k in sorted(RELATIONS.keys()):
-            rows.append({"relation": k, "type": RELATIONS[k].get("type", "?")})
+        rows = [{"relation": k, "type": RELATIONS[k].get("type", "?")} for k in sorted(RELATIONS.keys())]
         df_show = pd.DataFrame(rows)
         df_title = "Readable relations (allowlist)"
-        answer = "Hello 👋🏽 Here are the tables/views younchat can read (allowlist):"
+        answer = "Hello 👋🏽 Here are the tables/views younchat can read:"
 
-    # Describe
     elif _wants_describe(q):
         rel = _extract_relation_name(q)
         if not rel:
             used_source = "describe"
-            answer = "Hello 👋🏽 Tell me the relation name, like: **describe loans** or **columns contributions**."
+            answer = "Hello 👋🏽 Say: **describe loans** (or any table/view in the allowlist)."
         else:
             answer, df_show, used_source = _describe_relation(sb_anon, sb_service, schema, rel)
             df_title = f"Columns: {rel}"
 
-    # Show/preview
     elif _wants_show_table(q):
         rel = _extract_relation_name(q)
         if not rel:
             used_source = "show"
-            answer = "Hello 👋🏽 Tell me which table/view to preview, like: **show contributions**."
+            answer = "Hello 👋🏽 Say: **show contributions** (or any table/view in the allowlist)."
         else:
             answer, df_show, used_source = _show_relation(sb_anon, sb_service, schema, rel)
             df_title = f"Preview: {rel}"
 
-    # Members list
     elif _wants_list_members(q):
         used_source = "members"
         if members_truth is None or members_truth.empty:
             answer = "Hello 👋🏽 I couldn’t read **members** (source of truth). Check RLS / permissions."
         else:
-            lines = ["Hello 👋🏽 Here are all members (source of truth = `members`):\n"]
+            lines = ["Hello 👋🏽 Here are all members (from `members`):\n"]
             for r in members_truth.itertuples(index=False):
                 lines.append(f"- **{r.member_id}** • {r.member_name}")
             answer = "\n".join(lines)
             df_show, df_title = members_truth, "members (truth)"
 
-    # KPIs
     elif _wants_kpis(q):
         title, df, src = _kpis(sb_anon, sb_service, schema)
         used_source = src
         df_show, df_title = df, title
-        answer = f"Hello 👋🏽 Here are your **{title}** (from `{src}`):" if not df.empty else "Hello 👋🏽 No KPI rows returned."
+        answer = f"Hello 👋🏽 {title} (from `{src}`):" if not df.empty else "Hello 👋🏽 No KPI rows returned."
 
-    # Loans
     elif _wants_loans(q):
         mid = _extract_member_id(q) or member_id_focus
         title, df, src = _loans_with_member(sb_anon, sb_service, schema, mid, members_truth)
         used_source = src
         df_show, df_title = df, title
-        answer = f"Hello 👋🏽 {title} (from `{src}`): showing latest rows." if not df.empty else f"Hello 👋🏽 {title}: no rows returned."
+        answer = f"Hello 👋🏽 {title} (from `{src}`):" if not df.empty else f"Hello 👋🏽 {title}: no rows returned."
 
-    # Member summary (numbers)
     elif member_id_focus and (q.strip().isdigit() or "member" in _lc(q) or "summary" in _lc(q) or "status" in _lc(q)):
         answer, meta = _member_financial_totals(sb_anon, sb_service, schema, str(member_id_focus), members_truth)
         used_source = meta.get("source", "member_summary_local")
 
-    # Fallback: if user typed a relation name directly, preview it
     elif _lc(q) in RELATIONS:
         rel = _lc(q)
         answer, df_show, used_source = _show_relation(sb_anon, sb_service, schema, rel)
         df_title = f"Preview: {rel}"
 
-    # Otherwise: optional HF for modern phrasing (NO numbers)
     else:
         if hf_token:
             sys = (
-                "You are younchat. Keep answers modern and friendly.\n"
-                "If the user asks for Njangi numbers, DO NOT invent numbers. "
-                "Instead, suggest DB commands: members / loans / finance kpis / show <table> / describe <table>.\n"
-                "Never claim you cannot provide member info; member lists and summaries are allowed if coming from DB.\n"
+                "You are younchat. Salute with 'Hello'. Keep it modern.\n"
+                "Do NOT invent Njangi numbers. Suggest DB commands when needed.\n"
             )
             messages = [{"role": "system", "content": sys}]
             for m in st.session_state["younchat_history"][-10:]:
@@ -864,11 +764,10 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                     messages.append({"role": m["role"], "content": m.get("content", "")})
             ok, txt, mode = _hf_call(hf_model, hf_token, messages)
             used_source = f"hf:{mode}" if ok else "hf:failed"
-            answer = txt if ok else f"Hello 👋🏽 I can’t reach HF right now: {txt}\n\nTry: **help**, **members**, **loans**, **finance kpis**, **tables**."
+            answer = txt if ok else f"Hello 👋🏽 HF is not reachable: {txt}"
         else:
             answer = "Hello 👋🏽 Try: **help**, **members**, **loans**, **finance kpis**, **tables**, **show contributions**, **describe loans**."
 
-    # Output
     st.session_state["younchat_history"].append({"role": "assistant", "content": answer})
     with st.chat_message("assistant"):
         st.markdown(answer)
