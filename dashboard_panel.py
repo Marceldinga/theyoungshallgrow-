@@ -2,11 +2,11 @@
 # dashboard_panel.py ✅ COMPLETE SINGLE FILE — CLEAN Dashboard + 🤖 Young AI (grounded) + Safe Nav
 # ---------------------------------------------------------------------------------------------
 # ✅ NJANGI STANDARD (NO legacy)
-# ✅ CLEAN DASHBOARD (your request):
+# ✅ CLEAN DASHBOARD:
 #   - Only KPIs + Attendance + Young AI box
 #   - No extra banners/status text at the top
 #
-# ✅ Young AI behavior (your request):
+# ✅ Young AI behavior:
 #   - Uses name: "Young"
 #   - Responses MUST match the question asked (no random answers)
 #   - ChatGPT-standard style: short + direct + grounded
@@ -51,6 +51,13 @@ try:
     import requests
 except Exception:
     requests = None  # type: ignore
+
+
+# ============================================================
+# ✅ FIX: HF ROUTER ENDPOINTS (prevents NameError)
+# ============================================================
+HF_ROUTER_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
+HF_ROUTER_COMPLETIONS_URL = "https://router.huggingface.co/v1/completions"
 
 
 # ============================================================
@@ -417,7 +424,6 @@ def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 6
 
 
 def _snapshot_prompt(snapshot: Dict[str, Any], question: str) -> str:
-    # This prompt forces the model to answer ONLY the question asked.
     return (
         "You are Young, an assistant inside a dashboard.\n"
         "Rules:\n"
@@ -494,7 +500,6 @@ def _young_answer_rules(q: str, snap: Dict[str, Any]) -> str:
         except Exception:
             return str(x)
 
-    # Only answer what is asked (simple intent checks)
     if not t:
         return "Hello 👋🏽 Ask a question about this dashboard snapshot."
 
@@ -536,7 +541,6 @@ def _young_answer_rules(q: str, snap: Dict[str, Any]) -> str:
     if "interest" in t:
         return f"Hello 👋🏽 Interest total: **{money(interest_total)}**."
 
-    # Unknown question
     return "Hello 👋🏽 I don’t have that in this snapshot. Check another page (Loans / Contributions / Minutes)."
 
 
@@ -665,22 +669,13 @@ def _render_young_ai_view(snapshot: Dict[str, Any]):
 # MAIN DASHBOARD (CLEAN)
 # ============================================================
 def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
-    """
-    CLEAN dashboard:
-      - KPIs
-      - Attendance
-      - Young AI
-    """
     sb_read = sb_service if sb_service is not None else sb_anon
 
-    # Ensure current session (do not print the verbose message)
     session_id, _ = _ensure_current_session(sb_anon=sb_anon, sb_service=sb_service, schema=schema)
 
-    # Members count
     members_rows = _safe_select(sb_read, schema, "members", "id", limit=5000, show_error=False)
     total_members = len(members_rows) if members_rows else 0
 
-    # Contributions (current session)
     contrib_rows: List[Dict[str, Any]] = []
     if session_id is not None:
         contrib_rows = _safe_select(
@@ -697,7 +692,6 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
     members_paid = _count_distinct(contrib_rows, "member_id")
     current_pot = float(cycle_total)
 
-    # Attendance (current session)
     attendance_rows: List[Dict[str, Any]] = []
     if session_id is not None and _table_readable(sb_read, schema, "attendance"):
         attendance_rows = _safe_select(
@@ -719,7 +713,6 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
         except Exception:
             pass
 
-    # Loans (active)
     loans_rows: List[Dict[str, Any]] = []
     if _table_readable(sb_read, schema, "loans"):
         loans_rows = _safe_select(
@@ -745,25 +738,21 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
                 except Exception:
                     pass
 
-    # Fines
     fines_total = 0.0
     if _table_readable(sb_read, schema, "fines"):
         fines_rows = _safe_select(sb_read, schema, "fines", "amount,created_at", limit=20000, show_error=False)
         fines_total = _sum_amount(fines_rows, "amount")
 
-    # Repayments
     repayments_total = 0.0
     if _table_readable(sb_read, schema, "loan_payments"):
         pay_rows = _safe_select(sb_read, schema, "loan_payments", "amount,created_at", limit=20000, show_error=False)
         repayments_total = _sum_amount(pay_rows, "amount")
 
-    # Interest
     interest_total = 0.0
     if _table_readable(sb_read, schema, "interest_ledger"):
         i_rows = _safe_select(sb_read, schema, "interest_ledger", "amount,created_at", limit=20000, show_error=False)
         interest_total = _sum_amount(i_rows, "amount")
 
-    # KPIs
     c1, c2, c3, c4, c5 = st.columns([0.9, 0.9, 0.9, 0.9, 1.2])
     with c1:
         st.metric("Session ID", session_id if session_id is not None else "—")
@@ -778,7 +767,6 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
 
     st.divider()
 
-    # Attendance
     st.subheader("🧾 Attendance (session)")
     if session_id is None:
         st.info("No session selected.")
@@ -791,7 +779,6 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
 
     st.divider()
 
-    # Snapshot for Young AI
     snapshot = {
         "schema": schema,
         "session_id": session_id,
