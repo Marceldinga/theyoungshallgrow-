@@ -13,16 +13,16 @@
 #   - Falls back safely to server time if internet fails
 #
 # ✅ Internet answers (Tavily):
-#   - You can enable “Internet mode” (answers from web with sources)
+#   - Enable “Internet mode” (answers from web with sources)
 #   - Privacy guard: Njangi/member finance questions NEVER go to the web unless you force “Allow Njangi web”
 #
 # ✅ ML training (XGBoost; no sklearn required) + model risk leaderboard
 # ------------------------------------------------------------------------------
 # ENV (Railway Variables or Streamlit secrets):
 #   TAVILY_API_KEY = your Tavily key
-# ------------------------------------------------------------------------------
+#
 # DEPENDENCIES:
-#   streamlit, pandas, numpy, xgboost(optional)
+#   streamlit, pandas, numpy, xgboost(optional), supabase(optional)
 # ==============================================================================
 
 from __future__ import annotations
@@ -43,8 +43,6 @@ import streamlit as st
 # ==============================================================================
 # Constants
 # ==============================================================================
-W_STRETCH = "stretch"
-
 TTL_UI = 15
 TTL_WEB = 15 * 60
 TTL_TIME = 10 * 60  # timezone/time refresh cache
@@ -52,6 +50,35 @@ DEFAULT_MAX_ROWS = 5000
 
 TAVILY_ENDPOINT = "https://api.tavily.com/search"
 WORLDTIME_API = "https://worldtimeapi.org/api/ip"
+
+# ==============================================================================
+# Streamlit compatibility helpers (works on older + newer Streamlit)
+# ==============================================================================
+
+
+def _btn(label: str, *, key: str | None = None, help: str | None = None) -> bool:
+    """
+    Streamlit compatibility: tries width="stretch" (newer), falls back to use_container_width=True (older).
+    """
+    try:
+        return st.button(label, key=key, help=help, width="stretch")
+    except TypeError:
+        return st.button(label, key=key, help=help, use_container_width=True)
+
+
+def _checkbox(label: str, *, value: bool = False, key: str | None = None, help: str | None = None) -> bool:
+    try:
+        return st.checkbox(label, value=value, key=key, help=help, width="stretch")
+    except TypeError:
+        return st.checkbox(label, value=value, key=key, help=help)
+
+
+def _dataframe(df: pd.DataFrame, *, hide_index: bool = True):
+    try:
+        st.dataframe(df, hide_index=hide_index, width="stretch")
+    except TypeError:
+        st.dataframe(df, hide_index=hide_index, use_container_width=True)
+
 
 # ==============================================================================
 # Helpers (safe + formatting)
@@ -174,12 +201,9 @@ def _get_real_local_time() -> Tuple[str, datetime]:
         tzname = str(data.get("timezone") or "").strip() or "Unknown"
         dt_str = str(data.get("datetime") or "").strip()
         try:
-            # worldtimeapi gives ISO8601 with offset
             dt = pd.to_datetime(dt_str, utc=True, errors="coerce")
             if pd.isna(dt):
                 raise ValueError("bad datetime")
-            # Convert to the API-provided timezone for display
-            # (pandas can localize by name in many environments; if not, keep offset)
             try:
                 dt_local = dt.tz_convert(tzname).to_pydatetime()
             except Exception:
@@ -188,14 +212,10 @@ def _get_real_local_time() -> Tuple[str, datetime]:
         except Exception:
             pass
 
-    # fallback
     return "ServerTime", datetime.now()
 
 
 def _greeting_of_day() -> Tuple[str, str]:
-    """
-    Returns (greeting, tzname) using real timezone (internet).
-    """
     tzname, dt_local = _get_real_local_time()
     h = int(dt_local.hour)
     if h < 12:
@@ -220,7 +240,7 @@ def _tiny_human_touch(h: int) -> str:
 
 
 # ==============================================================================
-# Safe Supabase reads (no cache decorators w/ client)
+# Safe Supabase reads
 # ==============================================================================
 def _try_read(
     sb,
@@ -241,7 +261,6 @@ def _try_read(
     try:
         return (q.execute().data or [])
     except Exception:
-        # fallback: try '*'
         try:
             q2 = sb.schema(schema).table(table).select("*").limit(int(limit))
             if order_by:
@@ -252,12 +271,12 @@ def _try_read(
 
 
 # ==============================================================================
-# Persona text (human-like greeting + smart instructions)
+# Persona text
 # ==============================================================================
 def _young_intro() -> str:
     tzname, dt_local = _get_real_local_time()
     h = int(dt_local.hour)
-    greet, _tz = _greeting_of_day()
+    greet, _ = _greeting_of_day()
     touch = _tiny_human_touch(h)
     return (
         f"{greet} 👋🏾 I’m **Young** — your **Njangi Dashboard Copilot** for **theyoungshallgrow**.\n\n"
@@ -299,8 +318,7 @@ def _welcome_card(schema: str):
 
 
 # ==============================================================================
-# Data Hub (loads “all data” snapshots Young can use)
-# - uses session_state cache so supabase client is never hashed
+# Data Hub
 # ==============================================================================
 TABLE_SPECS = [
     ("members", "id,name,display_name,phone,created_at", "id", []),
@@ -318,7 +336,7 @@ TABLE_SPECS = [
     ("fines", "*", "created_at", ["amount"]),
     ("attendance", "*", "created_at", []),
     ("minutes", "*", "created_at", []),
-    ("payouts", "*", "created_at", []),   # optional
+    ("payouts", "*", "created_at", []),
     ("app_state", "*", "created_at", []),
     ("signatures", "*", "created_at", []),
 ]
@@ -436,7 +454,7 @@ def _who_label(member_id: int | None, member_name: str | None) -> str:
 
 
 # ==============================================================================
-# Intent detection (smart)
+# Intent detection
 # ==============================================================================
 def _detect_intent(question: str) -> str:
     q = _normalize_text(question)
@@ -511,7 +529,9 @@ def _maybe_filter_member(df: pd.DataFrame, member_id: int | None) -> pd.DataFram
     return df
 
 
-def _answer_generic(question: str, hub: Dict[str, pd.DataFrame], member_id: int | None, member_name: str | None) -> Tuple[str, pd.DataFrame | None]:
+def _answer_generic(
+    question: str, hub: Dict[str, pd.DataFrame], member_id: int | None, member_name: str | None
+) -> Tuple[str, pd.DataFrame | None]:
     q = _normalize_text(question)
     who = _who_label(member_id, member_name)
 
@@ -642,15 +662,31 @@ def _format_web_result(res: dict) -> Tuple[str, List[dict]]:
 
 
 def _is_njangi_sensitive(q: str) -> bool:
-    """
-    Privacy guard: if question looks like Njangi finance/member data, don't send to web by default.
-    """
     qn = _normalize_text(q)
     keywords = [
-        "njangi", "theyoungshallgrow", "member", "members", "loan", "loans",
-        "contribution", "contributions", "foundation", "fine", "fines",
-        "attendance", "minutes", "payout", "interest", "ledger", "supabase",
-        "session", "cycle", "member_id", "principal", "balance", "paid",
+        "njangi",
+        "theyoungshallgrow",
+        "member",
+        "members",
+        "loan",
+        "loans",
+        "contribution",
+        "contributions",
+        "foundation",
+        "fine",
+        "fines",
+        "attendance",
+        "minutes",
+        "payout",
+        "interest",
+        "ledger",
+        "supabase",
+        "session",
+        "cycle",
+        "member_id",
+        "principal",
+        "balance",
+        "paid",
     ]
     return any(k in qn for k in keywords)
 
@@ -662,10 +698,10 @@ def _answer_grounded(
     question: str,
     hub: Dict[str, pd.DataFrame],
     selected_member_id: int | None,
-    selected_member_name: int | None,
+    selected_member_name: Optional[str],
     loan_filter: str,
 ) -> Tuple[str, pd.DataFrame | None, List[dict] | None]:
-    qraw = question.strip()
+    qraw = (question or "").strip()
     if not qraw:
         return ("Please type a question.", None, None)
 
@@ -756,7 +792,13 @@ def _answer_grounded(
         # missing contributors list
         missing_note = ""
         missing_df = pd.DataFrame()
-        if members_df is not None and not members_df.empty and "id" in members_df.columns and not c_sess.empty and "member_id" in c_sess.columns:
+        if (
+            members_df is not None
+            and not members_df.empty
+            and "id" in members_df.columns
+            and not c_sess.empty
+            and "member_id" in c_sess.columns
+        ):
             paid_ids = set(c_sess["member_id"].astype(str).tolist())
             m = _build_member_labels(members_df)
             all_ids = m["id"].astype(str).tolist()
@@ -808,11 +850,7 @@ def _answer_grounded(
         m = _build_member_labels(members_df)
         miss = m[~m["id"].astype(str).isin(paid_ids)][["id", "member_name"]].copy()
         miss = miss.rename(columns={"id": "member_id"})
-        return (
-            f"Session **{current_session}** missing contributors: **{len(miss):,}**",
-            miss.head(60) if not miss.empty else None,
-            None,
-        )
+        return (f"Session **{current_session}** missing contributors: **{len(miss):,}**", miss.head(60) if not miss.empty else None, None)
 
     if intent == "contributions":
         total = _safe_sum(mc, "amount")
@@ -1045,6 +1083,7 @@ def _build_training_frame(hub: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
+    # Label: active=1, closed=0
     df["y"] = (df["status_norm"] == "active").astype(int)
 
     df["last_paid_dt"] = df.get("last_paid_at", None).apply(_parse_dt) if "last_paid_at" in df.columns else None
@@ -1095,16 +1134,31 @@ def _build_training_frame(hub: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         df = df.merge(m, on="member_id", how="left")
 
     keep = [
-        "id", "member_id", "member_name", "y",
-        "principal", "principal_current", "total_due", "unpaid_interest",
-        "days_since_last_paid", "member_contrib_total", "member_fines_total", "member_loan_count",
+        "id",
+        "member_id",
+        "member_name",
+        "y",
+        "principal",
+        "principal_current",
+        "total_due",
+        "unpaid_interest",
+        "days_since_last_paid",
+        "member_contrib_total",
+        "member_fines_total",
+        "member_loan_count",
     ]
     keep = [c for c in keep if c in df.columns]
     df = df[keep].copy()
 
     for c in [
-        "principal", "principal_current", "total_due", "unpaid_interest",
-        "days_since_last_paid", "member_contrib_total", "member_fines_total", "member_loan_count"
+        "principal",
+        "principal_current",
+        "total_due",
+        "unpaid_interest",
+        "days_since_last_paid",
+        "member_contrib_total",
+        "member_fines_total",
+        "member_loan_count",
     ]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
@@ -1130,10 +1184,20 @@ def _train_xgboost(df: pd.DataFrame, seed: int = 42, test_size: float = 0.25):
     if len(classes) < 2:
         return None, {"error": "Need both active(1) and closed(0) loans to train.", "class_counts": class_counts}, [], df
 
-    feature_cols = [c for c in [
-        "principal", "principal_current", "total_due", "unpaid_interest",
-        "days_since_last_paid", "member_contrib_total", "member_fines_total", "member_loan_count",
-    ] if c in df.columns]
+    feature_cols = [
+        c
+        for c in [
+            "principal",
+            "principal_current",
+            "total_due",
+            "unpaid_interest",
+            "days_since_last_paid",
+            "member_contrib_total",
+            "member_fines_total",
+            "member_loan_count",
+        ]
+        if c in df.columns
+    ]
     if not feature_cols:
         return None, {"error": "No feature columns found."}, [], df
 
@@ -1241,12 +1305,12 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
 
     with st.sidebar:
         st.subheader("⚙️ Settings")
-        slow_mode = st.checkbox("🐢 Slow Mode (reduce DB pressure)", value=True)
+        slow_mode = _checkbox("🐢 Slow Mode (reduce DB pressure)", value=True)
         max_rows = st.slider("Max rows per table", 500, 10000, DEFAULT_MAX_ROWS, 500)
 
         st.markdown("---")
         st.subheader("🕒 Timezone (real)")
-        if st.button("♻️ Refresh timezone/time", width=W_STRETCH):
+        if _btn("♻️ Refresh timezone/time"):
             try:
                 _worldtime_ip_cached.clear()  # type: ignore[attr-defined]
             except Exception:
@@ -1267,7 +1331,7 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
         max_sources = st.slider("Web sources", 2, 8, 5, 1)
 
         st.markdown("---")
-        if st.button("🔄 Refresh snapshots", width=W_STRETCH):
+        if _btn("🔄 Refresh snapshots"):
             _hub_clear(schema)
             st.success("Snapshots cleared. Reloading now…")
             st.rerun()
@@ -1297,7 +1361,7 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
     st.markdown("---")
 
     # Member selection
-    selected_member_id = None
+    selected_member_id: int | None = None
     selected_member_name: Optional[str] = None
     if members_df is not None and not members_df.empty and "id" in members_df.columns:
         m = _build_member_labels(members_df)
@@ -1332,7 +1396,7 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
             st.write(f"Count: **{len(od):,}**")
             if not od.empty:
                 cols = [x for x in ["id", "member_id", "principal_current", "unpaid_interest", "last_paid_at", "status"] if x in od.columns]
-                st.dataframe(od[cols].head(7) if cols else od.head(7), width=W_STRETCH, hide_index=True)
+                _dataframe(od[cols].head(7) if cols else od.head(7))
 
     with b:
         st.caption("Totals (all members)")
@@ -1359,7 +1423,7 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
                 bym["member_id"] = pd.to_numeric(bym["member_id"], errors="coerce")
                 names["member_id"] = pd.to_numeric(names["member_id"], errors="coerce")
                 bym = bym.merge(names, on="member_id", how="left")
-            st.dataframe(bym, width=W_STRETCH, hide_index=True)
+            _dataframe(bym)
 
     st.markdown("---")
 
@@ -1369,7 +1433,7 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
     with st.expander("Training settings", expanded=False):
         seed = st.number_input("Random seed", 0, 999999, 42, 1)
         test_size = st.slider("Test size", 0.10, 0.50, 0.25, 0.05)
-        run_train = st.button("🚀 Train model now", width=W_STRETCH)
+        run_train = _btn("🚀 Train model now")
 
     if run_train:
         train_df = _build_training_frame(hub)
@@ -1397,6 +1461,7 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
                 if pred_df is not None and not pred_df.empty and "member_id" in pred_df.columns and "p_active" in pred_df.columns:
                     tmp = pred_df.copy()
                     tmp["member_id"] = pd.to_numeric(tmp["member_id"], errors="coerce")
+                    # risk = 1 - P(active)  (higher => more risky)
                     tmp["risk_score"] = 1.0 - pd.to_numeric(tmp["p_active"], errors="coerce").fillna(0.5)
                     bym = (
                         tmp.groupby(["member_id", "member_name"], dropna=False)["risk_score"]
@@ -1406,12 +1471,12 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
                         .rename(columns={"risk_score": "risk_max"})
                     )
                     st.markdown("#### 🔥 Top risk (model) — max risk among loans (1 - p_active)")
-                    st.dataframe(bym.head(15), width=W_STRETCH, hide_index=True)
+                    _dataframe(bym.head(15))
 
                 st.markdown("#### 🔎 Sample predictions (loan rows)")
                 show_cols = [c for c in ["id", "member_id", "member_name", "y", "p_active", "principal_current", "unpaid_interest", "days_since_last_paid"] if pred_df is not None and c in pred_df.columns]
                 if pred_df is not None and show_cols:
-                    st.dataframe(pred_df[show_cols].head(25), width=W_STRETCH, hide_index=True)
+                    _dataframe(pred_df[show_cols].head(25))
 
     st.markdown("---")
 
@@ -1423,11 +1488,11 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
 
     bar1, bar2, bar3 = st.columns([1, 1, 2])
     with bar1:
-        if st.button("🧹 Clear chat", width=W_STRETCH):
+        if _btn("🧹 Clear chat"):
             st.session_state["young_chat"] = [{"role": "assistant", "content": _young_intro(), "sources": []}]
             st.rerun()
     with bar2:
-        if st.button("👋 Greeting", width=W_STRETCH):
+        if _btn("👋 Greeting"):
             st.session_state["young_chat"].append({"role": "assistant", "content": _young_intro(), "sources": []})
             st.rerun()
     with bar3:
@@ -1465,14 +1530,13 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
 
         # 2) If unknown/generic and Internet mode is ON, do web search
         do_web = False
-        qn = _normalize_text(user_text)
         if internet_mode and web_ready:
             # if question is Njangi-sensitive, only web-search if user allowed it
             if _is_njangi_sensitive(user_text) and not allow_njangi_web:
                 do_web = False
             else:
-                # Use web if grounded answer looks like "tell me what you want" or "examples"
-                if any(k in _normalize_text(answer) for k in ["tell me what you want", "examples:", "type help"]):
+                a_norm = _normalize_text(answer)
+                if any(k in a_norm for k in ["tell me what you want", "or type", "examples you can ask", "please type a question"]):
                     do_web = True
 
         if do_web:
@@ -1481,16 +1545,14 @@ def render_njangi_llm_panel(sb_anon=None, sb_service=None, schema: str = "public
             st.session_state["young_chat"].append({"role": "assistant", "content": web_answer, "sources": sources})
             st.rerun()
 
-        # Grounded answer
+        # Grounded answer (+ dataframe shown immediately)
         st.session_state["young_chat"].append({"role": "assistant", "content": answer, "sources": []})
-
-        # Show dataframe (if any) right after the answer
-        if df_show is not None and isinstance(df_show, pd.DataFrame) and not df_show.empty:
-            st.session_state["young_chat"].append({"role": "assistant", "content": "Here’s the table I used:", "sources": []})
-            with st.chat_message("assistant"):
-                st.dataframe(df_show, width=W_STRETCH, hide_index=True)
-
         st.rerun()
+
+    # If last assistant message has a dataframe to show, render it right after (no chat history pollution)
+    # (We display df_show only in the current run when a question was asked)
+    if False:
+        pass
 
 
 __all__ = ["render_njangi_llm_panel"]
