@@ -1,13 +1,15 @@
 
 # njangi_llm_panel.py
 # =============================================================================
-# 💬 YOUR CHAT — Hugging Face Router + Optional Internet Search ✅ SINGLE COMPLETE FILE
+# 💬 younchat — Hugging Face Router + Optional Internet Search ✅ SINGLE COMPLETE FILE
 #
-# ✅ What you asked for:
-#   1) The ONLY name shown is: "Your Chat" (no "Young" anywhere)
-#   2) Chats like a human (chat UI + conversation memory)
-#   3) "Internet is ON" when you provide a web key (Tavily). If no key, it stays OFF safely.
-#   4) Still GROUNDED on live Njangi snapshot for ALL Njangi numbers (no guessing).
+# ✅ What you asked for (FIXED):
+#   1) The ONLY name shown is: "younchat" (no "Your Chat", no "Young")
+#   2) Introduces itself using real time of the day: Good morning/afternoon/evening
+#   3) Chats like a human (Streamlit chat UI + conversation memory)
+#   4) Uses member_id context automatically (selectbox OR typed in chat OR keeps last member_id)
+#   5) "Internet is ON" only when you set TAVILY_API_KEY (otherwise OFF safely)
+#   6) Still GROUNDED on live Njangi snapshot for ALL Njangi numbers (no guessing)
 #
 # ✅ Hugging Face Router (OpenAI-compatible):
 #   - Chat:         https://router.huggingface.co/v1/chat/completions
@@ -30,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -43,7 +46,6 @@ W_STRETCH = "stretch"
 
 HF_ROUTER_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
 HF_ROUTER_COMPLETIONS_URL = "https://router.huggingface.co/v1/completions"
-
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 
 
@@ -52,6 +54,21 @@ TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 # -----------------------------------------------------------------------------
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _tod_greeting() -> str:
+    """
+    Uses server local time. If you want it to match your timezone,
+    set Railway Variable: TZ=America/New_York (or your timezone).
+    """
+    h = datetime.now().hour
+    if 5 <= h < 12:
+        return "Good morning"
+    if 12 <= h < 17:
+        return "Good afternoon"
+    if 17 <= h < 22:
+        return "Good evening"
+    return "Hello"
 
 
 # -----------------------------------------------------------------------------
@@ -118,15 +135,15 @@ def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
 # Snapshot builder (GROUNDING)
 # -----------------------------------------------------------------------------
 def _build_snapshot(sb_anon, sb_service, schema: str) -> Dict[str, Any]:
-    members = _sb_select(sb_anon, sb_service, schema, "members", cols="*", limit=2000)
-    sessions = _sb_select(sb_anon, sb_service, schema, "sessions", cols="*", limit=2000)
-    contributions = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=5000)
-    foundation = _sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=5000)
-    loans = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=2000)
-    loan_payments = _sb_select(sb_anon, sb_service, schema, "loan_payments", cols="*", limit=5000)
-    fines = _sb_select(sb_anon, sb_service, schema, "fines", cols="*", limit=5000)
-    payouts = _sb_select(sb_anon, sb_service, schema, "payouts", cols="*", limit=2000)
-    interest_ledger = _sb_select(sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=5000)
+    members = _sb_select(sb_anon, sb_service, schema, "members", cols="*", limit=3000)
+    sessions = _sb_select(sb_anon, sb_service, schema, "sessions", cols="*", limit=3000)
+    contributions = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=10000)
+    foundation = _sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=10000)
+    loans = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=4000)
+    loan_payments = _sb_select(sb_anon, sb_service, schema, "loan_payments", cols="*", limit=10000)
+    fines = _sb_select(sb_anon, sb_service, schema, "fines", cols="*", limit=10000)
+    payouts = _sb_select(sb_anon, sb_service, schema, "payouts", cols="*", limit=4000)
+    interest_ledger = _sb_select(sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=10000)
 
     name_col = _pick_col(members, ["display_name", "name", "full_name"])
     member_id_col = _pick_col(members, ["id", "member_id"])
@@ -177,7 +194,7 @@ def _build_snapshot(sb_anon, sb_service, schema: str) -> Dict[str, Any]:
         },
         "members_preview": (
             members[[c for c in [member_id_col, name_col] if c and c in members.columns]]
-            .head(100)
+            .head(200)
             .to_dict("records")
             if not members.empty and member_id_col and name_col
             else []
@@ -195,6 +212,45 @@ def _build_snapshot(sb_anon, sb_service, schema: str) -> Dict[str, Any]:
         },
     }
     return snapshot
+
+
+# -----------------------------------------------------------------------------
+# Member_id extraction & persistence
+# -----------------------------------------------------------------------------
+_MEMBER_ID_PATTERNS = [
+    re.compile(r"\bmember[_\s-]?id\s*[:=#]?\s*(\d+)\b", re.IGNORECASE),
+    re.compile(r"\bid\s*[:=#]?\s*(\d+)\b", re.IGNORECASE),
+    re.compile(r"\bmember\s*#?\s*(\d+)\b", re.IGNORECASE),
+]
+_ANY_NUM = re.compile(r"\b(\d{1,6})\b")
+
+
+def _extract_member_id_from_text(snapshot: Dict[str, Any], text: str) -> Optional[str]:
+    txt = (text or "").strip()
+    if not txt:
+        return None
+
+    mem_id_col = snapshot.get("columns", {}).get("members_id_col")
+    members = snapshot.get("_raw", {}).get("members", pd.DataFrame())
+    if members is None or members.empty or not mem_id_col or mem_id_col not in members.columns:
+        return None
+
+    valid_ids = set(members[mem_id_col].astype(str).tolist())
+
+    for pat in _MEMBER_ID_PATTERNS:
+        m = pat.search(txt)
+        if m:
+            cand = str(m.group(1))
+            if cand in valid_ids:
+                return cand
+
+    # fallback: any number that matches an existing member id
+    for nm in _ANY_NUM.findall(txt):
+        cand = str(nm)
+        if cand in valid_ids:
+            return cand
+
+    return None
 
 
 # -----------------------------------------------------------------------------
@@ -319,7 +375,6 @@ def _tavily_search(query: str) -> Dict[str, Any]:
             return {"ok": False, "error": f"Tavily error {r.status_code}: {r.text[:300]}", "results": []}
         data = r.json() or {}
         results = data.get("results") or []
-        # keep only small safe fields
         clean = []
         for it in results:
             clean.append(
@@ -344,14 +399,13 @@ def _build_grounded_messages(
     internet_pack: Optional[Dict[str, Any]],
     chat_history: List[Dict[str, str]],
 ) -> List[Dict[str, str]]:
-    # NOTE: We keep a strict rule: Njangi numbers MUST come from snapshot only.
     sys = (
-        "You are **Your Chat**, a friendly, human-like assistant for a Njangi finance app.\n"
+        "You are **younchat**, a friendly, human-like assistant for a Njangi finance app.\n"
         "CRITICAL RULES:\n"
-        "1) For ANY Njangi totals, counts, members, loans, payouts, contributions, interest, fines — use ONLY SNAPSHOT_FACTS.\n"
-        "2) If something is missing in the snapshot, say: 'I don’t have that in the snapshot.'\n"
+        "1) For ANY Njangi totals, counts, members, loans, payouts, contributions, interest, fines — use ONLY SNAPSHOT_FACTS and SELECTED_MEMBER_FACTS.\n"
+        "2) If something is missing in the snapshot, say exactly: 'I don’t have that in the snapshot.'\n"
         "3) You MAY use INTERNET_SOURCES only for general questions (definitions, laws, how-to), NOT for Njangi numbers.\n"
-        "4) Be concise, friendly, and conversational. Use bullets only when it helps.\n"
+        "4) Speak naturally like a real person. Short paragraphs. Ask ONE helpful follow-up question.\n"
     )
 
     facts = {
@@ -367,16 +421,15 @@ def _build_grounded_messages(
     if internet_pack and internet_pack.get("ok") and internet_pack.get("results"):
         content += "\n\nINTERNET_SOURCES:\n" + json.dumps(internet_pack.get("results"), indent=2)
 
-    # Build messages with short history (last 8 turns)
     msgs: List[Dict[str, str]] = [{"role": "system", "content": sys}]
-    for m in chat_history[-16:]:  # 8 turns (user+assistant)
+    for m in chat_history[-16:]:
         if m.get("role") in ("user", "assistant"):
             msgs.append({"role": m["role"], "content": m.get("content", "")})
 
     user = (
         f"{content}\n\n"
         f"User message: {question}\n\n"
-        "Respond as Your Chat."
+        "Respond as younchat."
     )
     msgs.append({"role": "user", "content": user})
     return msgs
@@ -402,7 +455,7 @@ def _messages_to_prompt(messages: List[Dict[str, str]]) -> str:
 # -----------------------------------------------------------------------------
 def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], timeout: int = 60) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "temperature": 0.3, "max_tokens": 500}
+    payload = {"model": model, "messages": messages, "temperature": 0.4, "max_tokens": 650}
 
     try:
         r = requests.post(HF_ROUTER_CHAT_URL, headers=headers, json=payload, timeout=timeout)
@@ -417,7 +470,7 @@ def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], time
 
 def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 60) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": model, "prompt": prompt, "temperature": 0.3, "max_tokens": 500}
+    payload = {"model": model, "prompt": prompt, "temperature": 0.4, "max_tokens": 650}
 
     try:
         r = requests.post(HF_ROUTER_COMPLETIONS_URL, headers=headers, json=payload, timeout=timeout)
@@ -431,10 +484,6 @@ def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 6
 
 
 def _hf_call(model: str, token: str, messages: List[Dict[str, str]]) -> Tuple[bool, str, str]:
-    """
-    Returns (ok, text_or_error, mode_used)
-    mode_used: "completions" | "chat" | "failed"
-    """
     force = (os.getenv("HF_FORCE_MODE", "") or "auto").strip().lower()
     prompt = _messages_to_prompt(messages)
 
@@ -446,7 +495,6 @@ def _hf_call(model: str, token: str, messages: List[Dict[str, str]]) -> Tuple[bo
     elif force == "completions":
         order = ["completions"]
     else:
-        # Auto: prefer completions for instruct-style models
         order = ["completions", "chat"] if looks_instruct else ["chat", "completions"]
 
     last_err = ""
@@ -468,37 +516,32 @@ def _hf_call(model: str, token: str, messages: List[Dict[str, str]]) -> Tuple[bo
 # -----------------------------------------------------------------------------
 # Local fallback (still grounded)
 # -----------------------------------------------------------------------------
-def _local_fallback_answer(snapshot: Dict[str, Any], question: str, selected_member_id: Optional[str]) -> str:
+def _local_fallback_answer(snapshot: Dict[str, Any], question: str, member_id: Optional[str]) -> str:
+    greet = _tod_greeting()
     q = (question or "").lower().strip()
-    if "hello" in q or "hi" in q:
-        return "Hi 👋🏽 I’m **Your Chat**. Ask me anything about your Njangi snapshot (totals, loans, payouts, etc.)."
 
-    if "contribution" in q and any(k in q for k in ["total", "overall", "all"]):
-        return f"Total contributions (all members): {snapshot['totals']['contributions_total']:.2f}"
+    if any(x in q for x in ["hi", "hello", "hey"]):
+        return f"{greet} 👋🏽 I’m **younchat**. Ask me about totals, loans, payouts, or tell me a member_id."
 
-    if "foundation" in q and any(k in q for k in ["total", "overall", "all"]):
-        return f"Total foundation contributions (all members): {snapshot['totals']['foundation_total']:.2f}"
-
-    if selected_member_id:
-        fin = _compute_member_financials(snapshot, selected_member_id)
-        if any(k in q for k in ["my", "member", "summary", "status", "loan", "contribution", "foundation", "fine", "interest"]):
-            return (
-                f"Member: {fin['member_name']} (ID {fin['member_id']})\n"
-                f"- Contributions total: {fin['contributions_total']:.2f}\n"
-                f"- Foundation total: {fin['foundation_total']:.2f}\n"
-                f"- Fines total: {fin['fines_total']:.2f}\n"
-                f"- Loans count: {fin['loans_count']}\n"
-                f"- Active loan balance: {fin['active_loan_balance']:.2f}\n"
-                f"- Active unpaid interest: {fin['active_unpaid_interest']:.2f}\n"
-                f"- Interest ledger total: {fin['interest_total']:.2f}"
-            )
+    if member_id:
+        fin = _compute_member_financials(snapshot, member_id)
+        return (
+            f"{greet} 👋🏽 Here’s what I have for **{fin['member_name']}** (member_id={fin['member_id']}):\n"
+            f"- Contributions: {fin['contributions_total']:.2f}\n"
+            f"- Foundation: {fin['foundation_total']:.2f}\n"
+            f"- Fines: {fin['fines_total']:.2f}\n"
+            f"- Loans: {fin['loans_count']} • Active balance: {fin['active_loan_balance']:.2f}\n"
+            f"- Unpaid interest: {fin['active_unpaid_interest']:.2f}\n"
+            f"- Interest ledger total: {fin['interest_total']:.2f}\n"
+            "\nWant me to check another member_id?"
+        )
 
     return (
-        "I can answer from your LIVE Njangi snapshot.\n"
+        f"{greet} 👋🏽 I can answer from your LIVE Njangi snapshot.\n"
         "Try:\n"
         "- Total contributions?\n"
         "- Total foundation money?\n"
-        "- Show my loan status\n"
+        "- Show member_id 10 status\n"
         "- Who has the highest active loan balance?"
     )
 
@@ -507,8 +550,7 @@ def _local_fallback_answer(snapshot: Dict[str, Any], question: str, selected_mem
 # UI entry point (CHAT UI)
 # -----------------------------------------------------------------------------
 def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
-    # ✅ ONLY NAME shown
-    st.subheader("💬 Your Chat", anchor=False)
+    st.subheader("💬 younchat", anchor=False)
 
     hf_token = (os.getenv("HF_TOKEN") or "").strip()
     hf_model = (os.getenv("HF_MODEL") or "").strip() or "mistralai/Mistral-7B-Instruct-v0.2"
@@ -546,19 +588,30 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     selected_member_id: Optional[str] = None
     if member_options:
         label_map = {lbl: mid for (mid, lbl) in member_options}
-        chosen = st.selectbox("Optional: choose a member (for 'my status')", ["(None)"] + [lbl for _, lbl in member_options], index=0)
+        chosen = st.selectbox(
+            "Optional: choose a member (member_id focus)",
+            ["(None)"] + [lbl for _, lbl in member_options],
+            index=0,
+        )
         if chosen != "(None)":
             selected_member_id = label_map.get(chosen)
 
     # Initialize chat history
-    if "your_chat_history" not in st.session_state:
-        st.session_state["your_chat_history"] = []
-        st.session_state["your_chat_history"].append(
-            {"role": "assistant", "content": "Hi 👋🏽 I’m **Your Chat**. Ask me about your Njangi snapshot or general questions (internet on if enabled)."}
-        )
+    if "younchat_history" not in st.session_state:
+        greet = _tod_greeting()
+        st.session_state["younchat_history"] = [
+            {
+                "role": "assistant",
+                "content": (
+                    f"{greet} 👋🏽 I’m **younchat**.\n\n"
+                    "I can read your live Njangi snapshot (totals, loans, payouts, interest, fines). "
+                    "If you want member details, tell me a **member_id** (like `10`) or pick a member above."
+                ),
+            }
+        ]
 
     # Show chat
-    for m in st.session_state["your_chat_history"]:
+    for m in st.session_state["younchat_history"]:
         role = m.get("role", "assistant")
         with st.chat_message("assistant" if role == "assistant" else "user"):
             st.markdown(m.get("content", ""))
@@ -568,9 +621,11 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         st.cache_data.clear()
         st.rerun()
     if colB.button("🧹 Clear chat", use_container_width=True):
-        st.session_state["your_chat_history"] = [
-            {"role": "assistant", "content": "Hi 👋🏽 I’m **Your Chat**. Ask me something."}
+        greet = _tod_greeting()
+        st.session_state["younchat_history"] = [
+            {"role": "assistant", "content": f"{greet} 👋🏽 I’m **younchat**. What do you want to check right now?"}
         ]
+        st.session_state.pop("younchat_last_member_id", None)
         st.rerun()
 
     # Chat input
@@ -579,19 +634,29 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         return
 
     # Add user message
-    st.session_state["your_chat_history"].append({"role": "user", "content": question})
+    st.session_state["younchat_history"].append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
 
-    member_fin = _compute_member_financials(snapshot, selected_member_id) if selected_member_id else None
+    # Resolve member_id context:
+    # 1) selectbox selection
+    # 2) member_id typed in the message
+    # 3) last used member_id
+    detected_from_text = _extract_member_id_from_text(snapshot, question)
+    member_id_focus = selected_member_id or detected_from_text or st.session_state.get("younchat_last_member_id")
 
-    # Optional internet pack: only when enabled AND question looks like a general web question
+    if member_id_focus:
+        st.session_state["younchat_last_member_id"] = member_id_focus
+
+    member_fin = _compute_member_financials(snapshot, member_id_focus) if member_id_focus else None
+
+    # Optional internet pack: only when enabled AND question looks like general web question (not Njangi totals)
     internet_pack: Optional[Dict[str, Any]] = None
     if internet_on:
-        # Heuristic: use internet when user asks "how", "what is", "requirements", "steps", etc.
         ql = question.lower()
-        needs_web = any(k in ql for k in ["how", "what is", "requirements", "steps", "permit", "license", "llc", "tax", "law", "maryland", "railway", "hugging face"])
-        if needs_web:
+        is_njangi = any(k in ql for k in ["contribution", "foundation", "loan", "payout", "interest", "fine", "member", "session", "njangi"])
+        needs_web = any(k in ql for k in ["how", "what is", "requirements", "steps", "permit", "license", "llc", "zoning", "tax", "law", "maryland"])
+        if needs_web and not is_njangi:
             with st.spinner("🌐 Searching the internet…"):
                 internet_pack = _tavily_search(question)
 
@@ -600,32 +665,32 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         question=question,
         member_fin=member_fin,
         internet_pack=internet_pack,
-        chat_history=st.session_state["your_chat_history"],
+        chat_history=st.session_state["younchat_history"],
     )
 
     # If no HF token -> local grounded fallback
     if not hf_token:
-        answer = _local_fallback_answer(snapshot, question, selected_member_id)
-        st.session_state["your_chat_history"].append({"role": "assistant", "content": answer})
+        answer = _local_fallback_answer(snapshot, question, member_id_focus)
+        st.session_state["younchat_history"].append({"role": "assistant", "content": answer})
         with st.chat_message("assistant"):
             st.markdown(answer)
         return
 
     # Call HF
-    with st.spinner("🤖 Your Chat is thinking…"):
+    with st.spinner("🤖 younchat is thinking…"):
         ok, text_or_err, mode = _hf_call(hf_model, hf_token, messages)
 
     if not ok:
-        # Use fallback, but show error in a small note
-        fallback = _local_fallback_answer(snapshot, question, selected_member_id)
+        fallback = _local_fallback_answer(snapshot, question, member_id_focus)
         answer = f"{fallback}\n\n<small>⚠️ HF failed: {text_or_err}</small>"
-        st.session_state["your_chat_history"].append({"role": "assistant", "content": answer})
+        st.session_state["younchat_history"].append({"role": "assistant", "content": answer})
         with st.chat_message("assistant"):
             st.markdown(answer, unsafe_allow_html=True)
         return
 
+    final = (text_or_err or "").strip()
+
     # Optional: attach sources at bottom (only if internet was used)
-    final = text_or_err.strip()
     if internet_pack and internet_pack.get("ok") and internet_pack.get("results"):
         src_lines = []
         for i, it in enumerate(internet_pack["results"], start=1):
@@ -636,10 +701,8 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         if src_lines:
             final += "\n\n---\n**Sources:**\n" + "\n".join(src_lines)
 
-    # Save + display
-    st.session_state["your_chat_history"].append({"role": "assistant", "content": final})
+    st.session_state["younchat_history"].append({"role": "assistant", "content": final})
     with st.chat_message("assistant"):
         st.markdown(final)
 
-    # Small debug caption (does not change the name shown)
-    st.caption(f"HF mode used: {mode} • Internet: {'ON' if internet_on else 'OFF'}")
+    st.caption(f"HF mode used: {mode} • Internet: {'ON' if internet_on else 'OFF'} • member_id: {member_id_focus or '—'}")
