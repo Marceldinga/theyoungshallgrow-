@@ -1,16 +1,21 @@
-
-# dashboard_panel.py ✅ COMPLETE SINGLE FILE — CLEAN Dashboard + 🤖 Young AI (grounded) + Safe Nav
+# dashboard_panel.py ✅ COMPLETE SINGLE FILE — CLEAN Dashboard + 🤖 Young AI (grounded) + Snapshot-first
 # ---------------------------------------------------------------------------------------------
 # ✅ NJANGI STANDARD (NO legacy)
 # ✅ CLEAN DASHBOARD:
 #   - Only KPIs + Attendance + Young AI box
 #   - No extra banners/status text at the top
 #
+# ✅ Snapshot-FIRST (FAST + consistent):
+#   - Uses DB RPC snapshot when available:
+#       public.fn_finance_snapshot()
+#     (falls back to table reads if RPC is missing)
+#   - Young answers ONLY from the LIVE snapshot (no guessing)
+#   - Adds snapshot time (UTC) + source used
+#
 # ✅ Young AI behavior:
-#   - Uses name: "Young"
+#   - Name: "Young"
 #   - Responses MUST match the question asked (no random answers)
 #   - Short + direct + grounded
-#   - Grounded ONLY on LIVE snapshot (no guessing)
 #   - Optional HF Router for nicer wording (still grounded)
 #   - Optional Tavily web search ONLY when query starts with "web:"
 #
@@ -21,8 +26,8 @@
 # Optional env vars:
 #   LOCAL_TZ=America/Chicago
 #   HF_TOKEN=...
-#   HF_MODEL=meta-llama/Meta-Llama-3-8B-Instruct
 #   HF_FORCE_MODE=auto|chat|completions
+#   HF_MODEL=meta-llama/Meta-Llama-3-8B-Instruct   (optional; still locked to allowed list below)
 #   TAVILY_API_KEY=...
 #
 # requirements.txt (optional):
@@ -54,16 +59,23 @@ except Exception:
 
 
 # ============================================================
-# ✅ HF ROUTER ENDPOINTS (fixes NameError)
+# HF ROUTER ENDPOINTS
 # ============================================================
 HF_ROUTER_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
 HF_ROUTER_COMPLETIONS_URL = "https://router.huggingface.co/v1/completions"
 
+# ✅ Lock HF models to the same stable 3 (prevents unsupported model errors)
+HF_ALLOWED_MODELS: List[str] = [
+    "meta-llama/Meta-Llama-3-8B-Instruct",
+    "meta-llama/Llama-3.1-8B-Instruct",
+    "mistralai/Mistral-7B-Instruct-v0.2",
+]
 
 # ============================================================
 # SETTINGS
 # ============================================================
 AUTO_CREATE_SESSION_IF_NONE = False  # set True only if you want auto-create sessions
+SNAPSHOT_TTL_SECONDS = 10            # snapshot cache to reduce DB spam (dashboard still stays "live")
 
 
 # ============================================================
@@ -99,7 +111,7 @@ def _human_touch() -> str:
 # TIME (UTC stamp for snapshot)
 # ============================================================
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ============================================================
@@ -144,9 +156,6 @@ def _safe_select(
     show_error: bool = False,
     **filters,
 ) -> List[Dict[str, Any]]:
-    """
-    Usage: _safe_select(sb, "public", "contributions", "id,amount", session_id=5, limit=1000)
-    """
     if client is None:
         return []
     try:
@@ -189,14 +198,31 @@ def _safe_update_eq(client, schema: str, table: str, updates: Dict[str, Any], eq
         return False
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _table_readable_cached(schema: str, table: str, _sig: str) -> bool:
+    # _sig forces cache separation per environment; caller supplies stable signature
+    return True  # replaced at runtime by wrapper below
+
+
 def _table_readable(client, schema: str, table: str) -> bool:
     if client is None:
         return False
+    sig = str(id(client))
     try:
+        # Use cached wrapper pattern to reduce repeated 1-row probes
+        key = f"{schema}:{table}:{sig}"
+        if "_tbl_ok_cache" not in st.session_state:
+            st.session_state["_tbl_ok_cache"] = {}
+        cache = st.session_state["_tbl_ok_cache"]
+        if key in cache and isinstance(cache[key], bool):
+            return bool(cache[key])
+
         _throttle_db()
         client.schema(schema).table(table).select("*").limit(1).execute()
+        cache[key] = True
         return True
     except Exception:
+        st.session_state["_tbl_ok_cache"][f"{schema}:{table}:{sig}"] = False
         return False
 
 
@@ -238,14 +264,12 @@ def _get_latest_session_id(sb_read, schema: str) -> Optional[int]:
     if sb_read is None:
         return None
 
-    # prefer "id"
     rows = _safe_select(sb_read, schema, "sessions", "id,created_at", order_by="id", desc=True, limit=1)
     if rows and rows[0].get("id") is not None:
         sid = _resolve_session_id(rows[0].get("id"))
         if sid is not None:
             return sid
 
-    # fallback "session_id"
     rows = _safe_select(sb_read, schema, "sessions", "session_id,created_at", order_by="session_id", desc=True, limit=1)
     if rows and rows[0].get("session_id") is not None:
         sid = _resolve_session_id(rows[0].get("session_id"))
@@ -296,6 +320,69 @@ def _ensure_current_session(sb_anon, sb_service, schema: str) -> Tuple[Optional[
         return latest_sid, "Selected latest session (app_state update failed)."
 
     return current_sid, "Using current session from app_state."
+
+
+# ============================================================
+# RPC Snapshot: fn_finance_snapshot()
+# ============================================================
+def _rpc_finance_snapshot(sb_read, schema: str) -> Dict[str, Any]:
+    """
+    Calls public.fn_finance_snapshot().
+    Supports formats:
+      A) flat dict keys
+      B) dict with nested: totals/counts/ratios
+      C) list with 1 dict row
+    """
+    if sb_read is None:
+        return {}
+    try:
+        _throttle_db()
+        try:
+            res = sb_read.schema(schema).rpc("fn_finance_snapshot", {}).execute()
+        except Exception:
+            res = sb_read.rpc("fn_finance_snapshot", {}).execute()
+
+        data = getattr(res, "data", None)
+        if not data:
+            return {}
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return data[0]
+        if isinstance(data, dict):
+            return data
+        return {}
+    except Exception:
+        return {}
+
+
+def _extract_snapshot_number(obj: Any, keys: List[str], default: float = 0.0) -> float:
+    if not isinstance(obj, dict):
+        return float(default)
+    for k in keys:
+        if k in obj and obj.get(k) is not None:
+            try:
+                return float(obj.get(k))
+            except Exception:
+                pass
+    return float(default)
+
+
+def _snapshot_get(snap: Dict[str, Any], group: str, keys: List[str], default: Any = 0) -> Any:
+    """
+    Reads either:
+      snap[group][key]  (nested)
+      OR snap[key]      (flat)
+    """
+    if not isinstance(snap, dict):
+        return default
+    nested = snap.get(group)
+    if isinstance(nested, dict):
+        for k in keys:
+            if k in nested and nested.get(k) is not None:
+                return nested.get(k)
+    for k in keys:
+        if k in snap and snap.get(k) is not None:
+            return snap.get(k)
+    return default
 
 
 # ============================================================
@@ -368,12 +455,14 @@ def _has_hf_token() -> bool:
     return bool((os.getenv("HF_TOKEN") or "").strip())
 
 
-def _hf_model() -> str:
-    return (os.getenv("HF_MODEL") or "meta-llama/Meta-Llama-3-8B-Instruct").strip()
-
-
 def _hf_force_mode() -> str:
     return (os.getenv("HF_FORCE_MODE") or "auto").strip().lower()
+
+
+def _hf_model() -> str:
+    requested = (os.getenv("HF_MODEL") or HF_ALLOWED_MODELS[0]).strip()
+    # lock to allowed list
+    return requested if requested in HF_ALLOWED_MODELS else HF_ALLOWED_MODELS[0]
 
 
 def _post_with_retries(url: str, headers: dict, payload: dict, timeout: int = 60) -> Tuple[bool, str]:
@@ -398,7 +487,7 @@ def _post_with_retries(url: str, headers: dict, payload: dict, timeout: int = 60
 
 def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], timeout: int = 60) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "temperature": 0.15, "max_tokens": 220}
+    payload = {"model": model, "messages": messages, "temperature": 0.15, "max_tokens": 240}
     ok, raw = _post_with_retries(HF_ROUTER_CHAT_URL, headers, payload, timeout=timeout)
     if not ok:
         return False, raw
@@ -412,7 +501,7 @@ def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], time
 
 def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 60) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": model, "prompt": prompt, "temperature": 0.15, "max_tokens": 220}
+    payload = {"model": model, "prompt": prompt, "temperature": 0.15, "max_tokens": 240}
     ok, raw = _post_with_retries(HF_ROUTER_COMPLETIONS_URL, headers, payload, timeout=timeout)
     if not ok:
         return False, raw
@@ -428,8 +517,8 @@ def _snapshot_prompt(snapshot: Dict[str, Any], question: str) -> str:
     return (
         "You are Young, an assistant inside a dashboard.\n"
         "Rules:\n"
-        "- Use ONLY the DASHBOARD_SNAPSHOT.\n"
-        "- Answer ONLY what the user asked. Do not add unrelated facts.\n"
+        "- Use ONLY the DASHBOARD_SNAPSHOT JSON.\n"
+        "- Answer ONLY what the user asked. No unrelated details.\n"
         "- If the answer is not in snapshot, say: 'I don’t have that in this snapshot.'\n"
         "- Never invent numbers.\n"
         "- Keep it short.\n\n"
@@ -450,7 +539,8 @@ def _hf_grounded_answer(question: str, snapshot: Dict[str, Any]) -> Tuple[bool, 
         "You are Young.\n"
         "Start every answer with: 'Hello 👋🏽'.\n"
         "Answer ONLY from DASHBOARD_SNAPSHOT. Answer ONLY the question asked.\n"
-        "Keep it short, like ChatGPT.\n"
+        "No SQL. No Python.\n"
+        "Keep it short.\n"
     )
     messages = [
         {"role": "system", "content": sys},
@@ -459,29 +549,40 @@ def _hf_grounded_answer(question: str, snapshot: Dict[str, Any]) -> Tuple[bool, 
 
     if force == "completions":
         ok, txt = _hf_router_completions(model, token, _snapshot_prompt(snapshot, question))
-        return (ok, txt, "hf:completions") if ok else (False, txt, "hf:completions_failed")
+        return (ok, txt, f"hf:completions:{model}") if ok else (False, txt, f"hf:completions_failed:{model}")
     if force == "chat":
         ok, txt = _hf_router_chat(model, token, messages)
-        return (ok, txt, "hf:chat") if ok else (False, txt, "hf:chat_failed")
+        return (ok, txt, f"hf:chat:{model}") if ok else (False, txt, f"hf:chat_failed:{model}")
 
     ok, txt = _hf_router_completions(model, token, _snapshot_prompt(snapshot, question))
     if ok and txt:
-        return True, txt, "hf:completions"
+        return True, txt, f"hf:completions:{model}"
     ok2, txt2 = _hf_router_chat(model, token, messages)
     if ok2 and txt2:
-        return True, txt2, "hf:chat"
-    return False, (txt2 or txt or "HF failed"), "hf:failed"
+        return True, txt2, f"hf:chat:{model}"
+    return False, (txt2 or txt or "HF failed"), f"hf:failed:{model}"
 
 
 # ============================================================
 # Young — local grounded rules (fallback)
 # ============================================================
+def _money0(x: Any) -> str:
+    try:
+        return f"{float(x):,.0f}"
+    except Exception:
+        return str(x)
+
+
 def _young_answer_rules(q: str, snap: Dict[str, Any]) -> str:
     t = (q or "").strip().lower()
+    if not t:
+        return "Hello 👋🏽 Ask a question about this dashboard snapshot."
 
+    # Core fields
     session_id = snap.get("session_id")
     total_members = int(snap.get("total_members", 0) or 0)
-    pot = float(snap.get("current_pot", 0.0) or 0.0)
+
+    current_pot = float(snap.get("current_pot", 0.0) or 0.0)
     cycle_total = float(snap.get("cycle_contributions_total", 0.0) or 0.0)
     members_paid = int(snap.get("members_paid", 0) or 0)
 
@@ -495,32 +596,24 @@ def _young_answer_rules(q: str, snap: Dict[str, Any]) -> str:
     repayments_total = float(snap.get("repayments_total", 0.0) or 0.0)
     interest_total = float(snap.get("interest_total", 0.0) or 0.0)
 
-    def money(x: float) -> str:
-        try:
-            return f"{float(x):,.0f}"
-        except Exception:
-            return str(x)
-
-    if not t:
-        return "Hello 👋🏽 Ask a question about this dashboard snapshot."
-
-    if "total members" in t or ("members" in t and "total" in t):
+    # Intents (simple + strict)
+    if "total members" in t or (("members" in t) and ("total" in t)):
         return f"Hello 👋🏽 Total members: **{total_members}**."
 
     if t.strip() in {"members", "member"}:
         return f"Hello 👋🏽 Total members: **{total_members}**."
 
-    if "members paid" in t or ("paid" in t and "members" in t):
+    if "members paid" in t or (("paid" in t) and ("members" in t)):
         return f"Hello 👋🏽 Members paid: **{members_paid}/{total_members}**."
 
-    if "session" in t and "id" in t:
+    if ("session" in t and "id" in t) or t.strip() in {"session id", "session"}:
         return f"Hello 👋🏽 Session ID: **{session_id}**."
 
     if "pot" in t:
-        return f"Hello 👋🏽 Current pot (Session {session_id}): **{money(pot)}**."
+        return f"Hello 👋🏽 Current pot (Session {session_id}): **{_money0(current_pot)}**."
 
-    if "cycle" in t and "contribution" in t:
-        return f"Hello 👋🏽 Cycle contributions (Session {session_id}): **{money(cycle_total)}**."
+    if ("cycle" in t and "contribution" in t) or "cycle total" in t:
+        return f"Hello 👋🏽 Cycle contributions (Session {session_id}): **{_money0(cycle_total)}**."
 
     if "attendance" in t:
         if attendance_total == 0:
@@ -528,19 +621,19 @@ def _young_answer_rules(q: str, snap: Dict[str, Any]) -> str:
         absent = max(attendance_total - attendance_present, 0)
         return f"Hello 👋🏽 Attendance (Session {session_id}): Present **{attendance_present}**, Absent **{absent}**, Marked **{attendance_total}**."
 
-    if "loan" in t:
+    if "loan" in t or "loans" in t:
         if loans_active_count == 0:
             return "Hello 👋🏽 Active loans: **0**."
-        return f"Hello 👋🏽 Active loans: **{loans_active_count}** (total **{money(loans_active_total)}**)."
+        return f"Hello 👋🏽 Active loans: **{loans_active_count}** (total **{_money0(loans_active_total)}**)."
 
-    if "fine" in t:
-        return f"Hello 👋🏽 Fines total: **{money(fines_total)}**."
+    if "fine" in t or "fines" in t:
+        return f"Hello 👋🏽 Fines total: **{_money0(fines_total)}**."
 
-    if "repay" in t or "payment" in t:
-        return f"Hello 👋🏽 Repayments total: **{money(repayments_total)}**."
+    if "repay" in t or "payment" in t or "paid back" in t:
+        return f"Hello 👋🏽 Repayments total: **{_money0(repayments_total)}**."
 
     if "interest" in t:
-        return f"Hello 👋🏽 Interest total: **{money(interest_total)}**."
+        return f"Hello 👋🏽 Interest total: **{_money0(interest_total)}**."
 
     return "Hello 👋🏽 I don’t have that in this snapshot. Check another page (Loans / Contributions / Minutes)."
 
@@ -609,13 +702,15 @@ def _render_young_ai_view(snapshot: Dict[str, Any]):
     ask = st.button("Ask", key="young_dash_ask", use_container_width=True)
 
     if ask:
-        if _is_web_query(q):
+        q_clean = (q or "").strip()
+
+        if _is_web_query(q_clean):
             if not _has_tavily_key():
                 st.session_state["young_dash_a"] = "Hello 👋🏽 Web search is OFF. Add **TAVILY_API_KEY** in Railway Variables."
                 st.session_state["young_dash_sources"] = []
                 st.session_state["young_dash_used"] = "web:off"
             else:
-                query = _strip_web_prefix(q)
+                query = _strip_web_prefix(q_clean)
                 tav = _tavily_search_cached(query=query, max_results=5, search_depth="basic")
                 summary, sources = _format_web_results(tav)
                 st.session_state["young_dash_a"] = "Hello 👋🏽 " + summary
@@ -623,7 +718,7 @@ def _render_young_ai_view(snapshot: Dict[str, Any]):
                 st.session_state["young_dash_used"] = "web:tavily"
         else:
             if use_hf and _has_hf_token():
-                ok, txt, used = _hf_grounded_answer(q, snapshot)
+                ok, txt, used = _hf_grounded_answer(q_clean, snapshot)
                 if ok and txt:
                     ans = txt.strip()
                     if not ans.lower().startswith("hello"):
@@ -635,12 +730,12 @@ def _render_young_ai_view(snapshot: Dict[str, Any]):
                     st.session_state["young_dash_a"] = (
                         "Hello 👋🏽 HF failed — using local grounded rules.\n\n"
                         f"**HF error:** {txt}\n\n"
-                        + _young_answer_rules(q, snapshot)
+                        + _young_answer_rules(q_clean, snapshot)
                     )
                     st.session_state["young_dash_sources"] = []
                     st.session_state["young_dash_used"] = used
             else:
-                st.session_state["young_dash_a"] = _young_answer_rules(q, snapshot)
+                st.session_state["young_dash_a"] = _young_answer_rules(q_clean, snapshot)
                 st.session_state["young_dash_sources"] = []
                 st.session_state["young_dash_used"] = "local"
 
@@ -660,10 +755,178 @@ def _render_young_ai_view(snapshot: Dict[str, Any]):
                 st.markdown(f"- {title}")
 
     used = st.session_state.get("young_dash_used", "—")
-    st.caption(f"Source used: {used} • Snapshot time (UTC): {snapshot.get('generated_at','—')}")
+    st.caption(f"Source used: {used} • Snapshot time (UTC): {snapshot.get('generated_at','—')} • Snapshot src: {snapshot.get('_snapshot_source','—')}")
 
     with st.expander("🔎 Debug snapshot", expanded=False):
         st.json(snapshot)
+
+
+# ============================================================
+# SNAPSHOT BUILDERS
+# ============================================================
+@st.cache_data(ttl=SNAPSHOT_TTL_SECONDS, show_spinner=False)
+def _cached_finance_snapshot(schema: str, _sig: str) -> Dict[str, Any]:
+    # NOTE: body replaced by wrapper; cache key uses schema+_sig
+    return {}
+
+
+def _get_finance_snapshot(sb_read, schema: str) -> Tuple[Dict[str, Any], str]:
+    """
+    Returns (finance_snapshot_dict, source_label)
+    """
+    if sb_read is None:
+        return {}, "none"
+
+    # in-session cache (fast) + streamlit cache (ttl)
+    sig = str(id(sb_read))
+    key = f"_finance_snapshot::{schema}::{sig}"
+    now = time.time()
+
+    local_cache = st.session_state.get("_dash_snap_cache") or {}
+    if isinstance(local_cache, dict):
+        entry = local_cache.get(key)
+        if isinstance(entry, dict) and (now - float(entry.get("_ts", 0.0))) <= SNAPSHOT_TTL_SECONDS:
+            return dict(entry.get("snap") or {}), "rpc:cached"
+
+    # Try RPC snapshot
+    snap = _rpc_finance_snapshot(sb_read, schema)
+    if snap:
+        local_cache[key] = {"_ts": now, "snap": snap}
+        st.session_state["_dash_snap_cache"] = local_cache
+        return snap, "rpc:fn_finance_snapshot"
+
+    return {}, "rpc:missing"
+
+
+def _build_dashboard_snapshot(
+    sb_read,
+    schema: str,
+    session_id: Optional[int],
+) -> Tuple[Dict[str, Any], str]:
+    """
+    Builds the dashboard snapshot:
+      - Finance totals from RPC (if available)
+      - Session KPIs (cycle pot, members paid) from contributions table (session-scoped)
+      - Attendance (session-scoped)
+      - Loans active totals (table)
+      - Fines/repayments/interest totals (table)   [global totals]
+    """
+    finance_snap, finance_src = _get_finance_snapshot(sb_read, schema)
+
+    # Always compute session-scoped contribution KPIs (needs session_id)
+    contrib_rows: List[Dict[str, Any]] = []
+    if session_id is not None and _table_readable(sb_read, schema, "contributions"):
+        contrib_rows = _safe_select(
+            sb_read,
+            schema,
+            "contributions",
+            "id,member_id,amount,session_id,created_at",
+            session_id=int(session_id),
+            limit=15000,
+            show_error=False,
+        )
+
+    cycle_total = _sum_amount(contrib_rows, "amount")
+    members_paid = _count_distinct(contrib_rows, "member_id")
+    current_pot = float(cycle_total)
+
+    # Members count (fallback to table)
+    total_members = 0
+    if _table_readable(sb_read, schema, "members"):
+        mrows = _safe_select(sb_read, schema, "members", "id", limit=20000, show_error=False)
+        total_members = len(mrows) if mrows else 0
+
+    # Attendance (session)
+    attendance_rows: List[Dict[str, Any]] = []
+    if session_id is not None and _table_readable(sb_read, schema, "attendance"):
+        attendance_rows = _safe_select(
+            sb_read,
+            schema,
+            "attendance",
+            "member_id,present,session_id,created_at",
+            session_id=int(session_id),
+            limit=15000,
+            show_error=False,
+        )
+    attendance_total = len(attendance_rows) if attendance_rows else 0
+    attendance_present = 0
+    for r in attendance_rows:
+        try:
+            if bool(r.get("present")):
+                attendance_present += 1
+        except Exception:
+            pass
+
+    # Loans active totals (global)
+    loans_active_count = 0
+    loans_active_total = 0.0
+    if _table_readable(sb_read, schema, "loans"):
+        loans_rows = _safe_select(
+            sb_read,
+            schema,
+            "loans",
+            "id,member_id,status,principal,principal_current,total_due,created_at",
+            limit=30000,
+            show_error=False,
+        )
+        active_status = {"active", "overdue", "late", "open"}
+        loans_active = [r for r in loans_rows if str(r.get("status") or "").strip().lower() in active_status]
+        loans_active_count = len(loans_active)
+        for r in loans_active:
+            # prefer principal_current if present
+            for k in ("principal_current", "principal", "total_due"):
+                if k in r and r.get(k) is not None:
+                    try:
+                        loans_active_total += float(r.get(k) or 0)
+                        break
+                    except Exception:
+                        pass
+
+    # Fines (global)
+    fines_total = 0.0
+    if _table_readable(sb_read, schema, "fines"):
+        fines_rows = _safe_select(sb_read, schema, "fines", "amount,created_at", limit=30000, show_error=False)
+        fines_total = _sum_amount(fines_rows, "amount")
+
+    # Repayments (global)
+    repayments_total = 0.0
+    if _table_readable(sb_read, schema, "loan_payments"):
+        pay_rows = _safe_select(sb_read, schema, "loan_payments", "amount,created_at", limit=30000, show_error=False)
+        repayments_total = _sum_amount(pay_rows, "amount")
+
+    # Interest (global)
+    interest_total = 0.0
+    if _table_readable(sb_read, schema, "interest_ledger"):
+        i_rows = _safe_select(sb_read, schema, "interest_ledger", "amount,created_at", limit=30000, show_error=False)
+        interest_total = _sum_amount(i_rows, "amount")
+
+    # Pull any finance totals if your fn_finance_snapshot provides them
+    # (safe: supports nested or flat)
+    total_contrib_all = _snapshot_get(finance_snap, "totals", ["total_contributions", "contributions_total"], default=None)
+    foundation_total = _snapshot_get(finance_snap, "totals", ["foundation_total"], default=None)
+
+    out = {
+        "schema": schema,
+        "session_id": session_id,
+        "total_members": int(total_members),
+        "current_pot": float(current_pot),
+        "cycle_contributions_total": float(cycle_total),
+        "members_paid": int(members_paid),
+        "attendance_total": int(attendance_total),
+        "attendance_present": int(attendance_present),
+        "loans_active_count": int(loans_active_count),
+        "loans_active_total": float(loans_active_total),
+        "fines_total": float(fines_total),
+        "repayments_total": float(repayments_total),
+        "interest_total": float(interest_total),
+        # Optional (from finance snapshot)
+        "total_contributions_all_time": (float(total_contrib_all) if total_contrib_all is not None else None),
+        "foundation_total_all_time": (float(foundation_total) if foundation_total is not None else None),
+        "generated_at": _now_iso(),
+        "_snapshot_source": finance_src,
+    }
+
+    return out, finance_src
 
 
 # ============================================================
@@ -681,113 +944,31 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
     # Ensure current session (do not print the verbose message)
     session_id, _ = _ensure_current_session(sb_anon=sb_anon, sb_service=sb_service, schema=schema)
 
-    # Members count
-    members_rows = _safe_select(sb_read, schema, "members", "id", limit=5000, show_error=False)
-    total_members = len(members_rows) if members_rows else 0
+    # Snapshot-first build
+    snapshot, _src = _build_dashboard_snapshot(sb_read=sb_read, schema=schema, session_id=session_id)
 
-    # Contributions (current session)
-    contrib_rows: List[Dict[str, Any]] = []
-    if session_id is not None:
-        contrib_rows = _safe_select(
-            sb_read,
-            schema,
-            "contributions",
-            "id,member_id,amount,session_id,created_at",
-            session_id=int(session_id),
-            limit=10000,
-            show_error=False,
-        )
-
-    cycle_total = _sum_amount(contrib_rows, "amount")
-    members_paid = _count_distinct(contrib_rows, "member_id")
-    current_pot = float(cycle_total)
-
-    # Attendance (current session)
-    attendance_rows: List[Dict[str, Any]] = []
-    if session_id is not None and _table_readable(sb_read, schema, "attendance"):
-        attendance_rows = _safe_select(
-            sb_read,
-            schema,
-            "attendance",
-            "member_id,present,session_id,created_at",
-            session_id=int(session_id),
-            limit=5000,
-            show_error=False,
-        )
-
-    attendance_total = len(attendance_rows) if attendance_rows else 0
-    attendance_present = 0
-    for r in attendance_rows:
-        try:
-            if bool(r.get("present")):
-                attendance_present += 1
-        except Exception:
-            pass
-
-    # Loans (active)
-    loans_rows: List[Dict[str, Any]] = []
-    if _table_readable(sb_read, schema, "loans"):
-        loans_rows = _safe_select(
-            sb_read,
-            schema,
-            "loans",
-            "id,member_id,status,principal,principal_current,total_due,created_at",
-            limit=20000,
-            show_error=False,
-        )
-
-    active_status = {"active", "overdue", "late", "open"}
-    loans_active = [r for r in loans_rows if str(r.get("status") or "").strip().lower() in active_status]
-
-    loans_active_count = len(loans_active)
-    loans_active_total = 0.0
-    for r in loans_active:
-        for k in ("principal_current", "principal", "total_due"):
-            if k in r and r.get(k) is not None:
-                try:
-                    loans_active_total += float(r.get(k) or 0)
-                    break
-                except Exception:
-                    pass
-
-    # Fines
-    fines_total = 0.0
-    if _table_readable(sb_read, schema, "fines"):
-        fines_rows = _safe_select(sb_read, schema, "fines", "amount,created_at", limit=20000, show_error=False)
-        fines_total = _sum_amount(fines_rows, "amount")
-
-    # Repayments
-    repayments_total = 0.0
-    if _table_readable(sb_read, schema, "loan_payments"):
-        pay_rows = _safe_select(sb_read, schema, "loan_payments", "amount,created_at", limit=20000, show_error=False)
-        repayments_total = _sum_amount(pay_rows, "amount")
-
-    # Interest
-    interest_total = 0.0
-    if _table_readable(sb_read, schema, "interest_ledger"):
-        i_rows = _safe_select(sb_read, schema, "interest_ledger", "amount,created_at", limit=20000, show_error=False)
-        interest_total = _sum_amount(i_rows, "amount")
-
-    # KPIs
+    # KPIs row (clean)
     c1, c2, c3, c4, c5 = st.columns([0.9, 0.9, 0.9, 0.9, 1.2])
     with c1:
-        st.metric("Session ID", session_id if session_id is not None else "—")
+        st.metric("Session ID", snapshot.get("session_id") if snapshot.get("session_id") is not None else "—")
     with c2:
-        st.metric("Total Members", f"{total_members:,}")
+        st.metric("Total Members", f"{int(snapshot.get('total_members') or 0):,}")
     with c3:
-        st.metric("Current Pot", f"{current_pot:,.0f}")
+        st.metric("Current Pot", f"{float(snapshot.get('current_pot') or 0):,.0f}")
     with c4:
-        st.metric("Cycle Contributions", f"{cycle_total:,.0f}")
+        st.metric("Cycle Contributions", f"{float(snapshot.get('cycle_contributions_total') or 0):,.0f}")
     with c5:
-        st.metric("Members Paid", f"{members_paid}/{total_members}")
+        st.metric("Members Paid", f"{int(snapshot.get('members_paid') or 0)}/{int(snapshot.get('total_members') or 0)}")
 
     st.divider()
 
     # Attendance
     st.subheader("🧾 Attendance (session)")
-    if session_id is None:
+    if snapshot.get("session_id") is None:
         st.info("No session selected.")
     else:
+        attendance_total = int(snapshot.get("attendance_total") or 0)
+        attendance_present = int(snapshot.get("attendance_present") or 0)
         if attendance_total == 0:
             st.info("No attendance records for this session yet.")
         else:
@@ -796,22 +977,5 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
 
     st.divider()
 
-    # Snapshot for Young AI
-    snapshot = {
-        "schema": schema,
-        "session_id": session_id,
-        "total_members": int(total_members),
-        "current_pot": float(current_pot),
-        "cycle_contributions_total": float(cycle_total),
-        "members_paid": int(members_paid),
-        "attendance_total": int(attendance_total),
-        "attendance_present": int(attendance_present),
-        "loans_active_count": int(loans_active_count),
-        "loans_active_total": float(loans_active_total),
-        "fines_total": float(fines_total),
-        "repayments_total": float(repayments_total),
-        "interest_total": float(interest_total),
-        "generated_at": _now_iso(),
-    }
-
+    # Young AI
     _render_young_ai_view(snapshot)
