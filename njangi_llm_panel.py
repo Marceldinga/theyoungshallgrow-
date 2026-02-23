@@ -295,7 +295,11 @@ def _snapshot_to_metrics(snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not snapshot:
         return None
 
-    if isinstance(snapshot.get("totals"), dict) or isinstance(snapshot.get("counts"), dict) or isinstance(snapshot.get("ratios"), dict):
+    if (
+        isinstance(snapshot.get("totals"), dict)
+        or isinstance(snapshot.get("counts"), dict)
+        or isinstance(snapshot.get("ratios"), dict)
+    ):
         totals = snapshot.get("totals") or {}
         counts = snapshot.get("counts") or {}
         ratios = snapshot.get("ratios") or {}
@@ -313,7 +317,9 @@ def _snapshot_to_metrics(snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "overdue_ratio": ratios.get("overdue_ratio"),
             "liquidity_pressure_ratio": ratios.get("liquidity_pressure_ratio"),
             "concentration_share": ratios.get("concentration_share") if "concentration_share" in ratios else None,
-            "top_borrower_member_id": ratios.get("top_borrower_member_id") if "top_borrower_member_id" in ratios else None,
+            "top_borrower_member_id": ratios.get("top_borrower_member_id")
+            if "top_borrower_member_id" in ratios
+            else None,
         }
 
     rc = snapshot.get("counts") if isinstance(snapshot.get("counts"), dict) else {}
@@ -361,7 +367,10 @@ def _overdue_loan_filter(loans: pd.DataFrame) -> pd.DataFrame:
 
 
 def _loan_balance_col(loans: pd.DataFrame) -> Optional[str]:
-    return _pick_col(loans, ["principal_current", "outstanding_principal", "principal_remaining", "principal", "amount", "total_due"])
+    return _pick_col(
+        loans,
+        ["principal_current", "outstanding_principal", "principal_remaining", "principal", "amount", "total_due"],
+    )
 
 
 def _unpaid_interest_col(loans: pd.DataFrame) -> Optional[str]:
@@ -373,9 +382,16 @@ def _collect_global_finance_context(sb_anon, sb_service, schema: str) -> Dict[st
     if snap:
         return {"ok": True, "notes": [], "snapshot": snap, "mode": "rpc"}
 
-    out: Dict[str, Any] = {"ok": True, "notes": ["Snapshot unavailable → fallback table scan."], "df": {}, "mode": "tables"}
+    out: Dict[str, Any] = {
+        "ok": True,
+        "notes": ["Snapshot unavailable → fallback table scan."],
+        "df": {},
+        "mode": "tables",
+    }
     out["df"]["contributions"] = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=200000)
-    out["df"]["foundation_contributions"] = _sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=200000)
+    out["df"]["foundation_contributions"] = _sb_select(
+        sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=200000
+    )
     out["df"]["loans"] = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=200000)
     out["df"]["interest_ledger"] = _sb_select(sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=200000)
     out["df"]["fines"] = _sb_select(sb_anon, sb_service, schema, "fines", cols="*", limit=200000)
@@ -535,10 +551,18 @@ def _health_score(metrics: Dict[str, Any]) -> Tuple[Optional[int], List[str]]:
         cred = 40
 
     coverage = _ratio(total_contributions, max(active_exposure, 1e-9))
-    contrib_strength = 90 if (coverage is not None and coverage >= 4) else (75 if (coverage is not None and coverage >= 2) else (60 if (coverage is not None and coverage >= 1) else 40))
+    contrib_strength = (
+        90
+        if (coverage is not None and coverage >= 4)
+        else (75 if (coverage is not None and coverage >= 2) else (60 if (coverage is not None and coverage >= 1) else 40))
+    )
 
     fcover = _ratio(foundation_total, max(active_exposure, 1e-9))
-    foundation_strength = 90 if (fcover is not None and fcover >= 1) else (75 if (fcover is not None and fcover >= 0.5) else (60 if (fcover is not None and fcover >= 0.25) else 40))
+    foundation_strength = (
+        90
+        if (fcover is not None and fcover >= 1)
+        else (75 if (fcover is not None and fcover >= 0.5) else (60 if (fcover is not None and fcover >= 0.25) else 40))
+    )
 
     score = round(0.30 * liq + 0.30 * cred + 0.20 * contrib_strength + 0.20 * foundation_strength)
     reasons = [
@@ -618,12 +642,20 @@ def _load_members_truth(sb_anon, sb_service, schema: str, limit: int = 3000) -> 
     out["member_id"] = df[id_col].astype(str)
 
     disp_clean = (
-        df[display_col].astype(str).replace(["None", "nan", "NaN", "NULL", "null"], "").fillna("").str.strip()
+        df[display_col]
+        .astype(str)
+        .replace(["None", "nan", "NaN", "NULL", "null"], "")
+        .fillna("")
+        .str.strip()
         if display_col and display_col in df.columns
         else pd.Series([""] * len(df))
     )
     nm_clean = (
-        df[name_col].astype(str).replace(["None", "nan", "NaN", "NULL", "null"], "").fillna("").str.strip()
+        df[name_col]
+        .astype(str)
+        .replace(["None", "nan", "NaN", "NULL", "null"], "")
+        .fillna("")
+        .str.strip()
         if name_col and name_col in df.columns
         else pd.Series([""] * len(df))
     )
@@ -671,11 +703,23 @@ def _compute_member_totals_from_tables(
 ) -> Tuple[Dict[str, Any], List[str]]:
     notes: List[str] = []
 
-    contributions = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
-    foundation = _sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
+    contributions = _sb_select(
+        sb_anon, sb_service, schema, "contributions", cols="*", limit=200000, filters=[("member_id", "eq", member_id)]
+    )
+    foundation = _sb_select(
+        sb_anon,
+        sb_service,
+        schema,
+        "foundation_contributions",
+        cols="*",
+        limit=200000,
+        filters=[("member_id", "eq", member_id)],
+    )
     fines = _sb_select(sb_anon, sb_service, schema, "fines", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
     loans = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
-    interest_ledger = _sb_select(sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
+    interest_ledger = _sb_select(
+        sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=200000, filters=[("member_id", "eq", member_id)]
+    )
 
     contrib_col = _pick_col(contributions, ["amount"])
     found_col = _pick_col(foundation, ["amount"])
@@ -762,9 +806,16 @@ def _wants_help(text: str) -> bool:
 def _wants_list_members(text: str) -> bool:
     t = _lc(text)
     phrases = [
-        "list all members", "list members", "show all members", "show members",
-        "members list", "all members", "member list", "who are the members",
-        "list members id", "member ids",
+        "list all members",
+        "list members",
+        "show all members",
+        "show members",
+        "members list",
+        "all members",
+        "member list",
+        "who are the members",
+        "list members id",
+        "member ids",
     ]
     return t in {"members", "member"} or any(p in t for p in phrases)
 
@@ -796,10 +847,20 @@ def _wants_loans(text: str) -> bool:
 def _wants_financial_review(text: str) -> bool:
     t = _lc(text)
     triggers = [
-        "how are we doing", "are we stable", "is njangi healthy", "njangi health",
-        "health score", "financial condition", "risk review", "any risk",
-        "liquidity", "credit risk", "executive summary", "summary",
-        "control tower", "financial intelligence",
+        "how are we doing",
+        "are we stable",
+        "is njangi healthy",
+        "njangi health",
+        "health score",
+        "financial condition",
+        "risk review",
+        "any risk",
+        "liquidity",
+        "credit risk",
+        "executive summary",
+        "summary",
+        "control tower",
+        "financial intelligence",
     ]
     return any(x in t for x in triggers)
 
@@ -872,9 +933,25 @@ def _is_db_command(text: str) -> bool:
     if _wants_show_table(t) or _wants_describe(t) or _wants_help(t) or _wants_verify_member(t):
         return True
     finance_words = [
-        "contribution", "contributions", "payout", "payouts", "loan", "loans",
-        "repayment", "interest", "unpaid", "overdue", "balance", "exposure",
-        "liquidity", "foundation", "kpi", "kpis", "risk", "health score", "grade",
+        "contribution",
+        "contributions",
+        "payout",
+        "payouts",
+        "loan",
+        "loans",
+        "repayment",
+        "interest",
+        "unpaid",
+        "overdue",
+        "balance",
+        "exposure",
+        "liquidity",
+        "foundation",
+        "kpi",
+        "kpis",
+        "risk",
+        "health score",
+        "grade",
         "total",
     ]
     return any(w in t for w in finance_words)
@@ -887,8 +964,16 @@ def _looks_like_code_output(txt: str) -> bool:
     if "```" in t:
         return True
     code_markers = [
-        "import ", "def ", "class ", "select ", "create table", "alter table", "drop table",
-        "insert into", "update ", "delete from"
+        "import ",
+        "def ",
+        "class ",
+        "select ",
+        "create table",
+        "alter table",
+        "drop table",
+        "insert into",
+        "update ",
+        "delete from",
     ]
     return any(m in t for m in code_markers)
 
@@ -899,10 +984,22 @@ def _looks_like_code_output(txt: str) -> bool:
 def _is_smalltalk(text: str) -> bool:
     t = _lc(text)
     keys = [
-        "how are you", "how r you", "how are u", "how you doing",
-        "who are you", "what are you", "what is your name", "your name",
-        "hello", "hi", "hey", "good morning", "good afternoon", "good evening",
-        "thanks", "thank you"
+        "how are you",
+        "how r you",
+        "how are u",
+        "how you doing",
+        "who are you",
+        "what are you",
+        "what is your name",
+        "your name",
+        "hello",
+        "hi",
+        "hey",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "thanks",
+        "thank you",
     ]
     return any(k in t for k in keys)
 
@@ -921,7 +1018,15 @@ def _smalltalk_state() -> Dict[str, Any]:
             ],
         },
         "capabilities": {
-            "db_commands_examples": ["members", "loans", "finance kpis", "tables", "show contributions", "describe loans", "verify member 10"],
+            "db_commands_examples": [
+                "members",
+                "loans",
+                "finance kpis",
+                "tables",
+                "show contributions",
+                "describe loans",
+                "verify member 10",
+            ],
             "intelligence_examples": ["How are we doing?", "Njangi health score", "Control tower", "Financial intelligence"],
         },
     }
@@ -972,6 +1077,7 @@ def _loans_with_member(
         filters = [("member_id", "eq", member_id)] if member_id else None
         df = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=5000, filters=filters)
         src = "loans"
+
     title = "Loans" if not member_id else f"Loans for {_member_name_from_truth(members_truth, member_id)} (member_id={member_id})"
     return title, df, src
 
@@ -988,7 +1094,9 @@ def _compute_member_totals_from_view(
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     if "v_member_financial_totals" not in RELATIONS:
         return None, None
-    v = _sb_select(sb_anon, sb_service, schema, "v_member_financial_totals", cols="*", limit=50, filters=[("member_id", "eq", member_id)])
+    v = _sb_select(
+        sb_anon, sb_service, schema, "v_member_financial_totals", cols="*", limit=50, filters=[("member_id", "eq", member_id)]
+    )
     if v.empty:
         return None, None
     row = v.iloc[0].to_dict()
@@ -1228,14 +1336,38 @@ def _build_control_tower_report_local(manifold: Dict[str, Any]) -> str:
     lines.append("Hello 👋🏽 Njangi Financial Intelligence Review (DB-grounded)\n")
 
     lines.append("1️⃣ Current Situation")
-    lines.append(f"- Total contributions: **{_fmt(m.get('total_contributions'))}**" if m.get("total_contributions") is not None else "- Total contributions: **Not available**")
-    lines.append(f"- Foundation reserves: **{_fmt(m.get('foundation_total'))}**" if m.get("foundation_total") is not None else "- Foundation reserves: **Not available**")
-    lines.append(f"- Active loan exposure: **{_fmt(m.get('active_loan_exposure'))}**" if m.get("active_loan_exposure") is not None else "- Active loan exposure: **Not available**")
+    lines.append(
+        f"- Total contributions: **{_fmt(m.get('total_contributions'))}**"
+        if m.get("total_contributions") is not None
+        else "- Total contributions: **Not available**"
+    )
+    lines.append(
+        f"- Foundation reserves: **{_fmt(m.get('foundation_total'))}**"
+        if m.get("foundation_total") is not None
+        else "- Foundation reserves: **Not available**"
+    )
+    lines.append(
+        f"- Active loan exposure: **{_fmt(m.get('active_loan_exposure'))}**"
+        if m.get("active_loan_exposure") is not None
+        else "- Active loan exposure: **Not available**"
+    )
     lines.append(f"- Active loans (count): **{int(m.get('active_loan_count') or 0)}**")
     lines.append(f"- Overdue loans (count): **{int(m.get('overdue_loan_count') or 0)}**")
-    lines.append(f"- Overdue ratio: **{_pct(m.get('overdue_ratio'))}**" if m.get("overdue_ratio") is not None else "- Overdue ratio: **Not available**")
-    lines.append(f"- Unpaid interest: **{_fmt(m.get('unpaid_interest'))}**" if m.get("unpaid_interest") is not None else "- Unpaid interest: **Not available**")
-    lines.append(f"- Liquidity Pressure Ratio: **{_pct(m.get('liquidity_pressure_ratio'))}**" if m.get("liquidity_pressure_ratio") is not None else "- Liquidity Pressure Ratio: **Not available**")
+    lines.append(
+        f"- Overdue ratio: **{_pct(m.get('overdue_ratio'))}**"
+        if m.get("overdue_ratio") is not None
+        else "- Overdue ratio: **Not available**"
+    )
+    lines.append(
+        f"- Unpaid interest: **{_fmt(m.get('unpaid_interest'))}**"
+        if m.get("unpaid_interest") is not None
+        else "- Unpaid interest: **Not available**"
+    )
+    lines.append(
+        f"- Liquidity Pressure Ratio: **{_pct(m.get('liquidity_pressure_ratio'))}**"
+        if m.get("liquidity_pressure_ratio") is not None
+        else "- Liquidity Pressure Ratio: **Not available**"
+    )
 
     lines.append("\n2️⃣ Risk Assessment")
     lines.append(f"- Risk classification: **{risk_label}**")
@@ -1485,7 +1617,9 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         else:
             answer, df_show, df_title, used_source = _member_verify_view_vs_tables(sb_anon, sb_service, schema, str(mid), members_truth)
 
-    elif member_id_focus and (q.strip().isdigit() or "member" in _lc(q) or "summary" in _lc(q) or "status" in _lc(q) or _wants_member_risk(q)):
+    elif member_id_focus and (
+        q.strip().isdigit() or "member" in _lc(q) or "summary" in _lc(q) or "status" in _lc(q) or _wants_member_risk(q)
+    ):
         mid = str(member_id_focus)
 
         if not _member_exists(members_truth, mid):
@@ -1566,5 +1700,6 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                 st.dataframe(df_show, use_container_width=True)
 
     st.caption(
-        f"Source used: {used_source} • member_id: {member_id_focus or '—'} • Internet: {'ON' if internet_on else 'OFF'} • Foundation reasoner: {'ON' if (use_foundation_reasoner and _has_hf_token()) else 'OFF'}"
-        )
+        f"Source used: {used_source} • member_id: {member_id_focus or '—'} • Internet: {'ON' if internet_on else 'OFF'} • "
+        f"Foundation reasoner: {'ON' if (use_foundation_reasoner and _has_hf_token()) else 'OFF'}"
+    )
