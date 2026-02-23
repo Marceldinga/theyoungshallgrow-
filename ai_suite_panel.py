@@ -1,3 +1,4 @@
+
 # ai_suite_panel.py ✅ ADVANCED+ NJANGI AI SUITE (NO API KEY) — SINGLE FILE
 # ------------------------------------------------------------------------------
 # ✅ Includes:
@@ -17,6 +18,12 @@
 #   • Member Segmentation (K-Means clustering implemented with NumPy)
 #   • What-If Stress Test (contrib drop + payment delays + fines shock)
 #   • Interest Income Projection (simple)
+#
+# ✅ EMBEDDED ADVANCED TECH:
+#   • Manifold Tangent Engine (KNN + PCA tangent) ALWAYS ON
+#     - Always computed
+#     - Always influences final risk
+#     - Adds manifold alerts + tightens loan policy
 #
 # Streamlit 2025+ safe: uses width="stretch"
 # Cache-safe: never caches supabase clients
@@ -119,7 +126,6 @@ def _fill_feature_defaults(X: pd.DataFrame) -> pd.DataFrame:
     for col in X.columns:
         if col == "member_id":
             continue
-        # keep dt columns if present
         if col.endswith("_dt"):
             continue
         if col.endswith("_count") or col.endswith("_n"):
@@ -140,6 +146,124 @@ def _throttle(slow_mode: bool, min_interval_s: float = 0.12):
     if wait > 0:
         time.sleep(wait)
     st.session_state["__ai_suite_last_tick__"] = time.time()
+
+
+# ============================================================
+# ✅ EMBEDDED MANIFOLD ENGINE (KNN + PCA Tangent) — NO API KEY
+# ============================================================
+def _standardize_matrix(df: pd.DataFrame, cols: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    X = df[cols].to_numpy(dtype=float)
+    mu = np.nanmean(X, axis=0)
+    sigma = np.nanstd(X, axis=0)
+    sigma = np.where(sigma <= 1e-12, 1.0, sigma)
+    Z = (X - mu) / sigma
+    Z = np.nan_to_num(Z, nan=0.0, posinf=0.0, neginf=0.0)
+    return Z, mu, sigma
+
+
+def _knn_indices(Z: np.ndarray, i: int, k: int) -> np.ndarray:
+    if Z.shape[0] <= 1:
+        return np.array([i], dtype=int)
+    k = int(max(4, min(k, Z.shape[0])))
+    dif = Z - Z[i]
+    dist2 = np.sum(dif * dif, axis=1)
+    idx = np.argsort(dist2)[:k]
+    return idx.astype(int)
+
+
+def _pca_first_component(centered: np.ndarray) -> np.ndarray:
+    _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+    v1 = Vt[0]
+    nrm = np.linalg.norm(v1) + 1e-12
+    return v1 / nrm
+
+
+def _corr_safe(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    if a.size < 4 or np.std(a) < 1e-12 or np.std(b) < 1e-12:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def manifold_tangent_metrics(
+    X: pd.DataFrame,
+    risk_series: pd.Series,
+    member_id: int,
+    feature_cols: list[str],
+    k_neighbors: int = 12,
+) -> dict:
+    out = {
+        "ok": False,
+        "msg": "",
+        "manifold_velocity": 0.0,    # [-1,1]
+        "manifold_trend": "→ stable",
+        "outlier_score": 0.0,        # [0,1]
+        "risk_alignment_corr": 0.0,
+        "k_used": 0,
+    }
+
+    if X is None or X.empty:
+        out["msg"] = "No feature matrix."
+        return out
+    if "member_id" not in X.columns:
+        out["msg"] = "Missing member_id."
+        return out
+
+    idx_row = X.index[X["member_id"].astype(int) == int(member_id)]
+    if len(idx_row) == 0:
+        out["msg"] = "Member not found."
+        return out
+    i = int(idx_row[0])
+
+    Z, _, _ = _standardize_matrix(X, feature_cols)
+    idx = _knn_indices(Z, i, k_neighbors)
+    out["k_used"] = int(len(idx))
+    if len(idx) < 4:
+        out["msg"] = "Not enough neighbors."
+        return out
+
+    Zn = Z[idx, :]
+    center = np.mean(Zn, axis=0)
+    centered = Zn - center
+
+    v1 = _pca_first_component(centered)
+    t = centered @ v1
+    t_i = float((Z[i] - center) @ v1)
+
+    rn = risk_series.loc[X.index[idx]].to_numpy(dtype=float)
+    corr = _corr_safe(t, rn)
+    out["risk_alignment_corr"] = float(corr)
+
+    vel = float(np.tanh(t_i) * (1.0 if corr >= 0 else -1.0))
+    vel = float(np.clip(vel, -1.0, 1.0))
+    out["manifold_velocity"] = vel
+    out["manifold_trend"] = ("↑ rising" if vel > 0.20 else ("↓ improving" if vel < -0.20 else "→ stable"))
+
+    centered_i = (Z[i] - center)
+    proj = t_i * v1
+    resid = centered_i - proj
+    resid_norm = float(np.linalg.norm(resid))
+    out["outlier_score"] = float(np.clip(np.tanh(resid_norm / 2.0), 0.0, 1.0))
+
+    out["ok"] = True
+    out["msg"] = "OK"
+    return out
+
+
+def embedded_manifold_adjustment(mf: dict) -> float:
+    """
+    ✅ Always-on risk adjustment:
+      - velocity pushes risk up/down
+      - high outlier (off-manifold) adds a penalty
+    """
+    if not mf or not mf.get("ok"):
+        return 0.0
+    vel = float(mf.get("manifold_velocity", 0.0))
+    outlier = float(mf.get("outlier_score", 0.0))
+    adj = 0.10 * vel
+    adj += 0.05 * max(0.0, outlier - 0.60)
+    return float(adj)
 
 
 # ============================================================
@@ -224,8 +348,10 @@ def build_member_features(
 
         if "session_id" in c.columns:
             c["session_id"] = _to_int(c["session_id"])
-            cfeat = cfeat.merge(c.groupby("member_id")["session_id"].nunique().rename("contrib_sessions_n"),
-                                left_on="member_id", right_index=True, how="left")
+            cfeat = cfeat.merge(
+                c.groupby("member_id")["session_id"].nunique().rename("contrib_sessions_n"),
+                left_on="member_id", right_index=True, how="left"
+            )
     else:
         cfeat["contrib_total"] = 0.0
         cfeat["contrib_count"] = 0
@@ -267,7 +393,6 @@ def build_member_features(
             lfeat["loan_unpaid_interest_sum"] = 0.0
 
         if "interest_rate_monthly" in l.columns:
-            # simple weighted avg by principal_current/principal
             w = l["balance_calc"].replace(0, np.nan)
             rate_wavg = (l["interest_rate_monthly"] * w).groupby(l["member_id"]).sum() / w.groupby(l["member_id"]).sum()
             lfeat = lfeat.merge(rate_wavg.rename("loan_interest_rate_wavg"), left_on="member_id", right_index=True, how="left")
@@ -843,39 +968,20 @@ def generate_alerts(member_name: str, final_risk: float, reliability: int, dropo
 
 # ============================================================
 # NEW: Risk trend over time (selected member)
-#   Uses last activity dates and recomputes “days_since” across the past N days.
 # ============================================================
-def member_risk_trend(
-    member_row: pd.Series,
-    cfg: dict[str, float],
-    *,
-    days_back: int = 90,
-) -> pd.DataFrame:
+def member_risk_trend(member_row: pd.Series, cfg: dict[str, float], *, days_back: int = 90) -> pd.DataFrame:
     now = _utc_now().normalize()
     dates = [now - pd.Timedelta(days=i) for i in range(days_back, -1, -1)]
 
-    # pull last known dates from features
-    last_contrib = member_row.get("contrib_last_dt", pd.NaT)
-    last_pay = member_row.get("pay_last_dt", pd.NaT)
-
-    # if missing, treat as very old
-    last_contrib = pd.to_datetime(last_contrib, utc=True, errors="coerce")
-    last_pay = pd.to_datetime(last_pay, utc=True, errors="coerce")
+    last_contrib = pd.to_datetime(member_row.get("contrib_last_dt", pd.NaT), utc=True, errors="coerce")
+    last_pay = pd.to_datetime(member_row.get("pay_last_dt", pd.NaT), utc=True, errors="coerce")
 
     out = []
     for d in dates:
         rr = member_row.copy()
 
-        # recompute days_since based on historical date "d"
-        if pd.notna(last_contrib):
-            rr["days_since_last_contrib"] = int((d - last_contrib.normalize()).days)
-        else:
-            rr["days_since_last_contrib"] = 999
-
-        if pd.notna(last_pay):
-            rr["days_since_last_payment"] = int((d - last_pay.normalize()).days)
-        else:
-            rr["days_since_last_payment"] = 999
+        rr["days_since_last_contrib"] = int((d - last_contrib.normalize()).days) if pd.notna(last_contrib) else 999
+        rr["days_since_last_payment"] = int((d - last_pay.normalize()).days) if pd.notna(last_pay) else 999
 
         risk, _ = compute_heuristic_risk(rr, cfg=cfg)
         out.append({"date": d.date(), "risk": float(risk)})
@@ -885,8 +991,6 @@ def member_risk_trend(
 
 # ============================================================
 # NEW: Simple Interest Income Projection
-#   Uses unpaid_interest if present; otherwise estimates:
-#     interest_rate_monthly * loan_balance_sum * months
 # ============================================================
 def interest_projection(member_row: pd.Series, horizon_days: int = 30) -> dict:
     bal = float(member_row.get("loan_balance_sum", 0.0))
@@ -914,16 +1018,13 @@ def _kmeans_numpy(X: np.ndarray, k: int = 3, iters: int = 30, seed: int = 42) ->
     if n == 0:
         return np.array([]), np.array([])
 
-    # init centers from random points
     idx = rng.choice(n, size=min(k, n), replace=False)
     centers = X[idx].copy()
 
     for _ in range(iters):
-        # assign
         dists = ((X[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
         labels = dists.argmin(axis=1)
 
-        # update
         new_centers = centers.copy()
         for j in range(centers.shape[0]):
             pts = X[labels == j]
@@ -934,7 +1035,6 @@ def _kmeans_numpy(X: np.ndarray, k: int = 3, iters: int = 30, seed: int = 42) ->
             break
         centers = new_centers
 
-    # final assign
     dists = ((X[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
     labels = dists.argmin(axis=1)
     return labels, centers
@@ -965,7 +1065,6 @@ def segmentation_clusters(features_df: pd.DataFrame, members_df: pd.DataFrame, k
     for c in cols:
         D[c] = pd.to_numeric(D[c], errors="coerce").fillna(0.0)
 
-    # standardize
     X = D[cols].to_numpy(dtype=float)
     mu = X.mean(axis=0)
     sd = X.std(axis=0)
@@ -982,26 +1081,38 @@ def segmentation_clusters(features_df: pd.DataFrame, members_df: pd.DataFrame, k
 
 
 # ============================================================
-# NEW: Early warning heatmap (all members)
+# NEW: Early warning heatmap (all members) + EMBEDDED MANIFOLD
 # ============================================================
-def early_warning_table(
-    X: pd.DataFrame,
-    members_df: pd.DataFrame,
-    cfg: dict[str, float],
-) -> pd.DataFrame:
+def early_warning_table(X: pd.DataFrame, members_df: pd.DataFrame, cfg: dict[str, float]) -> pd.DataFrame:
     id2name = _member_map(members_df)
     rows = []
+
+    # heuristic risk across all members
+    risks = []
     for _, rr in X.iterrows():
+        r, _ = compute_heuristic_risk(rr, cfg=cfg)
+        risks.append(float(r))
+    risk_series = pd.Series(risks, index=X.index, dtype=float)
+
+    feat_cols = [c for c in X.columns if c != "member_id"]
+    k_neighbors = int(np.clip(max(8, int(len(X) * 0.25)), 8, 18))
+
+    for idx, rr in X.iterrows():
+        mid = int(rr.get("member_id", 0))
+        name = id2name.get(mid, f"Member {mid}")
+
         r, _ = compute_heuristic_risk(rr, cfg=cfg)
         rel, _ = compute_reliability_score(rr)
         drop, _ = dropout_risk(rr)
 
-        # fraud needs raw tables normally; we keep a lightweight proxy here
-        # (you still get real fraud score on member detail tab)
         fraud_proxy = float(np.clip(0.05 + 0.12 * float(rr.get("loan_bad_status_count", 0)) + 0.05 * float(rr.get("fine_count", 0)), 0, 1))
 
+        mf = manifold_tangent_metrics(X=X, risk_series=risk_series, member_id=mid, feature_cols=feat_cols, k_neighbors=k_neighbors)
+        mf_adj = embedded_manifold_adjustment(mf)
+        final_r = float(np.clip(float(r) + mf_adj, 0.0, 1.0))
+
         flags = []
-        if r >= 0.70:
+        if final_r >= 0.70:
             flags.append("HIGH_RISK")
         if rel < 45:
             flags.append("LOW_RELIABILITY")
@@ -1009,11 +1120,19 @@ def early_warning_table(
             flags.append("DROPOUT_RISK")
         if fraud_proxy >= 0.45:
             flags.append("ANOMALY_PROXY")
+        if mf.get("ok") and float(mf.get("manifold_velocity", 0.0)) > 0.35:
+            flags.append("MANIFOLD_RISING")
+        if mf.get("ok") and float(mf.get("outlier_score", 0.0)) > 0.70:
+            flags.append("OFF_MANIFOLD")
 
         rows.append({
-            "member_id": int(rr.get("member_id", 0)),
-            "name": id2name.get(int(rr.get("member_id", 0)), f"Member {int(rr.get('member_id',0))}"),
-            "risk": float(r),
+            "member_id": mid,
+            "name": name,
+            "risk_base": float(r),
+            "manifold_adj": float(mf_adj),
+            "risk_final": float(final_r),
+            "manifold_trend": str(mf.get("manifold_trend", "—")),
+            "outlier_%": int(round(float(mf.get("outlier_score", 0.0)) * 100)),
             "reliability": int(rel),
             "dropout": float(drop),
             "anomaly_proxy": float(fraud_proxy),
@@ -1023,7 +1142,7 @@ def early_warning_table(
     df = pd.DataFrame(rows)
     if df.empty:
         return df
-    return df.sort_values(["risk", "dropout", "reliability"], ascending=[False, False, True])
+    return df.sort_values(["risk_final", "dropout", "reliability"], ascending=[False, False, True])
 
 
 # ============================================================
@@ -1163,6 +1282,7 @@ def system_chat_answer(question: str, ctx: dict) -> str:
     top_risky = ctx.get("top_risky", [])
     alerts = ctx.get("alerts", [])
     minutes_text = ctx.get("minutes_text", "")
+    manifold_ctx = ctx.get("manifold_ctx", {})
 
     id2name = _member_map(members)
 
@@ -1189,6 +1309,19 @@ def system_chat_answer(question: str, ctx: dict) -> str:
             "- `summary member 5` or `summary Marcel`\n"
             "- `alerts`\n"
             "- `minutes`\n"
+            "- `manifold` (show manifold trend/outlier for selected member)\n"
+        )
+
+    if "manifold" in ql:
+        mf = manifold_ctx.get("mf", {})
+        if not mf or not mf.get("ok"):
+            return f"Manifold not available: {mf.get('msg','missing data')}."
+        return (
+            "### 🧭 Manifold (embedded)\n"
+            f"- Trend: **{mf.get('manifold_trend','→ stable')}**\n"
+            f"- Velocity: **{float(mf.get('manifold_velocity',0.0)):+.2f}**\n"
+            f"- Outlier: **{float(mf.get('outlier_score',0.0))*100:.0f}%**\n"
+            f"- Embedded risk adjustment: **{float(manifold_ctx.get('mf_adj',0.0)):+.3f}**\n"
         )
 
     if "minutes" in ql:
@@ -1292,11 +1425,11 @@ def system_chat_answer(question: str, ctx: dict) -> str:
             f"- Loan balance (sum): **{_fmt_money(bal_sum)}**\n"
         )
 
-    return "Try `help`. I can answer totals, loan status, member summaries, alerts, top risky, and minutes."
+    return "Try `help`. I can answer totals, loan status, member summaries, alerts, top risky, minutes, and manifold."
 
 
 # ============================================================
-# UI: Render EVERYTHING
+# UI: Render EVERYTHING (MAIN ENTRY)
 # ============================================================
 def render_full_ai_suite_panel(
     *,
@@ -1390,8 +1523,8 @@ def render_full_ai_suite_panel(
     members2[name_col] = members2[name_col].astype(str)
     members2["label"] = members2.apply(lambda r: f"{int(r['id']):02d} • {r.get(name_col,'')}", axis=1)
 
-    st.header("🧠 NJANGI AI Suite — Advanced+")
-    st.caption("Risk • Reliability • Dropout • Fraud • Liquidity • Decisions • Alerts • Trends • Segments • Stress Test")
+    st.header("🧠 NJANGI AI Suite — Advanced+ (Embedded Manifold)")
+    st.caption("Risk • Reliability • Dropout • Fraud • Liquidity • Decisions • Alerts • Trends • Segments • Stress Test • ✅ Manifold always-on")
 
     pick = st.selectbox("Select member", members2["label"].tolist(), index=0)
     member_id = int(members2.loc[members2["label"] == pick, "id"].iloc[0])
@@ -1404,20 +1537,34 @@ def render_full_ai_suite_panel(
     row1 = row.iloc[0]
 
     # Risk modes
-    mode = st.radio("Risk mode", ["Heuristic", "ML (XGBoost)", "Hybrid"], horizontal=True)
+    mode = st.radio("Risk mode (base)", ["Heuristic", "ML (XGBoost)", "Hybrid"], horizontal=True)
+    st.caption("Manifold tangent is embedded and always modifies final risk.")
 
     h_risk, h_reasons = compute_heuristic_risk(row1, cfg=cfg)
     ml_risk, ml_msg = xgb_risk_for_member(loans, member_id=member_id, min_rows=int(min_loans_for_ml))
 
     if mode == "Heuristic":
-        final_risk = h_risk
+        base_risk = h_risk
         risk_source = "Heuristic"
     elif mode == "ML (XGBoost)":
-        final_risk = ml_risk if ml_risk is not None else h_risk
+        base_risk = ml_risk if ml_risk is not None else h_risk
         risk_source = "ML" if ml_risk is not None else "Heuristic (fallback)"
     else:
-        final_risk = h_risk if ml_risk is None else float(np.clip((h_risk + ml_risk) / 2.0, 0.0, 1.0))
+        base_risk = h_risk if ml_risk is None else float(np.clip((h_risk + ml_risk) / 2.0, 0.0, 1.0))
         risk_source = "Hybrid" if ml_risk is not None else "Heuristic (fallback)"
+
+    # ✅ ALWAYS compute manifold against heuristic risk field (stable + fast)
+    risks = []
+    for _, rr in X.iterrows():
+        r, _ = compute_heuristic_risk(rr, cfg=cfg)
+        risks.append(float(r))
+    risk_series = pd.Series(risks, index=X.index, dtype=float)
+    feat_cols = [c for c in X.columns if c != "member_id"]
+    k_neighbors = int(np.clip(max(8, int(len(X) * 0.25)), 8, 18))
+    mf = manifold_tangent_metrics(X=X, risk_series=risk_series, member_id=member_id, feature_cols=feat_cols, k_neighbors=k_neighbors)
+    mf_adj = embedded_manifold_adjustment(mf)
+
+    final_risk = float(np.clip(float(base_risk) + float(mf_adj), 0.0, 1.0))
 
     rel, rel_reasons = compute_reliability_score(row1)
     drop, drop_reasons = dropout_risk(row1)
@@ -1427,10 +1574,28 @@ def render_full_ai_suite_panel(
     liquidity_ok = bool(liq.get("ok")) and float(liq.get("avg_daily_net", 0.0)) >= 0
 
     req_amt = st.number_input("Test loan amount (recommendation)", min_value=0.0, value=3000.0, step=500.0)
+
     decision, dec_reasons = smart_loan_decision(final_risk, rel, liquidity_ok, float(req_amt))
+
+    # ✅ Embedded manifold tightening on decision
+    if mf.get("ok"):
+        if float(mf.get("manifold_velocity", 0.0)) > 0.35 and decision == "APPROVE":
+            decision = "APPROVE WITH CONDITIONS"
+            dec_reasons = ["Manifold rising trend: apply stricter conditions."] + dec_reasons
+        if float(mf.get("outlier_score", 0.0)) > 0.75 and decision in ("APPROVE", "APPROVE WITH CONDITIONS"):
+            decision = "APPROVE WITH CONDITIONS"
+            dec_reasons = ["Off-manifold behavior: require verification / surety."] + dec_reasons
+        dec_reasons = dec_reasons[:6]
+
     alerts = generate_alerts(member_name, final_risk, rel, drop, fraud, liq)
 
-    # Top risky (all)
+    # ✅ Manifold alerts
+    if mf.get("ok") and float(mf.get("manifold_velocity", 0.0)) > 0.35:
+        alerts.append({"severity": "med", "type": "manifold_trend", "message": f"{member_name}: Manifold trend rising (velocity {float(mf.get('manifold_velocity',0.0)):+.2f})."})
+    if mf.get("ok") and float(mf.get("outlier_score", 0.0)) > 0.70:
+        alerts.append({"severity": "med", "type": "manifold_outlier", "message": f"{member_name}: Off-manifold behavior detected (outlier {float(mf.get('outlier_score',0.0))*100:.0f}%)."})
+
+    # Top risky (all - heuristic, for system comparisons)
     id2name = _member_map(members2)
     top_risky = []
     try:
@@ -1445,11 +1610,23 @@ def render_full_ai_suite_panel(
         top_risky = []
 
     # KPI row
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Final Risk", _fmt_pct01(final_risk), help=f"Source: {risk_source}")
-    k2.metric("Reliability", f"{rel}/100")
-    k3.metric("Dropout Risk", _fmt_pct01(drop))
-    k4.metric("Fraud/Anomaly", _fmt_pct01(fraud))
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Final Risk", _fmt_pct01(final_risk), help=f"Base: {risk_source} + manifold adj {mf_adj:+.3f}")
+    k2.metric("Base Risk", _fmt_pct01(base_risk))
+    k3.metric("Reliability", f"{rel}/100")
+    k4.metric("Dropout", _fmt_pct01(drop))
+    k5.metric("Anomaly", _fmt_pct01(fraud))
+
+    st.subheader("🧭 Manifold (Embedded)")
+    if mf.get("ok"):
+        cA, cB, cC, cD = st.columns(4)
+        cA.metric("Trend", str(mf.get("manifold_trend", "→ stable")))
+        cB.metric("Velocity", f"{float(mf.get('manifold_velocity',0.0)):+.2f}")
+        cC.metric("Outlier", f"{float(mf.get('outlier_score',0.0))*100:.0f}%")
+        cD.metric("Adj", f"{mf_adj:+.3f}")
+        st.caption(f"Risk alignment corr: {float(mf.get('risk_alignment_corr',0.0)):+.2f} • K={int(mf.get('k_used',0))}")
+    else:
+        st.info(f"Manifold not available: {mf.get('msg','')}")
 
     # Tabs
     tab_risk, tab_heat, tab_trend, tab_seg, tab_stress, tab_liq, tab_loan, tab_alerts, tab_chat, tab_minutes = st.tabs([
@@ -1467,7 +1644,7 @@ def render_full_ai_suite_panel(
 
     with tab_risk:
         st.subheader(f"Risk prediction — {member_name}")
-        st.metric("Final Risk", _fmt_pct01(final_risk))
+        st.metric("Final Risk (embedded)", _fmt_pct01(final_risk))
         st.progress(float(np.clip(final_risk, 0.0, 1.0)))
 
         c1, c2 = st.columns(2)
@@ -1516,17 +1693,17 @@ def render_full_ai_suite_panel(
         st.write(f"- Estimated interest income ({h}d): **{_fmt_money(proj['estimated_interest_income'])}**")
 
     with tab_heat:
-        st.subheader("Early Warning Heatmap (All Members)")
+        st.subheader("Early Warning Heatmap (All Members) — Embedded Manifold")
         df_warn = early_warning_table(X, members2, cfg=cfg)
         if df_warn.empty:
             st.info("Not enough data to generate early warning table.")
         else:
-            # show risk as %
             df_show = df_warn.copy()
-            df_show["risk_%"] = (df_show["risk"] * 100).round(1)
+            df_show["risk_base_%"] = (df_show["risk_base"] * 100).round(1)
+            df_show["risk_final_%"] = (df_show["risk_final"] * 100).round(1)
             df_show["dropout_%"] = (df_show["dropout"] * 100).round(0).astype(int)
             df_show["anomaly_%"] = (df_show["anomaly_proxy"] * 100).round(0).astype(int)
-            df_show = df_show.drop(columns=["risk", "dropout", "anomaly_proxy"])
+            df_show = df_show.drop(columns=["risk_base", "risk_final", "dropout", "anomaly_proxy"])
             st.dataframe(df_show, width=W_STRETCH)
             st.download_button(
                 "⬇️ Download early warnings (CSV)",
@@ -1543,7 +1720,7 @@ def render_full_ai_suite_panel(
             st.info("Trend unavailable (missing date fields).")
         else:
             st.line_chart(df_tr.set_index("date"))
-            st.caption("This trend is computed by re-evaluating risk using the same balances but changing the inactivity days across time.")
+            st.caption("Trend recomputes inactivity days across time using last activity timestamps.")
 
     with tab_seg:
         st.subheader("Member Segmentation (K-Means, No sklearn)")
@@ -1552,13 +1729,11 @@ def render_full_ai_suite_panel(
             st.info("Segmentation unavailable (missing segmentation columns).")
         else:
             st.dataframe(seg, width=W_STRETCH)
-
             st.divider()
             st.caption("Segment summary (avg per segment)")
             cols = [c for c in seg.columns if c not in ("member_id", "name", "segment")]
             summary = seg.groupby("segment")[cols].mean(numeric_only=True).reset_index()
             st.dataframe(summary, width=W_STRETCH)
-
             st.download_button(
                 "⬇️ Download segmentation (CSV)",
                 seg.to_csv(index=False).encode("utf-8"),
@@ -1568,28 +1743,23 @@ def render_full_ai_suite_panel(
 
     with tab_stress:
         st.subheader("Stress Test (What-If)")
-        st.caption("Simulate shocks and see how risk changes for this member.")
+        st.caption("Simulate shocks and see how heuristic risk changes for this member (manifold still shown above).")
 
         rr = row1.copy()
-
-        # apply stress
         rr["contrib_total"] = float(rr.get("contrib_total", 0.0)) * (1.0 - (stress_contrib_drop / 100.0))
-        rr["contrib_count"] = int(rr.get("contrib_count", 0))
         rr["days_since_last_payment"] = int(rr.get("days_since_last_payment", 999)) + int(stress_payment_delay)
         rr["fine_total"] = float(rr.get("fine_total", 0.0)) * (1.0 + (stress_fines_increase / 100.0))
 
         stressed_risk, stressed_reasons = compute_heuristic_risk(rr, cfg=cfg)
 
         c1, c2 = st.columns(2)
-        c1.metric("Current Risk", _fmt_pct01(final_risk))
-        c2.metric("Stressed Risk", _fmt_pct01(stressed_risk))
+        c1.metric("Current Final Risk", _fmt_pct01(final_risk))
+        c2.metric("Stressed Base Risk", _fmt_pct01(stressed_risk))
 
         st.progress(float(np.clip(stressed_risk, 0.0, 1.0)))
         st.write("**Stressed signals**")
         for r in stressed_reasons:
             st.write(f"• {r}")
-
-        st.caption("Use this to decide caps/conditions under tougher economic conditions.")
 
     with tab_liq:
         st.subheader("Liquidity Forecast (System-Level)")
@@ -1599,12 +1769,11 @@ def render_full_ai_suite_panel(
             c1, c2 = st.columns(2)
             c1.metric("Estimated Net Balance (approx)", f"{liq.get('balance_est', 0.0):,.0f}")
             c2.metric("Avg Daily Net Flow (~30d)", f"{liq.get('avg_daily_net', 0.0):,.1f}")
-
             df_fc = pd.DataFrame({"date": liq["dates"], "forecast_balance": liq["forecast_balance"]})
             st.line_chart(df_fc.set_index("date"))
 
     with tab_loan:
-        st.subheader("Smart Loan Recommendation")
+        st.subheader("Smart Loan Recommendation (Embedded)")
         st.write(f"**Member:** {member_name} (ID {member_id})")
         st.write(f"**Requested amount:** {_fmt_money(req_amt)}")
         st.write(f"**Decision:** `{decision}`")
@@ -1655,13 +1824,14 @@ def render_full_ai_suite_panel(
             "top_risky": top_risky,
             "alerts": alerts,
             "minutes_text": minutes_text,
+            "manifold_ctx": {"mf": mf, "mf_adj": mf_adj},
         }
 
         for role, msg in st.session_state.system_ai_msgs[-30:]:
             with st.chat_message(role):
                 st.markdown(msg)
 
-        q = st.chat_input("Ask: totals, loan status, member summary, alerts, top risky, minutes…")
+        q = st.chat_input("Ask: totals, loan status, member summary, alerts, top risky, minutes, manifold…")
         if q:
             st.session_state.system_ai_msgs.append(("user", q))
             ans = system_chat_answer(q, chat_ctx)
