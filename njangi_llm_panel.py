@@ -1,4 +1,3 @@
-
 # njangi_llm_panel.py ✅ SINGLE COMPLETE FILE — younchat reads your DB (members = source of truth)
 # =============================================================================
 # 💬 younchat — DB-TOOLS FIRST (tables + views) + ✅ Manifold State + ✅ Foundation Reasoner (HF) + Optional Tavily
@@ -39,6 +38,7 @@
 # Railway env vars (optional):
 #   HF_TOKEN
 #   HF_FORCE_MODE = auto | completions | chat
+#   HF_MODEL = (optional, must be one of allowed)
 #   TAVILY_API_KEY
 #   INTERNET_MODE = on | off
 # =============================================================================
@@ -269,12 +269,6 @@ def _sb_select(
 # 3) SNAPSHOT / STATE (Manifold builders)
 # =============================================================================
 def _rpc_finance_snapshot(sb_anon, sb_service, schema: str) -> Dict[str, Any]:
-    """
-    Calls public.fn_finance_snapshot() and returns dict.
-    Supports:
-      A) flat keys
-      B) nested keys: {totals:{...}, counts:{...}, ratios:{...}}
-    """
     sb = sb_service or sb_anon
     if sb is None:
         return {}
@@ -301,7 +295,6 @@ def _snapshot_to_metrics(snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not snapshot:
         return None
 
-    # Nested format
     if isinstance(snapshot.get("totals"), dict) or isinstance(snapshot.get("counts"), dict) or isinstance(snapshot.get("ratios"), dict):
         totals = snapshot.get("totals") or {}
         counts = snapshot.get("counts") or {}
@@ -323,7 +316,6 @@ def _snapshot_to_metrics(snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "top_borrower_member_id": ratios.get("top_borrower_member_id") if "top_borrower_member_id" in ratios else None,
         }
 
-    # Flat format
     rc = snapshot.get("counts") if isinstance(snapshot.get("counts"), dict) else {}
     return {
         "notes": [],
@@ -381,7 +373,6 @@ def _collect_global_finance_context(sb_anon, sb_service, schema: str) -> Dict[st
     if snap:
         return {"ok": True, "notes": [], "snapshot": snap, "mode": "rpc"}
 
-    # Fallback: table scans
     out: Dict[str, Any] = {"ok": True, "notes": ["Snapshot unavailable → fallback table scan."], "df": {}, "mode": "tables"}
     out["df"]["contributions"] = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=200000)
     out["df"]["foundation_contributions"] = _sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=200000)
@@ -395,13 +386,11 @@ def _compute_global_metrics(ctx: Dict[str, Any]) -> Dict[str, Any]:
     snap = ctx.get("snapshot") or {}
     snap_metrics = _snapshot_to_metrics(snap) if isinstance(snap, dict) else None
     if snap_metrics is not None:
-        # Add provenance
         snap_metrics["notes"] = list(snap_metrics.get("notes") or []) + list(ctx.get("notes") or [])
         snap_metrics["_mode"] = ctx.get("mode")
         snap_metrics["_generated_at"] = _utc_now()
         return snap_metrics
 
-    # Fallback compute from tables
     dfc = (ctx.get("df") or {}).get("contributions", pd.DataFrame())
     dff = (ctx.get("df") or {}).get("foundation_contributions", pd.DataFrame())
     dfl = (ctx.get("df") or {}).get("loans", pd.DataFrame())
@@ -574,10 +563,6 @@ def _score_level(score: int) -> str:
 
 
 def _manifold_global_state(metrics: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    ✅ The "smooth manifold state": a structured state vector.
-    Foundation model is allowed to reason ONLY over this state JSON.
-    """
     risk_label, signals = _risk_classification(metrics)
     hs, hs_reasons = _health_score(metrics)
 
@@ -738,10 +723,9 @@ def _manifold_member_state(member_id: str, name: str, table_totals: Dict[str, An
     unpaid = _to_float(table_totals.get("active_unpaid_interest"))
     grade = _member_risk_grade(active_bal, unpaid)
 
-    # Derived manifold features (still DB-computed)
     contrib = _to_float(table_totals.get("contributions_total"))
     exposure = active_bal
-    exposure_ratio = _ratio(exposure, contrib)  # exposure per contribution strength
+    exposure_ratio = _ratio(exposure, contrib)
 
     state = {
         "manifold_type": "member_finance_state",
@@ -902,8 +886,62 @@ def _looks_like_code_output(txt: str) -> bool:
         return False
     if "```" in t:
         return True
-    code_markers = ["import ", "def ", "class ", "select ", "create table", "alter table", "drop table", "insert into", "update ", "delete from"]
+    code_markers = [
+        "import ", "def ", "class ", "select ", "create table", "alter table", "drop table",
+        "insert into", "update ", "delete from"
+    ]
     return any(m in t for m in code_markers)
+
+
+# =============================================================================
+# 5B) SMALLTALK (Foundation model allowed; never DB numbers)
+# =============================================================================
+def _is_smalltalk(text: str) -> bool:
+    t = _lc(text)
+    keys = [
+        "how are you", "how r you", "how are u", "how you doing",
+        "who are you", "what are you", "what is your name", "your name",
+        "hello", "hi", "hey", "good morning", "good afternoon", "good evening",
+        "thanks", "thank you"
+    ]
+    return any(k in t for k in keys)
+
+
+def _smalltalk_state() -> Dict[str, Any]:
+    return {
+        "manifold_type": "smalltalk_state",
+        "generated_at_utc": _utc_now(),
+        "assistant": {
+            "name": "younchat",
+            "role": "Njangi assistant",
+            "rules": [
+                "Start every answer with Hello 👋🏽",
+                "DB commands are answered from the Njangi database only",
+                "Do not invent Njangi financial numbers",
+            ],
+        },
+        "capabilities": {
+            "db_commands_examples": ["members", "loans", "finance kpis", "tables", "show contributions", "describe loans", "verify member 10"],
+            "intelligence_examples": ["How are we doing?", "Njangi health score", "Control tower", "Financial intelligence"],
+        },
+    }
+
+
+def _smalltalk_reply_local(text: str) -> str:
+    t = _lc(text)
+    if "who are you" in t or "what are you" in t or "your name" in t:
+        return (
+            "Hello 👋🏽 I’m younchat — your Njangi assistant.\n\n"
+            "I can read your Njangi database and answer with DB-grounded results.\n"
+            "Try: **members**, **loans**, or **finance kpis**."
+        )
+    if "how are you" in t or "how you doing" in t:
+        return "Hello 👋🏽 I’m doing well — ready to help. What should we check in your Njangi?"
+    if "thank" in t:
+        return "Hello 👋🏽 You’re welcome! What should we check next?"
+    if any(x in t for x in ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]):
+        return "Hello 👋🏽 How can I help you with your Njangi today?"
+    return "Hello 👋🏽"
 
 
 # =============================================================================
@@ -1066,7 +1104,7 @@ def _tavily_search(query: str) -> Dict[str, Any]:
 
 
 # =============================================================================
-# 8) FOUNDATION MODEL (HF Router) — MANIFOLD GROUNDED ONLY
+# 8) FOUNDATION MODEL (HF Router)
 # =============================================================================
 def _has_hf_token() -> bool:
     return bool((os.getenv("HF_TOKEN") or "").strip())
@@ -1128,9 +1166,6 @@ def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 6
 
 
 def _manifold_reasoner_prompt(manifold_state: Dict[str, Any], question: str) -> str:
-    """
-    ✅ HF must reason ONLY from manifold_state JSON.
-    """
     return (
         "You are younchat, an assistant inside the Njangi platform.\n"
         "RULES (STRICT):\n"
@@ -1286,7 +1321,6 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         st.write("**Internet**:", "✅ ON" if internet_on else "❌ OFF")
         st.caption("DB integrity: Njangi numbers are ALWAYS answered from DB. HF is narrative-only over manifold JSON.")
 
-    # ✅ toggle for manifold HF reasoning (applies to control-tower + member intelligence only)
     use_foundation_reasoner = st.toggle(
         "Use foundation reasoner (HF) for intelligence reports (manifold-grounded)",
         value=bool(hf_token),
@@ -1300,7 +1334,6 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
 
     members_truth = _cached_members_truth(int(time.time() // 10))
 
-    # ✅ ONLY INTRO LINE
     if "younchat_history" not in st.session_state:
         st.session_state["younchat_history"] = [{"role": "assistant", "content": _intro_only()}]
 
@@ -1335,9 +1368,6 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     df_show: Optional[pd.DataFrame] = None
     df_title: Optional[str] = None
 
-    # -------------------------
-    # Internet forced
-    # -------------------------
     if _wants_internet(q):
         used_source = "tavily" if internet_on else "tavily:off"
         if not internet_on:
@@ -1362,9 +1392,6 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                             lines.append(f"  - {snippet[:180]}…")
                     answer = "\n".join(lines)
 
-    # -------------------------
-    # Help
-    # -------------------------
     elif _wants_help(q):
         used_source = "help"
         answer = (
@@ -1381,9 +1408,6 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
             "- **web: <topic>** (internet help)\n"
         )
 
-    # -------------------------
-    # Tables list
-    # -------------------------
     elif _wants_tables_list(q):
         used_source = "relations"
         rows = [{"relation": k, "type": RELATIONS[k].get("type", "?")} for k in sorted(RELATIONS.keys())]
@@ -1391,9 +1415,6 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         df_title = "Readable relations (allowlist)"
         answer = "Hello 👋🏽 Here are the tables/views younchat can read:"
 
-    # -------------------------
-    # Describe
-    # -------------------------
     elif _wants_describe(q):
         rel = _extract_relation_name(q)
         if not rel:
@@ -1403,9 +1424,6 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
             answer, df_show, used_source = _describe_relation(sb_anon, sb_service, schema, rel)
             df_title = f"Columns: {rel}"
 
-    # -------------------------
-    # Show
-    # -------------------------
     elif _wants_show_table(q):
         rel = _extract_relation_name(q)
         if not rel:
@@ -1415,9 +1433,6 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
             answer, df_show, used_source = _show_relation(sb_anon, sb_service, schema, rel)
             df_title = f"Preview: {rel}"
 
-    # -------------------------
-    # Members list
-    # -------------------------
     elif _wants_list_members(q):
         used_source = "members"
         if members_truth is None or members_truth.empty:
@@ -1429,18 +1444,12 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
             answer = "\n".join(lines)
             df_show, df_title = members_truth, "members (truth)"
 
-    # -------------------------
-    # KPIs
-    # -------------------------
     elif _wants_kpis(q):
         title, df, src = _kpis(sb_anon, sb_service, schema)
         used_source = src
         df_show, df_title = df, title
         answer = f"Hello 👋🏽 {title} (from `{src}`):" if not df.empty else "Hello 👋🏽 No KPI rows returned."
 
-    # -------------------------
-    # Loans
-    # -------------------------
     elif _wants_loans(q):
         mid = _extract_member_id(q) or member_id_focus
         title, df, src = _loans_with_member(sb_anon, sb_service, schema, mid, members_truth)
@@ -1448,9 +1457,6 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         df_show, df_title = df, title
         answer = f"Hello 👋🏽 {title} (from `{src}`):" if not df.empty else f"Hello 👋🏽 {title}: no rows returned."
 
-    # -------------------------
-    # Control tower (Manifold + optional HF reasoner)
-    # -------------------------
     elif _wants_financial_review(q):
         ctx = _collect_global_finance_context(sb_anon, sb_service, schema)
         metrics = _compute_global_metrics(ctx)
@@ -1468,13 +1474,9 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
             used_source = "local:manifold"
             answer = _build_control_tower_report_local(manifold)
 
-        # Always append DB Proof line for finance intelligence outputs
         proof_counts = (manifold.get("db_proof") or {}).get("row_counts") or {}
         answer = answer.rstrip() + "\n\n🧾 DB Proof\n- " + _db_proof_line(proof_counts)
 
-    # -------------------------
-    # Verify member
-    # -------------------------
     elif _wants_verify_member(q):
         mid = _extract_verify_member_id(q) or member_id_focus
         if not mid:
@@ -1483,10 +1485,6 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         else:
             answer, df_show, df_title, used_source = _member_verify_view_vs_tables(sb_anon, sb_service, schema, str(mid), members_truth)
 
-    # -------------------------
-    # Member intelligence: typing member_id or asking member status/summary/risk
-    # (TABLES-only state manifold, optional HF reasoner)
-    # -------------------------
     elif member_id_focus and (q.strip().isdigit() or "member" in _lc(q) or "summary" in _lc(q) or "status" in _lc(q) or _wants_member_risk(q)):
         mid = str(member_id_focus)
 
@@ -1513,23 +1511,32 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                 used_source = "local:manifold_member"
                 answer = _build_member_report_local(manifold)
 
-            # Always append DB Proof for member intelligence
             proof_counts = (manifold.get("db_proof") or {}).get("row_counts") or {}
             answer = answer.rstrip() + "\n\n🧾 DB Proof\n- " + _db_proof_line(proof_counts)
 
-    # -------------------------
-    # direct relation name
-    # -------------------------
     elif _lc(q) in RELATIONS:
         rel = _lc(q)
         answer, df_show, used_source = _show_relation(sb_anon, sb_service, schema, rel)
         df_title = f"Preview: {rel}"
 
-    # -------------------------
-    # Non-DB general chat (local fallback)
-    # -------------------------
     else:
-        if _is_db_command(q):
+        # ✅ If it is smalltalk, we can use the foundation model safely (no DB numbers).
+        if _is_smalltalk(q):
+            st_state = _smalltalk_state()
+            if use_foundation_reasoner and _has_hf_token():
+                ok, txt, used = _hf_reason_over_manifold(q, st_state)
+                if ok and txt and not _looks_like_code_output(txt):
+                    used_source = used
+                    answer = txt
+                else:
+                    used_source = f"{used}:fallback_smalltalk"
+                    answer = _smalltalk_reply_local(q)
+            else:
+                used_source = "local:smalltalk"
+                answer = _smalltalk_reply_local(q)
+
+        # ✅ If user typed a DB-ish question but not in valid format → show guard text
+        elif _is_db_command(q):
             used_source = "db:first_guard"
             answer = (
                 "Hello 👋🏽 I can answer using your real Njangi database only.\n\n"
@@ -1560,4 +1567,4 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
 
     st.caption(
         f"Source used: {used_source} • member_id: {member_id_focus or '—'} • Internet: {'ON' if internet_on else 'OFF'} • Foundation reasoner: {'ON' if (use_foundation_reasoner and _has_hf_token()) else 'OFF'}"
-    )
+        )
