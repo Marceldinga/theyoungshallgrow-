@@ -1,3 +1,4 @@
+
 # njangi_llm_panel.py ✅ SINGLE COMPLETE FILE — younchat reads your DB (members = source of truth)
 # =============================================================================
 # 💬 younchat — DB-TOOLS FIRST + Manifold State + Foundation Reasoner (HF) + Optional Tavily
@@ -13,6 +14,10 @@
 #   - Non-DB messages routed to HF use a strict Njangi "intent & next step" prompt:
 #     The model MUST assess what the member wants inside Njangi and guide them to the
 #     right DB command (or ask 1 short clarifying question), without inventing numbers.
+#
+# ✅ FIX INCLUDED (your screenshot issue):
+#   - Messages like "member_id=4" or "Member id = 4" are now treated as DB requests
+#     and return a DB-grounded Member Intelligence Summary automatically (no HF).
 # =============================================================================
 
 from __future__ import annotations
@@ -813,6 +818,7 @@ def _extract_relation_name(text: str) -> Optional[str]:
 _MEMBER_ID_PATTERNS = [
     re.compile(r"\bmember[_\s-]?id\s*[:=#]?\s*(\d+)\b", re.IGNORECASE),
     re.compile(r"\bmember\s*#?\s*(\d+)\b", re.IGNORECASE),
+    # keep this last: "id=4" could match lots of contexts; still useful for your UI
     re.compile(r"\bid\s*[:=#]?\s*(\d+)\b", re.IGNORECASE),
 ]
 
@@ -830,14 +836,50 @@ def _extract_member_id(text: str) -> Optional[str]:
     return None
 
 
+def _is_member_id_only_request(text: str) -> bool:
+    """
+    True when message is basically "member_id=4" or "4" or "member 4"
+    and should trigger Member Intelligence Summary (DB-only).
+    """
+    t = _lc(text)
+    mid = _extract_member_id(t)
+    if not mid:
+        return False
+
+    # If it's purely numeric, that's definitely a member focus request.
+    if t.strip().isdigit():
+        return True
+
+    # If it contains clear member/id token but not other command words, treat as member summary.
+    member_tokens = {"member", "member_id", "member-id", "member id", "id"}
+    has_member_token = any(tok in t for tok in member_tokens)
+
+    # If they included another explicit command, don't treat as "id-only"
+    other_cmd_tokens = [
+        "loans", "loan", "kpi", "kpis", "tables", "show ", "describe ", "verify ",
+        "contributions", "fines", "payouts", "attendance", "minutes",
+        "web:", "internet:", "tavily:",
+    ]
+    has_other = any(tok in t for tok in other_cmd_tokens)
+    return has_member_token and not has_other
+
+
 def _is_db_command(text: str) -> bool:
     """
     True => MUST be answered from DB tools (never HF).
     False => route to HF (foundation model) per your request.
+
+    ✅ IMPORTANT FIX:
+      - Any message that contains a member_id pattern is now treated as DB-related.
+        Example: "member_id=4" should NEVER go to HF.
     """
     t = _lc(text)
     if not t:
         return False
+
+    # ✅ member id present => DB
+    if _extract_member_id(t) is not None:
+        return True
 
     if t in RELATIONS:
         return True
@@ -1289,6 +1331,10 @@ def _build_member_report_local(manifold: Dict[str, Any]) -> str:
     for s in (d.get("signals") or [])[:6]:
         lines.append(f"- {s}")
 
+    lines.append("\n4️⃣ Next Best Actions")
+    lines.append("- Type: **loans** (or **loans for member <id>**) to see loan rows.")
+    lines.append("- Type: **verify member <id>** to compare view vs tables (integrity check).")
+
     lines.append("\n🧾 DB Proof")
     lines.append(f"- {_db_proof_line((proof.get('row_counts') or {}))}")
 
@@ -1318,7 +1364,6 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         st.write("**Internet**:", "✅ ON" if internet_on else "❌ OFF")
         st.caption("DB integrity: DB commands are DB-only. Non-DB messages route to HF with intent & next-step guidance.")
 
-    # Only affects manifold narrative for intelligence reports
     use_foundation_reasoner = st.toggle(
         "Use foundation reasoner (HF) for intelligence reports (manifold-grounded)",
         value=bool(hf_token),
@@ -1518,22 +1563,26 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
             else:
                 answer, df_show, df_title, used_source = _member_verify_view_vs_tables(sb_anon, sb_service, schema, str(mid), members_truth)
 
-        elif member_id_focus and (q.strip().isdigit() or "member" in _lc(q) or "summary" in _lc(q) or "status" in _lc(q) or _wants_member_risk(q)):
-            mid = str(member_id_focus)
+        elif _is_member_id_only_request(q) or (detected_id is not None and detected_id == (member_id_focus or detected_id)):
+            # ✅ NEW: member_id=4 should land here and produce a real DB answer
+            mid = str(detected_id or member_id_focus or "").strip()
+            used_source = "db:member_intelligence"
 
-            if not _member_exists(members_truth, mid):
-                used_source = "members_truth_missing"
+            if not mid:
+                answer = "Hello 👋🏽 Type a member id (example: **10**) to get that member’s intelligence summary."
+            elif not _member_exists(members_truth, mid):
                 answer = (
-                    "Hello 👋🏽 I can’t confirm that member_id exists in `members` (source of truth). "
-                    "Type **members** to verify IDs, then retry."
+                    "Hello 👋🏽 I can’t confirm that member_id exists in `members` (source of truth).\n"
+                    "Next: Type **members** to see valid IDs, then try again."
                 )
             else:
                 name = _member_name_from_truth(members_truth, mid)
                 table_totals, table_notes = _compute_member_totals_from_tables(sb_anon, sb_service, schema, mid)
                 manifold = _manifold_member_state(mid, name, table_totals, table_notes)
 
+                # Narrative: local or manifold HF reasoner (still DB-grounded)
                 if use_foundation_reasoner and _has_hf_token():
-                    ok, txt, used = _hf_reason_over_manifold(q, manifold)
+                    ok, txt, used = _hf_reason_over_manifold("Give a short member financial intelligence summary with next best actions.", manifold)
                     if ok and txt and not _looks_like_code_output(txt):
                         used_source = used
                         answer = txt
@@ -1541,7 +1590,6 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                         used_source = f"{used}:fallback_local"
                         answer = _build_member_report_local(manifold)
                 else:
-                    used_source = "local:manifold_member"
                     answer = _build_member_report_local(manifold)
 
                 proof_counts = (manifold.get("db_proof") or {}).get("row_counts") or {}
@@ -1564,6 +1612,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                 "- **show contributions**\n"
                 "- **describe loans**\n"
                 "- **verify member 10**\n"
+                "- Or type **10** (member intelligence)\n"
                 "- Ask: **How are we doing?**\n"
             )
 
@@ -1583,4 +1632,4 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         f"Internet: {'ON' if internet_on else 'OFF'} • "
         f"HF_TOKEN: {'ON' if _has_hf_token() else 'OFF'} • "
         f"Manifold reasoner: {'ON' if (use_foundation_reasoner and _has_hf_token()) else 'OFF'}"
-)
+    )
