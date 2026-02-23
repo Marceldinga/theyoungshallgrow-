@@ -1,13 +1,22 @@
-# dashboard_panel.py ✅ COMPLETE SINGLE FILE — CLEAN Dashboard + 🤖 Young AI (grounded) + Snapshot-first
-# ---------------------------------------------------------------------------------------------
+
+# dashboard_panel.py ✅ COMPLETE SINGLE FILE — Smooth Manifold Structure (Atlas/Charts) + CLEAN Dashboard + 🤖 Young AI (grounded) + Snapshot-first
+# -------------------------------------------------------------------------------------------------------------
 # ✅ NJANGI STANDARD (NO legacy)
+#
+# ✅ “Smooth manifold structure” refactor:
+#   Think of this module like a manifold:
+#     - Core/Utils      = smooth structure (shared primitives)
+#     - DB Layer        = charts over data space (safe selects/inserts, throttling)
+#     - Snapshot Layer  = atlas chart (RPC snapshot + fallback reads)
+#     - AI Layer        = smooth map from (question, snapshot) → answer (grounded)
+#     - UI Layer        = chart rendering (KPIs, Attendance, Young box, nav transitions)
+#
 # ✅ CLEAN DASHBOARD:
 #   - Only KPIs + Attendance + Young AI box
 #   - No extra banners/status text at the top
 #
 # ✅ Snapshot-FIRST (FAST + consistent):
-#   - Uses DB RPC snapshot when available:
-#       public.fn_finance_snapshot()
+#   - Uses DB RPC snapshot when available: public.fn_finance_snapshot()
 #     (falls back to table reads if RPC is missing)
 #   - Young answers ONLY from the LIVE snapshot (no guessing)
 #   - Adds snapshot time (UTC) + source used
@@ -22,6 +31,7 @@
 # ✅ Safe navigation buttons:
 #   - Buttons set st.session_state["page"] then st.rerun()
 #   - Page labels MUST match your app.py sidebar labels exactly.
+#   - Includes "🧠 AI Suite" button (matches updated app.py)
 #
 # Optional env vars:
 #   LOCAL_TZ=America/Chicago
@@ -39,6 +49,7 @@ import json
 import os
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -59,28 +70,31 @@ except Exception:
 
 
 # ============================================================
-# HF ROUTER ENDPOINTS
+# (0) SMOOTH STRUCTURE: GLOBAL CONSTANTS / “MANIFOLD METRIC”
 # ============================================================
+
 HF_ROUTER_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
 HF_ROUTER_COMPLETIONS_URL = "https://router.huggingface.co/v1/completions"
 
-# ✅ Lock HF models to the same stable 3 (prevents unsupported model errors)
+# ✅ Lock HF models to stable 3 (prevents unsupported model errors)
 HF_ALLOWED_MODELS: List[str] = [
     "meta-llama/Meta-Llama-3-8B-Instruct",
     "meta-llama/Llama-3.1-8B-Instruct",
     "mistralai/Mistral-7B-Instruct-v0.2",
 ]
 
-# ============================================================
-# SETTINGS
-# ============================================================
 AUTO_CREATE_SESSION_IF_NONE = False  # set True only if you want auto-create sessions
 SNAPSHOT_TTL_SECONDS = 10            # snapshot cache to reduce DB spam (dashboard still stays "live")
 
 
 # ============================================================
-# LOCAL TIMEZONE (only for 1 human-touch line)
+# (1) CORE UTILS (smooth primitives)
 # ============================================================
+
+def _now_iso_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _local_now() -> datetime:
     tz_name = (os.getenv("LOCAL_TZ", "") or "America/Chicago").strip()
     try:
@@ -107,16 +121,6 @@ def _human_touch() -> str:
     return "Hope everything is okay on your side."
 
 
-# ============================================================
-# TIME (UTC stamp for snapshot)
-# ============================================================
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-# ============================================================
-# SAFE ERROR TEXT
-# ============================================================
 def _api_msg(e: Exception) -> str:
     if isinstance(e, APIError):
         payload = e.args[0] if getattr(e, "args", None) else {}
@@ -126,10 +130,50 @@ def _api_msg(e: Exception) -> str:
     return str(e)
 
 
+def _money0(x: Any) -> str:
+    try:
+        return f"{float(x):,.0f}"
+    except Exception:
+        return str(x)
+
+
+def _resolve_int(raw: Any) -> Optional[int]:
+    if raw is None:
+        return None
+    try:
+        s = str(raw).strip()
+        if not s:
+            return None
+        return int(float(s))
+    except Exception:
+        return None
+
+
+def _sum_amount(rows: List[Dict[str, Any]], col: str = "amount") -> float:
+    s = 0.0
+    for r in rows or []:
+        try:
+            s += float(r.get(col) or 0)
+        except Exception:
+            pass
+    return float(s)
+
+
+def _count_distinct(rows: List[Dict[str, Any]], key: str) -> int:
+    s = set()
+    for r in rows or []:
+        v = r.get(key)
+        if v is not None:
+            s.add(str(v))
+    return int(len(s))
+
+
 # ============================================================
-# THROTTLE (respects app.py session_state knobs if present)
+# (2) DB LAYER (charts over data space)
 # ============================================================
+
 def _throttle_db():
+    # Respects app.py knobs if present
     slow = bool(st.session_state.get("_slow_mode_override", True))
     min_wait = float(st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", 0.15))
     if not slow:
@@ -142,9 +186,6 @@ def _throttle_db():
     st.session_state["_last_db_call_ts"] = time.time()
 
 
-# ============================================================
-# SAFE DB HELPERS
-# ============================================================
 def _safe_select(
     client,
     schema: str,
@@ -198,18 +239,11 @@ def _safe_update_eq(client, schema: str, table: str, updates: Dict[str, Any], eq
         return False
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def _table_readable_cached(schema: str, table: str, _sig: str) -> bool:
-    # _sig forces cache separation per environment; caller supplies stable signature
-    return True  # replaced at runtime by wrapper below
-
-
 def _table_readable(client, schema: str, table: str) -> bool:
     if client is None:
         return False
     sig = str(id(client))
     try:
-        # Use cached wrapper pattern to reduce repeated 1-row probes
         key = f"{schema}:{table}:{sig}"
         if "_tbl_ok_cache" not in st.session_state:
             st.session_state["_tbl_ok_cache"] = {}
@@ -226,39 +260,9 @@ def _table_readable(client, schema: str, table: str) -> bool:
         return False
 
 
-def _sum_amount(rows: List[Dict[str, Any]], col: str = "amount") -> float:
-    s = 0.0
-    for r in rows or []:
-        try:
-            s += float(r.get(col) or 0)
-        except Exception:
-            pass
-    return float(s)
-
-
-def _count_distinct(rows: List[Dict[str, Any]], key: str) -> int:
-    s = set()
-    for r in rows or []:
-        v = r.get(key)
-        if v is not None:
-            s.add(str(v))
-    return int(len(s))
-
-
 # ============================================================
-# SESSION BOOTSTRAP
+# (3) SESSION CHART (choose a session smoothly)
 # ============================================================
-def _resolve_session_id(raw: Any) -> Optional[int]:
-    if raw is None:
-        return None
-    try:
-        s = str(raw).strip()
-        if not s:
-            return None
-        return int(float(s))
-    except Exception:
-        return None
-
 
 def _get_latest_session_id(sb_read, schema: str) -> Optional[int]:
     if sb_read is None:
@@ -266,13 +270,13 @@ def _get_latest_session_id(sb_read, schema: str) -> Optional[int]:
 
     rows = _safe_select(sb_read, schema, "sessions", "id,created_at", order_by="id", desc=True, limit=1)
     if rows and rows[0].get("id") is not None:
-        sid = _resolve_session_id(rows[0].get("id"))
+        sid = _resolve_int(rows[0].get("id"))
         if sid is not None:
             return sid
 
     rows = _safe_select(sb_read, schema, "sessions", "session_id,created_at", order_by="session_id", desc=True, limit=1)
     if rows and rows[0].get("session_id") is not None:
-        sid = _resolve_session_id(rows[0].get("session_id"))
+        sid = _resolve_int(rows[0].get("session_id"))
         if sid is not None:
             return sid
 
@@ -286,7 +290,7 @@ def _ensure_current_session(sb_anon, sb_service, schema: str) -> Tuple[Optional[
     app_state_rows = _safe_select(sb_read, schema, "app_state", "id,current_session_id", limit=1)
     app_state = app_state_rows[0] if app_state_rows else {}
     app_state_id = app_state.get("id")
-    current_sid = _resolve_session_id(app_state.get("current_session_id"))
+    current_sid = _resolve_int(app_state.get("current_session_id"))
 
     latest_sid = _get_latest_session_id(sb_read, schema)
 
@@ -297,9 +301,9 @@ def _ensure_current_session(sb_anon, sb_service, schema: str) -> Tuple[Optional[
             return None, "No sessions found and service key missing."
         name = f"Cycle {pd.Timestamp.utcnow().strftime('%Y-%m-%d')}"
         created = _safe_insert(sb_write, schema, "sessions", {"name": name, "is_active": True})
-        latest_sid = _resolve_session_id((created[0] or {}).get("id")) if created else None
+        latest_sid = _resolve_int((created[0] or {}).get("id")) if created else None
         if latest_sid is None:
-            latest_sid = _resolve_session_id((created[0] or {}).get("session_id")) if created else None
+            latest_sid = _resolve_int((created[0] or {}).get("session_id")) if created else None
         if latest_sid is None:
             return None, "Auto-create session failed."
 
@@ -323,14 +327,15 @@ def _ensure_current_session(sb_anon, sb_service, schema: str) -> Tuple[Optional[
 
 
 # ============================================================
-# RPC Snapshot: fn_finance_snapshot()
+# (4) SNAPSHOT ATLAS (RPC chart + fallback charts)
 # ============================================================
+
 def _rpc_finance_snapshot(sb_read, schema: str) -> Dict[str, Any]:
     """
     Calls public.fn_finance_snapshot().
-    Supports formats:
+    Supports:
       A) flat dict keys
-      B) dict with nested: totals/counts/ratios
+      B) dict with nested groups
       C) list with 1 dict row
     """
     if sb_read is None:
@@ -354,18 +359,6 @@ def _rpc_finance_snapshot(sb_read, schema: str) -> Dict[str, Any]:
         return {}
 
 
-def _extract_snapshot_number(obj: Any, keys: List[str], default: float = 0.0) -> float:
-    if not isinstance(obj, dict):
-        return float(default)
-    for k in keys:
-        if k in obj and obj.get(k) is not None:
-            try:
-                return float(obj.get(k))
-            except Exception:
-                pass
-    return float(default)
-
-
 def _snapshot_get(snap: Dict[str, Any], group: str, keys: List[str], default: Any = 0) -> Any:
     """
     Reads either:
@@ -385,9 +378,204 @@ def _snapshot_get(snap: Dict[str, Any], group: str, keys: List[str], default: An
     return default
 
 
+def _get_finance_snapshot(sb_read, schema: str) -> Tuple[Dict[str, Any], str]:
+    """
+    Returns (finance_snapshot_dict, source_label)
+    Uses an in-session TTL cache to reduce repeated RPC calls.
+    """
+    if sb_read is None:
+        return {}, "none"
+
+    sig = str(id(sb_read))
+    key = f"_finance_snapshot::{schema}::{sig}"
+    now = time.time()
+
+    local_cache = st.session_state.get("_dash_snap_cache") or {}
+    if isinstance(local_cache, dict):
+        entry = local_cache.get(key)
+        if isinstance(entry, dict) and (now - float(entry.get("_ts", 0.0))) <= SNAPSHOT_TTL_SECONDS:
+            return dict(entry.get("snap") or {}), "rpc:cached"
+
+    snap = _rpc_finance_snapshot(sb_read, schema)
+    if snap:
+        local_cache[key] = {"_ts": now, "snap": snap}
+        st.session_state["_dash_snap_cache"] = local_cache
+        return snap, "rpc:fn_finance_snapshot"
+
+    return {}, "rpc:missing"
+
+
+@dataclass(frozen=True)
+class DashboardSnapshot:
+    schema: str
+    session_id: Optional[int]
+
+    total_members: int
+    current_pot: float
+    cycle_contributions_total: float
+    members_paid: int
+
+    attendance_total: int
+    attendance_present: int
+
+    loans_active_count: int
+    loans_active_total: float
+
+    fines_total: float
+    repayments_total: float
+    interest_total: float
+
+    total_contributions_all_time: Optional[float]
+    foundation_total_all_time: Optional[float]
+
+    generated_at: str
+    _snapshot_source: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "session_id": self.session_id,
+            "total_members": self.total_members,
+            "current_pot": self.current_pot,
+            "cycle_contributions_total": self.cycle_contributions_total,
+            "members_paid": self.members_paid,
+            "attendance_total": self.attendance_total,
+            "attendance_present": self.attendance_present,
+            "loans_active_count": self.loans_active_count,
+            "loans_active_total": self.loans_active_total,
+            "fines_total": self.fines_total,
+            "repayments_total": self.repayments_total,
+            "interest_total": self.interest_total,
+            "total_contributions_all_time": self.total_contributions_all_time,
+            "foundation_total_all_time": self.foundation_total_all_time,
+            "generated_at": self.generated_at,
+            "_snapshot_source": self._snapshot_source,
+        }
+
+
+def _build_dashboard_snapshot(sb_read, schema: str, session_id: Optional[int]) -> DashboardSnapshot:
+    finance_snap, finance_src = _get_finance_snapshot(sb_read, schema)
+
+    # --- Session-scoped contributions
+    contrib_rows: List[Dict[str, Any]] = []
+    if session_id is not None and _table_readable(sb_read, schema, "contributions"):
+        contrib_rows = _safe_select(
+            sb_read,
+            schema,
+            "contributions",
+            "id,member_id,amount,session_id,created_at",
+            session_id=int(session_id),
+            limit=15000,
+            show_error=False,
+        )
+
+    cycle_total = _sum_amount(contrib_rows, "amount")
+    members_paid = _count_distinct(contrib_rows, "member_id")
+    current_pot = float(cycle_total)
+
+    # --- Members count
+    total_members = 0
+    if _table_readable(sb_read, schema, "members"):
+        mrows = _safe_select(sb_read, schema, "members", "id", limit=20000, show_error=False)
+        total_members = len(mrows) if mrows else 0
+
+    # --- Attendance (session)
+    attendance_rows: List[Dict[str, Any]] = []
+    if session_id is not None and _table_readable(sb_read, schema, "attendance"):
+        attendance_rows = _safe_select(
+            sb_read,
+            schema,
+            "attendance",
+            "member_id,present,session_id,created_at",
+            session_id=int(session_id),
+            limit=15000,
+            show_error=False,
+        )
+
+    attendance_total = len(attendance_rows) if attendance_rows else 0
+    attendance_present = 0
+    for r in attendance_rows:
+        try:
+            if bool(r.get("present")):
+                attendance_present += 1
+        except Exception:
+            pass
+
+    # --- Loans active totals (global)
+    loans_active_count = 0
+    loans_active_total = 0.0
+    if _table_readable(sb_read, schema, "loans"):
+        loans_rows = _safe_select(
+            sb_read,
+            schema,
+            "loans",
+            "id,member_id,status,principal,principal_current,total_due,created_at",
+            limit=30000,
+            show_error=False,
+        )
+        active_status = {"active", "overdue", "late", "open"}
+        loans_active = [r for r in loans_rows if str(r.get("status") or "").strip().lower() in active_status]
+        loans_active_count = len(loans_active)
+        for r in loans_active:
+            for k in ("principal_current", "principal", "total_due"):
+                if k in r and r.get(k) is not None:
+                    try:
+                        loans_active_total += float(r.get(k) or 0)
+                        break
+                    except Exception:
+                        pass
+
+    # --- Fines/Repayments/Interest (global)
+    fines_total = 0.0
+    if _table_readable(sb_read, schema, "fines"):
+        fines_rows = _safe_select(sb_read, schema, "fines", "amount,created_at", limit=30000, show_error=False)
+        fines_total = _sum_amount(fines_rows, "amount")
+
+    repayments_total = 0.0
+    if _table_readable(sb_read, schema, "loan_payments"):
+        pay_rows = _safe_select(sb_read, schema, "loan_payments", "amount,created_at", limit=30000, show_error=False)
+        repayments_total = _sum_amount(pay_rows, "amount")
+
+    interest_total = 0.0
+    if _table_readable(sb_read, schema, "interest_ledger"):
+        i_rows = _safe_select(sb_read, schema, "interest_ledger", "amount,created_at", limit=30000, show_error=False)
+        interest_total = _sum_amount(i_rows, "amount")
+
+    # Optional (from finance snapshot)
+    total_contrib_all = _snapshot_get(finance_snap, "totals", ["total_contributions", "contributions_total"], default=None)
+    foundation_total = _snapshot_get(finance_snap, "totals", ["foundation_total"], default=None)
+
+    return DashboardSnapshot(
+        schema=str(schema),
+        session_id=session_id,
+
+        total_members=int(total_members),
+        current_pot=float(current_pot),
+        cycle_contributions_total=float(cycle_total),
+        members_paid=int(members_paid),
+
+        attendance_total=int(attendance_total),
+        attendance_present=int(attendance_present),
+
+        loans_active_count=int(loans_active_count),
+        loans_active_total=float(loans_active_total),
+
+        fines_total=float(fines_total),
+        repayments_total=float(repayments_total),
+        interest_total=float(interest_total),
+
+        total_contributions_all_time=(float(total_contrib_all) if total_contrib_all is not None else None),
+        foundation_total_all_time=(float(foundation_total) if foundation_total is not None else None),
+
+        generated_at=_now_iso_utc(),
+        _snapshot_source=str(finance_src),
+    )
+
+
 # ============================================================
-# WEB SEARCH (Tavily) — ONLY when user types "web:"
+# (5) WEB SEARCH CHART (Tavily) — ONLY for "web:" prefix
 # ============================================================
+
 def _has_tavily_key() -> bool:
     return bool(os.getenv("TAVILY_API_KEY", "").strip())
 
@@ -449,8 +637,9 @@ def _format_web_results(tav: Dict[str, Any]) -> Tuple[str, List[Dict[str, str]]]
 
 
 # ============================================================
-# HF ROUTER (optional) — nicer wording, STILL grounded on snapshot
+# (6) HF ROUTER CHART (optional) — nicer wording, STILL grounded
 # ============================================================
+
 def _has_hf_token() -> bool:
     return bool((os.getenv("HF_TOKEN") or "").strip())
 
@@ -461,7 +650,6 @@ def _hf_force_mode() -> str:
 
 def _hf_model() -> str:
     requested = (os.getenv("HF_MODEL") or HF_ALLOWED_MODELS[0]).strip()
-    # lock to allowed list
     return requested if requested in HF_ALLOWED_MODELS else HF_ALLOWED_MODELS[0]
 
 
@@ -539,7 +727,7 @@ def _hf_grounded_answer(question: str, snapshot: Dict[str, Any]) -> Tuple[bool, 
         "You are Young.\n"
         "Start every answer with: 'Hello 👋🏽'.\n"
         "Answer ONLY from DASHBOARD_SNAPSHOT. Answer ONLY the question asked.\n"
-        "No SQL. No Python.\n"
+        "Never invent numbers.\n"
         "Keep it short.\n"
     )
     messages = [
@@ -564,21 +752,14 @@ def _hf_grounded_answer(question: str, snapshot: Dict[str, Any]) -> Tuple[bool, 
 
 
 # ============================================================
-# Young — local grounded rules (fallback)
+# (7) YOUNG LOCAL MAP (strict, grounded “transition map”)
 # ============================================================
-def _money0(x: Any) -> str:
-    try:
-        return f"{float(x):,.0f}"
-    except Exception:
-        return str(x)
-
 
 def _young_answer_rules(q: str, snap: Dict[str, Any]) -> str:
     t = (q or "").strip().lower()
     if not t:
         return "Hello 👋🏽 Ask a question about this dashboard snapshot."
 
-    # Core fields
     session_id = snap.get("session_id")
     total_members = int(snap.get("total_members", 0) or 0)
 
@@ -596,11 +777,7 @@ def _young_answer_rules(q: str, snap: Dict[str, Any]) -> str:
     repayments_total = float(snap.get("repayments_total", 0.0) or 0.0)
     interest_total = float(snap.get("interest_total", 0.0) or 0.0)
 
-    # Intents (simple + strict)
-    if "total members" in t or (("members" in t) and ("total" in t)):
-        return f"Hello 👋🏽 Total members: **{total_members}**."
-
-    if t.strip() in {"members", "member"}:
+    if "total members" in t or (("members" in t) and ("total" in t)) or t.strip() in {"members", "member"}:
         return f"Hello 👋🏽 Total members: **{total_members}**."
 
     if "members paid" in t or (("paid" in t) and ("members" in t)):
@@ -639,8 +816,9 @@ def _young_answer_rules(q: str, snap: Dict[str, Any]) -> str:
 
 
 # ============================================================
-# NAV BUTTONS
+# (8) UI LAYER (charts + smooth nav transitions)
 # ============================================================
+
 def _nav_to(page_name: str):
     st.session_state["page"] = str(page_name)
     st.rerun()
@@ -657,6 +835,8 @@ def _safe_nav_buttons():
             _nav_to("Dashboard")
         if st.button("💬 younchat", use_container_width=True):
             _nav_to("💬 younchat")
+        if st.button("🧠 AI Suite", use_container_width=True):
+            _nav_to("🧠 AI Suite")
         if st.button("Contributions", use_container_width=True):
             _nav_to("Contributions")
         if st.button("Loans", use_container_width=True):
@@ -673,9 +853,6 @@ def _safe_nav_buttons():
             _nav_to("Health")
 
 
-# ============================================================
-# Young AI view
-# ============================================================
 def _render_young_ai_view(snapshot: Dict[str, Any]):
     st.markdown("### 🤖 Young — Dashboard AI")
 
@@ -755,183 +932,18 @@ def _render_young_ai_view(snapshot: Dict[str, Any]):
                 st.markdown(f"- {title}")
 
     used = st.session_state.get("young_dash_used", "—")
-    st.caption(f"Source used: {used} • Snapshot time (UTC): {snapshot.get('generated_at','—')} • Snapshot src: {snapshot.get('_snapshot_source','—')}")
+    st.caption(
+        f"Source used: {used} • Snapshot time (UTC): {snapshot.get('generated_at','—')} • Snapshot src: {snapshot.get('_snapshot_source','—')}"
+    )
 
     with st.expander("🔎 Debug snapshot", expanded=False):
         st.json(snapshot)
 
 
 # ============================================================
-# SNAPSHOT BUILDERS
+# (9) PUBLIC ENTRYPOINT (chart rendering)
 # ============================================================
-@st.cache_data(ttl=SNAPSHOT_TTL_SECONDS, show_spinner=False)
-def _cached_finance_snapshot(schema: str, _sig: str) -> Dict[str, Any]:
-    # NOTE: body replaced by wrapper; cache key uses schema+_sig
-    return {}
 
-
-def _get_finance_snapshot(sb_read, schema: str) -> Tuple[Dict[str, Any], str]:
-    """
-    Returns (finance_snapshot_dict, source_label)
-    """
-    if sb_read is None:
-        return {}, "none"
-
-    # in-session cache (fast) + streamlit cache (ttl)
-    sig = str(id(sb_read))
-    key = f"_finance_snapshot::{schema}::{sig}"
-    now = time.time()
-
-    local_cache = st.session_state.get("_dash_snap_cache") or {}
-    if isinstance(local_cache, dict):
-        entry = local_cache.get(key)
-        if isinstance(entry, dict) and (now - float(entry.get("_ts", 0.0))) <= SNAPSHOT_TTL_SECONDS:
-            return dict(entry.get("snap") or {}), "rpc:cached"
-
-    # Try RPC snapshot
-    snap = _rpc_finance_snapshot(sb_read, schema)
-    if snap:
-        local_cache[key] = {"_ts": now, "snap": snap}
-        st.session_state["_dash_snap_cache"] = local_cache
-        return snap, "rpc:fn_finance_snapshot"
-
-    return {}, "rpc:missing"
-
-
-def _build_dashboard_snapshot(
-    sb_read,
-    schema: str,
-    session_id: Optional[int],
-) -> Tuple[Dict[str, Any], str]:
-    """
-    Builds the dashboard snapshot:
-      - Finance totals from RPC (if available)
-      - Session KPIs (cycle pot, members paid) from contributions table (session-scoped)
-      - Attendance (session-scoped)
-      - Loans active totals (table)
-      - Fines/repayments/interest totals (table)   [global totals]
-    """
-    finance_snap, finance_src = _get_finance_snapshot(sb_read, schema)
-
-    # Always compute session-scoped contribution KPIs (needs session_id)
-    contrib_rows: List[Dict[str, Any]] = []
-    if session_id is not None and _table_readable(sb_read, schema, "contributions"):
-        contrib_rows = _safe_select(
-            sb_read,
-            schema,
-            "contributions",
-            "id,member_id,amount,session_id,created_at",
-            session_id=int(session_id),
-            limit=15000,
-            show_error=False,
-        )
-
-    cycle_total = _sum_amount(contrib_rows, "amount")
-    members_paid = _count_distinct(contrib_rows, "member_id")
-    current_pot = float(cycle_total)
-
-    # Members count (fallback to table)
-    total_members = 0
-    if _table_readable(sb_read, schema, "members"):
-        mrows = _safe_select(sb_read, schema, "members", "id", limit=20000, show_error=False)
-        total_members = len(mrows) if mrows else 0
-
-    # Attendance (session)
-    attendance_rows: List[Dict[str, Any]] = []
-    if session_id is not None and _table_readable(sb_read, schema, "attendance"):
-        attendance_rows = _safe_select(
-            sb_read,
-            schema,
-            "attendance",
-            "member_id,present,session_id,created_at",
-            session_id=int(session_id),
-            limit=15000,
-            show_error=False,
-        )
-    attendance_total = len(attendance_rows) if attendance_rows else 0
-    attendance_present = 0
-    for r in attendance_rows:
-        try:
-            if bool(r.get("present")):
-                attendance_present += 1
-        except Exception:
-            pass
-
-    # Loans active totals (global)
-    loans_active_count = 0
-    loans_active_total = 0.0
-    if _table_readable(sb_read, schema, "loans"):
-        loans_rows = _safe_select(
-            sb_read,
-            schema,
-            "loans",
-            "id,member_id,status,principal,principal_current,total_due,created_at",
-            limit=30000,
-            show_error=False,
-        )
-        active_status = {"active", "overdue", "late", "open"}
-        loans_active = [r for r in loans_rows if str(r.get("status") or "").strip().lower() in active_status]
-        loans_active_count = len(loans_active)
-        for r in loans_active:
-            # prefer principal_current if present
-            for k in ("principal_current", "principal", "total_due"):
-                if k in r and r.get(k) is not None:
-                    try:
-                        loans_active_total += float(r.get(k) or 0)
-                        break
-                    except Exception:
-                        pass
-
-    # Fines (global)
-    fines_total = 0.0
-    if _table_readable(sb_read, schema, "fines"):
-        fines_rows = _safe_select(sb_read, schema, "fines", "amount,created_at", limit=30000, show_error=False)
-        fines_total = _sum_amount(fines_rows, "amount")
-
-    # Repayments (global)
-    repayments_total = 0.0
-    if _table_readable(sb_read, schema, "loan_payments"):
-        pay_rows = _safe_select(sb_read, schema, "loan_payments", "amount,created_at", limit=30000, show_error=False)
-        repayments_total = _sum_amount(pay_rows, "amount")
-
-    # Interest (global)
-    interest_total = 0.0
-    if _table_readable(sb_read, schema, "interest_ledger"):
-        i_rows = _safe_select(sb_read, schema, "interest_ledger", "amount,created_at", limit=30000, show_error=False)
-        interest_total = _sum_amount(i_rows, "amount")
-
-    # Pull any finance totals if your fn_finance_snapshot provides them
-    # (safe: supports nested or flat)
-    total_contrib_all = _snapshot_get(finance_snap, "totals", ["total_contributions", "contributions_total"], default=None)
-    foundation_total = _snapshot_get(finance_snap, "totals", ["foundation_total"], default=None)
-
-    out = {
-        "schema": schema,
-        "session_id": session_id,
-        "total_members": int(total_members),
-        "current_pot": float(current_pot),
-        "cycle_contributions_total": float(cycle_total),
-        "members_paid": int(members_paid),
-        "attendance_total": int(attendance_total),
-        "attendance_present": int(attendance_present),
-        "loans_active_count": int(loans_active_count),
-        "loans_active_total": float(loans_active_total),
-        "fines_total": float(fines_total),
-        "repayments_total": float(repayments_total),
-        "interest_total": float(interest_total),
-        # Optional (from finance snapshot)
-        "total_contributions_all_time": (float(total_contrib_all) if total_contrib_all is not None else None),
-        "foundation_total_all_time": (float(foundation_total) if foundation_total is not None else None),
-        "generated_at": _now_iso(),
-        "_snapshot_source": finance_src,
-    }
-
-    return out, finance_src
-
-
-# ============================================================
-# MAIN DASHBOARD (CLEAN)
-# ============================================================
 def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
     """
     CLEAN dashboard:
@@ -941,13 +953,14 @@ def render_dashboard(sb_anon, sb_service=None, schema: str = "public"):
     """
     sb_read = sb_service if sb_service is not None else sb_anon
 
-    # Ensure current session (do not print the verbose message)
+    # Session selection (kept silent: no extra banners)
     session_id, _ = _ensure_current_session(sb_anon=sb_anon, sb_service=sb_service, schema=schema)
 
     # Snapshot-first build
-    snapshot, _src = _build_dashboard_snapshot(sb_read=sb_read, schema=schema, session_id=session_id)
+    snap_obj = _build_dashboard_snapshot(sb_read=sb_read, schema=schema, session_id=session_id)
+    snapshot = snap_obj.to_dict()
 
-    # KPIs row (clean)
+    # KPIs (clean)
     c1, c2, c3, c4, c5 = st.columns([0.9, 0.9, 0.9, 0.9, 1.2])
     with c1:
         st.metric("Session ID", snapshot.get("session_id") if snapshot.get("session_id") is not None else "—")
