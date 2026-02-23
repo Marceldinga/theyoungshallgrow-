@@ -8,6 +8,11 @@
 #   2) DB commands are answered ONLY from DB (no HF for DB numbers)
 #   3) EVERY message that is NOT DB-related is routed to HF foundation model (if HF_TOKEN exists)
 #   4) Start every answer with "Hello 👋🏽"
+#
+# IMPORTANT ADDITION (your request):
+#   - Non-DB messages routed to HF use a strict Njangi "intent & next step" prompt:
+#     The model MUST assess what the member wants inside Njangi and guide them to the
+#     right DB command (or ask 1 short clarifying question), without inventing numbers.
 # =============================================================================
 
 from __future__ import annotations
@@ -584,18 +589,12 @@ def _load_members_truth(sb_anon, sb_service, schema: str, limit: int = 3000) -> 
     out["member_id"] = df[id_col].astype(str)
 
     disp_clean = (
-        df[display_col].astype(str)
-        .replace(["None", "nan", "NaN", "NULL", "null"], "")
-        .fillna("")
-        .str.strip()
+        df[display_col].astype(str).replace(["None", "nan", "NaN", "NULL", "null"], "").fillna("").str.strip()
         if display_col and display_col in df.columns
         else pd.Series([""] * len(df))
     )
     nm_clean = (
-        df[name_col].astype(str)
-        .replace(["None", "nan", "NaN", "NULL", "null"], "")
-        .fillna("")
-        .str.strip()
+        df[name_col].astype(str).replace(["None", "nan", "NaN", "NULL", "null"], "").fillna("").str.strip()
         if name_col and name_col in df.columns
         else pd.Series([""] * len(df))
     )
@@ -1065,7 +1064,7 @@ def _post_with_retries(url: str, headers: dict, payload: dict, timeout: int = 60
 
 def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], timeout: int = 60) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "temperature": 0.20, "max_tokens": 500}
+    payload = {"model": model, "messages": messages, "temperature": 0.20, "max_tokens": 520}
     ok, raw = _post_with_retries(HF_ROUTER_CHAT_URL, headers, payload, timeout=timeout)
     if not ok:
         return False, raw
@@ -1079,7 +1078,7 @@ def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], time
 
 def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 60) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": model, "prompt": prompt, "temperature": 0.20, "max_tokens": 500}
+    payload = {"model": model, "prompt": prompt, "temperature": 0.20, "max_tokens": 520}
     ok, raw = _post_with_retries(HF_ROUTER_COMPLETIONS_URL, headers, payload, timeout=timeout)
     if not ok:
         return False, raw
@@ -1137,10 +1136,57 @@ def _hf_reason_over_manifold(question: str, manifold_state: Dict[str, Any]) -> T
     return False, (txt2 or txt or "HF failed"), f"hf:failed:{model}"
 
 
+def _foundation_intent_system_prompt() -> str:
+    """
+    Strict prompt for non-DB messages:
+    - Assess what the member wants inside Njangi
+    - Map to the right DB command (or ask ONE question)
+    - Never invent any Njangi numbers
+    """
+    return (
+        "You are younchat, the assistant inside the Njangi system.\n\n"
+        "GOAL:\n"
+        "Help members achieve their goal inside Njangi. Understand their intent and guide them to the correct Njangi action.\n\n"
+        "STRICT RULES:\n"
+        "1) Start every reply with exactly: \"Hello 👋🏽\"\n"
+        "2) You are NOT allowed to invent or guess any Njangi financial numbers, balances, totals, dates, or member IDs.\n"
+        "3) If the request needs real Njangi data, you must tell them the exact DB command to type next, OR ask exactly ONE short clarifying question.\n"
+        "4) Do NOT output SQL, Python, code blocks, schema changes, or markdown fences.\n"
+        "5) Keep replies short and system-focused.\n\n"
+        "AVAILABLE DB COMMANDS YOU CAN RECOMMEND:\n"
+        "- members\n"
+        "- loans\n"
+        "- finance kpis\n"
+        "- tables\n"
+        "- show <table>\n"
+        "- describe <table>\n"
+        "- verify member <id>\n"
+        "- type a member id (example: 10) for that member’s intelligence summary\n\n"
+        "OUTPUT FORMAT (always):\n"
+        "Hello 👋🏽 <one-sentence helpful response>\n"
+        "Intent: <what you think they want>\n"
+        "Next: <one command OR one question>\n"
+    )
+
+
+def _foundation_intent_user_wrapper(user_message: str) -> str:
+    msg = (user_message or "").strip()
+    return (
+        "User message:\n"
+        f"\"{msg}\"\n\n"
+        "Your task:\n"
+        "- Decide what the member wants inside Njangi.\n"
+        "- If it requires database data, tell them EXACTLY what DB command to type next.\n"
+        "- If unclear, ask exactly ONE clarifying question.\n"
+        "- Do not guess numbers.\n"
+        "Return in the required output format.\n"
+    )
+
+
 def _hf_smalltalk_answer(question: str) -> Tuple[bool, str, str]:
     """
     For NON-DB messages only.
-    Uses HF directly (not manifold), but still enforces no code and Hello prefix.
+    Uses HF directly with strict "intent & next" Njangi prompt.
     """
     token = (os.getenv("HF_TOKEN") or "").strip()
     model = _hf_model()
@@ -1148,23 +1194,17 @@ def _hf_smalltalk_answer(question: str) -> Tuple[bool, str, str]:
     if not token:
         return False, "HF_TOKEN missing", "hf:missing"
 
-    sys = (
-        "You are younchat.\n"
-        "Start every answer with: 'Hello 👋🏽'.\n"
-        "Do not output SQL, Python, or code blocks.\n"
-        "If user asks for Njangi numbers, tell them to ask using DB commands like: members, loans, finance kpis.\n"
-    )
-    user = question.strip()
+    sys = _foundation_intent_system_prompt()
+    user = _foundation_intent_user_wrapper(question)
 
     if force == "completions":
-        prompt = f"{sys}\n\nUser: {user}\nAssistant:"
+        prompt = f"{sys}\n\n{user}\nAssistant:"
         ok, txt = _hf_router_completions(model, token, prompt)
-        return (ok, txt, f"hf:smalltalk:completions:{model}") if ok else (False, txt, f"hf:smalltalk:completions_failed:{model}")
+        return (ok, txt, f"hf:intent:completions:{model}") if ok else (False, txt, f"hf:intent:completions_failed:{model}")
 
-    # default chat
     messages = [{"role": "system", "content": sys}, {"role": "user", "content": user}]
     ok, txt = _hf_router_chat(model, token, messages)
-    return (ok, txt, f"hf:smalltalk:chat:{model}") if ok else (False, txt, f"hf:smalltalk:chat_failed:{model}")
+    return (ok, txt, f"hf:intent:chat:{model}") if ok else (False, txt, f"hf:intent:chat_failed:{model}")
 
 
 # =============================================================================
@@ -1276,10 +1316,9 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         st.write("**HF_TOKEN present**:", "✅ Yes" if hf_token else "❌ No")
         st.write("**HF_FORCE_MODE**:", (os.getenv("HF_FORCE_MODE") or "auto"))
         st.write("**Internet**:", "✅ ON" if internet_on else "❌ OFF")
-        st.caption("DB integrity: Njangi numbers are ALWAYS answered from DB. Non-DB messages go to HF.")
+        st.caption("DB integrity: DB commands are DB-only. Non-DB messages route to HF with intent & next-step guidance.")
 
-    # This toggle ONLY affects intelligence reports (manifold narrative).
-    # Your new rule (non-DB -> HF) is enforced regardless, if HF_TOKEN exists.
+    # Only affects manifold narrative for intelligence reports
     use_foundation_reasoner = st.toggle(
         "Use foundation reasoner (HF) for intelligence reports (manifold-grounded)",
         value=bool(hf_token),
@@ -1317,7 +1356,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     with st.chat_message("user"):
         st.markdown(q)
 
-    # remember last member id if user mentions it
+    # Remember last member id if user mentions it
     detected_id = _extract_member_id(q)
     if detected_id:
         st.session_state["younchat_last_member_id"] = detected_id
@@ -1329,11 +1368,13 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     df_title: Optional[str] = None
 
     # -------------------------------------------------------------------------
-    # RULE: Non-DB -> Foundation model (if possible)
+    # ROUTING RULE:
+    #   - DB => DB tools only
+    #   - Non-DB => HF intent model (if HF_TOKEN exists)
     # -------------------------------------------------------------------------
     is_db = _is_db_command(q)
 
-    # INTERNET commands are treated "non-DB" (still not Njangi numbers)
+    # Internet commands are NON-DB (still never Njangi numbers)
     if _wants_internet(q):
         used_source = "tavily" if internet_on else "tavily:off"
         if not internet_on:
@@ -1359,7 +1400,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                     answer = "\n".join(lines)
 
     elif not is_db:
-        # ✅ STRICT: every non-DB message goes to foundation model
+        # ✅ STRICT: every non-DB message goes to foundation model (if possible)
         if _has_hf_token():
             ok, txt, used = _hf_smalltalk_answer(q)
             if ok and txt and (not _looks_like_code_output(txt)):
@@ -1367,14 +1408,22 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                 answer = txt
             else:
                 used_source = f"{used}:fallback_local"
-                answer = "Hello 👋🏽 I couldn’t get a clean response from the foundation model. Try again."
+                answer = (
+                    "Hello 👋🏽 I couldn’t get a clean response from the foundation model.\n"
+                    "Intent: Foundation model failed\n"
+                    "Next: Please try again (or type: members / loans / finance kpis)."
+                )
         else:
             used_source = "local:no_hf"
-            answer = "Hello 👋🏽 HF_TOKEN is missing, so foundation replies are OFF. Add HF_TOKEN to enable non-DB answers."
+            answer = (
+                "Hello 👋🏽 HF_TOKEN is missing, so foundation replies are OFF.\n"
+                "Intent: Non-DB request\n"
+                "Next: Add HF_TOKEN to enable non-DB answers (or use: members / loans / finance kpis)."
+            )
 
     else:
         # ---------------------------------------------------------------------
-        # DB COMMANDS: DB-only (no HF for these)
+        # DB COMMANDS: DB-only (never HF for these)
         # ---------------------------------------------------------------------
         if _wants_help(q):
             used_source = "help"
@@ -1534,4 +1583,4 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         f"Internet: {'ON' if internet_on else 'OFF'} • "
         f"HF_TOKEN: {'ON' if _has_hf_token() else 'OFF'} • "
         f"Manifold reasoner: {'ON' if (use_foundation_reasoner and _has_hf_token()) else 'OFF'}"
-    )
+)
