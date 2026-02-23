@@ -1,34 +1,21 @@
-# ai_risk_panel.py ✅ COMPLETE SINGLE-FILE — NJANGI STANDARD (NO legacy) — XGBoost ML + PAYOUTS FIXED
-# + ✅ EXTRA AI SUITE (NO API KEY): Reliability • Dropout • Fraud/Anomaly • Liquidity Forecast • Loan Recommendation • Alerts • Local Chatbox
-# + ✅ MEETING MINUTES GENERATOR (NO API KEY): auto-build minutes from real tables + optional save
-# ------------------------------------------------------------------------------
-# ✅ Uses ONLY new tables:
+
+# ai_risk_panel.py ✅ COMPLETE SINGLE-FILE — NJANGI STANDARD (NO legacy)
+# ✅ XGBoost ML + PAYOUTS FIXED + EXTRA AI SUITE (NO API KEY) + MINUTES (NO API KEY)
+# ✅ ADVANCED TECHNOLOGY: EMBEDDED MANIFOLD ENGINE (KNN + PCA Tangent) ALWAYS ON
+#
+# Tables used (NEW ONLY):
 #   - members
 #   - contributions
 #   - loans
 #   - loan_payments (optional)
 #   - foundation_contributions
 #   - fines (optional)
-#   - payouts (optional)  ✅ FIXED: payout_amount / payout_date
-#   - sessions (optional; for meeting selector)
-#   - minutes (optional; for saving generated minutes)
+#   - payouts (optional) ✅ payout_amount / payout_date
+#   - sessions (optional)
+#   - minutes (optional)
 #
-# ✅ Schema-safe for YOUR loans columns:
-#    - principal, principal_current, total_due, unpaid_interest, last_paid_at,
-#      borrow_date, due_cycle_days, interest_rate_monthly, status
-# ✅ loan_payments may have member_id OR only loan_id -> auto-joins via loans to get member_id
-# ✅ Always produces numbers (no blank NaNs in snapshot)
-# ✅ Cache-safe: no unhashable supabase clients in cache args
-# ✅ UTC-safe date math (no tz-naive vs tz-aware errors)
-#
-# ✅ ML uses XGBoost:
-#    - Trains on loans rows: closed=0, active=1
-#    - Scores member risk as MAX probability among their active loans
-#    - Gate by MIN_LOANS_FOR_ML (default 20)
-#    - Caches trained model in st.session_state using a dataframe fingerprint
-#
-# 🔧 REQUIREMENT (Railway):
-#    Add to requirements.txt:  xgboost==2.0.3
+# Railway requirements:
+#   xgboost==2.0.3
 # ------------------------------------------------------------------------------
 
 from __future__ import annotations
@@ -41,7 +28,7 @@ import numpy as np
 # =========================
 # CONFIG
 # =========================
-MIN_LOANS_FOR_ML = 20  # set to 5 if you want ML to run immediately (unstable when tiny)
+MIN_LOANS_FOR_ML = 20
 CACHE_TTL_SECONDS = 60
 
 
@@ -153,6 +140,111 @@ def _fmt_money(x) -> str:
 
 
 # ============================================================
+# ✅ ADVANCED MANIFOLD ENGINE (KNN + PCA Tangent) — NO API KEY
+# ============================================================
+def _standardize_matrix(df: pd.DataFrame, cols: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    X = df[cols].to_numpy(dtype=float)
+    mu = np.nanmean(X, axis=0)
+    sigma = np.nanstd(X, axis=0)
+    sigma = np.where(sigma <= 1e-12, 1.0, sigma)
+    Z = (X - mu) / sigma
+    Z = np.nan_to_num(Z, nan=0.0, posinf=0.0, neginf=0.0)
+    return Z, mu, sigma
+
+
+def _knn_indices(Z: np.ndarray, i: int, k: int) -> np.ndarray:
+    if Z.shape[0] <= 1:
+        return np.array([i], dtype=int)
+    k = int(max(4, min(k, Z.shape[0])))
+    dif = Z - Z[i]
+    dist2 = np.sum(dif * dif, axis=1)
+    idx = np.argsort(dist2)[:k]
+    return idx.astype(int)
+
+
+def _pca_first_component(centered: np.ndarray) -> np.ndarray:
+    # centered = U S Vt ; first tangent direction = Vt[0]
+    _, _, Vt = np.linalg.svd(centered, full_matrices=False)
+    v1 = Vt[0]
+    nrm = np.linalg.norm(v1) + 1e-12
+    return v1 / nrm
+
+
+def _corr_safe(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    if a.size < 4 or np.std(a) < 1e-12 or np.std(b) < 1e-12:
+        return 0.0
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def _manifold_tangent_metrics(
+    X: pd.DataFrame,
+    risk_series: pd.Series,
+    member_id: int,
+    feature_cols: list[str],
+    k_neighbors: int = 12,
+) -> dict:
+    out = {
+        "ok": False,
+        "msg": "",
+        "manifold_velocity": 0.0,   # [-1,1]
+        "manifold_trend": "→ stable",
+        "outlier_score": 0.0,       # [0,1]
+        "risk_alignment_corr": 0.0,
+        "k_used": 0,
+    }
+
+    if X is None or X.empty:
+        out["msg"] = "No feature matrix."
+        return out
+    if "member_id" not in X.columns:
+        out["msg"] = "Missing member_id."
+        return out
+
+    idx_row = X.index[X["member_id"].astype(int) == int(member_id)]
+    if len(idx_row) == 0:
+        out["msg"] = "Member not found."
+        return out
+    i = int(idx_row[0])
+
+    Z, _, _ = _standardize_matrix(X, feature_cols)
+    idx = _knn_indices(Z, i, k_neighbors)
+    out["k_used"] = int(len(idx))
+    if len(idx) < 4:
+        out["msg"] = "Not enough neighbors."
+        return out
+
+    Zn = Z[idx, :]
+    center = np.mean(Zn, axis=0)
+    centered = Zn - center
+
+    v1 = _pca_first_component(centered)
+
+    t = centered @ v1
+    t_i = float((Z[i] - center) @ v1)
+
+    rn = risk_series.loc[X.index[idx]].to_numpy(dtype=float)
+    corr = _corr_safe(t, rn)
+    out["risk_alignment_corr"] = float(corr)
+
+    vel = float(np.tanh(t_i) * (1.0 if corr >= 0 else -1.0))
+    vel = float(np.clip(vel, -1.0, 1.0))
+    out["manifold_velocity"] = vel
+    out["manifold_trend"] = ("↑ rising" if vel > 0.20 else ("↓ improving" if vel < -0.20 else "→ stable"))
+
+    centered_i = (Z[i] - center)
+    proj = t_i * v1
+    resid = centered_i - proj
+    resid_norm = float(np.linalg.norm(resid))
+    out["outlier_score"] = float(np.clip(np.tanh(resid_norm / 2.0), 0.0, 1.0))
+
+    out["ok"] = True
+    out["msg"] = "OK"
+    return out
+
+
+# ============================================================
 # Cache-safe loaders (NO unhashable clients in cache args)
 # ============================================================
 def _ensure_clients_in_state(sb_anon, sb_service):
@@ -223,7 +315,6 @@ def _load_payments_schema_safe(sb_anon, sb_service, schema: str, limit: int = 20
         if sb_service is not None
         else _load_table(sb_anon, sb_service, schema, "loans", cols="id,member_id", limit=10000)
     )
-
     if loans_map.empty or "id" not in loans_map.columns or "member_id" not in loans_map.columns:
         return pd.DataFrame()
 
@@ -265,9 +356,7 @@ def _build_member_features(
 
     base = pd.DataFrame({"member_id": members["id"].astype(int)})
 
-    # ----------------------------
     # Contributions
-    # ----------------------------
     cfeat = base.copy()
     if not contrib.empty and "member_id" in contrib.columns:
         c = contrib.copy()
@@ -280,7 +369,6 @@ def _build_member_features(
         cfeat = cfeat.merge(grp["amount"].count().rename("contrib_count"), left_on="member_id", right_index=True, how="left")
         cfeat = cfeat.merge(grp["amount"].mean().rename("contrib_avg"), left_on="member_id", right_index=True, how="left")
         cfeat = cfeat.merge(grp["created_at"].max().rename("contrib_last_dt"), left_on="member_id", right_index=True, how="left")
-
         if "session_id" in c.columns:
             c["session_id"] = _to_int(c["session_id"])
             cfeat = cfeat.merge(
@@ -295,28 +383,22 @@ def _build_member_features(
         cfeat["contrib_avg"] = 0.0
         cfeat["contrib_sessions_n"] = 0
         cfeat["contrib_last_dt"] = pd.NaT
-
     cfeat["days_since_last_contrib"] = _days_since(now, cfeat["contrib_last_dt"])
 
-    # ----------------------------
     # Loans
-    # ----------------------------
     lfeat = base.copy()
     if not loans.empty and "member_id" in loans.columns:
         l = loans.copy()
         l["member_id"] = _to_int(l["member_id"])
-
         for col in ["principal", "principal_current", "total_due", "unpaid_interest"]:
             if col in l.columns:
                 l[col] = _to_num(l[col])
-
         if "principal_current" in l.columns:
             l["balance_calc"] = l["principal_current"]
         elif "principal" in l.columns:
             l["balance_calc"] = l["principal"]
         else:
             l["balance_calc"] = 0.0
-
         l["status"] = l.get("status", "").astype(str).str.lower().fillna("")
         l["last_paid_at"] = _to_dt_utc(l.get("last_paid_at", pd.NaT))
         l["created_at"] = _to_dt_utc(l.get("created_at", pd.NaT))
@@ -342,7 +424,6 @@ def _build_member_features(
             right_index=True,
             how="left",
         )
-
         lfeat = lfeat.merge(grp["last_paid_at"].max().rename("loan_last_paid_dt"), left_on="member_id", right_index=True, how="left")
     else:
         lfeat["loan_count"] = 0
@@ -352,9 +433,7 @@ def _build_member_features(
         lfeat["loan_bad_status_count"] = 0
         lfeat["loan_last_paid_dt"] = pd.NaT
 
-    # ----------------------------
-    # Loan payments (repayments)
-    # ----------------------------
+    # Loan payments
     pfeat = base.copy()
     if not payments.empty and "member_id" in payments.columns:
         p = payments.copy()
@@ -364,7 +443,6 @@ def _build_member_features(
             p["paid_at"] = _to_dt_utc(p.get("paid_at", pd.NaT))
         else:
             p["paid_at"] = _to_dt_utc(p.get("created_at", pd.NaT))
-
         grp = p.groupby("member_id", dropna=False)
         pfeat = pfeat.merge(grp["amount"].count().rename("pay_count"), left_on="member_id", right_index=True, how="left")
         pfeat = pfeat.merge(grp["amount"].sum().rename("pay_total"), left_on="member_id", right_index=True, how="left")
@@ -373,29 +451,17 @@ def _build_member_features(
         pfeat["pay_count"] = 0
         pfeat["pay_total"] = 0.0
         pfeat["pay_last_dt"] = pd.NaT
-
     pfeat["days_since_last_payment"] = _days_since(now, pfeat["pay_last_dt"])
 
-    # ----------------------------
-    # Payouts ✅ (your table uses payout_amount / payout_date)
-    # ----------------------------
+    # Payouts ✅ payout_amount / payout_date
     poutfeat = base.copy()
     if not payouts.empty and "member_id" in payouts.columns:
         po = payouts.copy()
         po["member_id"] = _to_int(po["member_id"])
-
         amt_col = "payout_amount" if "payout_amount" in po.columns else ("amount" if "amount" in po.columns else None)
-        if amt_col is None:
-            po["payout_amount_calc"] = 0.0
-        else:
-            po["payout_amount_calc"] = _to_num(po[amt_col])
-
+        po["payout_amount_calc"] = _to_num(po[amt_col]) if amt_col else 0.0
         dt_col = "payout_date" if "payout_date" in po.columns else ("created_at" if "created_at" in po.columns else None)
-        if dt_col is None:
-            po["payout_dt_calc"] = pd.NaT
-        else:
-            po["payout_dt_calc"] = _to_dt_utc(po[dt_col])
-
+        po["payout_dt_calc"] = _to_dt_utc(po[dt_col]) if dt_col else pd.NaT
         grp = po.groupby("member_id", dropna=False)
         poutfeat = poutfeat.merge(grp["payout_amount_calc"].count().rename("payout_count"), left_on="member_id", right_index=True, how="left")
         poutfeat = poutfeat.merge(grp["payout_amount_calc"].sum().rename("payout_total"), left_on="member_id", right_index=True, how="left")
@@ -404,12 +470,9 @@ def _build_member_features(
         poutfeat["payout_count"] = 0
         poutfeat["payout_total"] = 0.0
         poutfeat["payout_last_dt"] = pd.NaT
-
     poutfeat["days_since_last_payout"] = _days_since(now, poutfeat["payout_last_dt"])
 
-    # ----------------------------
     # Fines
-    # ----------------------------
     ffeat = base.copy()
     if not fines.empty and "member_id" in fines.columns:
         f = fines.copy()
@@ -422,16 +485,13 @@ def _build_member_features(
         ffeat["fine_total"] = 0.0
         ffeat["fine_count"] = 0
 
-    # ----------------------------
     # Foundation
-    # ----------------------------
     fdfeat = base.copy()
     if not foundation.empty and "member_id" in foundation.columns:
         fd = foundation.copy()
         fd["member_id"] = _to_int(fd["member_id"])
         fd["amount"] = _to_num(fd.get("amount", 0))
         fd["created_at"] = _to_dt_utc(fd.get("created_at", pd.NaT))
-
         grp = fd.groupby("member_id", dropna=False)
         fdfeat = fdfeat.merge(grp["amount"].sum().rename("foundation_total"), left_on="member_id", right_index=True, how="left")
         fdfeat = fdfeat.merge(grp["amount"].count().rename("foundation_count"), left_on="member_id", right_index=True, how="left")
@@ -440,12 +500,8 @@ def _build_member_features(
         fdfeat["foundation_total"] = 0.0
         fdfeat["foundation_count"] = 0
         fdfeat["foundation_last_dt"] = pd.NaT
-
     fdfeat["days_since_last_foundation"] = _days_since(now, fdfeat["foundation_last_dt"])
 
-    # ----------------------------
-    # Merge all features
-    # ----------------------------
     X = (
         cfeat.merge(lfeat, on="member_id", how="left")
         .merge(pfeat, on="member_id", how="left")
@@ -454,7 +510,6 @@ def _build_member_features(
         .merge(fdfeat, on="member_id", how="left")
     )
 
-    # Drop raw date cols (keep only days_since_* numbers)
     for dtcol in ["contrib_last_dt", "pay_last_dt", "foundation_last_dt", "loan_last_paid_dt", "payout_last_dt"]:
         if dtcol in X.columns:
             X.drop(columns=[dtcol], inplace=True)
@@ -521,7 +576,7 @@ def _compute_risk_score(row: pd.Series) -> tuple[float, list[str]]:
 
 
 # ============================================================
-# ✅ EXTRA AI SUITE (no API key)
+# EXTRA AI SUITE (NO API KEY)
 # ============================================================
 def _clip01(x: float) -> float:
     try:
@@ -629,6 +684,9 @@ def _compute_fraud_anomaly_score(member_id: int, contrib: pd.DataFrame, loans: p
         c = contrib.copy()
         c["member_id"] = _to_int(c["member_id"])
         c["amount"] = _to_num(c["amount"])
+        if "created_at" in c.columns:
+            c["created_at"] = _to_dt_utc(c["created_at"])
+            c = c.sort_values("created_at")
         mc = c[c["member_id"] == int(member_id)].copy()
         if len(mc) >= 6:
             mu = float(mc["amount"].mean())
@@ -654,6 +712,9 @@ def _compute_fraud_anomaly_score(member_id: int, contrib: pd.DataFrame, loans: p
         p = payments.copy()
         p["member_id"] = _to_int(p["member_id"])
         p["amount"] = _to_num(p.get("amount", 0))
+        if "paid_at" in p.columns:
+            p["paid_at"] = _to_dt_utc(p["paid_at"])
+            p = p.sort_values("paid_at")
         mp = p[p["member_id"] == int(member_id)].copy()
         if len(mp) >= 6:
             mu = float(mp["amount"].mean())
@@ -802,7 +863,20 @@ def _local_chat_answer(question: str, context: dict) -> str:
             "- **Liquidity**: `is liquidity safe?`\n"
             "- **Top risky members**: `top risky members`\n"
             "- **Loan recommendation**: `loan recommendation`\n"
+            "- **Manifold**: `manifold status`\n"
             "- **Minutes**: use the **Minutes tab** to generate meeting minutes.\n"
+        )
+
+    if "manifold" in q:
+        mf = context.get("manifold", {})
+        if not mf or not mf.get("ok"):
+            return f"Manifold tangent not available: {mf.get('msg','missing data')}."
+        return (
+            "### 🧭 Manifold tangent (KNN + PCA)\n"
+            f"- Trend: **{mf.get('manifold_trend','→ stable')}**\n"
+            f"- Velocity: **{float(mf.get('manifold_velocity',0.0)):+.2f}**\n"
+            f"- Outlier score: **{float(mf.get('outlier_score',0.0))*100:.0f}%**\n"
+            f"- Risk alignment corr: **{float(mf.get('risk_alignment_corr',0.0)):+.2f}** (K={int(mf.get('k_used',0))})\n"
         )
 
     if "top" in q and ("risk" in q or "risky" in q):
@@ -843,13 +917,11 @@ def _local_chat_answer(question: str, context: dict) -> str:
             out += f"- {r}\n"
         return out
 
-    return (
-        "Ask: **alerts**, **liquidity**, **top risky members**, **loan recommendation**, or type `help`."
-    )
+    return "Ask: **alerts**, **liquidity**, **top risky members**, **loan recommendation**, **manifold status**, or type `help`."
 
 
 # ============================================================
-# ✅ MEETING MINUTES GENERATOR (no API key)
+# Minutes generator (NO API KEY)
 # ============================================================
 def _minutes_build(
     *,
@@ -869,7 +941,6 @@ def _minutes_build(
     top_risky: list[dict],
     alerts: list[dict],
 ) -> str:
-    # Totals
     contrib_total = float(_to_num(contrib.get("amount", 0)).sum()) if (contrib is not None and not contrib.empty and "amount" in contrib.columns) else 0.0
     foundation_total = float(_to_num(foundation.get("amount", 0)).sum()) if (foundation is not None and not foundation.empty and "amount" in foundation.columns) else 0.0
     fines_total = float(_to_num(fines.get("amount", 0)).sum()) if (fines is not None and not fines.empty and "amount" in fines.columns) else 0.0
@@ -878,7 +949,6 @@ def _minutes_build(
     payout_amt_col = "payout_amount" if (payouts is not None and not payouts.empty and "payout_amount" in payouts.columns) else ("amount" if (payouts is not None and not payouts.empty and "amount" in payouts.columns) else None)
     payouts_total = float(_to_num(payouts.get(payout_amt_col, 0)).sum()) if payout_amt_col else 0.0
 
-    # Loans stats
     loan_count = int(len(loans)) if loans is not None else 0
     active_loans = 0
     closed_loans = 0
@@ -893,21 +963,17 @@ def _minutes_build(
         if bal_col:
             loan_balance_sum = float(_to_num(loans[bal_col]).sum())
 
-    # Member count
     member_count = int(len(members)) if members is not None and not members.empty else 0
 
-    # Alerts summary
     high_alerts = [a for a in (alerts or []) if a.get("severity") == "high"]
     med_alerts = [a for a in (alerts or []) if a.get("severity") == "med"]
 
-    # Risk list
     risk_lines = ""
     if top_risky:
         risk_lines += "\n".join([f"- {r.get('name','Member')} ({r.get('member_id','?')}): {float(r.get('risk',0))*100:.1f}%" for r in top_risky])
     else:
         risk_lines = "- Not available"
 
-    # Compose minutes (simple but professional)
     date_str = meeting_date.strftime("%Y-%m-%d")
     lines = []
     lines.append(f"{meeting_title}")
@@ -974,8 +1040,7 @@ def _minutes_build(
 
 
 # ============================================================
-# ML dataset from loans (YOUR schema)
-#   target: closed=0, active=1
+# XGBoost ML frame from loans (YOUR schema)
 # ============================================================
 def _make_loan_ml_frame(loans: pd.DataFrame) -> pd.DataFrame:
     if loans is None or loans.empty:
@@ -1003,7 +1068,6 @@ def _make_loan_ml_frame(loans: pd.DataFrame) -> pd.DataFrame:
     l["loan_age_days"] = _days_since(now, l["borrow_date"])
     l["days_since_last_payment"] = _days_since(now, l["last_paid_at"].fillna(l["borrow_date"]))
 
-    # target
     l["target"] = np.where(l["status"] == "closed", 0, 1).astype(int)
 
     out = l[
@@ -1137,7 +1201,8 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     st.header("🤖 AI Risk Panel")
     st.caption(
         "NJANGI STANDARD • no legacy • Heuristic + ML (XGBoost) • payouts fixed • "
-        "+ Extra AI Suite + Local Chat + Minutes Generator (no API key)."
+        "+ Extra AI Suite + Local Chat + Minutes (no API key) • "
+        "✅ Manifold Tangent embedded (always-on)."
     )
 
     _ensure_clients_in_state(sb_anon, sb_service)
@@ -1149,13 +1214,13 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
             st.session_state.pop("__xgb_cache__", None)
             st.rerun()
     with c2:
-        mode = st.radio("Risk mode", ["Heuristic", "ML (XGBoost)", "Hybrid"], horizontal=True)
+        mode = st.radio("Base scoring mode", ["Heuristic", "ML (XGBoost)", "Hybrid"], horizontal=True)
+        st.caption("Manifold is always applied on top of the base mode (embedded).")
 
     if not _table_exists(sb_anon, schema, "members"):
         st.error("Missing table: members")
         return
 
-    # NOTE: If your members table uses full_name instead of name, change cols to "id,full_name"
     members = _load_table(sb_anon, sb_service, schema, "members", cols="id,name", limit=5000)
     if members.empty or "id" not in members.columns:
         st.error("members not readable.")
@@ -1213,7 +1278,6 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
         else pd.DataFrame()
     )
 
-    # sessions is optional
     sessions = (
         _load_table(sb_anon, sb_service, schema, "sessions", cols="id,session_date,created_at", limit=5000)
         if _table_exists(sb_anon, schema, "sessions")
@@ -1262,16 +1326,49 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     loans_ml = _make_loan_ml_frame(loans)
     ml_risk, ml_msg = _xgb_risk_for_member(loans_ml, member_id=mid, min_rows=MIN_LOANS_FOR_ML)
 
-    # Final risk
+    # ============================================================
+    # ✅ Manifold always computed (embedded)
+    #   Risk field = heuristic risk across all members (fast + stable)
+    # ============================================================
+    risk_field = []
+    for _, rr in X.iterrows():
+        hh, _ = _compute_risk_score(rr)
+        risk_field.append(float(hh))
+    risk_field = pd.Series(risk_field, index=X.index, dtype=float)
+
+    feature_cols = [c for c in X.columns if c != "member_id"]
+    k_neighbors = int(np.clip(max(8, int(len(X) * 0.25)), 8, 18))
+    manifold = _manifold_tangent_metrics(
+        X=X,
+        risk_series=risk_field,
+        member_id=mid,
+        feature_cols=feature_cols,
+        k_neighbors=k_neighbors,
+    )
+
+    # ============================================================
+    # ✅ EMBEDDED FINAL RISK
+    #   1) compute base risk from chosen mode
+    #   2) ALWAYS apply manifold adjustment when available
+    # ============================================================
     if mode == "Heuristic":
-        final_risk = h_risk
+        base_risk = h_risk
     elif mode == "ML (XGBoost)":
-        final_risk = ml_risk if ml_risk is not None else h_risk
-    else:  # Hybrid
-        final_risk = h_risk if ml_risk is None else float(np.clip((h_risk + ml_risk) / 2.0, 0.0, 1.0))
+        base_risk = ml_risk if ml_risk is not None else h_risk
+    else:
+        base_risk = h_risk if ml_risk is None else float(np.clip((h_risk + ml_risk) / 2.0, 0.0, 1.0))
+
+    mf_adj = 0.0
+    if manifold.get("ok"):
+        vel = float(manifold.get("manifold_velocity", 0.0))
+        outlier = float(manifold.get("outlier_score", 0.0))
+        mf_adj += 0.10 * vel
+        mf_adj += 0.05 * max(0.0, outlier - 0.60)  # penalize only high outliers
+
+    final_risk = float(np.clip(base_risk + mf_adj, 0.0, 1.0))
 
     # Display
-    st.subheader("Risk prediction")
+    st.subheader("Risk prediction (embedded manifold)")
     st.metric("Predicted Risk", f"{final_risk * 100:.1f}%")
     st.progress(float(np.clip(final_risk, 0.0, 1.0)))
 
@@ -1286,6 +1383,25 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
         for r in reasons:
             st.write(f"• {r}")
 
+    st.subheader("🧭 Manifold (KNN + PCA Tangent) — embedded")
+    if manifold.get("ok"):
+        cM1, cM2, cM3 = st.columns(3)
+        cM1.metric("Trend", str(manifold.get("manifold_trend", "→ stable")))
+        cM2.metric("Velocity", f"{float(manifold.get('manifold_velocity', 0.0)):+.2f}")
+        cM3.metric("Outlier", f"{float(manifold.get('outlier_score', 0.0))*100:.0f}%")
+        st.caption(
+            f"Risk alignment corr: {float(manifold.get('risk_alignment_corr', 0.0)):+.2f} • "
+            f"K={int(manifold.get('k_used', 0))} • Embedded adj={mf_adj:+.3f}"
+        )
+        if float(manifold.get("manifold_velocity", 0.0)) > 0.20:
+            st.info("Manifold tangent suggests risk is trending upward — consider early intervention.")
+        elif float(manifold.get("manifold_velocity", 0.0)) < -0.20:
+            st.success("Manifold tangent suggests improving stability.")
+        if float(manifold.get("outlier_score", 0.0)) > 0.65:
+            st.warning("Off-manifold behavior: could be unusual activity or missing/blocked data (RLS).")
+    else:
+        st.info(f"Manifold not available: {manifold.get('msg','')}")
+
     st.divider()
     st.subheader("Member feature snapshot (no blanks)")
     snap = row.T
@@ -1293,7 +1409,7 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     st.dataframe(snap, use_container_width=True)
 
     # ============================================================
-    # ✅ EXTRA AI SUITE UI (single-file) + ✅ Minutes tab added
+    # EXTRA AI SUITE + embedded manifold into alerts + loan policy
     # ============================================================
     st.divider()
     st.subheader("🧠 Extra AI Suite (Reliability • Dropout • Fraud • Liquidity • Loan Decision • Alerts • Chat • Minutes)")
@@ -1320,6 +1436,18 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
         requested_amount=float(amt),
     )
 
+    # ✅ Embedded manifold tightening for loan recommendation
+    if manifold.get("ok"):
+        vel = float(manifold.get("manifold_velocity", 0.0))
+        outlier = float(manifold.get("outlier_score", 0.0))
+        if vel > 0.35 and decision == "APPROVE":
+            decision = "APPROVE WITH CONDITIONS"
+            dec_reasons = ["Manifold trend rising: apply stricter conditions."] + dec_reasons
+        if outlier > 0.75 and decision in ("APPROVE", "APPROVE WITH CONDITIONS"):
+            decision = "APPROVE WITH CONDITIONS"
+            dec_reasons = ["Off-manifold behavior: require verification / surety."] + dec_reasons
+        dec_reasons = dec_reasons[:6]
+
     alerts = _generate_ai_alerts(
         member_name=member_name,
         final_risk=float(final_risk),
@@ -1328,6 +1456,21 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
         fraud=float(fraud),
         liquidity_forecast=liquidity,
     )
+
+    # ✅ Embedded manifold alerts
+    if manifold.get("ok"):
+        if float(manifold.get("manifold_velocity", 0.0)) > 0.35:
+            alerts.append({
+                "severity": "med",
+                "type": "manifold_trend",
+                "message": f"{member_name}: Manifold trend rising (velocity {float(manifold.get('manifold_velocity',0.0)):+.2f})."
+            })
+        if float(manifold.get("outlier_score", 0.0)) > 0.70:
+            alerts.append({
+                "severity": "med",
+                "type": "manifold_outlier",
+                "message": f"{member_name}: Off-manifold behavior detected (outlier {float(manifold.get('outlier_score',0.0))*100:.0f}%)."
+            })
 
     # Top risky members (heuristic)
     top_risky = []
@@ -1377,7 +1520,7 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
                 st.write(f"• {r}")
         else:
             st.info("No anomaly signals detected from current data.")
-        st.caption("Note: This is lightweight anomaly detection (fast + safe).")
+        st.caption("Lightweight anomaly detection (fast + safe).")
 
     with tab3:
         if not liquidity.get("ok"):
@@ -1385,7 +1528,7 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
         else:
             st.metric("Estimated Net Balance (approx)", f"{liquidity.get('balance_est', 0.0):,.0f}")
             st.metric("Avg Daily Net Flow (last ~30d)", f"{liquidity.get('avg_daily_net', 0.0):,.1f}")
-            st.caption("Forecast is simple: linear projection using trailing average net flow.")
+            st.caption("Forecast: linear projection using trailing avg net flow.")
             df_fc = pd.DataFrame({"date": liquidity["dates"], "forecast_balance": liquidity["forecast_balance"]})
             st.line_chart(df_fc.set_index("date"))
 
@@ -1393,7 +1536,7 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
         st.write(f"**Decision:** `{decision}`")
         for r in dec_reasons:
             st.write(f"• {r}")
-        st.caption("Policy engine uses Risk + Reliability + Liquidity trend.")
+        st.caption("Policy uses Risk + Reliability + Liquidity + Embedded Manifold tightening.")
 
     with tab5:
         if not alerts:
@@ -1424,6 +1567,8 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
             "member_id": mid,
             "member_name": member_name,
             "final_risk": float(final_risk),
+            "base_risk": float(base_risk),
+            "manifold_adj": float(mf_adj),
             "reliability": int(reliability),
             "dropout": float(dropout),
             "fraud": float(fraud),
@@ -1431,13 +1576,14 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
             "alerts": alerts,
             "loan_reco": {"decision": decision, "reasons": dec_reasons},
             "top_risky": top_risky,
+            "manifold": manifold,
         }
 
         for role, msg in st.session_state.local_ai_msgs[-20:]:
             with st.chat_message(role):
                 st.markdown(msg)
 
-        q = st.chat_input("Ask: alerts / liquidity / top risky / loan recommendation (or type help)")
+        q = st.chat_input("Ask: alerts / liquidity / top risky / loan recommendation / manifold status (or type help)")
         if q:
             st.session_state.local_ai_msgs.append(("user", q))
             ans = _local_chat_answer(q, context)
@@ -1451,7 +1597,6 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
     with tab7:
         st.caption("Generate meeting minutes from your real Njangi tables (no API key).")
 
-        # Optional session selection for filtering totals
         session_id = None
         if sessions is not None and not sessions.empty and "id" in sessions.columns:
             s = sessions.copy()
@@ -1465,7 +1610,6 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
                 if sel != "All data (no session filter)":
                     session_id = int(s.loc[s["label"] == sel, "id"].iloc[0])
 
-        # Filter data by session_id if possible
         def filt(df: pd.DataFrame) -> pd.DataFrame:
             if session_id is None:
                 return df
@@ -1478,7 +1622,6 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
         contrib_f = filt(contrib)
         payouts_f = filt(payouts)
 
-        # For foundation/fines/payments/loans we typically don't have session_id; keep full
         meeting_title = st.text_input("Meeting title", value="THE YOUNG SHALL GROW (NJANGI) — Meeting Minutes")
         meeting_date = st.date_input("Meeting date", value=pd.Timestamp.utcnow().date())
         location = st.text_input("Location (optional)", value="")
@@ -1506,7 +1649,6 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
 
         st.text_area("Generated Minutes (copy/paste)", value=minutes_text, height=420)
 
-        # Optional save to "minutes" table (if exists)
         can_save = _table_exists(sb_anon, schema, "minutes") or (sb_service is not None and _table_exists(sb_service, schema, "minutes"))
         if can_save:
             st.info("A `minutes` table exists. You can save this minutes text to the database.")
@@ -1525,4 +1667,4 @@ def render_ai_risk_panel(sb_anon, sb_service=None, schema: str = "public"):
                     st.error("Failed to save minutes.")
                     st.code(msg, language="text")
         else:
-            st.caption("No `minutes` table found. (This is OK.) Copy/paste the minutes text, or create a minutes table later.")
+            st.caption("No `minutes` table found. Copy/paste the minutes text, or create a minutes table later.")
