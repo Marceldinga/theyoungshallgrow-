@@ -1,17 +1,12 @@
 
 # app.py ✅ COMPLETE SINGLE FILE — NJANGI STANDARD (NO legacy)
-# FAST VERSION + SLOW/GENTLE MODE + ✅ younchat (replaces "Young") + SAFE NAV FIX + ✅ DASHBOARD-AI NAV BRIDGE
+# FAST VERSION + SLOW/GENTLE MODE + ✅ younchat + SAFE NAV FIX + ✅ DASHBOARD-AI NAV BRIDGE
+# ✅ NEW: 🧠 AI Suite page (ai_suite_panel.py) — loads your Advanced+ NJANGI AI Suite panel
 # ------------------------------------------------------------------------------
-# ✅ What changed (as you requested):
-#   1) "🤖 AI Mode (Young)" page REMOVED
-#   2) Added "💬 younchat" page that loads njangi_llm_panel.render_njangi_llm_panel()
-#   3) Renamed "🧠 Njangi LLM" menu item to "🧠 Njangi LLM (younchat)" to avoid confusion
-#      (so you can keep both if you want — they both open younchat)
-#
 # ✅ Keeps:
-#   - Safe navigation + nav bridge
+#   - Safe navigation + nav bridge (dashboard → other pages)
 #   - Fast/Slow mode throttling
-#   - Cache-safe loaders
+#   - Cache-safe loaders (never cache supabase clients)
 #   - Admin import fix (admin_panels.py)
 #   - Streamlit params use_container_width=True
 # ------------------------------------------------------------------------------
@@ -426,6 +421,7 @@ SLOW_MODE = bool(st.session_state.get("_slow_mode_override", SLOW_MODE_DEFAULT))
 # =========================
 MEMBERS_TTL = 120 if not SLOW_MODE else 300
 VIEW_TTL = 90 if not SLOW_MODE else 240
+AI_TTL = 90 if not SLOW_MODE else 240
 
 
 @st.cache_data(ttl=MEMBERS_TTL, show_spinner=False)
@@ -533,6 +529,107 @@ def load_attendance_view(url: str, anon_key: str, schema: str, session_id: int) 
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=AI_TTL, show_spinner=False)
+def load_ai_table(
+    url: str,
+    anon_key: str,
+    schema: str,
+    table: str,
+    select_cols: str,
+    order_by: Optional[str],
+    order_desc: bool,
+    limit: int,
+) -> pd.DataFrame:
+    """
+    Cache-safe AI loader: creates a new client inside cache function (OK).
+    Throttle is global; works fine here to protect rate limits.
+    """
+    client = create_client(url, anon_key)
+    try:
+        throttle_db()
+        q = client.schema(schema).table(table).select(select_cols)
+        if order_by:
+            q = q.order(order_by, desc=order_desc)
+        q = q.limit(int(limit))
+        rows = (q.execute().data or [])
+        return pd.DataFrame(rows) if rows else pd.DataFrame()
+    except Exception as e:
+        st.session_state[f"_last_ai_load_err_{table}"] = _api_msg(e)
+        return pd.DataFrame()
+
+
+def _ai_limit(slow_mode: bool, fast_limit: int, slow_limit: int) -> int:
+    return int(slow_limit if slow_mode else fast_limit)
+
+
+def load_ai_bundle() -> dict:
+    """
+    Loads raw tables needed for ai_suite_panel.render_full_ai_suite_panel().
+    Uses anon key reads (RLS must allow). If your RLS blocks anon reads,
+    you can flip these reads to service key by adding parallel loaders.
+    """
+    lim_small = _ai_limit(SLOW_MODE, 2500, 1200)
+    lim_med = _ai_limit(SLOW_MODE, 4000, 2000)
+    lim_big = _ai_limit(SLOW_MODE, 6000, 3000)
+
+    members = load_members(SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA)
+
+    contributions = load_ai_table(
+        SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA,
+        "contributions",
+        "id,member_id,session_id,amount,paid_at,note,created_at",
+        "created_at", True, lim_big
+    )
+    foundation = load_ai_table(
+        SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA,
+        "foundation_contributions",
+        "id,member_id,amount,created_at,note,session_id",
+        "created_at", True, lim_med
+    )
+    loans = load_ai_table(
+        SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA,
+        "loans",
+        # try to cover common schemas; missing cols are handled by ai_suite_panel
+        "id,member_id,status,principal,principal_current,total_due,unpaid_interest,interest_rate_monthly,due_cycle_days,borrow_date,last_paid_at,created_at",
+        "created_at", True, lim_small
+    )
+    loan_payments = load_ai_table(
+        SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA,
+        "loan_payments",
+        "id,member_id,loan_id,amount,paid_at,created_at,note",
+        "created_at", True, lim_med
+    )
+    payouts = load_ai_table(
+        SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA,
+        "payouts",
+        "id,member_id,session_id,payout_amount,amount,payout_date,created_at,note",
+        "created_at", True, lim_small
+    )
+    fines = load_ai_table(
+        SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA,
+        "fines",
+        "id,member_id,amount,created_at,note,session_id",
+        "created_at", True, lim_small
+    )
+    sessions = load_ai_table(
+        SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA,
+        "sessions",
+        "id,session_id,session_date,start_date,end_date,created_at",
+        "id", True, 500
+    )
+
+    return {
+        "members": members,
+        "contributions": contributions,
+        "foundation_contributions": foundation,
+        "loans": loans,
+        "loan_payments": loan_payments,
+        "payouts": payouts,
+        "fines": fines,
+        "sessions": sessions,
+    }
+
+
 # =========================
 # SESSION HELPERS
 # =========================
@@ -598,6 +695,7 @@ else:
     PAGES = [
         "Dashboard",
         "💬 younchat",
+        "🧠 AI Suite",
         "Contributions",
         "Payouts",
         "Loans",
@@ -626,6 +724,57 @@ elif page == "💬 younchat":
         st.code(err or "", language="text")
     else:
         fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
+
+elif page == "🧠 AI Suite":
+    st.markdown(glass_open(), unsafe_allow_html=True)
+    st.subheader("🧠 NJANGI AI Suite — Advanced+ (No API Key)")
+    st.caption("Risk • Reliability • Dropout • Fraud • Liquidity • Decisions • Alerts • Trends • Segments • Stress Test • Minutes Generator")
+
+    fn, err = lazy_import("ai_suite_panel", "render_full_ai_suite_panel")
+    if fn is None:
+        st.error("AI Suite failed to load (ai_suite_panel.py).")
+        st.code(err or "", language="text")
+        st.markdown(glass_close(), unsafe_allow_html=True)
+        st.stop()
+
+    bundle = load_ai_bundle()
+    # minimal guard
+    if bundle["members"].empty:
+        if st.session_state.get("_last_members_error"):
+            st.error("Members not readable. Error:")
+            st.code(st.session_state.get("_last_members_error"), language="text")
+        else:
+            st.error("No members found (or RLS blocked). Check DB details at top.")
+        st.markdown(glass_close(), unsafe_allow_html=True)
+        st.stop()
+
+    # Render AI Suite (expects raw DataFrames; handles missing cols safely)
+    fn(
+        members=bundle["members"].rename(columns={"member_name": "display_name"}).assign(name=bundle["members"]["member_name"]),
+        contributions=bundle["contributions"],
+        loans=bundle["loans"],
+        loan_payments=bundle["loan_payments"],
+        payouts=bundle["payouts"],
+        fines=bundle["fines"],
+        foundation_contributions=bundle["foundation_contributions"],
+        sessions=bundle["sessions"],
+        schema=SUPABASE_SCHEMA,
+        sb_anon=sb_anon,
+        sb_service=sb_service,
+        min_loans_for_ml=20,
+        slow_mode=bool(SLOW_MODE),
+    )
+
+    # Helpful diagnostics
+    with st.expander("🔧 AI Suite load diagnostics", expanded=False):
+        for t in ["contributions", "foundation_contributions", "loans", "loan_payments", "payouts", "fines", "sessions"]:
+            errk = f"_last_ai_load_err_{t}"
+            if st.session_state.get(errk):
+                st.warning(f"{t} load error:")
+                st.code(st.session_state.get(errk), language="text")
+        st.write("Tip: If tables are empty due to RLS, allow anon reads (SELECT) or switch loaders to service key.")
+
+    st.markdown(glass_close(), unsafe_allow_html=True)
 
 elif page == "Contributions":
     st.markdown(glass_open(), unsafe_allow_html=True)
