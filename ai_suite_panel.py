@@ -1,316 +1,432 @@
 
-# ai_suite_panel.py ✅ ADVANCED+ NJANGI AI SUITE (NO API KEY) — SINGLE FILE
-# ------------------------------------------------------------------------------
-# ✅ Includes:
-#   • Risk scoring (Heuristic + XGBoost if installed) + Hybrid
-#   • Reliability score (0–100)
-#   • Dropout risk
-#   • Fraud/Anomaly detection
-#   • Liquidity forecast
-#   • Smart loan decision engine
-#   • Alerts Center
-#   • System Chat Assistant (free, grounded)
-#   • Minutes generator + Download + optional save to DB if `minutes` table exists
+# ai_suite_panel.py ✅ COMPLETE SINGLE FILE — NJANGI STANDARD (NO legacy)
+# =============================================================================
+# 🧠 NJANGI AI Suite — Advanced+ (No API Key)
+# Risk • Reliability • Dropout • Fraud • Liquidity • Decisions • Alerts • Trends
+# Segments • Stress Test • (Optional) ML (XGBoost if installed + enough data)
 #
-# ✅ NEW “Next-Level” Features:
-#   • Early Warning Heatmap (all members)
-#   • Risk Trend Over Time (selected member, last N days)
-#   • Member Segmentation (K-Means clustering implemented with NumPy)
-#   • What-If Stress Test (contrib drop + payment delays + fines shock)
-#   • Interest Income Projection (simple)
+# ✅ FIXES YOUR CRASH (ValueError length mismatch):
+#   - ALL feature vectors are built on a FULL members index (member_id)
+#   - Aggregates from loans/contrib/payments etc are MERGED back (left join)
+#   - No ".values" assignment from shorter group results
 #
-# ✅ EMBEDDED ADVANCED TECH:
-#   • Manifold Tangent Engine (KNN + PCA tangent) ALWAYS ON
-#     - Always computed
-#     - Always influences final risk
-#     - Adds manifold alerts + tightens loan policy
+# ✅ Snapshot-first friendly:
+#   - Uses RPC: fn_finance_snapshot() when available (fast)
+#   - Falls back to table reads safely
 #
-# Streamlit 2025+ safe: uses width="stretch"
-# Cache-safe: never caches supabase clients
-# ------------------------------------------------------------------------------
+# ✅ Works with your app.py:
+#   ai_suite_panel.render_full_ai_suite_panel(sb_anon=..., sb_service=..., schema=...)
+#
+# Optional deps (safe if missing):
+#   - scikit-learn (segmentation)
+#   - xgboost (ML model)
+#
+# =============================================================================
 
 from __future__ import annotations
 
-import re
+import os
 import time
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-W_STRETCH = "stretch"
+# Supabase APIError (safe import)
+try:
+    from postgrest.exceptions import APIError
+except Exception:
+    APIError = Exception  # type: ignore
+
+# Optional ML/segmentation deps
+try:
+    from sklearn.cluster import KMeans
+    from sklearn.preprocessing import StandardScaler
+except Exception:
+    KMeans = None  # type: ignore
+    StandardScaler = None  # type: ignore
+
+try:
+    import xgboost as xgb
+except Exception:
+    xgb = None  # type: ignore
 
 
-# ============================================================
-# Basic utilities
-# ============================================================
-def _clip01(x: float) -> float:
+# =============================================================================
+# SETTINGS
+# =============================================================================
+FEATURE_TTL = 60
+SNAPSHOT_TTL = 10
+MAX_ROWS_SCAN = 250_000  # safety cap
+ACTIVE_STATUSES = {"active", "open", "ongoing", "overdue", "late", "running", "disbursed"}
+
+APP_TITLE = "🧠 NJANGI AI Suite — Advanced+ (No API Key)"
+APP_TAGLINE = "Risk • Reliability • Dropout • Fraud • Liquidity • Decisions • Alerts • Trends • Segments • Stress Test • Minutes Generator"
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+def _api_msg(e: Exception) -> str:
+    if isinstance(e, APIError):
+        payload = e.args[0] if getattr(e, "args", None) else {}
+        if isinstance(payload, dict):
+            return str(payload.get("message") or payload.get("details") or payload.get("hint") or payload)
+        return str(payload)
+    return str(e)
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _throttle_db():
+    slow = bool(st.session_state.get("_slow_mode_override", True))
+    min_wait = float(st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", 0.15))
+    if not slow:
+        return
+    last = float(st.session_state.get("_last_db_call_ts", 0.0))
+    now = time.time()
+    wait = min_wait - (now - last)
+    if wait > 0:
+        time.sleep(wait)
+    st.session_state["_last_db_call_ts"] = time.time()
+
+
+def _to_num(s: Any) -> float:
     try:
-        return float(np.clip(float(x), 0.0, 1.0))
+        v = pd.to_numeric(s, errors="coerce")
+        return 0.0 if pd.isna(v) else float(v)
     except Exception:
         return 0.0
 
 
-def _to_int(s) -> pd.Series:
-    return pd.to_numeric(s, errors="coerce").fillna(0).astype(int)
+def _days_since_utc(dt: Any) -> Optional[int]:
+    if dt is None or str(dt).strip() == "":
+        return None
+    try:
+        ts = pd.to_datetime(dt, errors="coerce", utc=True)
+        if pd.isna(ts):
+            return None
+        delta = (pd.Timestamp.utcnow().tz_localize("UTC") - ts)
+        return int(delta.total_seconds() // 86400)
+    except Exception:
+        return None
 
 
-def _to_num(s) -> pd.Series:
-    return pd.to_numeric(s, errors="coerce").fillna(0.0)
+def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    if df is None or df.empty:
+        return None
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
 
 
-def _to_dt_utc(s) -> pd.Series:
-    return pd.to_datetime(s, errors="coerce", utc=True)
+def _safe_sum(df: pd.DataFrame, col: Optional[str]) -> float:
+    if df is None or df.empty or not col or col not in df.columns:
+        return 0.0
+    return float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
 
 
-def _utc_now() -> pd.Timestamp:
-    return pd.Timestamp.now(tz="UTC")
+def _safe_count(df: pd.DataFrame) -> int:
+    return 0 if df is None or df.empty else int(len(df))
 
 
-def _days_since(now_utc: pd.Timestamp, dt_series) -> pd.Series:
-    dt_utc = pd.to_datetime(dt_series, errors="coerce", utc=True)
-    out = (now_utc - dt_utc).dt.days
-    return out.fillna(999).astype(int)
-
-
-def _fmt_money(x) -> str:
+def _money0(x: Any) -> str:
     try:
         return f"{float(x):,.0f}"
     except Exception:
         return str(x)
 
 
-def _fmt_pct01(x: float) -> str:
-    try:
-        return f"{float(x) * 100:.1f}%"
-    except Exception:
-        return "—"
-
-
-def _df_fingerprint(df: pd.DataFrame) -> str:
-    if df is None or df.empty:
-        return "empty"
-    try:
-        cols = df.columns.tolist()
-        h = pd.util.hash_pandas_object(df[cols], index=True).sum()
-        return str(int(h))
-    except Exception:
-        return f"len={len(df)};cols={len(getattr(df,'columns',[]))}"
-
-
-def _infer_member_name_col(members: pd.DataFrame) -> str | None:
-    for c in ["display_name", "name", "full_name", "member_name"]:
-        if members is not None and not members.empty and c in members.columns:
-            return c
-    return None
-
-
-def _member_map(members: pd.DataFrame) -> dict[int, str]:
-    if members is None or members.empty or "id" not in members.columns:
-        return {}
-    name_col = _infer_member_name_col(members)
-    if not name_col:
-        return {}
-    out: dict[int, str] = {}
-    for _, r in members.iterrows():
-        try:
-            out[int(r["id"])] = str(r.get(name_col) or f"Member {int(r['id'])}")
-        except Exception:
-            pass
-    return out
-
-
-def _fill_feature_defaults(X: pd.DataFrame) -> pd.DataFrame:
-    X = X.copy()
-    for col in X.columns:
-        if col == "member_id":
-            continue
-        if col.endswith("_dt"):
-            continue
-        if col.endswith("_count") or col.endswith("_n"):
-            X[col] = pd.to_numeric(X[col], errors="coerce").fillna(0).astype(int)
-        elif col.startswith("days_since_") or col.endswith("_days"):
-            X[col] = pd.to_numeric(X[col], errors="coerce").fillna(999).astype(int)
-        else:
-            X[col] = pd.to_numeric(X[col], errors="coerce").fillna(0.0)
-    return X
-
-
-def _throttle(slow_mode: bool, min_interval_s: float = 0.12):
-    if not slow_mode:
-        return
-    last = st.session_state.get("__ai_suite_last_tick__", 0.0)
-    now = time.time()
-    wait = (last + float(min_interval_s)) - now
-    if wait > 0:
-        time.sleep(wait)
-    st.session_state["__ai_suite_last_tick__"] = time.time()
-
-
-# ============================================================
-# ✅ EMBEDDED MANIFOLD ENGINE (KNN + PCA Tangent) — NO API KEY
-# ============================================================
-def _standardize_matrix(df: pd.DataFrame, cols: list[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    X = df[cols].to_numpy(dtype=float)
-    mu = np.nanmean(X, axis=0)
-    sigma = np.nanstd(X, axis=0)
-    sigma = np.where(sigma <= 1e-12, 1.0, sigma)
-    Z = (X - mu) / sigma
-    Z = np.nan_to_num(Z, nan=0.0, posinf=0.0, neginf=0.0)
-    return Z, mu, sigma
-
-
-def _knn_indices(Z: np.ndarray, i: int, k: int) -> np.ndarray:
-    if Z.shape[0] <= 1:
-        return np.array([i], dtype=int)
-    k = int(max(4, min(k, Z.shape[0])))
-    dif = Z - Z[i]
-    dist2 = np.sum(dif * dif, axis=1)
-    idx = np.argsort(dist2)[:k]
-    return idx.astype(int)
-
-
-def _pca_first_component(centered: np.ndarray) -> np.ndarray:
-    _, _, Vt = np.linalg.svd(centered, full_matrices=False)
-    v1 = Vt[0]
-    nrm = np.linalg.norm(v1) + 1e-12
-    return v1 / nrm
-
-
-def _corr_safe(a: np.ndarray, b: np.ndarray) -> float:
-    a = np.asarray(a, dtype=float)
-    b = np.asarray(b, dtype=float)
-    if a.size < 4 or np.std(a) < 1e-12 or np.std(b) < 1e-12:
-        return 0.0
-    return float(np.corrcoef(a, b)[0, 1])
-
-
-def manifold_tangent_metrics(
-    X: pd.DataFrame,
-    risk_series: pd.Series,
-    member_id: int,
-    feature_cols: list[str],
-    k_neighbors: int = 12,
-) -> dict:
-    out = {
-        "ok": False,
-        "msg": "",
-        "manifold_velocity": 0.0,    # [-1,1]
-        "manifold_trend": "→ stable",
-        "outlier_score": 0.0,        # [0,1]
-        "risk_alignment_corr": 0.0,
-        "k_used": 0,
-    }
-
-    if X is None or X.empty:
-        out["msg"] = "No feature matrix."
-        return out
-    if "member_id" not in X.columns:
-        out["msg"] = "Missing member_id."
-        return out
-
-    idx_row = X.index[X["member_id"].astype(int) == int(member_id)]
-    if len(idx_row) == 0:
-        out["msg"] = "Member not found."
-        return out
-    i = int(idx_row[0])
-
-    Z, _, _ = _standardize_matrix(X, feature_cols)
-    idx = _knn_indices(Z, i, k_neighbors)
-    out["k_used"] = int(len(idx))
-    if len(idx) < 4:
-        out["msg"] = "Not enough neighbors."
-        return out
-
-    Zn = Z[idx, :]
-    center = np.mean(Zn, axis=0)
-    centered = Zn - center
-
-    v1 = _pca_first_component(centered)
-    t = centered @ v1
-    t_i = float((Z[i] - center) @ v1)
-
-    rn = risk_series.loc[X.index[idx]].to_numpy(dtype=float)
-    corr = _corr_safe(t, rn)
-    out["risk_alignment_corr"] = float(corr)
-
-    vel = float(np.tanh(t_i) * (1.0 if corr >= 0 else -1.0))
-    vel = float(np.clip(vel, -1.0, 1.0))
-    out["manifold_velocity"] = vel
-    out["manifold_trend"] = ("↑ rising" if vel > 0.20 else ("↓ improving" if vel < -0.20 else "→ stable"))
-
-    centered_i = (Z[i] - center)
-    proj = t_i * v1
-    resid = centered_i - proj
-    resid_norm = float(np.linalg.norm(resid))
-    out["outlier_score"] = float(np.clip(np.tanh(resid_norm / 2.0), 0.0, 1.0))
-
-    out["ok"] = True
-    out["msg"] = "OK"
-    return out
-
-
-def embedded_manifold_adjustment(mf: dict) -> float:
-    """
-    ✅ Always-on risk adjustment:
-      - velocity pushes risk up/down
-      - high outlier (off-manifold) adds a penalty
-    """
-    if not mf or not mf.get("ok"):
-        return 0.0
-    vel = float(mf.get("manifold_velocity", 0.0))
-    outlier = float(mf.get("outlier_score", 0.0))
-    adj = 0.10 * vel
-    adj += 0.05 * max(0.0, outlier - 0.60)
-    return float(adj)
-
-
-# ============================================================
-# Optional DB helpers (Minutes saving only)
-# ============================================================
-def _safe_insert(client, schema: str, table: str, row: dict) -> tuple[bool, str]:
-    if client is None:
-        return False, "No client provided."
-    try:
-        client.schema(schema).table(table).insert(row).execute()
-        return True, "OK"
-    except Exception as e:
-        return False, repr(e)
-
-
-def _table_exists(client, schema: str, table: str) -> bool:
-    if client is None:
-        return False
-    try:
-        client.schema(schema).table(table).select("*").limit(1).execute()
-        return True
-    except Exception:
-        return False
-
-
-# ============================================================
-# Feature engineering (member-level)
-#   Keeps *_last_dt columns for trend analysis
-# ============================================================
-@st.cache_data(ttl=180, show_spinner=False)
-def build_member_features_cached(
-    members: pd.DataFrame,
-    contrib: pd.DataFrame,
-    loans: pd.DataFrame,
-    payments: pd.DataFrame,
-    payouts: pd.DataFrame,
-    fines: pd.DataFrame,
-    foundation: pd.DataFrame,
-    _fp_members: str,
-    _fp_contrib: str,
-    _fp_loans: str,
-    _fp_payments: str,
-    _fp_payouts: str,
-    _fp_fines: str,
-    _fp_foundation: str,
+# =============================================================================
+# Supabase Readers
+# =============================================================================
+def _sb_select(
+    sb_anon,
+    sb_service,
+    schema: str,
+    table: str,
+    cols: str = "*",
+    limit: int = 10_000,
+    order_by: Optional[str] = None,
+    desc: bool = True,
+    filters: Optional[List[Tuple[str, str, Any]]] = None,
 ) -> pd.DataFrame:
-    return build_member_features(members, contrib, loans, payments, payouts, fines, foundation)
+    sb = sb_service or sb_anon
+    if sb is None:
+        return pd.DataFrame()
+
+    def _apply(q):
+        if filters:
+            for col, op, val in filters:
+                if val is None:
+                    continue
+                if op == "eq":
+                    q = q.eq(col, val)
+                elif op == "gte":
+                    q = q.gte(col, val)
+                elif op == "lte":
+                    q = q.lte(col, val)
+                elif op == "ilike":
+                    q = q.ilike(col, val)
+        if order_by:
+            q = q.order(order_by, desc=desc)
+        return q
+
+    try:
+        _throttle_db()
+        q = (sb.schema(schema).table(table).select(cols).limit(int(limit)))
+        q = _apply(q)
+        res = q.execute()
+        return pd.DataFrame(getattr(res, "data", None) or [])
+    except Exception:
+        try:
+            _throttle_db()
+            q = (sb.table(table).select(cols).limit(int(limit)))
+            q = _apply(q)
+            res = q.execute()
+            return pd.DataFrame(getattr(res, "data", None) or [])
+        except Exception as e:
+            st.warning(f"Could not read {schema}.{table}: {_api_msg(e)}")
+            return pd.DataFrame()
+
+
+def _rpc_finance_snapshot(sb_anon, sb_service, schema: str) -> Dict[str, Any]:
+    sb = sb_service or sb_anon
+    if sb is None:
+        return {}
+    try:
+        _throttle_db()
+        try:
+            res = sb.schema(schema).rpc("fn_finance_snapshot", {}).execute()
+        except Exception:
+            res = sb.rpc("fn_finance_snapshot", {}).execute()
+        data = getattr(res, "data", None)
+        if not data:
+            return {}
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return data[0]
+        if isinstance(data, dict):
+            return data
+        return {}
+    except Exception:
+        return {}
+
+
+# =============================================================================
+# Feature Engineering (FULL members index → safe merges)
+# =============================================================================
+def _normalize_members(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["member_id", "member_name"])
+
+    id_col = _pick_col(df, ["id", "member_id"])
+    if not id_col:
+        return pd.DataFrame(columns=["member_id", "member_name"])
+
+    # name preference: display_name > full_name/name
+    disp = _pick_col(df, ["display_name"])
+    nm = _pick_col(df, ["full_name", "name"])
+
+    out = pd.DataFrame()
+    out["member_id"] = df[id_col].astype(str)
+
+    disp_clean = (
+        df[disp].astype(str).replace(["None", "nan", "NaN", "NULL", "null"], "").fillna("").str.strip()
+        if disp and disp in df.columns
+        else pd.Series([""] * len(df))
+    )
+    nm_clean = (
+        df[nm].astype(str).replace(["None", "nan", "NaN", "NULL", "null"], "").fillna("").str.strip()
+        if nm and nm in df.columns
+        else pd.Series([""] * len(df))
+    )
+
+    out["member_name"] = disp_clean.where(disp_clean != "", nm_clean).replace("", "(no name)")
+
+    # stable sort by numeric id when possible
+    out["_id_num"] = pd.to_numeric(out["member_id"], errors="coerce")
+    out = out.sort_values(["_id_num", "member_id"], ascending=True).drop(columns=["_id_num"])
+
+    return out.reset_index(drop=True)
+
+
+def _agg_contributions(contrib: pd.DataFrame) -> pd.DataFrame:
+    if contrib is None or contrib.empty:
+        return pd.DataFrame(columns=["member_id", "contrib_total", "contrib_count", "last_contrib_days"])
+
+    mid = _pick_col(contrib, ["member_id"])
+    amt = _pick_col(contrib, ["amount"])
+    dt = _pick_col(contrib, ["paid_at", "created_at"])
+    if not mid:
+        return pd.DataFrame(columns=["member_id", "contrib_total", "contrib_count", "last_contrib_days"])
+
+    tmp = contrib.copy()
+    tmp["member_id"] = tmp[mid].astype(str)
+    tmp["_amt"] = pd.to_numeric(tmp[amt], errors="coerce").fillna(0) if amt and amt in tmp.columns else 0.0
+
+    if dt and dt in tmp.columns:
+        tmp["_dt"] = pd.to_datetime(tmp[dt], errors="coerce", utc=True)
+        last_dt = tmp.groupby("member_id")["_dt"].max()
+        last_days = (pd.Timestamp.utcnow().tz_localize("UTC") - last_dt).dt.days
+        last_days = last_days.replace([np.inf, -np.inf], np.nan)
+    else:
+        last_days = pd.Series(index=tmp["member_id"].unique(), dtype="float64")
+
+    g = tmp.groupby("member_id", dropna=False)
+    out = pd.DataFrame({
+        "member_id": g.size().index.astype(str),
+        "contrib_total": g["_amt"].sum().values,
+        "contrib_count": g.size().values,
+    })
+    out = out.merge(last_days.rename("last_contrib_days").reset_index(), on="member_id", how="left")
+    out["last_contrib_days"] = pd.to_numeric(out["last_contrib_days"], errors="coerce")
+    return out
+
+
+def _agg_foundation(fnd: pd.DataFrame) -> pd.DataFrame:
+    if fnd is None or fnd.empty:
+        return pd.DataFrame(columns=["member_id", "foundation_total", "foundation_count"])
+    mid = _pick_col(fnd, ["member_id"])
+    amt = _pick_col(fnd, ["amount"])
+    if not mid:
+        return pd.DataFrame(columns=["member_id", "foundation_total", "foundation_count"])
+    tmp = fnd.copy()
+    tmp["member_id"] = tmp[mid].astype(str)
+    tmp["_amt"] = pd.to_numeric(tmp[amt], errors="coerce").fillna(0) if amt and amt in tmp.columns else 0.0
+    g = tmp.groupby("member_id", dropna=False)
+    return pd.DataFrame({
+        "member_id": g.size().index.astype(str),
+        "foundation_total": g["_amt"].sum().values,
+        "foundation_count": g.size().values,
+    })
+
+
+def _agg_fines(fines: pd.DataFrame) -> pd.DataFrame:
+    if fines is None or fines.empty:
+        return pd.DataFrame(columns=["member_id", "fines_total", "fines_count"])
+    mid = _pick_col(fines, ["member_id"])
+    amt = _pick_col(fines, ["amount"])
+    if not mid:
+        return pd.DataFrame(columns=["member_id", "fines_total", "fines_count"])
+    tmp = fines.copy()
+    tmp["member_id"] = tmp[mid].astype(str)
+    tmp["_amt"] = pd.to_numeric(tmp[amt], errors="coerce").fillna(0) if amt and amt in tmp.columns else 0.0
+    g = tmp.groupby("member_id", dropna=False)
+    return pd.DataFrame({
+        "member_id": g.size().index.astype(str),
+        "fines_total": g["_amt"].sum().values,
+        "fines_count": g.size().values,
+    })
+
+
+def _agg_loans(loans: pd.DataFrame) -> pd.DataFrame:
+    cols = ["member_id", "active_loan_count", "active_loan_exposure", "overdue_flag_count", "total_due_like"]
+    if loans is None or loans.empty:
+        return pd.DataFrame(columns=cols)
+
+    mid = _pick_col(loans, ["member_id"])
+    if not mid:
+        return pd.DataFrame(columns=cols)
+
+    status = _pick_col(loans, ["status"])
+    principal = _pick_col(loans, ["principal_current", "principal", "amount"])
+    total_due = _pick_col(loans, ["total_due", "arrears", "balance_due", "amount_due"])
+    unpaid = _pick_col(loans, ["unpaid_interest", "interest_due", "interest_unpaid"])
+
+    tmp = loans.copy()
+    tmp["member_id"] = tmp[mid].astype(str)
+
+    stt = tmp[status].astype(str).str.lower().str.strip() if status and status in tmp.columns else ""
+    tmp["_is_active"] = stt.isin(ACTIVE_STATUSES)
+    tmp["_is_overdue"] = stt.isin({"overdue", "late"})
+
+    # choose exposure from best available
+    if principal and principal in tmp.columns:
+        tmp["_exposure"] = pd.to_numeric(tmp[principal], errors="coerce").fillna(0)
+    elif total_due and total_due in tmp.columns:
+        tmp["_exposure"] = pd.to_numeric(tmp[total_due], errors="coerce").fillna(0)
+    else:
+        tmp["_exposure"] = 0.0
+
+    tmp["_total_due"] = pd.to_numeric(tmp[total_due], errors="coerce").fillna(0) if total_due and total_due in tmp.columns else 0.0
+    tmp["_unpaid_int"] = pd.to_numeric(tmp[unpaid], errors="coerce").fillna(0) if unpaid and unpaid in tmp.columns else 0.0
+
+    g = tmp.groupby("member_id", dropna=False)
+
+    out = pd.DataFrame({
+        "member_id": g.size().index.astype(str),
+        "active_loan_count": g["_is_active"].sum().values.astype(int),
+        "overdue_flag_count": g["_is_overdue"].sum().values.astype(int),
+        "active_loan_exposure": g.apply(lambda d: float(d.loc[d["_is_active"], "_exposure"].sum())).values,
+        "total_due_like": g["_total_due"].sum().values,
+        "unpaid_interest_like": g["_unpaid_int"].sum().values,
+    })
+    return out
+
+
+def _agg_payments(pay: pd.DataFrame) -> pd.DataFrame:
+    cols = ["member_id", "payment_total", "payment_count", "last_payment_days"]
+    if pay is None or pay.empty:
+        return pd.DataFrame(columns=cols)
+
+    mid = _pick_col(pay, ["member_id"])
+    amt = _pick_col(pay, ["amount"])
+    dt = _pick_col(pay, ["paid_at", "created_at"])
+    if not mid:
+        return pd.DataFrame(columns=cols)
+
+    tmp = pay.copy()
+    tmp["member_id"] = tmp[mid].astype(str)
+    tmp["_amt"] = pd.to_numeric(tmp[amt], errors="coerce").fillna(0) if amt and amt in tmp.columns else 0.0
+
+    if dt and dt in tmp.columns:
+        tmp["_dt"] = pd.to_datetime(tmp[dt], errors="coerce", utc=True)
+        last_dt = tmp.groupby("member_id")["_dt"].max()
+        last_days = (pd.Timestamp.utcnow().tz_localize("UTC") - last_dt).dt.days
+    else:
+        last_days = pd.Series(index=tmp["member_id"].unique(), dtype="float64")
+
+    g = tmp.groupby("member_id", dropna=False)
+    out = pd.DataFrame({
+        "member_id": g.size().index.astype(str),
+        "payment_total": g["_amt"].sum().values,
+        "payment_count": g.size().values,
+    })
+    out = out.merge(last_days.rename("last_payment_days").reset_index(), on="member_id", how="left")
+    out["last_payment_days"] = pd.to_numeric(out["last_payment_days"], errors="coerce")
+    return out
+
+
+def _agg_payouts(payouts: pd.DataFrame) -> pd.DataFrame:
+    cols = ["member_id", "payout_count", "last_payout_days"]
+    if payouts is None or payouts.empty:
+        return pd.DataFrame(columns=cols)
+    mid = _pick_col(payouts, ["member_id"])
+    dt = _pick_col(payouts, ["paid_at", "created_at"])
+    if not mid:
+        return pd.DataFrame(columns=cols)
+    tmp = payouts.copy()
+    tmp["member_id"] = tmp[mid].astype(str)
+    if dt and dt in tmp.columns:
+        tmp["_dt"] = pd.to_datetime(tmp[dt], errors="coerce", utc=True)
+        last_dt = tmp.groupby("member_id")["_dt"].max()
+        last_days = (pd.Timestamp.utcnow().tz_localize("UTC") - last_dt).dt.days
+    else:
+        last_days = pd.Series(index=tmp["member_id"].unique(), dtype="float64")
+
+    g = tmp.groupby("member_id", dropna=False)
+    out = pd.DataFrame({
+        "member_id": g.size().index.astype(str),
+        "payout_count": g.size().values.astype(int),
+    })
+    out = out.merge(last_days.rename("last_payout_days").reset_index(), on="member_id", how="left")
+    out["last_payout_days"] = pd.to_numeric(out["last_payout_days"], errors="coerce")
+    return out
 
 
 def build_member_features(
@@ -322,1607 +438,629 @@ def build_member_features(
     fines: pd.DataFrame,
     foundation: pd.DataFrame,
 ) -> pd.DataFrame:
-    if members is None or members.empty or "id" not in members.columns:
+    """
+    ✅ Always returns full member frame with safe merged aggregates.
+    """
+    base = _normalize_members(members)
+    if base.empty:
         return pd.DataFrame()
 
-    members2 = members.copy()
-    members2["id"] = _to_int(members2["id"])
-    members2 = members2[members2["id"] > 0].copy()
-    now = _utc_now()
+    # aggregates
+    a_contrib = _agg_contributions(contrib)
+    a_loans = _agg_loans(loans)
+    a_pay = _agg_payments(payments)
+    a_payout = _agg_payouts(payouts)
+    a_fines = _agg_fines(fines)
+    a_found = _agg_foundation(foundation)
 
-    base = pd.DataFrame({"member_id": members2["id"].astype(int)})
+    # merge all onto base member_id
+    X = base.copy()
+    for agg in [a_contrib, a_found, a_fines, a_loans, a_pay, a_payout]:
+        if agg is None or agg.empty:
+            continue
+        X = X.merge(agg, on="member_id", how="left")
 
-    # Contributions
-    cfeat = base.copy()
-    if contrib is not None and not contrib.empty and "member_id" in contrib.columns:
-        c = contrib.copy()
-        c["member_id"] = _to_int(c["member_id"])
-        c["amount"] = _to_num(c.get("amount", 0))
-        c["created_at"] = _to_dt_utc(c.get("created_at", pd.NaT))
-        grp = c.groupby("member_id", dropna=False)
+    # fill
+    num_cols = [c for c in X.columns if c not in ("member_id", "member_name")]
+    for c in num_cols:
+        X[c] = pd.to_numeric(X[c], errors="coerce")
 
-        cfeat = cfeat.merge(grp["amount"].sum().rename("contrib_total"), left_on="member_id", right_index=True, how="left")
-        cfeat = cfeat.merge(grp["amount"].count().rename("contrib_count"), left_on="member_id", right_index=True, how="left")
-        cfeat = cfeat.merge(grp["amount"].mean().rename("contrib_avg"), left_on="member_id", right_index=True, how="left")
-        cfeat = cfeat.merge(grp["created_at"].max().rename("contrib_last_dt"), left_on="member_id", right_index=True, how="left")
-
-        if "session_id" in c.columns:
-            c["session_id"] = _to_int(c["session_id"])
-            cfeat = cfeat.merge(
-                c.groupby("member_id")["session_id"].nunique().rename("contrib_sessions_n"),
-                left_on="member_id", right_index=True, how="left"
-            )
-    else:
-        cfeat["contrib_total"] = 0.0
-        cfeat["contrib_count"] = 0
-        cfeat["contrib_avg"] = 0.0
-        cfeat["contrib_sessions_n"] = 0
-        cfeat["contrib_last_dt"] = pd.NaT
-
-    cfeat["days_since_last_contrib"] = _days_since(now, cfeat["contrib_last_dt"])
-
-    # Loans
-    lfeat = base.copy()
-    if loans is not None and not loans.empty and "member_id" in loans.columns:
-        l = loans.copy()
-        l["member_id"] = _to_int(l["member_id"])
-        for col in ["principal", "principal_current", "total_due", "unpaid_interest", "interest_rate_monthly"]:
-            if col in l.columns:
-                l[col] = _to_num(l[col])
-
-        l["status"] = l.get("status", "").astype(str).str.lower().fillna("")
-        l["last_paid_at"] = _to_dt_utc(l.get("last_paid_at", pd.NaT))
-        l["borrow_date"] = _to_dt_utc(l.get("borrow_date", l.get("created_at", pd.NaT)))
-
-        if "principal_current" in l.columns:
-            l["balance_calc"] = l["principal_current"]
-        elif "principal" in l.columns:
-            l["balance_calc"] = l["principal"]
+    for c in num_cols:
+        if c.endswith("_days"):
+            # days can be NaN if never happened
+            X[c] = X[c].fillna(np.nan)
         else:
-            l["balance_calc"] = 0.0
+            X[c] = X[c].fillna(0.0)
 
-        grp = l.groupby("member_id", dropna=False)
-        lfeat = lfeat.merge(grp.size().rename("loan_count"), left_on="member_id", right_index=True, how="left")
-        lfeat = lfeat.merge(grp["balance_calc"].sum().rename("loan_balance_sum"), left_on="member_id", right_index=True, how="left")
-        lfeat = lfeat.merge(grp["borrow_date"].max().rename("loan_last_borrow_dt"), left_on="member_id", right_index=True, how="left")
-        lfeat = lfeat.merge(grp["last_paid_at"].max().rename("loan_last_paid_dt"), left_on="member_id", right_index=True, how="left")
+    # derived signals
+    X["no_payment_14d"] = (X.get("last_payment_days") >= 14).fillna(True).astype(int) if "last_payment_days" in X else 1
+    X["no_payment_30d"] = (X.get("last_payment_days") >= 30).fillna(True).astype(int) if "last_payment_days" in X else 1
+    X["no_contrib_14d"] = (X.get("last_contrib_days") >= 14).fillna(True).astype(int) if "last_contrib_days" in X else 1
+    X["no_contrib_30d"] = (X.get("last_contrib_days") >= 30).fillna(True).astype(int) if "last_contrib_days" in X else 1
 
-        if "unpaid_interest" in l.columns:
-            lfeat = lfeat.merge(grp["unpaid_interest"].sum().rename("loan_unpaid_interest_sum"), left_on="member_id", right_index=True, how="left")
-        else:
-            lfeat["loan_unpaid_interest_sum"] = 0.0
+    # simple fraud-ish / behavior flags (heuristic)
+    X["bad_status_flag"] = (X.get("overdue_flag_count", 0) > 0).astype(int)
+    X["outstanding_loan_flag"] = (X.get("active_loan_exposure", 0) > 0).astype(int)
 
-        if "interest_rate_monthly" in l.columns:
-            w = l["balance_calc"].replace(0, np.nan)
-            rate_wavg = (l["interest_rate_monthly"] * w).groupby(l["member_id"]).sum() / w.groupby(l["member_id"]).sum()
-            lfeat = lfeat.merge(rate_wavg.rename("loan_interest_rate_wavg"), left_on="member_id", right_index=True, how="left")
-        else:
-            lfeat["loan_interest_rate_wavg"] = 0.0
+    return X
 
-        if "total_due" in l.columns:
-            lfeat = lfeat.merge(grp["total_due"].sum().rename("loan_total_due_sum"), left_on="member_id", right_index=True, how="left")
-        else:
-            lfeat["loan_total_due_sum"] = 0.0
 
-        bad_tokens = ["delinquent", "default", "overdue", "late", "arrears", "past due", "past_due", "unpaid"]
-        lfeat = lfeat.merge(
-            grp["status"].apply(lambda s: sum(any(tok in str(v) for tok in bad_tokens) for v in s)).rename("loan_bad_status_count"),
-            left_on="member_id", right_index=True, how="left",
-        )
-        lfeat["active_loan_count"] = grp["status"].apply(lambda s: int(sum(str(v) == "active" for v in s))).values
-    else:
-        lfeat["loan_count"] = 0
-        lfeat["loan_balance_sum"] = 0.0
-        lfeat["loan_total_due_sum"] = 0.0
-        lfeat["loan_bad_status_count"] = 0
-        lfeat["loan_last_paid_dt"] = pd.NaT
-        lfeat["loan_last_borrow_dt"] = pd.NaT
-        lfeat["loan_unpaid_interest_sum"] = 0.0
-        lfeat["loan_interest_rate_wavg"] = 0.0
-        lfeat["active_loan_count"] = 0
+# =============================================================================
+# Heuristic Scoring (Manifold-style: smooth blend of signals)
+# =============================================================================
+def score_members_heuristic(
+    X: pd.DataFrame,
+    w: Dict[str, float],
+) -> pd.DataFrame:
+    """
+    Returns X with:
+      - risk_score (0..100)
+      - reliability_score (0..100)
+      - dropout_score (0..100)
+      - risk_band
+    """
+    if X is None or X.empty:
+        return pd.DataFrame()
 
-    # Payments
-    pfeat = base.copy()
-    if payments is not None and not payments.empty and "member_id" in payments.columns:
-        p = payments.copy()
-        p["member_id"] = _to_int(p["member_id"])
-        p["amount"] = _to_num(p.get("amount", 0))
-        dtc = "paid_at" if "paid_at" in p.columns else ("created_at" if "created_at" in p.columns else None)
-        p["paid_at_calc"] = _to_dt_utc(p.get(dtc, pd.NaT)) if dtc else pd.NaT
-        grp = p.groupby("member_id", dropna=False)
-        pfeat = pfeat.merge(grp["amount"].count().rename("pay_count"), left_on="member_id", right_index=True, how="left")
-        pfeat = pfeat.merge(grp["amount"].sum().rename("pay_total"), left_on="member_id", right_index=True, how="left")
-        pfeat = pfeat.merge(grp["paid_at_calc"].max().rename("pay_last_dt"), left_on="member_id", right_index=True, how="left")
-    else:
-        pfeat["pay_count"] = 0
-        pfeat["pay_total"] = 0.0
-        pfeat["pay_last_dt"] = pd.NaT
+    df = X.copy()
 
-    pfeat["days_since_last_payment"] = _days_since(now, pfeat["pay_last_dt"])
+    # Normalize helpers
+    def zpos(series: pd.Series) -> pd.Series:
+        s = pd.to_numeric(series, errors="coerce").fillna(0.0).astype(float)
+        if s.max() <= 0:
+            return s * 0
+        return (s / (s.max() + 1e-9)).clip(0, 1)
 
-    # Payouts
-    poutfeat = base.copy()
-    if payouts is not None and not payouts.empty and "member_id" in payouts.columns:
-        po = payouts.copy()
-        po["member_id"] = _to_int(po["member_id"])
-        amt_col = "payout_amount" if "payout_amount" in po.columns else ("amount" if "amount" in po.columns else None)
-        dt_col = "payout_date" if "payout_date" in po.columns else ("created_at" if "created_at" in po.columns else None)
-        po["payout_amount_calc"] = _to_num(po[amt_col]) if amt_col else 0.0
-        po["payout_dt_calc"] = _to_dt_utc(po[dt_col]) if dt_col else pd.NaT
-        grp = po.groupby("member_id", dropna=False)
-        poutfeat = poutfeat.merge(grp["payout_amount_calc"].count().rename("payout_count"), left_on="member_id", right_index=True, how="left")
-        poutfeat = poutfeat.merge(grp["payout_amount_calc"].sum().rename("payout_total"), left_on="member_id", right_index=True, how="left")
-        poutfeat = poutfeat.merge(grp["payout_dt_calc"].max().rename("payout_last_dt"), left_on="member_id", right_index=True, how="left")
-    else:
-        poutfeat["payout_count"] = 0
-        poutfeat["payout_total"] = 0.0
-        poutfeat["payout_last_dt"] = pd.NaT
+    # Core components
+    outstanding = zpos(df.get("active_loan_exposure", 0))
+    total_due = zpos(df.get("total_due_like", 0))
+    bad_status = zpos(df.get("bad_status_flag", 0))
+    no_pay_30 = zpos(df.get("no_payment_30d", 0))
+    no_pay_14 = zpos(df.get("no_payment_14d", 0))
+    no_contrib_30 = zpos(df.get("no_contrib_30d", 0))
+    no_contrib_14 = zpos(df.get("no_contrib_14d", 0))
+    fines = zpos(df.get("fines_total", 0))
 
-    poutfeat["days_since_last_payout"] = _days_since(now, poutfeat["payout_last_dt"])
+    contrib_total = zpos(df.get("contrib_total", 0))
+    contrib_freq = zpos(df.get("contrib_count", 0))
 
-    # Fines
-    ffeat = base.copy()
-    if fines is not None and not fines.empty and "member_id" in fines.columns:
-        f = fines.copy()
-        f["member_id"] = _to_int(f["member_id"])
-        f["amount"] = _to_num(f.get("amount", 0))
-        grp = f.groupby("member_id", dropna=False)
-        ffeat = ffeat.merge(grp["amount"].sum().rename("fine_total"), left_on="member_id", right_index=True, how="left")
-        ffeat = ffeat.merge(grp["amount"].count().rename("fine_count"), left_on="member_id", right_index=True, how="left")
-    else:
-        ffeat["fine_total"] = 0.0
-        ffeat["fine_count"] = 0
-
-    # Foundation
-    fdfeat = base.copy()
-    if foundation is not None and not foundation.empty and "member_id" in foundation.columns:
-        fd = foundation.copy()
-        fd["member_id"] = _to_int(fd["member_id"])
-        fd["amount"] = _to_num(fd.get("amount", 0))
-        fd["created_at"] = _to_dt_utc(fd.get("created_at", pd.NaT))
-        grp = fd.groupby("member_id", dropna=False)
-        fdfeat = fdfeat.merge(grp["amount"].sum().rename("foundation_total"), left_on="member_id", right_index=True, how="left")
-        fdfeat = fdfeat.merge(grp["amount"].count().rename("foundation_count"), left_on="member_id", right_index=True, how="left")
-        fdfeat = fdfeat.merge(grp["created_at"].max().rename("foundation_last_dt"), left_on="member_id", right_index=True, how="left")
-    else:
-        fdfeat["foundation_total"] = 0.0
-        fdfeat["foundation_count"] = 0
-        fdfeat["foundation_last_dt"] = pd.NaT
-
-    fdfeat["days_since_last_foundation"] = _days_since(now, fdfeat["foundation_last_dt"])
-
-    X = (
-        cfeat.merge(lfeat, on="member_id", how="left")
-        .merge(pfeat, on="member_id", how="left")
-        .merge(poutfeat, on="member_id", how="left")
-        .merge(ffeat, on="member_id", how="left")
-        .merge(fdfeat, on="member_id", how="left")
+    # "Manifold blend": smooth weighted sum → sigmoid-like squashing
+    raw = (
+        w.get("w_outstanding", 0.50) * outstanding
+        + w.get("w_total_due", 0.30) * total_due
+        + w.get("w_bad_status", 0.30) * bad_status
+        + w.get("w_no_pay_30", 0.50) * no_pay_30
+        + w.get("w_no_pay_14", 0.50) * no_pay_14
+        + w.get("w_no_contrib_30", 0.50) * no_contrib_30
+        + w.get("w_no_contrib_14", 0.50) * no_contrib_14
+        + w.get("w_fines_cap", 0.50) * fines
+        - w.get("w_bonus_total_contrib", 0.20) * contrib_total
+        - w.get("w_bonus_contrib_freq", 0.20) * contrib_freq
     )
 
-    return _fill_feature_defaults(X)
+    # squash to 0..100 (smooth)
+    risk_score = (1 / (1 + np.exp(-4 * (raw - 0.5)))) * 100
+    df["risk_score"] = np.clip(risk_score, 0, 100).round(1)
+
+    # Reliability: inverse-risk blended with contribution strength
+    reli_raw = (0.60 * (1 - (df["risk_score"] / 100.0)) + 0.25 * contrib_total + 0.15 * contrib_freq)
+    df["reliability_score"] = np.clip(reli_raw * 100, 0, 100).round(1)
+
+    # Dropout: mainly contribution inactivity + low frequency
+    drop_raw = 0.55 * no_contrib_30 + 0.25 * no_contrib_14 + 0.20 * (1 - contrib_freq)
+    df["dropout_score"] = np.clip(drop_raw * 100, 0, 100).round(1)
+
+    def band(s: float) -> str:
+        if s >= 80:
+            return "Critical"
+        if s >= 60:
+            return "High"
+        if s >= 40:
+            return "Elevated"
+        if s >= 20:
+            return "Moderate"
+        return "Low"
+
+    df["risk_band"] = df["risk_score"].apply(lambda x: band(float(x)))
+
+    return df
 
 
-# ============================================================
-# Heuristic Risk
-# ============================================================
-def compute_heuristic_risk(row: pd.Series, *, cfg: dict[str, float] | None = None) -> tuple[float, list[str]]:
-    cfg = cfg or {}
-    reasons: list[str] = []
-
-    loan_balance = float(row.get("loan_balance_sum", 0.0))
-    total_due = float(row.get("loan_total_due_sum", 0.0))
-    bad_status = int(row.get("loan_bad_status_count", 0))
-    days_pay = int(row.get("days_since_last_payment", 999))
-    days_contrib = int(row.get("days_since_last_contrib", 999))
-    fine_total = float(row.get("fine_total", 0.0))
-    contrib_total = float(row.get("contrib_total", 0.0))
-    contrib_count = int(row.get("contrib_count", 0))
-
-    w_loan = float(cfg.get("w_loan_balance", 0.20))
-    w_due = float(cfg.get("w_total_due", 0.10))
-    w_bad = float(cfg.get("w_bad_status", 0.10))
-    w_pay30 = float(cfg.get("w_no_payment_30", 0.25))
-    w_pay14 = float(cfg.get("w_no_payment_14", 0.15))
-    w_contrib30 = float(cfg.get("w_no_contrib_30", 0.15))
-    w_contrib14 = float(cfg.get("w_no_contrib_14", 0.08))
-    w_fines = float(cfg.get("w_fines", 0.15))
-    bonus_contrib_total = float(cfg.get("bonus_contrib_total", 0.05))
-    bonus_contrib_freq = float(cfg.get("bonus_contrib_freq", 0.05))
-
-    score = 0.0
-
-    if loan_balance > 0:
-        score += w_loan
-        reasons.append("Has outstanding loan balance")
-
-    if total_due > 0 and total_due >= max(loan_balance, 1.0) * 1.02:
-        score += w_due
-        reasons.append("Total due suggests interest/arrears")
-
-    if bad_status > 0:
-        score += min(0.30, w_bad * bad_status)
-        reasons.append("Loan status flagged as overdue/delinquent/etc.")
-
-    if loan_balance > 0:
-        if days_pay >= 30:
-            score += w_pay30
-            reasons.append("No recent loan payment (≥30 days) while loan balance > 0")
-        elif days_pay >= 14:
-            score += w_pay14
-            reasons.append("No recent loan payment (≥14 days) while loan balance > 0")
-
-    if days_contrib >= 30:
-        score += w_contrib30
-        reasons.append("No recent contribution (≥30 days)")
-    elif days_contrib >= 14:
-        score += w_contrib14
-        reasons.append("No recent contribution (≥14 days)")
-
-    if fine_total > 0:
-        score += min(w_fines, fine_total / 2000.0)
-        reasons.append("Has fines")
-
-    if contrib_total >= 2000:
-        score -= bonus_contrib_total
-        reasons.append("Strong contributions reduce risk")
-    if contrib_count >= 6:
-        score -= bonus_contrib_freq
-        reasons.append("Consistent contribution frequency reduces risk")
-
-    return float(np.clip(score, 0.0, 1.0)), reasons[:6]
-
-
-# ============================================================
-# XGBoost (optional)
-# ============================================================
-def _make_loan_ml_frame(loans: pd.DataFrame) -> pd.DataFrame:
-    if loans is None or loans.empty or "member_id" not in loans.columns or "status" not in loans.columns:
+# =============================================================================
+# Stress Test
+# =============================================================================
+def stress_test(df: pd.DataFrame, drop_pct: float, pay_delay_days: int, fines_increase_pct: float, w: Dict[str, float]) -> pd.DataFrame:
+    if df is None or df.empty:
         return pd.DataFrame()
 
-    l = loans.copy()
-    now = _utc_now()
+    X = df.copy()
 
-    l["member_id"] = _to_int(l["member_id"])
-    l["status"] = l["status"].astype(str).str.lower().fillna("")
+    # apply what-if perturbations
+    if "contrib_total" in X:
+        X["contrib_total"] = X["contrib_total"] * (1 - (float(drop_pct) / 100.0))
+    if "last_payment_days" in X:
+        X["last_payment_days"] = (pd.to_numeric(X["last_payment_days"], errors="coerce") + float(pay_delay_days)).fillna(np.nan)
+        X["no_payment_14d"] = (X["last_payment_days"] >= 14).fillna(True).astype(int)
+        X["no_payment_30d"] = (X["last_payment_days"] >= 30).fillna(True).astype(int)
+    if "fines_total" in X:
+        X["fines_total"] = X["fines_total"] * (1 + (float(fines_increase_pct) / 100.0))
 
-    l["principal"] = _to_num(l.get("principal", 0))
-    l["principal_current"] = _to_num(l.get("principal_current", l["principal"]))
-    l["total_due"] = _to_num(l.get("total_due", 0))
-    l["unpaid_interest"] = _to_num(l.get("unpaid_interest", 0))
-    l["interest_rate_monthly"] = _to_num(l.get("interest_rate_monthly", 0))
-    l["due_cycle_days"] = _to_num(l.get("due_cycle_days", 0))
+    return score_members_heuristic(X, w)
 
-    l["borrow_date"] = _to_dt_utc(l.get("borrow_date", l.get("created_at", pd.NaT)))
-    l["last_paid_at"] = _to_dt_utc(l.get("last_paid_at", pd.NaT))
 
-    l["loan_age_days"] = _days_since(now, l["borrow_date"])
-    l["days_since_last_payment"] = _days_since(now, l["last_paid_at"].fillna(l["borrow_date"]))
+# =============================================================================
+# Segmentation (KMeans if available)
+# =============================================================================
+def segment_members(df: pd.DataFrame, k: int) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
 
-    l["target"] = np.where(l["status"] == "closed", 0, 1).astype(int)
+    out = df.copy()
+    if KMeans is None or StandardScaler is None:
+        out["segment"] = "segmentation:missing_sklearn"
+        return out
 
-    cols = [
-        "member_id", "status",
-        "principal", "principal_current", "interest_rate_monthly",
-        "total_due", "unpaid_interest", "due_cycle_days",
-        "loan_age_days", "days_since_last_payment",
-        "target",
-    ]
-    out = l[cols].copy()
-    out = out.replace([np.inf, -np.inf], np.nan).fillna(0)
-    out = out[out["member_id"] > 0].copy()
+    feats = []
+    for c in ["risk_score", "reliability_score", "dropout_score", "contrib_total", "active_loan_exposure", "fines_total"]:
+        if c in out.columns:
+            feats.append(c)
+
+    if len(feats) < 2:
+        out["segment"] = "segmentation:insufficient_features"
+        return out
+
+    Z = out[feats].copy()
+    for c in feats:
+        Z[c] = pd.to_numeric(Z[c], errors="coerce").fillna(0.0)
+
+    scaler = StandardScaler()
+    Zs = scaler.fit_transform(Z.values)
+
+    km = KMeans(n_clusters=int(k), n_init=10, random_state=42)
+    labels = km.fit_predict(Zs)
+    out["segment"] = labels.astype(int)
     return out
 
 
-def _xgb_get_or_train(loans_ml: pd.DataFrame):
-    try:
-        from xgboost import XGBClassifier
-    except Exception as e:
-        return None, f"xgboost not installed or failed to import: {repr(e)}"
-
-    feature_cols = [
-        "principal", "principal_current", "interest_rate_monthly",
-        "total_due", "unpaid_interest", "due_cycle_days",
-        "loan_age_days", "days_since_last_payment",
-    ]
-
-    fp = _df_fingerprint(loans_ml[feature_cols + ["target"]].copy())
-    cache = st.session_state.get("__ai_suite_xgb_cache__", {})
-
-    if cache.get("fp") == fp and cache.get("model") is not None:
-        return cache["model"], "OK (cached)"
-
-    X = loans_ml[feature_cols].to_numpy(dtype=float)
-    y = loans_ml["target"].to_numpy(dtype=int)
-    vc = loans_ml["target"].value_counts().to_dict()
-    if len(vc) < 2:
-        return None, "ML needs both classes: closed and active."
-
-    n_pos = int((y == 1).sum())
-    n_neg = int((y == 0).sum())
-    scale_pos_weight = (n_neg / max(n_pos, 1))
-
-    model = XGBClassifier(
-        n_estimators=250,
-        max_depth=3,
-        learning_rate=0.08,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        reg_lambda=1.0,
-        random_state=42,
-        objective="binary:logistic",
-        eval_metric="logloss",
-        scale_pos_weight=scale_pos_weight,
-    )
-    model.fit(X, y)
-
-    st.session_state["__ai_suite_xgb_cache__"] = {"fp": fp, "model": model}
-    return model, "OK (trained)"
-
-
-def xgb_risk_for_member(loans: pd.DataFrame, member_id: int, min_rows: int = 20) -> tuple[float | None, str]:
-    loans_ml = _make_loan_ml_frame(loans)
-    if loans_ml.empty:
-        return None, "No loans for ML."
-    if len(loans_ml) < int(min_rows):
-        return None, f"Need at least {min_rows} loans for ML (currently {len(loans_ml)})."
-
-    model, msg = _xgb_get_or_train(loans_ml)
-    if model is None:
-        return None, msg
-
-    feature_cols = [
-        "principal", "principal_current", "interest_rate_monthly",
-        "total_due", "unpaid_interest", "due_cycle_days",
-        "loan_age_days", "days_since_last_payment",
-    ]
-
-    mdf = loans_ml[loans_ml["member_id"] == int(member_id)].copy()
-    if mdf.empty:
-        return None, "Member has no loans."
-    active = mdf[mdf["status"] == "active"]
-    if not active.empty:
-        mdf = active
-
-    Xm = mdf[feature_cols].to_numpy(dtype=float)
-    proba = model.predict_proba(Xm)[:, 1]
-    risk = float(np.max(proba)) if len(proba) else None
-    if risk is None:
-        return None, "Unable to compute ML risk."
-    return float(np.clip(risk, 0.0, 1.0)), msg
-
-
-# ============================================================
-# Reliability / Dropout / Fraud
-# ============================================================
-def compute_reliability_score(row: pd.Series) -> tuple[int, list[str]]:
-    reasons: list[str] = []
-    score = 70.0
-
-    contrib_count = int(row.get("contrib_count", 0))
-    contrib_total = float(row.get("contrib_total", 0.0))
-    days_contrib = int(row.get("days_since_last_contrib", 999))
-
-    fine_count = int(row.get("fine_count", 0))
-    fine_total = float(row.get("fine_total", 0.0))
-
-    loan_balance = float(row.get("loan_balance_sum", 0.0))
-    days_pay = int(row.get("days_since_last_payment", 999))
-    bad_status = int(row.get("loan_bad_status_count", 0))
-
-    if contrib_count >= 8:
-        score += 12
-        reasons.append("Consistent contributions (8+ records)")
-    elif contrib_count >= 4:
-        score += 6
-        reasons.append("Moderate contribution consistency (4+ records)")
-    else:
-        score -= 8
-        reasons.append("Low contribution history")
-
-    if days_contrib >= 30:
-        score -= 15
-        reasons.append("No contribution in 30+ days")
-    elif days_contrib >= 14:
-        score -= 7
-        reasons.append("No contribution in 14+ days")
-
-    if contrib_total >= 5000:
-        score += 6
-        reasons.append("Strong total contributions")
-
-    if fine_count > 0:
-        score -= min(18, 3 * fine_count)
-        reasons.append("Fines reduce reliability")
-    if fine_total >= 1000:
-        score -= 6
-        reasons.append("High total fines")
-
-    if loan_balance > 0:
-        if days_pay >= 30:
-            score -= 18
-            reasons.append("Loan balance with no payment in 30+ days")
-        elif days_pay >= 14:
-            score -= 10
-            reasons.append("Loan balance with no payment in 14+ days")
-        else:
-            score += 3
-            reasons.append("Active loan with recent payment")
-
-    if bad_status > 0:
-        score -= min(15, 7 * bad_status)
-        reasons.append("Overdue/delinquent status flags")
-
-    score = int(np.clip(score, 0, 100))
-    return score, reasons[:6]
-
-
-def dropout_risk(row: pd.Series) -> tuple[float, list[str]]:
-    reasons: list[str] = []
-    days_contrib = int(row.get("days_since_last_contrib", 999))
-    contrib_count = int(row.get("contrib_count", 0))
-    fine_count = int(row.get("fine_count", 0))
-
-    risk = 0.15
-
-    if contrib_count <= 2:
-        risk += 0.20
-        reasons.append("Very low contribution history")
-
-    if days_contrib >= 60:
-        risk += 0.45
-        reasons.append("Inactive contributions for 60+ days")
-    elif days_contrib >= 30:
-        risk += 0.30
-        reasons.append("Inactive contributions for 30+ days")
-    elif days_contrib >= 14:
-        risk += 0.15
-        reasons.append("Inactive contributions for 14+ days")
-
-    if fine_count >= 3:
-        risk += 0.10
-        reasons.append("Frequent fines indicate disengagement")
-
-    return _clip01(risk), reasons[:6]
-
-
-def fraud_anomaly_score(member_id: int, contrib: pd.DataFrame, loans: pd.DataFrame, payments: pd.DataFrame) -> tuple[float, list[str]]:
-    reasons: list[str] = []
-    score = 0.05
-
-    if contrib is not None and not contrib.empty and "member_id" in contrib.columns and "amount" in contrib.columns:
-        c = contrib.copy()
-        c["member_id"] = _to_int(c["member_id"])
-        c["amount"] = _to_num(c["amount"])
-        mc = c[c["member_id"] == int(member_id)].copy()
-        if len(mc) >= 6:
-            mu = float(mc["amount"].mean())
-            sd = float(mc["amount"].std(ddof=0) or 0.0)
-            last_amt = float(mc["amount"].iloc[-1])
-            if sd > 0 and abs(last_amt - mu) > 3 * sd:
-                score += 0.35
-                reasons.append("Contribution is strong outlier vs history (3σ)")
-            if mu > 0 and last_amt > (mu * 3.0):
-                score += 0.15
-                reasons.append("Latest contribution unusually large (≥3× avg)")
-
-    if loans is not None and not loans.empty and "member_id" in loans.columns:
-        l = loans.copy()
-        l["member_id"] = _to_int(l["member_id"])
-        l["borrow_date"] = _to_dt_utc(l.get("borrow_date", l.get("created_at", pd.NaT)))
-        ml = l[l["member_id"] == int(member_id)].copy()
-        if not ml.empty:
-            now = _utc_now()
-            recent14 = ml[(_days_since(now, ml["borrow_date"]) <= 14)].copy()
-            if len(recent14) >= 2:
-                score += 0.25
-                reasons.append("Multiple loans created within last 14 days")
-            if "status" in ml.columns:
-                s = ml["status"].astype(str).str.lower()
-                if int((s == "active").sum()) >= 2:
-                    score += 0.15
-                    reasons.append("Multiple active loans at same time")
-
-    if payments is not None and not payments.empty and "member_id" in payments.columns and "amount" in payments.columns:
-        p = payments.copy()
-        p["member_id"] = _to_int(p["member_id"])
-        p["amount"] = _to_num(p.get("amount", 0))
-        mp = p[p["member_id"] == int(member_id)].copy()
-        if len(mp) >= 6:
-            mu = float(mp["amount"].mean())
-            sd = float(mp["amount"].std(ddof=0) or 0.0)
-            last_amt = float(mp["amount"].iloc[-1])
-            if sd > 0 and abs(last_amt - mu) > 3 * sd:
-                score += 0.20
-                reasons.append("Payment outlier vs history (3σ)")
-
-    return _clip01(score), reasons[:6]
-
-
-# ============================================================
-# Liquidity
-# ============================================================
-def liquidity_forecast_simple(
-    contrib: pd.DataFrame,
-    foundation: pd.DataFrame,
-    loans: pd.DataFrame,
-    payments: pd.DataFrame,
-    payouts: pd.DataFrame,
-    horizon_days: int = 30,
-) -> dict:
-    now = _utc_now().normalize()
-
-    def daily_sum(df: pd.DataFrame, dt_col: str, amt_col: str, sign: float) -> pd.Series:
-        if df is None or df.empty or dt_col not in df.columns:
-            return pd.Series(dtype=float)
-        d = df.copy()
-        d[dt_col] = _to_dt_utc(d[dt_col]).dt.normalize()
-        d[amt_col] = _to_num(d.get(amt_col, 0))
-        return d.groupby(dt_col)[amt_col].sum() * float(sign)
-
-    inflow = pd.Series(dtype=float)
-    if contrib is not None and not contrib.empty and "created_at" in contrib.columns:
-        inflow = inflow.add(daily_sum(contrib, "created_at", "amount", +1.0), fill_value=0.0)
-    if foundation is not None and not foundation.empty and "created_at" in foundation.columns:
-        inflow = inflow.add(daily_sum(foundation, "created_at", "amount", +1.0), fill_value=0.0)
-    if payments is not None and not payments.empty:
-        dtc = "paid_at" if "paid_at" in payments.columns else ("created_at" if "created_at" in payments.columns else None)
-        if dtc:
-            inflow = inflow.add(daily_sum(payments, dtc, "amount", +1.0), fill_value=0.0)
-
-    outflow = pd.Series(dtype=float)
-    if loans is not None and not loans.empty:
-        dtc = "borrow_date" if "borrow_date" in loans.columns else ("created_at" if "created_at" in loans.columns else None)
-        principal_col = "principal" if "principal" in loans.columns else ("principal_current" if "principal_current" in loans.columns else None)
-        if dtc and principal_col:
-            outflow = outflow.add(daily_sum(loans, dtc, principal_col, +1.0), fill_value=0.0)
-
-    if payouts is not None and not payouts.empty:
-        dtc = "payout_date" if "payout_date" in payouts.columns else ("created_at" if "created_at" in payouts.columns else None)
-        amt_col = "payout_amount" if "payout_amount" in payouts.columns else ("amount" if "amount" in payouts.columns else None)
-        if dtc and amt_col:
-            outflow = outflow.add(daily_sum(payouts, dtc, amt_col, +1.0), fill_value=0.0)
-
-    daily_net = inflow.sub(outflow, fill_value=0.0).sort_index()
-    if daily_net.empty:
-        return {"ok": False, "msg": "Not enough history for liquidity forecast."}
-
-    balance_est = float(daily_net.sum())
-    trailing = daily_net[daily_net.index >= (now - pd.Timedelta(days=30))]
-    avg_daily_net = float(trailing.mean()) if not trailing.empty else float(daily_net.mean())
-
-    dates = [now + pd.Timedelta(days=i) for i in range(1, int(horizon_days) + 1)]
-    b = balance_est
-    forecast_bal = []
-    for _ in dates:
-        b += avg_daily_net
-        forecast_bal.append(b)
-
-    return {
-        "ok": True,
-        "balance_est": balance_est,
-        "avg_daily_net": avg_daily_net,
-        "horizon_days": int(horizon_days),
-        "dates": dates,
-        "forecast_balance": forecast_bal,
-    }
-
-
-# ============================================================
-# Smart loan decision + Alerts
-# ============================================================
-def smart_loan_decision(risk: float, reliability: int, liquidity_ok: bool, requested_amount: float) -> tuple[str, list[str]]:
-    reasons: list[str] = []
-    decision = "APPROVE"
-
-    if not liquidity_ok:
-        decision = "REJECT"
-        reasons.append("Liquidity trend is weak: avoid new loans now.")
-    if risk >= 0.70:
-        decision = "REJECT"
-        reasons.append("Very high risk score (≥70%).")
-    if 0.45 <= risk < 0.70:
-        decision = "APPROVE WITH CONDITIONS"
-        reasons.append("Moderate-to-high risk: cap amount + require stronger surety.")
-    if reliability < 45:
-        decision = "REJECT"
-        reasons.append("Low reliability score (<45).")
-    elif reliability < 65 and decision == "APPROVE":
-        decision = "APPROVE WITH CONDITIONS"
-        reasons.append("Reliability moderate: require surety + lower cap.")
-    if requested_amount >= 5000 and decision == "APPROVE":
-        decision = "APPROVE WITH CONDITIONS"
-        reasons.append("Large amount: recommend cap or split disbursement.")
-
-    return decision, reasons[:6]
-
-
-def generate_alerts(member_name: str, final_risk: float, reliability: int, dropout: float, fraud: float, liquidity: dict) -> list[dict]:
-    alerts: list[dict] = []
-
-    if final_risk >= 0.70:
-        alerts.append({"severity": "high", "type": "default_risk", "message": f"{member_name}: High risk ({final_risk*100:.1f}%)."})
-    elif final_risk >= 0.45:
-        alerts.append({"severity": "med", "type": "default_risk", "message": f"{member_name}: Moderate risk ({final_risk*100:.1f}%)."})
-
-    if reliability < 45:
-        alerts.append({"severity": "high", "type": "reliability", "message": f"{member_name}: Low reliability ({reliability}/100)."})
-    elif reliability < 65:
-        alerts.append({"severity": "med", "type": "reliability", "message": f"{member_name}: Moderate reliability ({reliability}/100)."})
-
-    if dropout >= 0.70:
-        alerts.append({"severity": "med", "type": "dropout", "message": f"{member_name}: High dropout risk ({dropout*100:.0f}%)."})
-
-    if fraud >= 0.60:
-        alerts.append({"severity": "high", "type": "fraud", "message": f"{member_name}: Strong anomaly signals ({fraud*100:.0f}%)."})
-    elif fraud >= 0.35:
-        alerts.append({"severity": "med", "type": "fraud", "message": f"{member_name}: Mild anomaly signals ({fraud*100:.0f}%)."})
-
-    if liquidity.get("ok"):
-        if float(liquidity.get("avg_daily_net", 0.0)) < 0:
-            alerts.append({"severity": "med", "type": "liquidity", "message": "System liquidity trend is negative (avg daily net outflow)."})
-    else:
-        alerts.append({"severity": "low", "type": "liquidity", "message": "Liquidity forecast unavailable (missing history)."})
-
-    return alerts
-
-
-# ============================================================
-# NEW: Risk trend over time (selected member)
-# ============================================================
-def member_risk_trend(member_row: pd.Series, cfg: dict[str, float], *, days_back: int = 90) -> pd.DataFrame:
-    now = _utc_now().normalize()
-    dates = [now - pd.Timedelta(days=i) for i in range(days_back, -1, -1)]
-
-    last_contrib = pd.to_datetime(member_row.get("contrib_last_dt", pd.NaT), utc=True, errors="coerce")
-    last_pay = pd.to_datetime(member_row.get("pay_last_dt", pd.NaT), utc=True, errors="coerce")
-
-    out = []
-    for d in dates:
-        rr = member_row.copy()
-
-        rr["days_since_last_contrib"] = int((d - last_contrib.normalize()).days) if pd.notna(last_contrib) else 999
-        rr["days_since_last_payment"] = int((d - last_pay.normalize()).days) if pd.notna(last_pay) else 999
-
-        risk, _ = compute_heuristic_risk(rr, cfg=cfg)
-        out.append({"date": d.date(), "risk": float(risk)})
-
-    return pd.DataFrame(out)
-
-
-# ============================================================
-# NEW: Simple Interest Income Projection
-# ============================================================
-def interest_projection(member_row: pd.Series, horizon_days: int = 30) -> dict:
-    bal = float(member_row.get("loan_balance_sum", 0.0))
-    unpaid = float(member_row.get("loan_unpaid_interest_sum", 0.0))
-    rate_m = float(member_row.get("loan_interest_rate_wavg", 0.0))
-
-    months = float(horizon_days) / 30.0
-    est_interest = bal * rate_m * months if (bal > 0 and rate_m > 0) else 0.0
-
-    return {
-        "horizon_days": int(horizon_days),
-        "loan_balance_sum": bal,
-        "unpaid_interest_sum": unpaid,
-        "rate_monthly_wavg": rate_m,
-        "estimated_interest_income": est_interest,
-    }
-
-
-# ============================================================
-# NEW: K-Means clustering (pure NumPy) for segmentation
-# ============================================================
-def _kmeans_numpy(X: np.ndarray, k: int = 3, iters: int = 30, seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
-    rng = np.random.default_rng(seed)
-    n = X.shape[0]
-    if n == 0:
-        return np.array([]), np.array([])
-
-    idx = rng.choice(n, size=min(k, n), replace=False)
-    centers = X[idx].copy()
-
-    for _ in range(iters):
-        dists = ((X[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
-        labels = dists.argmin(axis=1)
-
-        new_centers = centers.copy()
-        for j in range(centers.shape[0]):
-            pts = X[labels == j]
-            if len(pts) > 0:
-                new_centers[j] = pts.mean(axis=0)
-        if np.allclose(new_centers, centers, atol=1e-6):
-            centers = new_centers
-            break
-        centers = new_centers
-
-    dists = ((X[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
-    labels = dists.argmin(axis=1)
-    return labels, centers
-
-
-def segmentation_clusters(features_df: pd.DataFrame, members_df: pd.DataFrame, k: int = 3) -> pd.DataFrame:
-    if features_df is None or features_df.empty:
-        return pd.DataFrame()
-
-    id2name = _member_map(members_df)
-
-    seg_cols = [
-        "contrib_total",
-        "contrib_count",
-        "days_since_last_contrib",
-        "loan_balance_sum",
-        "loan_bad_status_count",
-        "days_since_last_payment",
-        "fine_total",
+# =============================================================================
+# Optional ML (XGBoost) — only if installed + enough loans
+# =============================================================================
+def train_xgb_if_possible(df: pd.DataFrame, min_loans: int) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    Trains a simple classifier for "high risk" label using engineered features.
+    This is OPTIONAL and never blocks the UI.
+    """
+    if df is None or df.empty:
+        return None, "ml:empty"
+    if xgb is None:
+        return None, "ml:xgboost_missing"
+
+    # We need a proxy label: high risk if overdue_flag_count>0 or unpaid_interest_like>0 or risk_score>=60
+    if "active_loan_count" not in df:
+        return None, "ml:missing_active_loan_count"
+
+    total_loans = int(pd.to_numeric(df.get("active_loan_count", 0), errors="coerce").fillna(0).sum())
+    if total_loans < int(min_loans):
+        return None, f"ml:insufficient_loans({total_loans}<{min_loans})"
+
+    y = (
+        (pd.to_numeric(df.get("overdue_flag_count", 0), errors="coerce").fillna(0) > 0)
+        | (pd.to_numeric(df.get("unpaid_interest_like", 0), errors="coerce").fillna(0) > 0)
+        | (pd.to_numeric(df.get("risk_score", 0), errors="coerce").fillna(0) >= 60)
+    ).astype(int)
+
+    # features
+    feat_cols = [c for c in [
+        "contrib_total", "contrib_count",
         "foundation_total",
-    ]
-    cols = [c for c in seg_cols if c in features_df.columns]
-    if not cols:
-        return pd.DataFrame()
+        "fines_total", "fines_count",
+        "active_loan_exposure", "active_loan_count",
+        "total_due_like", "unpaid_interest_like",
+        "payment_total", "payment_count",
+        "last_contrib_days", "last_payment_days",
+    ] if c in df.columns]
 
-    D = features_df[["member_id"] + cols].copy()
-    D["member_id"] = _to_int(D["member_id"])
-    for c in cols:
-        D[c] = pd.to_numeric(D[c], errors="coerce").fillna(0.0)
+    X = df[feat_cols].copy()
+    for c in feat_cols:
+        X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0.0)
 
-    X = D[cols].to_numpy(dtype=float)
-    mu = X.mean(axis=0)
-    sd = X.std(axis=0)
-    sd = np.where(sd == 0, 1.0, sd)
-    Xz = (X - mu) / sd
+    # guard
+    if y.nunique() < 2:
+        return None, "ml:label_single_class"
 
-    labels, _ = _kmeans_numpy(Xz, k=int(max(2, min(k, len(D)))), iters=40, seed=42)
-    if labels.size == 0:
-        return pd.DataFrame()
+    dtrain = xgb.DMatrix(X.values, label=y.values, feature_names=feat_cols)
+    params = {
+        "objective": "binary:logistic",
+        "eval_metric": "logloss",
+        "max_depth": 3,
+        "eta": 0.15,
+        "subsample": 0.9,
+        "colsample_bytree": 0.9,
+        "seed": 42,
+    }
+    booster = xgb.train(params, dtrain, num_boost_round=60)
 
-    D["segment"] = labels.astype(int)
-    D["name"] = D["member_id"].apply(lambda mid: id2name.get(int(mid), f"Member {int(mid)}"))
-    return D[["member_id", "name", "segment"] + cols].sort_values(["segment", "member_id"])
-
-
-# ============================================================
-# NEW: Early warning heatmap (all members) + EMBEDDED MANIFOLD
-# ============================================================
-def early_warning_table(X: pd.DataFrame, members_df: pd.DataFrame, cfg: dict[str, float]) -> pd.DataFrame:
-    id2name = _member_map(members_df)
-    rows = []
-
-    # heuristic risk across all members
-    risks = []
-    for _, rr in X.iterrows():
-        r, _ = compute_heuristic_risk(rr, cfg=cfg)
-        risks.append(float(r))
-    risk_series = pd.Series(risks, index=X.index, dtype=float)
-
-    feat_cols = [c for c in X.columns if c != "member_id"]
-    k_neighbors = int(np.clip(max(8, int(len(X) * 0.25)), 8, 18))
-
-    for idx, rr in X.iterrows():
-        mid = int(rr.get("member_id", 0))
-        name = id2name.get(mid, f"Member {mid}")
-
-        r, _ = compute_heuristic_risk(rr, cfg=cfg)
-        rel, _ = compute_reliability_score(rr)
-        drop, _ = dropout_risk(rr)
-
-        fraud_proxy = float(np.clip(0.05 + 0.12 * float(rr.get("loan_bad_status_count", 0)) + 0.05 * float(rr.get("fine_count", 0)), 0, 1))
-
-        mf = manifold_tangent_metrics(X=X, risk_series=risk_series, member_id=mid, feature_cols=feat_cols, k_neighbors=k_neighbors)
-        mf_adj = embedded_manifold_adjustment(mf)
-        final_r = float(np.clip(float(r) + mf_adj, 0.0, 1.0))
-
-        flags = []
-        if final_r >= 0.70:
-            flags.append("HIGH_RISK")
-        if rel < 45:
-            flags.append("LOW_RELIABILITY")
-        if drop >= 0.70:
-            flags.append("DROPOUT_RISK")
-        if fraud_proxy >= 0.45:
-            flags.append("ANOMALY_PROXY")
-        if mf.get("ok") and float(mf.get("manifold_velocity", 0.0)) > 0.35:
-            flags.append("MANIFOLD_RISING")
-        if mf.get("ok") and float(mf.get("outlier_score", 0.0)) > 0.70:
-            flags.append("OFF_MANIFOLD")
-
-        rows.append({
-            "member_id": mid,
-            "name": name,
-            "risk_base": float(r),
-            "manifold_adj": float(mf_adj),
-            "risk_final": float(final_r),
-            "manifold_trend": str(mf.get("manifold_trend", "—")),
-            "outlier_%": int(round(float(mf.get("outlier_score", 0.0)) * 100)),
-            "reliability": int(rel),
-            "dropout": float(drop),
-            "anomaly_proxy": float(fraud_proxy),
-            "flags": ", ".join(flags) if flags else "",
-        })
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    return df.sort_values(["risk_final", "dropout", "reliability"], ascending=[False, False, True])
+    preds = booster.predict(dtrain)
+    out = {
+        "feat_cols": feat_cols,
+        "train_rows": int(len(df)),
+        "pos_rate": float(y.mean()),
+        "avg_pred": float(np.mean(preds)),
+        "top_features": sorted(
+            [(f, float(w)) for f, w in zip(feat_cols, booster.get_score(importance_type="weight").values())],
+            key=lambda x: x[1],
+            reverse=True,
+        )[:8],
+    }
+    return out, "ml:trained"
 
 
-# ============================================================
-# Minutes generator
-# ============================================================
-def build_minutes_text(
-    *,
-    meeting_title: str,
-    meeting_date: pd.Timestamp,
-    location: str,
-    chairperson: str,
-    secretary: str,
-    agenda: str,
-    members: pd.DataFrame,
-    contrib: pd.DataFrame,
-    foundation: pd.DataFrame,
-    loans: pd.DataFrame,
-    payments: pd.DataFrame,
-    payouts: pd.DataFrame,
-    fines: pd.DataFrame,
-    top_risky: list[dict],
-    alerts: list[dict],
-) -> str:
-    contrib_total = float(_to_num(contrib.get("amount", 0)).sum()) if (contrib is not None and not contrib.empty and "amount" in contrib.columns) else 0.0
-    foundation_total = float(_to_num(foundation.get("amount", 0)).sum()) if (foundation is not None and not foundation.empty and "amount" in foundation.columns) else 0.0
-    fines_total = float(_to_num(fines.get("amount", 0)).sum()) if (fines is not None and not fines.empty and "amount" in fines.columns) else 0.0
-    payments_total = float(_to_num(payments.get("amount", 0)).sum()) if (payments is not None and not payments.empty and "amount" in payments.columns) else 0.0
-
-    payout_amt_col = (
-        "payout_amount" if (payouts is not None and not payouts.empty and "payout_amount" in payouts.columns)
-        else ("amount" if (payouts is not None and not payouts.empty and "amount" in payouts.columns) else None)
-    )
-    payouts_total = float(_to_num(payouts.get(payout_amt_col, 0)).sum()) if payout_amt_col else 0.0
-
-    loan_count = int(len(loans)) if loans is not None else 0
-    active_loans = 0
-    closed_loans = 0
-    loan_balance_sum = 0.0
-    if loans is not None and not loans.empty:
-        if "status" in loans.columns:
-            s = loans["status"].astype(str).str.lower()
-            active_loans = int((s == "active").sum())
-            closed_loans = int((s == "closed").sum())
-        bal_col = "principal_current" if "principal_current" in loans.columns else ("principal" if "principal" in loans.columns else None)
-        if bal_col:
-            loan_balance_sum = float(_to_num(loans[bal_col]).sum())
-
-    member_count = int(len(members)) if members is not None and not members.empty else 0
-    high_alerts = [a for a in (alerts or []) if a.get("severity") == "high"]
-    med_alerts = [a for a in (alerts or []) if a.get("severity") == "med"]
-
-    risk_lines = "\n".join(
-        [f"- {r.get('name','Member')} ({r.get('member_id','?')}): {float(r.get('risk',0))*100:.1f}%"
-         for r in (top_risky or [])]
-    ) if top_risky else "- Not available"
-
-    date_str = meeting_date.strftime("%Y-%m-%d")
-
-    lines: list[str] = []
-    lines.append(f"{meeting_title}")
-    lines.append(f"Date: {date_str}")
-    if location:
-        lines.append(f"Location: {location}")
-    if chairperson:
-        lines.append(f"Chairperson: {chairperson}")
-    if secretary:
-        lines.append(f"Secretary: {secretary}")
-    lines.append("")
-    lines.append("1. Opening")
-    lines.append(f"The meeting was called to order on {date_str}.")
-    lines.append("")
-    lines.append("2. Attendance")
-    lines.append(f"Total registered members in system: {member_count}.")
-    lines.append("")
-    lines.append("3. Agenda")
-    lines.append(agenda.strip() if agenda.strip() else "Treasury update, contributions, loans, payouts, fines, risk review, and resolutions.")
-    lines.append("")
-    lines.append("4. Treasury Summary (System Totals)")
-    lines.append(f"- Contributions (total): {_fmt_money(contrib_total)}")
-    lines.append(f"- Foundation contributions (total): {_fmt_money(foundation_total)}")
-    lines.append(f"- Loan payments (total): {_fmt_money(payments_total)}")
-    lines.append(f"- Payouts (total): {_fmt_money(payouts_total)}")
-    lines.append(f"- Fines (total): {_fmt_money(fines_total)}")
-    lines.append("")
-    lines.append("5. Loans Summary")
-    lines.append(f"- Total loans recorded: {loan_count}")
-    lines.append(f"- Active loans: {active_loans}")
-    lines.append(f"- Closed loans: {closed_loans}")
-    lines.append(f"- Total outstanding principal (sum): {_fmt_money(loan_balance_sum)}")
-    lines.append("")
-    lines.append("6. Risk & Compliance Review")
-    lines.append("Top risk members (heuristic):")
-    lines.append(risk_lines)
-    lines.append("")
-    lines.append("Alerts raised:")
-    if not alerts:
-        lines.append("- None")
-    else:
-        if high_alerts:
-            lines.append("High severity:")
-            for a in high_alerts[:10]:
-                lines.append(f"- {a.get('message','')}")
-        if med_alerts:
-            lines.append("Medium severity:")
-            for a in med_alerts[:10]:
-                lines.append(f"- {a.get('message','')}")
-    lines.append("")
-    lines.append("7. Resolutions / Action Items")
-    lines.append("- Treasury to review any high-risk members and enforce loan conditions where necessary.")
-    lines.append("- Members with overdue payment patterns should be contacted for repayment plan.")
-    lines.append("- Continue monitoring liquidity trend before approving large loans.")
-    lines.append("")
-    lines.append("8. Closing")
-    lines.append("The meeting was adjourned after completing all agenda items.")
-    lines.append("")
-    lines.append("Signatures:")
-    lines.append(f"- Chairperson: ____________________   Date: {date_str}")
-    lines.append(f"- Secretary:   ____________________   Date: {date_str}")
-
-    return "\n".join(lines)
+# =============================================================================
+# UI
+# =============================================================================
+@st.cache_data(ttl=FEATURE_TTL, show_spinner=False)
+def build_member_features_cached(
+    url_sig: str,
+    schema: str,
+    members_json: str,
+    contrib_json: str,
+    loans_json: str,
+    pay_json: str,
+    payouts_json: str,
+    fines_json: str,
+    foundation_json: str,
+) -> pd.DataFrame:
+    # cache key uses serialized JSON to avoid supabase client caching issues
+    members = pd.read_json(members_json)
+    contrib = pd.read_json(contrib_json)
+    loans = pd.read_json(loans_json)
+    pay = pd.read_json(pay_json)
+    payouts = pd.read_json(payouts_json)
+    fines = pd.read_json(fines_json)
+    foundation = pd.read_json(foundation_json)
+    return build_member_features(members, contrib, loans, pay, payouts, fines, foundation)
 
 
-# ============================================================
-# System Chat Assistant
-# ============================================================
-def system_chat_answer(question: str, ctx: dict) -> str:
-    q0 = (question or "").strip()
-    ql = q0.lower()
-
-    members = ctx.get("members", pd.DataFrame())
-    contrib = ctx.get("contrib", pd.DataFrame())
-    loans = ctx.get("loans", pd.DataFrame())
-    payments = ctx.get("payments", pd.DataFrame())
-    payouts = ctx.get("payouts", pd.DataFrame())
-    fines = ctx.get("fines", pd.DataFrame())
-    foundation = ctx.get("foundation", pd.DataFrame())
-    top_risky = ctx.get("top_risky", [])
-    alerts = ctx.get("alerts", [])
-    minutes_text = ctx.get("minutes_text", "")
-    manifold_ctx = ctx.get("manifold_ctx", {})
-
-    id2name = _member_map(members)
-
-    def _find_member_id(text: str) -> int | None:
-        m = re.search(r"(member\s*|#)(\d+)", text.lower())
-        if m:
-            try:
-                return int(m.group(2))
-            except Exception:
-                pass
-        name_col = _infer_member_name_col(members)
-        if name_col and members is not None and not members.empty:
-            hits = members[members[name_col].astype(str).str.lower().str.contains(text.lower(), na=False)]
-            if len(hits) == 1:
-                return int(_to_int(hits["id"]).iloc[0])
-        return None
-
-    if ql in ("help", "?", "commands", "what can you do"):
-        return (
-            "### ✅ System Chat (Free)\n"
-            "- `top risky`\n"
-            "- `loan status`\n"
-            "- `total contributions` / `total payouts` / `total fines` / `total payments` / `foundation total`\n"
-            "- `summary member 5` or `summary Marcel`\n"
-            "- `alerts`\n"
-            "- `minutes`\n"
-            "- `manifold` (show manifold trend/outlier for selected member)\n"
-        )
-
-    if "manifold" in ql:
-        mf = manifold_ctx.get("mf", {})
-        if not mf or not mf.get("ok"):
-            return f"Manifold not available: {mf.get('msg','missing data')}."
-        return (
-            "### 🧭 Manifold (embedded)\n"
-            f"- Trend: **{mf.get('manifold_trend','→ stable')}**\n"
-            f"- Velocity: **{float(mf.get('manifold_velocity',0.0)):+.2f}**\n"
-            f"- Outlier: **{float(mf.get('outlier_score',0.0))*100:.0f}%**\n"
-            f"- Embedded risk adjustment: **{float(manifold_ctx.get('mf_adj',0.0)):+.3f}**\n"
-        )
-
-    if "minutes" in ql:
-        if minutes_text:
-            return "### 📝 Latest Generated Minutes\n" + minutes_text
-        return "Minutes not generated yet. Open the **Minutes** tab and generate minutes first."
-
-    if ("top" in ql and "risk" in ql) or "top risky" in ql or "highest risk" in ql:
-        if not top_risky:
-            return "Top risky list not available yet."
-        out = "### 🔴 Top risky members\n"
-        for r in top_risky:
-            out += f"- {r.get('name','Member')} → {float(r.get('risk',0))*100:.1f}%\n"
-        return out
-
-    if "loan status" in ql or ("loans" in ql and "status" in ql):
-        if loans is None or loans.empty or "status" not in loans.columns:
-            return "Loans status not available."
-        vc = loans["status"].astype(str).str.lower().value_counts()
-        out = "### 📌 Loan status counts\n"
-        for k, v in vc.items():
-            out += f"- **{k}**: {int(v)}\n"
-        return out
-
-    if "alerts" in ql or "alert" in ql:
-        if not alerts:
-            return "No alerts generated right now."
-        out = "### 🚨 Alerts\n"
-        for a in alerts[:25]:
-            out += f"- **{a.get('severity','').upper()}** [{a.get('type','')}] — {a.get('message','')}\n"
-        return out
-
-    if "total contributions" in ql:
-        if contrib is None or contrib.empty or "amount" not in contrib.columns:
-            return "Contributions data not available."
-        return f"### 💵 Total contributions\n**{_fmt_money(_to_num(contrib['amount']).sum())}**"
-
-    if "total payouts" in ql:
-        if payouts is None or payouts.empty:
-            return "Payouts data not available."
-        amt_col = "payout_amount" if "payout_amount" in payouts.columns else ("amount" if "amount" in payouts.columns else None)
-        if not amt_col:
-            return "Payout amount column not found."
-        return f"### 🧾 Total payouts\n**{_fmt_money(_to_num(payouts[amt_col]).sum())}**"
-
-    if "total fines" in ql:
-        if fines is None or fines.empty or "amount" not in fines.columns:
-            return "Fines data not available."
-        return f"### 💸 Total fines\n**{_fmt_money(_to_num(fines['amount']).sum())}**"
-
-    if "total payments" in ql:
-        if payments is None or payments.empty or "amount" not in payments.columns:
-            return "Payments data not available."
-        return f"### ✅ Total loan payments\n**{_fmt_money(_to_num(payments['amount']).sum())}**"
-
-    if "foundation total" in ql or ("total" in ql and "foundation" in ql):
-        if foundation is None or foundation.empty or "amount" not in foundation.columns:
-            return "Foundation contributions data not available."
-        return f"### 🏦 Foundation total contributions\n**{_fmt_money(_to_num(foundation['amount']).sum())}**"
-
-    if "summary" in ql or "profile" in ql or "member" in ql:
-        mid = _find_member_id(q0)
-        if mid is None:
-            return "I couldn’t identify the member. Try `summary member 5` or `summary <exact name>`."
-        name = id2name.get(mid, f"Member {mid}")
-
-        def _sum(df: pd.DataFrame, amt_col: str, mid_col: str = "member_id") -> float:
-            if df is None or df.empty or amt_col not in df.columns or mid_col not in df.columns:
-                return 0.0
-            d = df.copy()
-            d[mid_col] = _to_int(d[mid_col])
-            return float(_to_num(d[d[mid_col] == int(mid)][amt_col]).sum())
-
-        c_total = _sum(contrib, "amount")
-        fd_total = _sum(foundation, "amount")
-        f_total = _sum(fines, "amount")
-        p_total = _sum(payments, "amount")
-        po_amt_col = "payout_amount" if payouts is not None and "payout_amount" in payouts.columns else ("amount" if payouts is not None and "amount" in payouts.columns else None)
-        po_total = _sum(payouts, po_amt_col) if po_amt_col else 0.0
-
-        active_loans = 0
-        bal_sum = 0.0
-        if loans is not None and not loans.empty and "member_id" in loans.columns:
-            l = loans.copy()
-            l["member_id"] = _to_int(l["member_id"])
-            lm = l[l["member_id"] == int(mid)].copy()
-            if not lm.empty and "status" in lm.columns:
-                active_loans = int((lm["status"].astype(str).str.lower() == "active").sum())
-            bal_col = "principal_current" if "principal_current" in lm.columns else ("principal" if "principal" in lm.columns else None)
-            if bal_col:
-                bal_sum = float(_to_num(lm[bal_col]).sum())
-
-        return (
-            f"### 👤 Member Summary — {name} (ID {mid})\n"
-            f"- Contributions: **{_fmt_money(c_total)}**\n"
-            f"- Foundation: **{_fmt_money(fd_total)}**\n"
-            f"- Loan payments: **{_fmt_money(p_total)}**\n"
-            f"- Payouts: **{_fmt_money(po_total)}**\n"
-            f"- Fines: **{_fmt_money(f_total)}**\n"
-            f"- Active loans: **{active_loans}**\n"
-            f"- Loan balance (sum): **{_fmt_money(bal_sum)}**\n"
-        )
-
-    return "Try `help`. I can answer totals, loan status, member summaries, alerts, top risky, minutes, and manifold."
+def _safe_json(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return pd.DataFrame().to_json()
+    # cap to avoid huge cache payload
+    if len(df) > MAX_ROWS_SCAN:
+        df = df.head(MAX_ROWS_SCAN).copy()
+    return df.to_json()
 
 
-# ============================================================
-# UI: Render EVERYTHING (MAIN ENTRY)
-# ============================================================
-def render_full_ai_suite_panel(
-    *,
-    members: pd.DataFrame,
-    contributions: pd.DataFrame,
-    loans: pd.DataFrame,
-    loan_payments: pd.DataFrame,
-    payouts: pd.DataFrame,
-    fines: pd.DataFrame,
-    foundation_contributions: pd.DataFrame,
-    sessions: pd.DataFrame | None = None,
-    schema: str = "public",
-    sb_anon=None,
-    sb_service=None,
-    min_loans_for_ml: int = 20,
-    slow_mode: bool = True,
-):
-    sessions = sessions if sessions is not None else pd.DataFrame()
+def _render_header():
+    st.markdown(f"### {APP_TITLE}")
+    st.caption(APP_TAGLINE)
 
-    with st.sidebar:
-        st.subheader("🧠 AI Suite Settings")
-        slow_mode = st.toggle("🐢 Slow Mode", value=bool(slow_mode))
-        min_loans_for_ml = st.number_input("Min loans for ML (XGBoost)", min_value=5, value=int(min_loans_for_ml), step=1)
 
-        st.divider()
-        st.caption("Heuristic weights (optional)")
-        w_loan_balance = st.slider("Outstanding loan weight", 0.0, 0.50, 0.20, 0.01)
-        w_total_due = st.slider("Total due/arrears weight", 0.0, 0.30, 0.10, 0.01)
-        w_bad_status = st.slider("Bad status per flag", 0.0, 0.30, 0.10, 0.01)
-        w_no_payment_30 = st.slider("No payment ≥30d", 0.0, 0.50, 0.25, 0.01)
-        w_no_payment_14 = st.slider("No payment ≥14d", 0.0, 0.50, 0.15, 0.01)
-        w_no_contrib_30 = st.slider("No contrib ≥30d", 0.0, 0.50, 0.15, 0.01)
-        w_no_contrib_14 = st.slider("No contrib ≥14d", 0.0, 0.50, 0.08, 0.01)
-        w_fines = st.slider("Fines cap weight", 0.0, 0.50, 0.15, 0.01)
-        bonus_contrib_total = st.slider("Bonus: strong total contrib", 0.0, 0.20, 0.05, 0.01)
-        bonus_contrib_freq = st.slider("Bonus: contrib frequency", 0.0, 0.20, 0.05, 0.01)
+def _render_settings() -> Dict[str, Any]:
+    st.markdown("#### 🧠 AI Suite Settings")
 
-        cfg = {
-            "w_loan_balance": float(w_loan_balance),
+    c1, c2 = st.columns([0.55, 0.45], gap="large")
+    with c1:
+        min_loans = st.number_input("Min loans for ML (XGBoost)", min_value=0, value=25, step=5)
+
+    st.markdown("#### Heuristic weights (optional)")
+
+    # weights (match your UI vibe)
+    w_outstanding = st.slider("Outstanding loan weight", 0.0, 1.0, 0.50, 0.05)
+    w_total_due = st.slider("Total due/arrears weight", 0.0, 1.0, 0.30, 0.05)
+    w_bad_status = st.slider("Bad status per flag", 0.0, 1.0, 0.30, 0.05)
+    w_no_pay_30 = st.slider("No payment ≥30d", 0.0, 1.0, 0.50, 0.05)
+    w_no_pay_14 = st.slider("No payment ≥14d", 0.0, 1.0, 0.50, 0.05)
+    w_no_contrib_30 = st.slider("No contrib ≥30d", 0.0, 1.0, 0.50, 0.05)
+    w_no_contrib_14 = st.slider("No contrib ≥14d", 0.0, 1.0, 0.50, 0.05)
+    w_fines_cap = st.slider("Fines cap weight", 0.0, 1.0, 0.50, 0.05)
+    w_bonus_total = st.slider("Bonus: strong total contrib", 0.0, 1.0, 0.20, 0.05)
+    w_bonus_freq = st.slider("Bonus: contrib frequency", 0.0, 1.0, 0.20, 0.05)
+
+    st.markdown("#### 🧪 Stress Test (What-if)")
+    drop_pct = st.slider("Contribution drop (%)", 0, 80, 0, 5)
+    pay_delay = st.slider("Payment delay (extra days)", 0, 90, 0, 5)
+    fines_inc = st.slider("Fines increase (%)", 0, 200, 0, 10)
+
+    st.markdown("#### 🧩 Segmentation")
+    k = st.slider("Number of segments (K)", 2, 6, 3, 1)
+
+    return {
+        "min_loans": int(min_loans),
+        "weights": {
+            "w_outstanding": float(w_outstanding),
             "w_total_due": float(w_total_due),
             "w_bad_status": float(w_bad_status),
-            "w_no_payment_30": float(w_no_payment_30),
-            "w_no_payment_14": float(w_no_payment_14),
+            "w_no_pay_30": float(w_no_pay_30),
+            "w_no_pay_14": float(w_no_pay_14),
             "w_no_contrib_30": float(w_no_contrib_30),
             "w_no_contrib_14": float(w_no_contrib_14),
-            "w_fines": float(w_fines),
-            "bonus_contrib_total": float(bonus_contrib_total),
-            "bonus_contrib_freq": float(bonus_contrib_freq),
-        }
+            "w_fines_cap": float(w_fines_cap),
+            "w_bonus_total_contrib": float(w_bonus_total),
+            "w_bonus_contrib_freq": float(w_bonus_freq),
+        },
+        "stress": {"drop_pct": float(drop_pct), "pay_delay": int(pay_delay), "fines_inc": float(fines_inc)},
+        "segments": int(k),
+    }
 
-        st.divider()
-        st.subheader("🧪 Stress Test (What-if)")
-        stress_contrib_drop = st.slider("Contribution drop (%)", 0, 80, 0, 5)
-        stress_payment_delay = st.slider("Payment delay (extra days)", 0, 90, 0, 5)
-        stress_fines_increase = st.slider("Fines increase (%)", 0, 200, 0, 10)
 
-        st.divider()
-        st.subheader("🧩 Segmentation")
-        k = st.slider("Number of segments (K)", 2, 6, 3, 1)
+def _render_top_kpis(sb_anon, sb_service, schema: str):
+    snap = _rpc_finance_snapshot(sb_anon, sb_service, schema)
+    if not snap:
+        st.caption("Snapshot: rpc missing → KPIs will be computed from tables below.")
+        return
 
-    _throttle(slow_mode)
+    # support nested or flat
+    totals = snap.get("totals") if isinstance(snap.get("totals"), dict) else {}
+    total_contrib = totals.get("total_contributions") if totals else snap.get("total_contributions")
+    foundation_total = totals.get("foundation_total") if totals else snap.get("foundation_total")
+    total_fines = totals.get("total_fines") if totals else snap.get("total_fines")
+    active_exposure = totals.get("active_loan_exposure") if totals else snap.get("active_loan_exposure")
 
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Contributions", _money0(_to_num(total_contrib)))
+    c2.metric("Foundation Total", _money0(_to_num(foundation_total)))
+    c3.metric("Total Fines", _money0(_to_num(total_fines)))
+    c4.metric("Active Loan Exposure", _money0(_to_num(active_exposure)))
+
+    st.caption(f"Snapshot source: fn_finance_snapshot • fetched_at={_utc_iso()}")
+
+
+def _render_alerts(df: pd.DataFrame):
+    st.markdown("#### 🚨 Alerts (DB-grounded)")
+    if df is None or df.empty:
+        st.info("No data.")
+        return
+
+    crit = df[df["risk_band"].isin(["Critical", "High"])].copy()
+    if crit.empty:
+        st.success("No Critical/High risk members flagged by current heuristic.")
+        return
+
+    crit = crit.sort_values(["risk_score", "dropout_score"], ascending=False).head(15)
+    st.dataframe(
+        crit[["member_id", "member_name", "risk_band", "risk_score", "reliability_score", "dropout_score",
+              "active_loan_exposure", "overdue_flag_count", "fines_total", "last_contrib_days", "last_payment_days"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+def _render_trends(contrib: pd.DataFrame, payments: pd.DataFrame):
+    st.markdown("#### 📈 Trends (last 90 days, if timestamps available)")
+    cdt = _pick_col(contrib, ["paid_at", "created_at"]) if contrib is not None else None
+    pdt = _pick_col(payments, ["paid_at", "created_at"]) if payments is not None else None
+
+    colA, colB = st.columns(2)
+    with colA:
+        st.caption("Contributions")
+        if contrib is None or contrib.empty or not cdt or cdt not in contrib.columns:
+            st.info("No contribution timestamps available.")
+        else:
+            tmp = contrib.copy()
+            tmp["_dt"] = pd.to_datetime(tmp[cdt], errors="coerce", utc=True)
+            tmp = tmp.dropna(subset=["_dt"])
+            tmp = tmp[tmp["_dt"] >= (pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(days=90))]
+            if tmp.empty:
+                st.info("No contributions in the last 90 days (or timestamps missing).")
+            else:
+                amt = _pick_col(tmp, ["amount"])
+                tmp["_amt"] = pd.to_numeric(tmp[amt], errors="coerce").fillna(0) if amt else 0.0
+                by = tmp.groupby(tmp["_dt"].dt.date)["_amt"].sum().reset_index(name="total_amount")
+                by = by.sort_values("_dt")
+                st.line_chart(by.set_index("_dt")["total_amount"])
+
+    with colB:
+        st.caption("Loan Payments")
+        if payments is None or payments.empty or not pdt or pdt not in payments.columns:
+            st.info("No payment timestamps available.")
+        else:
+            tmp = payments.copy()
+            tmp["_dt"] = pd.to_datetime(tmp[pdt], errors="coerce", utc=True)
+            tmp = tmp.dropna(subset=["_dt"])
+            tmp = tmp[tmp["_dt"] >= (pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(days=90))]
+            if tmp.empty:
+                st.info("No payments in the last 90 days (or timestamps missing).")
+            else:
+                amt = _pick_col(tmp, ["amount"])
+                tmp["_amt"] = pd.to_numeric(tmp[amt], errors="coerce").fillna(0) if amt else 0.0
+                by = tmp.groupby(tmp["_dt"].dt.date)["_amt"].sum().reset_index(name="total_amount")
+                by = by.sort_values("_dt")
+                st.line_chart(by.set_index("_dt")["total_amount"])
+
+
+def _render_minutes_generator(df_scored: pd.DataFrame, schema: str):
+    st.markdown("#### 📝 Minutes Generator (DB-grounded, no LLM)")
+    if df_scored is None or df_scored.empty:
+        st.info("No data available.")
+        return
+
+    top_risk = df_scored.sort_values("risk_score", ascending=False).head(5)
+    top_drop = df_scored.sort_values("dropout_score", ascending=False).head(5)
+
+    lines: List[str] = []
+    lines.append(f"Meeting Minutes (Auto) — {datetime.now().strftime('%Y-%m-%d')}")
+    lines.append(f"Schema: {schema}")
+    lines.append("")
+    lines.append("1) Control Tower Summary")
+    lines.append(f"- Generated at (UTC): {_utc_iso()}")
+    lines.append(f"- Members analyzed: {len(df_scored)}")
+    lines.append("")
+    lines.append("2) Highest Risk Members (Top 5)")
+    for r in top_risk.itertuples(index=False):
+        lines.append(f"- {r.member_id} • {r.member_name} — Risk {r.risk_score} ({r.risk_band}), Exposure {r.active_loan_exposure:,.0f}")
+    lines.append("")
+    lines.append("3) Dropout Watchlist (Top 5)")
+    for r in top_drop.itertuples(index=False):
+        lines.append(f"- {r.member_id} • {r.member_name} — Dropout {r.dropout_score}, Last contrib days {r.last_contrib_days}")
+    lines.append("")
+    lines.append("4) Recommended Actions")
+    lines.append("- Follow up on overdue/late borrowers; enforce interest settlement policy.")
+    lines.append("- For no-contrib/no-payment flags, apply reminders, fines, or borrowing freeze per bylaws.")
+    lines.append("- Re-check liquidity pressure before new lending approvals.")
+
+    st.text_area("Generated minutes (copy/paste)", value="\n".join(lines), height=260)
+
+
+# =============================================================================
+# MAIN ENTRY
+# =============================================================================
+def render_full_ai_suite_panel(sb_anon, sb_service=None, schema: str = "public") -> None:
+    _render_header()
+
+    # settings UI (matches your screenshot)
+    cfg = _render_settings()
+    w = cfg["weights"]
+
+    st.divider()
+    _render_top_kpis(sb_anon, sb_service, schema)
+    st.divider()
+
+    # Load core tables (safe columns; broad select to survive schema variation)
+    with st.spinner("Loading Njangi data…"):
+        members = _sb_select(sb_anon, sb_service, schema, "members", cols="*", limit=20_000, order_by="id", desc=False)
+        contrib = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=MAX_ROWS_SCAN, order_by="created_at", desc=True)
+        loans = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=MAX_ROWS_SCAN, order_by="created_at", desc=True)
+        payments = _sb_select(sb_anon, sb_service, schema, "loan_payments", cols="*", limit=MAX_ROWS_SCAN, order_by="created_at", desc=True)
+        payouts = _sb_select(sb_anon, sb_service, schema, "payouts", cols="*", limit=MAX_ROWS_SCAN, order_by="created_at", desc=True)
+        fines = _sb_select(sb_anon, sb_service, schema, "fines", cols="*", limit=MAX_ROWS_SCAN, order_by="created_at", desc=True)
+        foundation = _sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=MAX_ROWS_SCAN, order_by="created_at", desc=True)
+
+    # Build features (cached)
+    url_sig = f"{schema}:{id(sb_service or sb_anon)}"
     X = build_member_features_cached(
-        members=members,
-        contrib=contributions,
-        loans=loans,
-        payments=loan_payments,
-        payouts=payouts,
-        fines=fines,
-        foundation=foundation_contributions,
-        _fp_members=_df_fingerprint(members),
-        _fp_contrib=_df_fingerprint(contributions),
-        _fp_loans=_df_fingerprint(loans),
-        _fp_payments=_df_fingerprint(loan_payments),
-        _fp_payouts=_df_fingerprint(payouts),
-        _fp_fines=_df_fingerprint(fines),
-        _fp_foundation=_df_fingerprint(foundation_contributions),
+        url_sig=url_sig,
+        schema=schema,
+        members_json=_safe_json(members),
+        contrib_json=_safe_json(contrib),
+        loans_json=_safe_json(loans),
+        pay_json=_safe_json(payments),
+        payouts_json=_safe_json(payouts),
+        fines_json=_safe_json(fines),
+        foundation_json=_safe_json(foundation),
     )
 
     if X is None or X.empty:
-        st.error("AI Suite: could not build features (check members / ids).")
+        st.error("AI Suite: could not build features (members table empty or unreadable).")
         return
 
-    members2 = members.copy()
-    members2["id"] = _to_int(members2["id"])
-    members2 = members2[members2["id"] > 0].copy()
-    name_col = _infer_member_name_col(members2) or "name"
-    if name_col not in members2.columns:
-        members2["name"] = members2.get("name", "").astype(str)
-        name_col = "name"
-    members2[name_col] = members2[name_col].astype(str)
-    members2["label"] = members2.apply(lambda r: f"{int(r['id']):02d} • {r.get(name_col,'')}", axis=1)
+    # Score
+    df_scored = score_members_heuristic(X, w)
 
-    st.header("🧠 NJANGI AI Suite — Advanced+ (Embedded Manifold)")
-    st.caption("Risk • Reliability • Dropout • Fraud • Liquidity • Decisions • Alerts • Trends • Segments • Stress Test • ✅ Manifold always-on")
+    # Segments
+    df_scored = segment_members(df_scored, cfg["segments"])
 
-    pick = st.selectbox("Select member", members2["label"].tolist(), index=0)
-    member_id = int(members2.loc[members2["label"] == pick, "id"].iloc[0])
-    member_name = str(members2.loc[members2["id"] == member_id, name_col].iloc[0])
+    # Stress test
+    st.markdown("#### 🧪 Stress Test Output")
+    st.caption("Applies your what-if knobs and recomputes risk smoothly (manifold blend).")
+    st_df = stress_test(
+        df_scored,
+        drop_pct=cfg["stress"]["drop_pct"],
+        pay_delay_days=cfg["stress"]["pay_delay"],
+        fines_increase_pct=cfg["stress"]["fines_inc"],
+        w=w,
+    )
+    st_df = segment_members(st_df, cfg["segments"])
 
-    row = X[X["member_id"] == int(member_id)]
-    if row.empty:
-        st.warning("No feature row for selected member.")
-        return
-    row1 = row.iloc[0]
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Avg Risk (baseline)", f"{float(df_scored['risk_score'].mean()):.1f}")
+    with c2:
+        st.metric("Avg Risk (stress)", f"{float(st_df['risk_score'].mean()):.1f}")
+    with c3:
+        delta = float(st_df["risk_score"].mean() - df_scored["risk_score"].mean())
+        st.metric("Δ Risk", f"{delta:+.1f}")
 
-    # Risk modes
-    mode = st.radio("Risk mode (base)", ["Heuristic", "ML (XGBoost)", "Hybrid"], horizontal=True)
-    st.caption("Manifold tangent is embedded and always modifies final risk.")
+    st.divider()
 
-    h_risk, h_reasons = compute_heuristic_risk(row1, cfg=cfg)
-    ml_risk, ml_msg = xgb_risk_for_member(loans, member_id=member_id, min_rows=int(min_loans_for_ml))
+    # Main tabs
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["📌 Leaderboard", "🚨 Alerts", "📈 Trends", "🧩 Segments", "📝 Minutes Generator"]
+    )
 
-    if mode == "Heuristic":
-        base_risk = h_risk
-        risk_source = "Heuristic"
-    elif mode == "ML (XGBoost)":
-        base_risk = ml_risk if ml_risk is not None else h_risk
-        risk_source = "ML" if ml_risk is not None else "Heuristic (fallback)"
-    else:
-        base_risk = h_risk if ml_risk is None else float(np.clip((h_risk + ml_risk) / 2.0, 0.0, 1.0))
-        risk_source = "Hybrid" if ml_risk is not None else "Heuristic (fallback)"
-
-    # ✅ ALWAYS compute manifold against heuristic risk field (stable + fast)
-    risks = []
-    for _, rr in X.iterrows():
-        r, _ = compute_heuristic_risk(rr, cfg=cfg)
-        risks.append(float(r))
-    risk_series = pd.Series(risks, index=X.index, dtype=float)
-    feat_cols = [c for c in X.columns if c != "member_id"]
-    k_neighbors = int(np.clip(max(8, int(len(X) * 0.25)), 8, 18))
-    mf = manifold_tangent_metrics(X=X, risk_series=risk_series, member_id=member_id, feature_cols=feat_cols, k_neighbors=k_neighbors)
-    mf_adj = embedded_manifold_adjustment(mf)
-
-    final_risk = float(np.clip(float(base_risk) + float(mf_adj), 0.0, 1.0))
-
-    rel, rel_reasons = compute_reliability_score(row1)
-    drop, drop_reasons = dropout_risk(row1)
-    fraud, fraud_reasons = fraud_anomaly_score(member_id, contributions, loans, loan_payments)
-
-    liq = liquidity_forecast_simple(contributions, foundation_contributions, loans, loan_payments, payouts, horizon_days=30)
-    liquidity_ok = bool(liq.get("ok")) and float(liq.get("avg_daily_net", 0.0)) >= 0
-
-    req_amt = st.number_input("Test loan amount (recommendation)", min_value=0.0, value=3000.0, step=500.0)
-
-    decision, dec_reasons = smart_loan_decision(final_risk, rel, liquidity_ok, float(req_amt))
-
-    # ✅ Embedded manifold tightening on decision
-    if mf.get("ok"):
-        if float(mf.get("manifold_velocity", 0.0)) > 0.35 and decision == "APPROVE":
-            decision = "APPROVE WITH CONDITIONS"
-            dec_reasons = ["Manifold rising trend: apply stricter conditions."] + dec_reasons
-        if float(mf.get("outlier_score", 0.0)) > 0.75 and decision in ("APPROVE", "APPROVE WITH CONDITIONS"):
-            decision = "APPROVE WITH CONDITIONS"
-            dec_reasons = ["Off-manifold behavior: require verification / surety."] + dec_reasons
-        dec_reasons = dec_reasons[:6]
-
-    alerts = generate_alerts(member_name, final_risk, rel, drop, fraud, liq)
-
-    # ✅ Manifold alerts
-    if mf.get("ok") and float(mf.get("manifold_velocity", 0.0)) > 0.35:
-        alerts.append({"severity": "med", "type": "manifold_trend", "message": f"{member_name}: Manifold trend rising (velocity {float(mf.get('manifold_velocity',0.0)):+.2f})."})
-    if mf.get("ok") and float(mf.get("outlier_score", 0.0)) > 0.70:
-        alerts.append({"severity": "med", "type": "manifold_outlier", "message": f"{member_name}: Off-manifold behavior detected (outlier {float(mf.get('outlier_score',0.0))*100:.0f}%)."})
-
-    # Top risky (all - heuristic, for system comparisons)
-    id2name = _member_map(members2)
-    top_risky = []
-    try:
-        tmp = []
-        for _, rr in X.iterrows():
-            r, _ = compute_heuristic_risk(rr, cfg=cfg)
-            mid = int(rr["member_id"])
-            tmp.append({"member_id": mid, "name": id2name.get(mid, f"Member {mid}"), "risk": float(r)})
-        tmp.sort(key=lambda z: z["risk"], reverse=True)
-        top_risky = tmp[:5]
-    except Exception:
-        top_risky = []
-
-    # KPI row
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Final Risk", _fmt_pct01(final_risk), help=f"Base: {risk_source} + manifold adj {mf_adj:+.3f}")
-    k2.metric("Base Risk", _fmt_pct01(base_risk))
-    k3.metric("Reliability", f"{rel}/100")
-    k4.metric("Dropout", _fmt_pct01(drop))
-    k5.metric("Anomaly", _fmt_pct01(fraud))
-
-    st.subheader("🧭 Manifold (Embedded)")
-    if mf.get("ok"):
-        cA, cB, cC, cD = st.columns(4)
-        cA.metric("Trend", str(mf.get("manifold_trend", "→ stable")))
-        cB.metric("Velocity", f"{float(mf.get('manifold_velocity',0.0)):+.2f}")
-        cC.metric("Outlier", f"{float(mf.get('outlier_score',0.0))*100:.0f}%")
-        cD.metric("Adj", f"{mf_adj:+.3f}")
-        st.caption(f"Risk alignment corr: {float(mf.get('risk_alignment_corr',0.0)):+.2f} • K={int(mf.get('k_used',0))}")
-    else:
-        st.info(f"Manifold not available: {mf.get('msg','')}")
-
-    # Tabs
-    tab_risk, tab_heat, tab_trend, tab_seg, tab_stress, tab_liq, tab_loan, tab_alerts, tab_chat, tab_minutes = st.tabs([
-        "📈 Risk (Member)",
-        "🟧 Early Warning Heatmap",
-        "📉 Risk Trend",
-        "🧩 Segmentation",
-        "🧪 Stress Test",
-        "💰 Liquidity",
-        "🧾 Loan Decision",
-        "🚨 Alerts",
-        "💬 System Chat",
-        "📝 Minutes",
-    ])
-
-    with tab_risk:
-        st.subheader(f"Risk prediction — {member_name}")
-        st.metric("Final Risk (embedded)", _fmt_pct01(final_risk))
-        st.progress(float(np.clip(final_risk, 0.0, 1.0)))
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.caption("Heuristic signals")
-            for r in h_reasons:
-                st.write(f"• {r}")
-        with c2:
-            st.caption("ML status")
-            if mode in ["ML (XGBoost)", "Hybrid"]:
-                if ml_risk is None:
-                    st.info(f"ML not ready: {ml_msg}")
-                else:
-                    st.success(f"ML active: {ml_msg}")
-                    st.write(f"• ML risk: **{_fmt_pct01(ml_risk)}**")
-            else:
-                st.write("• ML not selected.")
-
-        st.write("**Reliability reasons**")
-        for r in rel_reasons:
-            st.write(f"• {r}")
-
-        st.write("**Dropout reasons**")
-        for r in drop_reasons:
-            st.write(f"• {r}")
-
-        st.write("**Fraud signals**")
-        if fraud_reasons:
-            for r in fraud_reasons:
-                st.write(f"• {r}")
-        else:
-            st.caption("No strong anomaly signals detected.")
-
-        with st.expander("Member feature snapshot", expanded=False):
-            snap = row.T
-            snap.columns = ["value"]
-            st.dataframe(snap, width=W_STRETCH)
-
-        st.divider()
-        st.subheader("💸 Interest Projection")
-        h = st.selectbox("Interest horizon", [30, 60, 90], index=0)
-        proj = interest_projection(row1, horizon_days=int(h))
-        st.write(f"- Loan balance: **{_fmt_money(proj['loan_balance_sum'])}**")
-        st.write(f"- Unpaid interest (current): **{_fmt_money(proj['unpaid_interest_sum'])}**")
-        st.write(f"- Weighted monthly rate: **{proj['rate_monthly_wavg']:.3f}**")
-        st.write(f"- Estimated interest income ({h}d): **{_fmt_money(proj['estimated_interest_income'])}**")
-
-    with tab_heat:
-        st.subheader("Early Warning Heatmap (All Members) — Embedded Manifold")
-        df_warn = early_warning_table(X, members2, cfg=cfg)
-        if df_warn.empty:
-            st.info("Not enough data to generate early warning table.")
-        else:
-            df_show = df_warn.copy()
-            df_show["risk_base_%"] = (df_show["risk_base"] * 100).round(1)
-            df_show["risk_final_%"] = (df_show["risk_final"] * 100).round(1)
-            df_show["dropout_%"] = (df_show["dropout"] * 100).round(0).astype(int)
-            df_show["anomaly_%"] = (df_show["anomaly_proxy"] * 100).round(0).astype(int)
-            df_show = df_show.drop(columns=["risk_base", "risk_final", "dropout", "anomaly_proxy"])
-            st.dataframe(df_show, width=W_STRETCH)
-            st.download_button(
-                "⬇️ Download early warnings (CSV)",
-                df_warn.to_csv(index=False).encode("utf-8"),
-                file_name="early_warning_heatmap.csv",
-                mime="text/csv",
-            )
-
-    with tab_trend:
-        st.subheader("Risk Trend Over Time (Heuristic)")
-        days_back = st.slider("Days back", 30, 180, 90, 10)
-        df_tr = member_risk_trend(row1, cfg=cfg, days_back=int(days_back))
-        if df_tr is None or df_tr.empty:
-            st.info("Trend unavailable (missing date fields).")
-        else:
-            st.line_chart(df_tr.set_index("date"))
-            st.caption("Trend recomputes inactivity days across time using last activity timestamps.")
-
-    with tab_seg:
-        st.subheader("Member Segmentation (K-Means, No sklearn)")
-        seg = segmentation_clusters(X, members2, k=int(k))
-        if seg.empty:
-            st.info("Segmentation unavailable (missing segmentation columns).")
-        else:
-            st.dataframe(seg, width=W_STRETCH)
-            st.divider()
-            st.caption("Segment summary (avg per segment)")
-            cols = [c for c in seg.columns if c not in ("member_id", "name", "segment")]
-            summary = seg.groupby("segment")[cols].mean(numeric_only=True).reset_index()
-            st.dataframe(summary, width=W_STRETCH)
-            st.download_button(
-                "⬇️ Download segmentation (CSV)",
-                seg.to_csv(index=False).encode("utf-8"),
-                file_name="member_segmentation.csv",
-                mime="text/csv",
-            )
-
-    with tab_stress:
-        st.subheader("Stress Test (What-If)")
-        st.caption("Simulate shocks and see how heuristic risk changes for this member (manifold still shown above).")
-
-        rr = row1.copy()
-        rr["contrib_total"] = float(rr.get("contrib_total", 0.0)) * (1.0 - (stress_contrib_drop / 100.0))
-        rr["days_since_last_payment"] = int(rr.get("days_since_last_payment", 999)) + int(stress_payment_delay)
-        rr["fine_total"] = float(rr.get("fine_total", 0.0)) * (1.0 + (stress_fines_increase / 100.0))
-
-        stressed_risk, stressed_reasons = compute_heuristic_risk(rr, cfg=cfg)
-
-        c1, c2 = st.columns(2)
-        c1.metric("Current Final Risk", _fmt_pct01(final_risk))
-        c2.metric("Stressed Base Risk", _fmt_pct01(stressed_risk))
-
-        st.progress(float(np.clip(stressed_risk, 0.0, 1.0)))
-        st.write("**Stressed signals**")
-        for r in stressed_reasons:
-            st.write(f"• {r}")
-
-    with tab_liq:
-        st.subheader("Liquidity Forecast (System-Level)")
-        if not liq.get("ok"):
-            st.warning(liq.get("msg", "Liquidity forecast unavailable."))
-        else:
-            c1, c2 = st.columns(2)
-            c1.metric("Estimated Net Balance (approx)", f"{liq.get('balance_est', 0.0):,.0f}")
-            c2.metric("Avg Daily Net Flow (~30d)", f"{liq.get('avg_daily_net', 0.0):,.1f}")
-            df_fc = pd.DataFrame({"date": liq["dates"], "forecast_balance": liq["forecast_balance"]})
-            st.line_chart(df_fc.set_index("date"))
-
-    with tab_loan:
-        st.subheader("Smart Loan Recommendation (Embedded)")
-        st.write(f"**Member:** {member_name} (ID {member_id})")
-        st.write(f"**Requested amount:** {_fmt_money(req_amt)}")
-        st.write(f"**Decision:** `{decision}`")
-        for r in dec_reasons:
-            st.write(f"• {r}")
-
-    with tab_alerts:
-        st.subheader("Alerts Center")
-        if not alerts:
-            st.success("No alerts generated.")
-        else:
-            for a in alerts:
-                sev = a.get("severity")
-                msg = a.get("message", "")
-                if sev == "high":
-                    st.error(msg)
-                elif sev == "med":
-                    st.warning(msg)
-                else:
-                    st.info(msg)
-
-        st.write("**Top 5 risky members (heuristic)**")
-        if top_risky:
-            df_top = pd.DataFrame(top_risky)
-            st.dataframe(df_top, width=W_STRETCH)
-            st.download_button(
-                "⬇️ Download top risky (CSV)",
-                df_top.to_csv(index=False).encode("utf-8"),
-                file_name="top_risky_members.csv",
-                mime="text/csv",
-            )
-
-    with tab_chat:
-        st.subheader("System Chat Assistant (Free)")
-        st.caption("Type `help` to see commands. Grounded in your real tables.")
-        if "system_ai_msgs" not in st.session_state:
-            st.session_state.system_ai_msgs = []
-
-        minutes_text = st.session_state.get("__latest_minutes_text__", "")
-        chat_ctx = {
-            "members": members2,
-            "contrib": contributions,
-            "loans": loans,
-            "payments": loan_payments,
-            "payouts": payouts,
-            "fines": fines,
-            "foundation": foundation_contributions,
-            "top_risky": top_risky,
-            "alerts": alerts,
-            "minutes_text": minutes_text,
-            "manifold_ctx": {"mf": mf, "mf_adj": mf_adj},
-        }
-
-        for role, msg in st.session_state.system_ai_msgs[-30:]:
-            with st.chat_message(role):
-                st.markdown(msg)
-
-        q = st.chat_input("Ask: totals, loan status, member summary, alerts, top risky, minutes, manifold…")
-        if q:
-            st.session_state.system_ai_msgs.append(("user", q))
-            ans = system_chat_answer(q, chat_ctx)
-            with st.chat_message("assistant"):
-                st.markdown(ans)
-            st.session_state.system_ai_msgs.append(("assistant", ans))
-
-    with tab_minutes:
-        st.subheader("Minutes Generator (Free)")
-        st.caption("Generates copy/paste minutes from your real tables. Optional DB save if `minutes` table exists.")
-
-        session_id = None
-        if sessions is not None and not sessions.empty and "id" in sessions.columns:
-            s = sessions.copy()
-            s["id"] = _to_int(s["id"])
-            date_col = "session_date" if "session_date" in s.columns else ("created_at" if "created_at" in s.columns else None)
-            if date_col:
-                s[date_col] = _to_dt_utc(s[date_col])
-                s["label"] = s.apply(lambda r: f"Session {int(r['id'])} • {r[date_col].date() if pd.notna(r[date_col]) else ''}", axis=1)
-                opts = ["All data (no session filter)"] + s["label"].tolist()
-                sel = st.selectbox("Filter minutes by session (optional)", opts, index=0)
-                if sel != "All data (no session filter)":
-                    session_id = int(s.loc[s["label"] == sel, "id"].iloc[0])
-
-        def filt_by_session(df: pd.DataFrame) -> pd.DataFrame:
-            if session_id is None:
-                return df
-            if df is None or df.empty or "session_id" not in df.columns:
-                return df
-            d = df.copy()
-            d["session_id"] = _to_int(d["session_id"])
-            return d[d["session_id"] == int(session_id)].copy()
-
-        contrib_f = filt_by_session(contributions)
-        payouts_f = filt_by_session(payouts)
-
-        meeting_title_default = "THE YOUNG SHALL GROW (NJANGI) — Meeting Minutes"
-        agenda_default = "Treasury update, contributions, loans, payouts, fines, risk review, and resolutions."
-
-        meeting_title = st.text_input("Meeting title", value=meeting_title_default)
-        meeting_date = st.date_input("Meeting date", value=pd.Timestamp.utcnow().date())
-        location = st.text_input("Location (optional)", value="")
-        chairperson = st.text_input("Chairperson (optional)", value="")
-        secretary = st.text_input("Secretary (optional)", value="")
-        agenda = st.text_area("Agenda (optional)", value=agenda_default)
-
-        minutes_text = build_minutes_text(
-            meeting_title=meeting_title,
-            meeting_date=pd.Timestamp(meeting_date),
-            location=location,
-            chairperson=chairperson,
-            secretary=secretary,
-            agenda=agenda,
-            members=members2,
-            contrib=contrib_f,
-            foundation=foundation_contributions,
-            loans=loans,
-            payments=loan_payments,
-            payouts=payouts_f,
-            fines=fines,
-            top_risky=top_risky,
-            alerts=alerts,
+    with tab1:
+        st.markdown("#### 📌 Member Leaderboard (DB-grounded)")
+        show_cols = [
+            "member_id", "member_name",
+            "risk_band", "risk_score", "reliability_score", "dropout_score",
+            "contrib_total", "contrib_count",
+            "active_loan_exposure", "active_loan_count",
+            "overdue_flag_count", "unpaid_interest_like",
+            "fines_total", "last_contrib_days", "last_payment_days",
+            "segment",
+        ]
+        show_cols = [c for c in show_cols if c in df_scored.columns]
+        st.dataframe(
+            df_scored.sort_values(["risk_score", "dropout_score"], ascending=False)[show_cols],
+            use_container_width=True,
+            hide_index=True,
         )
 
-        st.session_state["__latest_minutes_text__"] = minutes_text
-        st.text_area("Generated Minutes (copy/paste)", value=minutes_text, height=420)
+        st.caption(f"Built at (UTC): {_utc_iso()} • Members: {len(df_scored)}")
 
-        st.download_button(
-            "⬇️ Download minutes (TXT)",
-            minutes_text.encode("utf-8"),
-            file_name=f"minutes_{pd.Timestamp(meeting_date).strftime('%Y%m%d')}.txt",
-            mime="text/plain",
-        )
+    with tab2:
+        _render_alerts(df_scored)
 
-        client = sb_service if sb_service is not None else sb_anon
-        can_save = _table_exists(client, schema, "minutes")
+    with tab3:
+        _render_trends(contrib, payments)
 
-        if can_save:
-            st.info("A `minutes` table exists. You can save these minutes to the database.")
-            if st.button("💾 Save Minutes to DB"):
-                rowdb = {
-                    "meeting_date": str(meeting_date),
-                    "title": meeting_title,
-                    "content": minutes_text,
-                    "session_id": int(session_id) if session_id is not None else None,
-                }
-                ok, msg = _safe_insert(client, schema, "minutes", rowdb)
-                if ok:
-                    st.success("Minutes saved.")
-                else:
-                    st.error("Failed to save minutes.")
-                    st.code(msg, language="text")
+    with tab4:
+        st.markdown("#### 🧩 Segmentation")
+        if "segment" not in df_scored.columns:
+            st.info("Segmentation is unavailable (install scikit-learn).")
         else:
-            st.caption("No `minutes` table found (or no DB client passed). Copy/paste the minutes text, or create a minutes table later.")
+            seg_summary = (
+                df_scored.groupby("segment", dropna=False)
+                .agg(
+                    members=("member_id", "count"),
+                    avg_risk=("risk_score", "mean"),
+                    avg_reliability=("reliability_score", "mean"),
+                    avg_dropout=("dropout_score", "mean"),
+                    total_contrib=("contrib_total", "sum"),
+                    total_exposure=("active_loan_exposure", "sum"),
+                )
+                .reset_index()
+            )
+            seg_summary["avg_risk"] = seg_summary["avg_risk"].round(1)
+            seg_summary["avg_reliability"] = seg_summary["avg_reliability"].round(1)
+            seg_summary["avg_dropout"] = seg_summary["avg_dropout"].round(1)
+
+            st.dataframe(seg_summary, use_container_width=True, hide_index=True)
+
+            st.markdown("**Members in selected segment**")
+            seg_pick = st.selectbox("Segment", sorted(df_scored["segment"].dropna().unique().tolist()), index=0)
+            seg_members = df_scored[df_scored["segment"] == seg_pick].sort_values("risk_score", ascending=False).head(50)
+            cols = [c for c in ["member_id", "member_name", "risk_band", "risk_score", "contrib_total", "active_loan_exposure", "fines_total"] if c in seg_members.columns]
+            st.dataframe(seg_members[cols], use_container_width=True, hide_index=True)
+
+    with tab5:
+        _render_minutes_generator(df_scored, schema=schema)
+
+    st.divider()
+
+    # Optional ML
+    st.markdown("#### 🤖 Optional ML (XGBoost)")
+    st.caption("Only runs if xgboost is installed AND enough loans exist. Never blocks the suite.")
+    ml_info, ml_status = train_xgb_if_possible(df_scored, min_loans=cfg["min_loans"])
+
+    if ml_info is None:
+        st.info(f"ML status: {ml_status}")
+        if ml_status == "ml:xgboost_missing":
+            st.caption("If you want ML: add `xgboost` to requirements.txt.")
+    else:
+        st.success(f"ML status: {ml_status}")
+        st.json(ml_info)
+
+    # Debug
+    with st.expander("🔎 Debug (feature columns)", expanded=False):
+        st.write("Feature columns:", list(df_scored.columns))
+        st.write("Row counts:")
+        st.json({
+            "members": _safe_count(members),
+            "contributions": _safe_count(contrib),
+            "loans": _safe_count(loans),
+            "loan_payments": _safe_count(payments),
+            "payouts": _safe_count(payouts),
+            "fines": _safe_count(fines),
+            "foundation_contributions": _safe_count(foundation),
+        })
+        st.caption("This panel is index-safe: all aggregates are merged onto full members list (no length mismatch).")
