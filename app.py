@@ -1,7 +1,6 @@
-
 # app.py ✅ COMPLETE SINGLE FILE — NJANGI STANDARD (NO legacy)
 # FAST VERSION + SLOW/GENTLE MODE + ✅ younchat + SAFE NAV FIX + ✅ DASHBOARD-AI NAV BRIDGE
-# ✅ NEW: 🧠 AI Suite page (ai_suite_panel.py) — loads your Advanced+ NJANGI AI Suite panel
+# ✅ NEW: Smooth floating rotating manifold background (CSS-only, Streamlit-safe)
 # ------------------------------------------------------------------------------
 # ✅ Keeps:
 #   - Safe navigation + nav bridge (dashboard → other pages)
@@ -48,7 +47,7 @@ def now_iso() -> str:
 
 
 # =========================
-# THEME
+# THEME + MANIFOLD BACKGROUND
 # =========================
 def inject_global_theme():
     st.markdown(
@@ -62,6 +61,11 @@ def inject_global_theme():
             --primary: #00C896;
             --primary2:#00E6A8;
             --link: #60A5FA;
+
+            /* Manifold colors */
+            --manifoldA: rgba(0, 230, 168, 0.22);
+            --manifoldB: rgba(96, 165, 250, 0.18);
+            --manifoldC: rgba(255, 255, 255, 0.06);
         }
 
         .stApp {
@@ -78,6 +82,84 @@ def inject_global_theme():
 
             background-size: 24px 24px, auto, auto, auto !important;
             color: var(--text) !important;
+        }
+
+        /* ================================
+           MANIFOLD SHAPE (floating blobs)
+           ================================ */
+        .stApp::before,
+        .stApp::after{
+            content: "";
+            position: fixed;
+            z-index: 0;
+            pointer-events: none;
+            width: 620px;
+            height: 620px;
+            border-radius: 42% 58% 60% 40% / 45% 44% 56% 55%;
+            filter: blur(28px);
+            opacity: 0.95;
+            transform: translate3d(0,0,0);
+            will-change: transform, border-radius;
+        }
+
+        /* Blob 1: emerald → blue */
+        .stApp::before{
+            left: -180px;
+            top: 90px;
+            background:
+                radial-gradient(circle at 28% 30%, var(--manifoldA), transparent 58%),
+                radial-gradient(circle at 70% 65%, var(--manifoldB), transparent 62%),
+                radial-gradient(circle at 52% 48%, var(--manifoldC), transparent 65%);
+            animation:
+                manifold-float-1 16s ease-in-out infinite,
+                manifold-morph 10s ease-in-out infinite,
+                manifold-rotate 36s linear infinite;
+        }
+
+        /* Blob 2: blue → emerald */
+        .stApp::after{
+            right: -210px;
+            bottom: -160px;
+            width: 720px;
+            height: 720px;
+            background:
+                radial-gradient(circle at 35% 35%, var(--manifoldB), transparent 58%),
+                radial-gradient(circle at 72% 62%, var(--manifoldA), transparent 60%),
+                radial-gradient(circle at 48% 52%, var(--manifoldC), transparent 66%);
+            animation:
+                manifold-float-2 18s ease-in-out infinite,
+                manifold-morph 12s ease-in-out infinite reverse,
+                manifold-rotate 44s linear infinite reverse;
+        }
+
+        /* Ensure content sits above blobs */
+        .stApp > div,
+        header, footer,
+        section[data-testid="stSidebar"]{
+            position: relative;
+            z-index: 1;
+        }
+
+        @keyframes manifold-float-1{
+            0%   { transform: translate3d(0px, 0px, 0) scale(1.00); }
+            50%  { transform: translate3d(60px, 18px, 0) scale(1.04); }
+            100% { transform: translate3d(0px, 0px, 0) scale(1.00); }
+        }
+        @keyframes manifold-float-2{
+            0%   { transform: translate3d(0px, 0px, 0) scale(1.00); }
+            50%  { transform: translate3d(-56px, -26px, 0) scale(1.05); }
+            100% { transform: translate3d(0px, 0px, 0) scale(1.00); }
+        }
+        @keyframes manifold-morph{
+            0%   { border-radius: 42% 58% 60% 40% / 45% 44% 56% 55%; }
+            25%  { border-radius: 50% 50% 45% 55% / 55% 40% 60% 45%; }
+            50%  { border-radius: 58% 42% 55% 45% / 45% 60% 40% 55%; }
+            75%  { border-radius: 46% 54% 62% 38% / 42% 50% 50% 58%; }
+            100% { border-radius: 42% 58% 60% 40% / 45% 44% 56% 55%; }
+        }
+        @keyframes manifold-rotate{
+            0%   { rotate: 0deg; }
+            100% { rotate: 360deg; }
         }
 
         header, footer { background: transparent !important; }
@@ -589,7 +671,6 @@ def load_ai_bundle() -> dict:
     loans = load_ai_table(
         SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SCHEMA,
         "loans",
-        # try to cover common schemas; missing cols are handled by ai_suite_panel
         "id,member_id,status,principal,principal_current,total_due,unpaid_interest,interest_rate_monthly,due_cycle_days,borrow_date,last_paid_at,created_at",
         "created_at", True, lim_small
     )
@@ -738,7 +819,6 @@ elif page == "🧠 AI Suite":
         st.stop()
 
     bundle = load_ai_bundle()
-    # minimal guard
     if bundle["members"].empty:
         if st.session_state.get("_last_members_error"):
             st.error("Members not readable. Error:")
@@ -748,7 +828,6 @@ elif page == "🧠 AI Suite":
         st.markdown(glass_close(), unsafe_allow_html=True)
         st.stop()
 
-    # Render AI Suite (expects raw DataFrames; handles missing cols safely)
     fn(
         members=bundle["members"].rename(columns={"member_name": "display_name"}).assign(name=bundle["members"]["member_name"]),
         contributions=bundle["contributions"],
@@ -765,7 +844,6 @@ elif page == "🧠 AI Suite":
         slow_mode=bool(SLOW_MODE),
     )
 
-    # Helpful diagnostics
     with st.expander("🔧 AI Suite load diagnostics", expanded=False):
         for t in ["contributions", "foundation_contributions", "loans", "loan_payments", "payouts", "fines", "sessions"]:
             errk = f"_last_ai_load_err_{t}"
@@ -1167,7 +1245,6 @@ elif page == "Admin":
         st.markdown(glass_close(), unsafe_allow_html=True)
         st.stop()
 
-    # ✅ IMPORTANT FIX: your repo shows admin_panels.py (plural)
     admin_fn, admin_err = lazy_import("admin_panels", "render_admin_panel")
     if admin_fn is not None:
         admin_fn(sb_anon=sb_anon, sb_service=sb_service, schema=SUPABASE_SCHEMA)
