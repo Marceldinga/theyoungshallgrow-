@@ -1,3 +1,4 @@
+
 # njangi_llm_panel.py ✅ SINGLE COMPLETE FILE — younchat reads your DB (members = source of truth)
 # =============================================================================
 # 💬 younchat — DB-TOOLS FIRST + Manifold State + Foundation Reasoner (HF) + Optional Tavily
@@ -9,19 +10,10 @@
 #   3) EVERY message that is NOT DB-related is routed to HF foundation model (if HF_TOKEN exists)
 #   4) Start every answer with "Hello 👋🏽"
 #
-# IMPORTANT ADDITION:
-#   - Non-DB messages routed to HF use a strict Njangi "intent & next step" prompt
-#     (no hallucinated DB numbers).
-#
-# ✅ ONE-AGENT UPGRADE (this file):
-#   - Integrated Tools Layer via njangi_actions_agent.py
-#   - READ tools execute immediately
-#   - WRITE tools are STAGED and require CONFIRMATION
-#   - Optional HF action planner can translate “do something” requests into tool JSON
-#
-# ✅ FIX INCLUDED:
-#   - Messages like "member_id=4" or "Member id = 4" are treated as DB requests
-#     and return a DB-grounded Member Intelligence Summary automatically (no HF).
+# ✅ Works with the FIXED circular-import-safe njangi_actions_agent.py:
+#   - Uses READ_TOOLS + WRITE_TOOLS + execute_tool
+#   - Adds: JSON tool runner + staged confirmations (writes still require confirm)
+#   - Member id messages like "member_id=4" trigger DB member intelligence summary
 # =============================================================================
 
 from __future__ import annotations
@@ -30,6 +22,7 @@ import json
 import os
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -43,21 +36,12 @@ except Exception:
     APIError = Exception  # type: ignore
 
 # =============================================================================
-# ✅ TOOLS LAYER (new file you created)
+# ✅ TOOLS LAYER
 # =============================================================================
-from njangi_actions_agent import (  # type: ignore
-    READ_TOOLS,
-    WRITE_TOOLS,
-    ALL_TOOLS,
-    ToolResult,
-    safe_json_from_text,
-    execute_confirmed_action,
-    resolve_user_context,
-    iso_utc,
-)
+from njangi_actions_agent import READ_TOOLS, WRITE_TOOLS, execute_tool  # type: ignore
 
 # =============================================================================
-# 0) CONSTANTS / ALLOWLISTS
+# 0) CONSTANTS
 # =============================================================================
 HF_ROUTER_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
 HF_ROUTER_COMPLETIONS_URL = "https://router.huggingface.co/v1/completions"
@@ -69,50 +53,15 @@ HF_ALLOWED_MODELS: List[str] = [
     "mistralai/Mistral-7B-Instruct-v0.2",
 ]
 
-# ✅ Allowlist relations (tables + views)
-RELATIONS: Dict[str, Dict[str, Any]] = {
-    # Tables
-    "members": {"type": "table", "truth": True},
-    "contributions": {"type": "table"},
-    "foundation_contributions": {"type": "table"},
-    "loans": {"type": "table"},
-    "loan_payments": {"type": "table"},
-    "fines": {"type": "table"},
-    "payouts": {"type": "table"},
-    "sessions": {"type": "table"},
-    "minutes": {"type": "table"},
-    "attendance": {"type": "table"},
-    "signatures": {"type": "table"},
-    "audit_log": {"type": "table"},
-    "app_state": {"type": "table"},
-    "loan_requests": {"type": "table"},
-    "loan_repayments_pending": {"type": "table"},
-    "profiles": {"type": "table"},
-    "ml_training_data": {"type": "table"},
-    "member_contribution_totals": {"type": "table"},
-    "interest_ledger": {"type": "table"},
-    # Views (optional)
-    "v_finance_kpis": {"type": "view"},
-    "v_member_financial_totals": {"type": "view"},
-    "v_loans_with_member": {"type": "view"},
-    "v_loan_payments_with_member": {"type": "view"},
-    "v_contributions_with_member": {"type": "view"},
-    "v_foundation_contributions_with_member": {"type": "view"},
-    "v_payouts_with_member": {"type": "view"},
-    "v_next_beneficiary": {"type": "view"},
-    "v_loans_dpd": {"type": "view"},
-    "v_loans_next_interest": {"type": "view"},
-    "v_loans_next_interest_with_member": {"type": "view"},
-    "v_loan_power_status": {"type": "view"},
-    "v_attendance_all_time_per_member": {"type": "view"},
-    "v_attendance_by_member_session": {"type": "view"},
-    "v_attendance_member_totals": {"type": "view"},
-    "v_attendance_with_member": {"type": "view"},
-}
+ALL_TOOLS: Dict[str, Any] = {**dict(READ_TOOLS.items()), **dict(WRITE_TOOLS.items())}
 
 # =============================================================================
 # 1) CORE HELPERS
 # =============================================================================
+def iso_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+
+
 def _intro_only() -> str:
     return "Hello 👋🏽 I’m younchat — your Njangi assistant."
 
@@ -121,86 +70,28 @@ def _force_hello_prefix(text: str) -> str:
     t = (text or "").strip()
     if not t:
         return "Hello 👋🏽"
+    if t == _intro_only():
+        return t
     if not t.lower().startswith("hello"):
         return "Hello 👋🏽 " + t
     return t
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+def _clean(s: Any) -> str:
+    return ("" if s is None else str(s)).strip()
+
+
+def _lc(s: Any) -> str:
+    return _clean(s).lower()
 
 
 def _api_msg(e: Exception) -> str:
     if isinstance(e, APIError):
         payload = e.args[0] if getattr(e, "args", None) else {}
         if isinstance(payload, dict):
-            return str(payload.get("message") or payload.get("details") or payload)
+            return str(payload.get("message") or payload.get("details") or payload.get("hint") or payload)
         return str(payload)
     return str(e)
-
-
-def _clean(text: str) -> str:
-    return (text or "").strip()
-
-
-def _lc(text: str) -> str:
-    return _clean(text).lower()
-
-
-def _to_float(x: Any) -> float:
-    try:
-        v = pd.to_numeric(x, errors="coerce")
-        if pd.isna(v):
-            return 0.0
-        return float(v)
-    except Exception:
-        return 0.0
-
-
-def _fmt(x: Any) -> str:
-    return f"{_to_float(x):,.2f}"
-
-
-def _pct(x: Optional[float]) -> str:
-    if x is None:
-        return "—"
-    try:
-        return f"{x * 100:.1f}%"
-    except Exception:
-        return "—"
-
-
-def _ratio(n: Optional[float], d: Optional[float]) -> Optional[float]:
-    if n is None or d is None or d == 0:
-        return None
-    return n / d
-
-
-def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    if df is None or df.empty:
-        return None
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
-
-
-def _to_num_series(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(s, errors="coerce").fillna(0)
-
-
-def _safe_sum(df: pd.DataFrame, col: Optional[str]) -> float:
-    if df is None or df.empty or not col or col not in df.columns:
-        return 0.0
-    return float(_to_num_series(df[col]).sum())
-
-
-def _db_proof_line(row_counts: Dict[str, int]) -> str:
-    ts = _utc_now()
-    if not row_counts:
-        return f"DB Proof: (no row counts) • fetched_at={ts}"
-    parts = [f"{k}={int(v)}" for k, v in row_counts.items()]
-    return f"DB Proof: {', '.join(parts)} • fetched_at={ts}"
 
 
 def _looks_like_code_output(txt: str) -> bool:
@@ -209,641 +100,56 @@ def _looks_like_code_output(txt: str) -> bool:
         return False
     if "```" in t:
         return True
-    code_markers = [
-        "import ", "def ", "class ", "select ", "create table", "alter table", "drop table",
-        "insert into", "update ", "delete from"
+    markers = [
+        "import ",
+        "def ",
+        "class ",
+        "select ",
+        "create table",
+        "alter table",
+        "drop table",
+        "insert into",
+        "update ",
+        "delete from",
     ]
-    return any(m in t for m in code_markers)
+    return any(m in t for m in markers)
 
 
-# =============================================================================
-# 2) DB ADAPTER (Supabase reads)
-# =============================================================================
-def _sb_select(
-    sb_anon,
-    sb_service,
-    schema: str,
-    relation: str,
-    cols: str = "*",
-    limit: int = 2000,
-    filters: Optional[List[Tuple[str, str, Any]]] = None,
-    order: Optional[Tuple[str, bool]] = None,
-) -> pd.DataFrame:
-    sb = sb_service or sb_anon
-    if sb is None:
-        return pd.DataFrame()
-    if relation not in RELATIONS:
-        return pd.DataFrame()
-
-    def _apply(q):
-        if filters:
-            for col, op, val in filters:
-                if val is None:
-                    continue
-                if op == "eq":
-                    q = q.eq(col, val)
-                elif op == "gte":
-                    q = q.gte(col, val)
-                elif op == "lte":
-                    q = q.lte(col, val)
-                elif op == "ilike":
-                    q = q.ilike(col, val)
-                elif op == "in":
-                    q = q.in_(col, val)  # type: ignore
-        if order:
-            col, asc = order
-            q = q.order(col, desc=not asc)
-        return q
-
-    try:
-        q = sb.schema(schema).table(relation).select(cols).limit(limit)
-        q = _apply(q)
-        res = q.execute()
-        return pd.DataFrame(getattr(res, "data", None) or [])
-    except Exception:
-        try:
-            q = sb.table(relation).select(cols).limit(limit)
-            q = _apply(q)
-            res = q.execute()
-            return pd.DataFrame(getattr(res, "data", None) or [])
-        except Exception as e2:
-            st.warning(f"Could not read {schema}.{relation}: {_api_msg(e2)}")
-            return pd.DataFrame()
-
-
-# =============================================================================
-# 3) SNAPSHOT / STATE (Manifold builders)
-# =============================================================================
-def _rpc_finance_snapshot(sb_anon, sb_service, schema: str) -> Dict[str, Any]:
-    sb = sb_service or sb_anon
-    if sb is None:
+def safe_json_from_text(txt: str) -> Dict[str, Any]:
+    """Extract JSON from text safely (handles cases where model returns extra words)."""
+    if not txt:
         return {}
-
+    t = txt.strip()
     try:
-        res = sb.schema(schema).rpc("fn_finance_snapshot", {}).execute()
-    except Exception:
-        try:
-            res = sb.rpc("fn_finance_snapshot", {}).execute()
-        except Exception:
-            return {}
-
-    data = getattr(res, "data", None)
-    if not data:
-        return {}
-    if isinstance(data, list) and data and isinstance(data[0], dict):
-        return data[0]
-    if isinstance(data, dict):
-        return data
-    return {}
-
-
-def _snapshot_to_metrics(snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    if not snapshot:
-        return None
-
-    if isinstance(snapshot.get("totals"), dict) or isinstance(snapshot.get("counts"), dict) or isinstance(snapshot.get("ratios"), dict):
-        totals = snapshot.get("totals") or {}
-        counts = snapshot.get("counts") or {}
-        ratios = snapshot.get("ratios") or {}
-        return {
-            "notes": [],
-            "row_counts": {k: int(v) for k, v in (counts or {}).items() if v is not None},
-            "total_contributions": totals.get("total_contributions") or totals.get("contributions_total"),
-            "foundation_total": totals.get("foundation_total"),
-            "total_fines": totals.get("total_fines"),
-            "active_loan_exposure": totals.get("active_loan_exposure"),
-            "unpaid_interest": totals.get("unpaid_interest"),
-            "interest_total": totals.get("interest_ledger_total") or totals.get("interest_total"),
-            "active_loan_count": counts.get("active_loans") or counts.get("active_loan_count") or 0,
-            "overdue_loan_count": counts.get("overdue_loans") or counts.get("overdue_loan_count") or 0,
-            "overdue_ratio": ratios.get("overdue_ratio"),
-            "liquidity_pressure_ratio": ratios.get("liquidity_pressure_ratio"),
-            "concentration_share": ratios.get("concentration_share") if "concentration_share" in ratios else None,
-            "top_borrower_member_id": ratios.get("top_borrower_member_id") if "top_borrower_member_id" in ratios else None,
-        }
-
-    rc = snapshot.get("counts") if isinstance(snapshot.get("counts"), dict) else {}
-    return {
-        "notes": [],
-        "row_counts": {k: int(v) for k, v in (rc or {}).items() if v is not None},
-        "total_contributions": snapshot.get("total_contributions"),
-        "foundation_total": snapshot.get("foundation_total"),
-        "total_fines": snapshot.get("total_fines"),
-        "active_loan_exposure": snapshot.get("active_loan_exposure"),
-        "unpaid_interest": snapshot.get("unpaid_interest"),
-        "interest_total": snapshot.get("interest_ledger_total") or snapshot.get("interest_total"),
-        "active_loan_count": snapshot.get("active_loan_count") or 0,
-        "overdue_loan_count": snapshot.get("overdue_loan_count") or 0,
-        "overdue_ratio": snapshot.get("overdue_ratio"),
-        "liquidity_pressure_ratio": snapshot.get("liquidity_pressure_ratio"),
-        "concentration_share": snapshot.get("concentration_share"),
-        "top_borrower_member_id": snapshot.get("top_borrower_member_id"),
-    }
-
-
-def _active_loan_filter(loans: pd.DataFrame) -> pd.DataFrame:
-    if loans is None or loans.empty:
-        return loans
-    status_col = _pick_col(loans, ["status"])
-    if not status_col:
-        return loans
-    s = loans[status_col].astype(str).str.lower().fillna("")
-    active_status = {"active", "open", "ongoing", "overdue", "late", "running", "disbursed"}
-    return loans[s.isin(active_status)]
-
-
-def _overdue_loan_filter(loans: pd.DataFrame) -> pd.DataFrame:
-    if loans is None or loans.empty:
-        return loans
-    status_col = _pick_col(loans, ["status"])
-    if status_col:
-        s = loans[status_col].astype(str).str.lower().fillna("")
-        return loans[s.isin({"overdue", "late"})]
-    dpd_col = _pick_col(loans, ["dpd", "days_past_due", "overdue_days"])
-    if dpd_col:
-        dpd = _to_num_series(loans[dpd_col])
-        return loans[dpd > 0]
-    return loans.iloc[0:0]
-
-
-def _loan_balance_col(loans: pd.DataFrame) -> Optional[str]:
-    return _pick_col(loans, ["principal_current", "outstanding_principal", "principal_remaining", "principal", "amount", "total_due"])
-
-
-def _unpaid_interest_col(loans: pd.DataFrame) -> Optional[str]:
-    return _pick_col(loans, ["unpaid_interest", "interest_unpaid", "interest_due", "interest_balance"])
-
-
-def _collect_global_finance_context(sb_anon, sb_service, schema: str) -> Dict[str, Any]:
-    snap = _rpc_finance_snapshot(sb_anon, sb_service, schema)
-    if snap:
-        return {"ok": True, "notes": [], "snapshot": snap, "mode": "rpc"}
-
-    out: Dict[str, Any] = {"ok": True, "notes": ["Snapshot unavailable → fallback table scan."], "df": {}, "mode": "tables"}
-    out["df"]["contributions"] = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=200000)
-    out["df"]["foundation_contributions"] = _sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=200000)
-    out["df"]["loans"] = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=200000)
-    out["df"]["interest_ledger"] = _sb_select(sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=200000)
-    out["df"]["fines"] = _sb_select(sb_anon, sb_service, schema, "fines", cols="*", limit=200000)
-    return out
-
-
-def _compute_global_metrics(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    snap = ctx.get("snapshot") or {}
-    snap_metrics = _snapshot_to_metrics(snap) if isinstance(snap, dict) else None
-    if snap_metrics is not None:
-        snap_metrics["notes"] = list(snap_metrics.get("notes") or []) + list(ctx.get("notes") or [])
-        snap_metrics["_mode"] = ctx.get("mode")
-        snap_metrics["_generated_at"] = _utc_now()
-        return snap_metrics
-
-    dfc = (ctx.get("df") or {}).get("contributions", pd.DataFrame())
-    dff = (ctx.get("df") or {}).get("foundation_contributions", pd.DataFrame())
-    dfl = (ctx.get("df") or {}).get("loans", pd.DataFrame())
-    dfi = (ctx.get("df") or {}).get("interest_ledger", pd.DataFrame())
-    dffines = (ctx.get("df") or {}).get("fines", pd.DataFrame())
-
-    notes: List[str] = list(ctx.get("notes") or [])
-
-    contrib_col = _pick_col(dfc, ["amount"])
-    if not contrib_col and not dfc.empty:
-        notes.append("Missing contributions amount column (expected: amount).")
-    total_contributions: Optional[float] = _safe_sum(dfc, contrib_col) if contrib_col else (0.0 if dfc.empty else None)
-
-    foundation_col = _pick_col(dff, ["amount"])
-    if not foundation_col and not dff.empty:
-        notes.append("Missing foundation_contributions amount column (expected: amount).")
-    foundation_total: Optional[float] = _safe_sum(dff, foundation_col) if foundation_col else (0.0 if dff.empty else None)
-
-    fines_col = _pick_col(dffines, ["amount"])
-    if not fines_col and not dffines.empty:
-        notes.append("Missing fines amount column (expected: amount).")
-    total_fines: Optional[float] = _safe_sum(dffines, fines_col) if fines_col else (0.0 if dffines.empty else None)
-
-    active_loans = _active_loan_filter(dfl)
-    overdue_loans = _overdue_loan_filter(active_loans)
-
-    bal_col = _loan_balance_col(active_loans)
-    if not bal_col and not active_loans.empty:
-        notes.append("Missing loans balance column (expected: principal_current or principal).")
-    active_loan_exposure: Optional[float] = _safe_sum(active_loans, bal_col) if bal_col else (0.0 if active_loans.empty else None)
-
-    unpaid_col = _unpaid_interest_col(active_loans)
-    if unpaid_col is None and not active_loans.empty:
-        notes.append("Missing loans unpaid interest column (expected: unpaid_interest).")
-    unpaid_interest: Optional[float] = _safe_sum(active_loans, unpaid_col) if unpaid_col else (0.0 if active_loans.empty else None)
-
-    active_count = int(len(active_loans)) if active_loans is not None else 0
-    overdue_count = int(len(overdue_loans)) if overdue_loans is not None else 0
-    overdue_ratio: Optional[float] = (overdue_count / active_count) if active_count > 0 else (0.0 if overdue_count == 0 else None)
-
-    interest_col = _pick_col(dfi, ["amount"])
-    if interest_col is None and not dfi.empty:
-        notes.append("Missing interest_ledger amount column (expected: amount).")
-    interest_total: Optional[float] = _safe_sum(dfi, interest_col) if interest_col else (0.0 if dfi.empty else None)
-
-    liquidity_pressure = _ratio(active_loan_exposure, total_contributions) if active_loan_exposure is not None else None
-
-    row_counts = {
-        "contributions": int(len(dfc)),
-        "foundation_contributions": int(len(dff)),
-        "loans": int(len(dfl)),
-        "interest_ledger": int(len(dfi)),
-        "fines": int(len(dffines)),
-    }
-
-    return {
-        "notes": notes,
-        "row_counts": row_counts,
-        "total_contributions": total_contributions,
-        "foundation_total": foundation_total,
-        "total_fines": total_fines,
-        "active_loan_exposure": active_loan_exposure,
-        "active_loan_count": active_count,
-        "overdue_loan_count": overdue_count,
-        "overdue_ratio": overdue_ratio,
-        "unpaid_interest": unpaid_interest,
-        "interest_total": interest_total,
-        "liquidity_pressure_ratio": liquidity_pressure,
-        "concentration_share": None,
-        "top_borrower_member_id": None,
-        "_mode": ctx.get("mode"),
-        "_generated_at": _utc_now(),
-    }
-
-
-def _risk_classification(metrics: Dict[str, Any]) -> Tuple[str, List[str]]:
-    signals: List[str] = []
-    lpr = metrics.get("liquidity_pressure_ratio")
-    overdue_ratio = metrics.get("overdue_ratio")
-    unpaid_interest = metrics.get("unpaid_interest")
-    conc = metrics.get("concentration_share")
-
-    if lpr is not None and lpr > 0.75:
-        signals.append("Liquidity pressure > 75% (Exposure ÷ Contributions).")
-    if overdue_ratio is not None and overdue_ratio > 0.20:
-        signals.append("Overdue ratio is elevated (> 20% of active loans).")
-    if unpaid_interest is not None and unpaid_interest > 0:
-        signals.append("Unpaid interest exists on active loans.")
-    if conc is not None and conc > 0.40:
-        signals.append("Concentration risk: top borrower > 40% of exposure.")
-
-    score = 0
-    if lpr is not None:
-        score += 2 if lpr > 0.75 else (1 if lpr > 0.50 else 0)
-    if overdue_ratio is not None:
-        score += 2 if overdue_ratio > 0.30 else (1 if overdue_ratio > 0.10 else 0)
-    if unpaid_interest is not None:
-        score += 1 if unpaid_interest > 0 else 0
-    if conc is not None:
-        score += 2 if conc > 0.50 else (1 if conc > 0.35 else 0)
-
-    if score >= 6:
-        return "Critical", signals
-    if score >= 4:
-        return "High", signals
-    if score >= 2:
-        return "Elevated", signals
-    if score >= 1:
-        return "Moderate", signals
-    return "Low", signals
-
-
-def _health_score(metrics: Dict[str, Any]) -> Tuple[Optional[int], List[str]]:
-    total_contributions = metrics.get("total_contributions")
-    foundation_total = metrics.get("foundation_total")
-    active_exposure = metrics.get("active_loan_exposure")
-    overdue_ratio = metrics.get("overdue_ratio")
-
-    if total_contributions is None or foundation_total is None or active_exposure is None or overdue_ratio is None:
-        return None, ["Health Score not generated: insufficient DB context (missing totals/exposure/overdue ratio)."]
-
-    lpr = _ratio(active_exposure, total_contributions)
-    if lpr is None:
-        return None, ["Health Score not generated: cannot compute Liquidity Pressure Ratio."]
-
-    if lpr <= 0.25:
-        liq = 95
-    elif lpr <= 0.50:
-        liq = 80
-    elif lpr <= 0.75:
-        liq = 60
-    else:
-        liq = 35
-
-    if overdue_ratio <= 0.05:
-        cred = 95
-    elif overdue_ratio <= 0.10:
-        cred = 85
-    elif overdue_ratio <= 0.20:
-        cred = 65
-    else:
-        cred = 40
-
-    coverage = _ratio(total_contributions, max(active_exposure, 1e-9))
-    contrib_strength = 90 if (coverage is not None and coverage >= 4) else (75 if (coverage is not None and coverage >= 2) else (60 if (coverage is not None and coverage >= 1) else 40))
-
-    fcover = _ratio(foundation_total, max(active_exposure, 1e-9))
-    foundation_strength = 90 if (fcover is not None and fcover >= 1) else (75 if (fcover is not None and fcover >= 0.5) else (60 if (fcover is not None and fcover >= 0.25) else 40))
-
-    score = round(0.30 * liq + 0.30 * cred + 0.20 * contrib_strength + 0.20 * foundation_strength)
-    reasons = [
-        f"Liquidity Strength from Liquidity Pressure Ratio = {_pct(lpr)}.",
-        f"Credit Stability from overdue ratio = {_pct(overdue_ratio)}.",
-        "Contribution Strength uses contribution-to-exposure coverage proxy.",
-        "Foundation Stability uses foundation-to-exposure coverage proxy.",
-    ]
-    return int(score), reasons
-
-
-def _score_level(score: int) -> str:
-    if score >= 90:
-        return "Excellent"
-    if score >= 75:
-        return "Strong"
-    if score >= 60:
-        return "Stable"
-    if score >= 40:
-        return "Elevated Risk"
-    return "High Risk"
-
-
-def _manifold_global_state(metrics: Dict[str, Any]) -> Dict[str, Any]:
-    risk_label, signals = _risk_classification(metrics)
-    hs, hs_reasons = _health_score(metrics)
-
-    return {
-        "manifold_type": "global_finance_state",
-        "generated_at_utc": metrics.get("_generated_at") or _utc_now(),
-        "mode": metrics.get("_mode") or "unknown",
-        "metrics": {
-            "total_contributions": metrics.get("total_contributions"),
-            "foundation_total": metrics.get("foundation_total"),
-            "total_fines": metrics.get("total_fines"),
-            "active_loan_exposure": metrics.get("active_loan_exposure"),
-            "active_loan_count": metrics.get("active_loan_count"),
-            "overdue_loan_count": metrics.get("overdue_loan_count"),
-            "overdue_ratio": metrics.get("overdue_ratio"),
-            "unpaid_interest": metrics.get("unpaid_interest"),
-            "interest_total": metrics.get("interest_total"),
-            "liquidity_pressure_ratio": metrics.get("liquidity_pressure_ratio"),
-            "concentration_share": metrics.get("concentration_share"),
-            "top_borrower_member_id": metrics.get("top_borrower_member_id"),
-        },
-        "derived": {
-            "risk_classification": risk_label,
-            "risk_signals": signals,
-            "health_score": hs,
-            "health_score_level": (_score_level(hs) if isinstance(hs, int) else None),
-            "health_score_reasons": hs_reasons,
-        },
-        "db_proof": {
-            "row_counts": metrics.get("row_counts") or {},
-            "notes": metrics.get("notes") or [],
-        },
-    }
-
-
-# =============================================================================
-# 4) MEMBERS TRUTH
-# =============================================================================
-def _load_members_truth(sb_anon, sb_service, schema: str, limit: int = 3000) -> pd.DataFrame:
-    df = _sb_select(sb_anon, sb_service, schema, "members", cols="*", limit=limit)
-    if df.empty:
-        return df
-
-    id_col = _pick_col(df, ["id", "member_id"])
-    name_col = _pick_col(df, ["name", "full_name"])
-    display_col = _pick_col(df, ["display_name"])
-
-    if not id_col:
-        return pd.DataFrame()
-
-    out = pd.DataFrame()
-    out["member_id"] = df[id_col].astype(str)
-
-    disp_clean = (
-        df[display_col].astype(str).replace(["None", "nan", "NaN", "NULL", "null"], "").fillna("").str.strip()
-        if display_col and display_col in df.columns
-        else pd.Series([""] * len(df))
-    )
-    nm_clean = (
-        df[name_col].astype(str).replace(["None", "nan", "NaN", "NULL", "null"], "").fillna("").str.strip()
-        if name_col and name_col in df.columns
-        else pd.Series([""] * len(df))
-    )
-
-    out["member_name"] = disp_clean.where(disp_clean != "", nm_clean).fillna("").replace("", "(no name)")
-
-    try:
-        out["_id_num"] = pd.to_numeric(out["member_id"], errors="coerce")
-        out = out.sort_values(["_id_num", "member_id"], ascending=True).drop(columns=["_id_num"])
+        obj = json.loads(t)
+        return obj if isinstance(obj, dict) else {}
     except Exception:
         pass
 
-    return out
+    try:
+        i = t.find("{")
+        j = t.rfind("}")
+        if i >= 0 and j > i:
+            obj = json.loads(t[i : j + 1])
+            return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+    return {}
 
 
-def _member_name_from_truth(members_truth: pd.DataFrame, member_id: str) -> str:
-    if members_truth is None or members_truth.empty:
-        return "(unknown)"
-    hit = members_truth[members_truth["member_id"].astype(str) == str(member_id)]
-    if hit.empty:
-        return "(unknown)"
-    return str(hit.iloc[0]["member_name"])
-
-
-def _member_exists(members_truth: pd.DataFrame, member_id: str) -> bool:
-    if members_truth is None or members_truth.empty:
-        return False
-    return not members_truth[members_truth["member_id"].astype(str) == str(member_id)].empty
-
-
-def _member_risk_grade(active_bal: float, unpaid: float) -> str:
-    if active_bal <= 0 and unpaid <= 0:
-        return "A"
-    if active_bal > 0 and unpaid <= 0:
-        return "B"
-    if active_bal > 0 and unpaid > 0:
-        return "C"
-    if unpaid > 0:
-        return "C"
-    return "C"
-
-
-def _compute_member_totals_from_tables(
-    sb_anon, sb_service, schema: str, member_id: str
-) -> Tuple[Dict[str, Any], List[str]]:
-    notes: List[str] = []
-
-    contributions = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
-    foundation = _sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
-    fines = _sb_select(sb_anon, sb_service, schema, "fines", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
-    loans = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
-    interest_ledger = _sb_select(sb_anon, sb_service, schema, "interest_ledger", cols="*", limit=200000, filters=[("member_id", "eq", member_id)])
-
-    contrib_col = _pick_col(contributions, ["amount"])
-    found_col = _pick_col(foundation, ["amount"])
-    fines_col = _pick_col(fines, ["amount"])
-    interest_col = _pick_col(interest_ledger, ["amount"])
-
-    active = _active_loan_filter(loans)
-    bal_col = _loan_balance_col(active)
-    unpaid_col = _unpaid_interest_col(active)
-
-    if contrib_col is None and not contributions.empty:
-        notes.append("Missing contributions amount column (expected: amount).")
-    if found_col is None and not foundation.empty:
-        notes.append("Missing foundation_contributions amount column (expected: amount).")
-    if fines_col is None and not fines.empty:
-        notes.append("Missing fines amount column (expected: amount).")
-    if bal_col is None and not active.empty:
-        notes.append("Missing loans balance column (expected: principal_current or principal).")
-    if unpaid_col is None and not active.empty:
-        notes.append("Missing loans unpaid interest column (expected: unpaid_interest).")
-
-    out = {
-        "source": "tables",
-        "contributions_total": _safe_sum(contributions, contrib_col),
-        "foundation_total": _safe_sum(foundation, found_col),
-        "fines_total": _safe_sum(fines, fines_col),
-        "active_loan_balance": _safe_sum(active, bal_col) if bal_col else 0.0,
-        "active_unpaid_interest": _safe_sum(active, unpaid_col) if unpaid_col else 0.0,
-        "interest_total": _safe_sum(interest_ledger, interest_col),
-        "_rows": {
-            "members": 1,
-            "contributions": int(len(contributions)),
-            "foundation_contributions": int(len(foundation)),
-            "fines": int(len(fines)),
-            "loans": int(len(loans)),
-            "interest_ledger": int(len(interest_ledger)),
-        },
-        "_generated_at": _utc_now(),
-    }
-    return out, notes
-
-
-def _manifold_member_state(member_id: str, name: str, table_totals: Dict[str, Any], table_notes: List[str]) -> Dict[str, Any]:
-    active_bal = _to_float(table_totals.get("active_loan_balance"))
-    unpaid = _to_float(table_totals.get("active_unpaid_interest"))
-    grade = _member_risk_grade(active_bal, unpaid)
-
-    contrib = _to_float(table_totals.get("contributions_total"))
-    exposure_ratio = _ratio(active_bal, contrib)
-
-    return {
-        "manifold_type": "member_finance_state",
-        "generated_at_utc": table_totals.get("_generated_at") or _utc_now(),
-        "member": {"member_id": str(member_id), "member_name": str(name)},
-        "metrics": {
-            "contributions_total": table_totals.get("contributions_total"),
-            "foundation_total": table_totals.get("foundation_total"),
-            "fines_total": table_totals.get("fines_total"),
-            "active_loan_balance": table_totals.get("active_loan_balance"),
-            "active_unpaid_interest": table_totals.get("active_unpaid_interest"),
-            "interest_total": table_totals.get("interest_total"),
-        },
-        "derived": {
-            "risk_grade": grade,
-            "exposure_to_contributions_ratio": exposure_ratio,
-            "signals": [
-                ("Unpaid interest exists" if unpaid > 0 else "No unpaid interest detected"),
-                ("Active exposure exists" if active_bal > 0 else "No active exposure detected"),
-            ],
-        },
-        "db_proof": {"row_counts": table_totals.get("_rows") or {}, "notes": table_notes or []},
-    }
+def _fmt_money(x: Any) -> str:
+    try:
+        v = pd.to_numeric(x, errors="coerce")
+        if pd.isna(v):
+            return "0.00"
+        return f"{float(v):,.2f}"
+    except Exception:
+        return "0.00"
 
 
 # =============================================================================
-# 5) INTENTS / PARSING
+# 2) MEMBER ID PARSING (member_id=4 etc.)
 # =============================================================================
-def _wants_help(text: str) -> bool:
-    return _lc(text) in {"help", "/help", "commands", "options"}
-
-
-def _wants_list_members(text: str) -> bool:
-    t = _lc(text)
-    phrases = [
-        "list all members", "list members", "show all members", "show members",
-        "members list", "all members", "member list", "who are the members",
-        "list members id", "member ids",
-    ]
-    return t in {"members", "member"} or any(p in t for p in phrases)
-
-
-def _wants_tables_list(text: str) -> bool:
-    return _lc(text) in {"tables", "relations", "views", "list tables", "list views"}
-
-
-def _wants_describe(text: str) -> bool:
-    t = _lc(text)
-    return t.startswith("describe ") or t.startswith("columns ") or t.startswith("cols ") or t.startswith("schema ")
-
-
-def _wants_show_table(text: str) -> bool:
-    t = _lc(text)
-    return t.startswith("show ") or t.startswith("preview ") or t.startswith("open ")
-
-
-def _wants_kpis(text: str) -> bool:
-    t = _lc(text)
-    return any(k in t for k in ["kpi", "kpis", "finance kpi", "finance kpis", "dashboard kpi"])
-
-
-def _wants_loans(text: str) -> bool:
-    t = _lc(text)
-    return any(k in t for k in ["loan", "loans", "borrow", "repay", "repayment", "overdue", "dpd", "interest due"])
-
-
-def _wants_financial_review(text: str) -> bool:
-    t = _lc(text)
-    triggers = [
-        "how are we doing", "are we stable", "is njangi healthy", "njangi health",
-        "health score", "financial condition", "risk review", "any risk",
-        "liquidity", "credit risk", "executive summary", "summary",
-        "control tower", "financial intelligence",
-    ]
-    return any(x in t for x in triggers)
-
-
-def _wants_member_risk(text: str) -> bool:
-    t = _lc(text)
-    return any(x in t for x in ["member risk", "risk grade", "credit grade", "member health"])
-
-
-def _wants_internet(text: str) -> bool:
-    t = _lc(text)
-    return t.startswith("web:") or t.startswith("internet:") or t.startswith("tavily:")
-
-
-def _strip_web_prefix(q: str) -> str:
-    return re.sub(r"^(web:|internet:|tavily:)\s*", "", (q or "").strip(), flags=re.IGNORECASE).strip()
-
-
-def _wants_verify_member(text: str) -> bool:
-    t = _lc(text)
-    return t.startswith("verify member ") or t.startswith("verify ")
-
-
-def _extract_verify_member_id(text: str) -> Optional[str]:
-    t = _lc(text)
-    t = re.sub(r"^verify(\s+member)?\s+", "", t).strip()
-    m = re.search(r"(\d+)", t)
-    return m.group(1) if m else None
-
-
-def _extract_relation_name(text: str) -> Optional[str]:
-    t = _lc(text)
-    t = re.sub(r"^(show|preview|open|describe|columns|cols|schema)\s+", "", t).strip()
-    t = re.sub(r"^table\s+", "", t).strip()
-    t = re.sub(r"[^\w]+$", "", t)
-    if not t:
-        return None
-    token = t.split()[0]
-    return token if token in RELATIONS else None
-
-
 _MEMBER_ID_PATTERNS = [
     re.compile(r"\bmember[_\s-]?id\s*[:=#]?\s*(\d+)\b", re.IGNORECASE),
     re.compile(r"\bmember\s*#?\s*(\d+)\b", re.IGNORECASE),
@@ -869,188 +175,134 @@ def _is_member_id_only_request(text: str) -> bool:
     mid = _extract_member_id(t)
     if not mid:
         return False
-
     if t.strip().isdigit():
         return True
+    has_member_token = any(tok in t for tok in ["member", "member_id", "member id", "id="])
+    other = any(
+        tok in t
+        for tok in ["show ", "describe ", "tables", "members", "loans", "kpi", "web:", "internet:", "tavily:", "verify "]
+    )
+    return has_member_token and (not other)
 
-    member_tokens = {"member", "member_id", "member-id", "member id", "id"}
-    has_member_token = any(tok in t for tok in member_tokens)
 
-    other_cmd_tokens = [
-        "loans", "loan", "kpi", "kpis", "tables", "show ", "describe ", "verify ",
-        "contributions", "fines", "payouts", "attendance", "minutes",
-        "web:", "internet:", "tavily:",
-        # action keywords (avoid treating as id-only)
-        "create", "add", "record", "approve", "fine", "pay", "payout", "session",
+# =============================================================================
+# 3) INTENTS / ROUTING
+# =============================================================================
+def _wants_help(text: str) -> bool:
+    return _lc(text) in {"help", "/help", "commands", "options"}
+
+
+def _wants_internet(text: str) -> bool:
+    t = _lc(text)
+    return t.startswith("web:") or t.startswith("internet:") or t.startswith("tavily:")
+
+
+def _strip_web_prefix(q: str) -> str:
+    return re.sub(r"^(web:|internet:|tavily:)\s*", "", (q or "").strip(), flags=re.IGNORECASE).strip()
+
+
+def _wants_tables_list(text: str) -> bool:
+    return _lc(text) in {"tables", "relations", "views", "list tables", "list views"}
+
+
+def _wants_list_members(text: str) -> bool:
+    t = _lc(text)
+    phrases = [
+        "list all members",
+        "list members",
+        "show all members",
+        "show members",
+        "members list",
+        "all members",
+        "member list",
+        "who are the members",
+        "member ids",
+        "list members id",
     ]
-    has_other = any(tok in t for tok in other_cmd_tokens)
-    return has_member_token and not has_other
+    return t in {"members", "member"} or any(p in t for p in phrases)
+
+
+def _wants_kpis(text: str) -> bool:
+    t = _lc(text)
+    return any(k in t for k in ["kpi", "kpis", "finance kpi", "finance kpis", "dashboard kpi"])
+
+
+def _wants_loans(text: str) -> bool:
+    t = _lc(text)
+    return any(k in t for k in ["loan", "loans", "overdue", "dpd", "repay", "repayment"])
+
+
+def _wants_describe(text: str) -> bool:
+    t = _lc(text)
+    return t.startswith("describe ") or t.startswith("columns ") or t.startswith("cols ") or t.startswith("schema ")
+
+
+def _wants_show_table(text: str) -> bool:
+    t = _lc(text)
+    return t.startswith("show ") or t.startswith("preview ") or t.startswith("open ")
+
+
+def _extract_relation_name(text: str) -> Optional[str]:
+    t = _lc(text)
+    t = re.sub(r"^(show|preview|open|describe|columns|cols|schema)\s+", "", t).strip()
+    t = re.sub(r"^table\s+", "", t).strip()
+    t = re.sub(r"[^\w]+$", "", t)
+    if not t:
+        return None
+    return t.split()[0]
+
+
+def _wants_verify_member(text: str) -> bool:
+    t = _lc(text)
+    return t.startswith("verify member ") or t.startswith("verify ")
+
+
+def _extract_verify_member_id(text: str) -> Optional[str]:
+    t = _lc(text)
+    t = re.sub(r"^verify(\s+member)?\s+", "", t).strip()
+    m = re.search(r"(\d+)", t)
+    return m.group(1) if m else None
+
+
+def _wants_db_actions(text: str) -> bool:
+    t = _lc(text)
+    verbs = [
+        "create ",
+        "add ",
+        "record ",
+        "approve ",
+        "fine ",
+        "pay ",
+        "payout ",
+        "disburse ",
+        "mark paid",
+        "new session",
+        "open session",
+        "make payment",
+    ]
+    return any(v in t for v in verbs)
 
 
 def _is_db_command(text: str) -> bool:
     t = _lc(text)
     if not t:
         return False
-
-    # ✅ member id present => DB
     if _extract_member_id(t) is not None:
         return True
-
-    if t in RELATIONS:
+    if _wants_help(t) or _wants_tables_list(t) or _wants_list_members(t) or _wants_kpis(t) or _wants_loans(t):
         return True
-    if _wants_list_members(t) or _wants_loans(t) or _wants_kpis(t) or _wants_tables_list(t):
+    if _wants_show_table(t) or _wants_describe(t) or _wants_verify_member(t):
         return True
-    if _wants_show_table(t) or _wants_describe(t) or _wants_help(t) or _wants_verify_member(t):
+    finance_words = ["contribution", "payout", "loan", "interest", "overdue", "liquidity", "foundation", "risk", "health score", "total"]
+    if any(w in t for w in finance_words):
         return True
-
-    finance_words = [
-        "contribution", "contributions", "payout", "payouts", "loan", "loans",
-        "repayment", "interest", "unpaid", "overdue", "balance", "exposure",
-        "liquidity", "foundation", "kpi", "kpis", "risk", "health score", "grade",
-        "total", "arrears", "dpd", "due",
-        # action words (still DB)
-        "create", "add", "record", "approve", "fine", "pay", "payout", "session", "mark paid"
-    ]
-    return any(w in t for w in finance_words)
-
-
-def _wants_db_actions(text: str) -> bool:
-    """
-    True when user is requesting a write / operational action.
-    We allow HF to PLAN tool JSON, but execution is DB-only + confirm.
-    """
-    t = _lc(text)
-    verbs = [
-        "create ", "add ", "record ", "approve ", "fine ", "mark fine", "mark paid",
-        "pay fine", "payout ", "disburse ", "request loan", "loan request",
-        "make payment", "loan payment", "new session", "open session"
-    ]
-    return any(v in t for v in verbs)
+    if _wants_db_actions(t):
+        return True
+    return False
 
 
 # =============================================================================
-# 6) TABLE/VIEW OPERATIONS
-# =============================================================================
-def _describe_relation(sb_anon, sb_service, schema: str, relation: str) -> Tuple[str, pd.DataFrame, str]:
-    df = _sb_select(sb_anon, sb_service, schema, relation, cols="*", limit=1)
-    cols = list(df.columns) if df is not None else []
-    out = pd.DataFrame({"column_name": cols})
-    msg = f"Hello 👋🏽 Columns for **{relation}** ({RELATIONS[relation]['type']}):"
-    return msg, out, f"describe:{relation}"
-
-
-def _show_relation(sb_anon, sb_service, schema: str, relation: str) -> Tuple[str, pd.DataFrame, str]:
-    df = _sb_select(sb_anon, sb_service, schema, relation, cols="*", limit=2000)
-    msg = f"Hello 👋🏽 Preview of **{relation}** ({RELATIONS[relation]['type']}):"
-    return msg, df, f"show:{relation}"
-
-
-def _loans_with_member(
-    sb_anon, sb_service, schema: str, member_id: Optional[str], members_truth: pd.DataFrame
-) -> Tuple[str, pd.DataFrame, str]:
-    if "v_loans_with_member" in RELATIONS:
-        filters = [("member_id", "eq", member_id)] if member_id else None
-        df = _sb_select(sb_anon, sb_service, schema, "v_loans_with_member", cols="*", limit=5000, filters=filters)
-        src = "v_loans_with_member"
-    else:
-        filters = [("member_id", "eq", member_id)] if member_id else None
-        df = _sb_select(sb_anon, sb_service, schema, "loans", cols="*", limit=5000, filters=filters)
-        src = "loans"
-    title = "Loans" if not member_id else f"Loans for {_member_name_from_truth(members_truth, member_id)} (member_id={member_id})"
-    return title, df, src
-
-
-def _kpis(sb_anon, sb_service, schema: str) -> Tuple[str, pd.DataFrame, str]:
-    if "v_finance_kpis" in RELATIONS:
-        df = _sb_select(sb_anon, sb_service, schema, "v_finance_kpis", cols="*", limit=200)
-        return "Finance KPIs", df, "v_finance_kpis"
-    return "Finance KPIs", pd.DataFrame([{"note": "v_finance_kpis not available"}]), "fallback"
-
-
-def _compute_member_totals_from_view(
-    sb_anon, sb_service, schema: str, member_id: str
-) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    if "v_member_financial_totals" not in RELATIONS:
-        return None, None
-    v = _sb_select(sb_anon, sb_service, schema, "v_member_financial_totals", cols="*", limit=50, filters=[("member_id", "eq", member_id)])
-    if v.empty:
-        return None, None
-    row = v.iloc[0].to_dict()
-
-    def _extract(row0: Dict[str, Any], keys: List[str]) -> float:
-        for k in keys:
-            if k in row0:
-                return _to_float(row0.get(k))
-        return 0.0
-
-    out = {
-        "source": "view",
-        "contributions_total": _extract(row, ["contributions_total", "contribution_total", "contributions", "total_contributions"]),
-        "foundation_total": _extract(row, ["foundation_total", "foundation_contributions_total", "foundation", "total_foundation"]),
-        "fines_total": _extract(row, ["fines_total", "fines", "total_fines"]),
-        "active_loan_balance": _extract(row, ["active_loan_balance", "loan_balance", "principal_current_total", "active_balance"]),
-        "active_unpaid_interest": _extract(row, ["active_unpaid_interest", "unpaid_interest_total", "unpaid_interest", "interest_due_total"]),
-        "interest_total": _extract(row, ["interest_total", "interest_ledger_total", "interest", "total_interest"]),
-    }
-    return out, row
-
-
-def _member_verify_view_vs_tables(
-    sb_anon,
-    sb_service,
-    schema: str,
-    member_id: str,
-    members_truth: pd.DataFrame,
-) -> Tuple[str, pd.DataFrame, str, str]:
-    if not _member_exists(members_truth, member_id):
-        return (
-            "Hello 👋🏽 I can’t confirm that member_id exists in `members` (source of truth). Type **members** first.",
-            pd.DataFrame(),
-            "Verify",
-            "members_truth_missing",
-        )
-
-    name = _member_name_from_truth(members_truth, member_id)
-    table_totals, table_notes = _compute_member_totals_from_tables(sb_anon, sb_service, schema, member_id)
-    view_totals, _view_row = _compute_member_totals_from_view(sb_anon, sb_service, schema, member_id)
-
-    rows = []
-    if view_totals is not None:
-        rows.append({"source": "view", **{k: view_totals.get(k) for k in view_totals if k != "source"}})
-    rows.append(
-        {
-            "source": "tables",
-            "contributions_total": table_totals.get("contributions_total"),
-            "foundation_total": table_totals.get("foundation_total"),
-            "fines_total": table_totals.get("fines_total"),
-            "active_loan_balance": table_totals.get("active_loan_balance"),
-            "active_unpaid_interest": table_totals.get("active_unpaid_interest"),
-            "interest_total": table_totals.get("interest_total"),
-        }
-    )
-    df = pd.DataFrame(rows)
-
-    msg_lines = [
-        "Hello 👋🏽 Verify Member Totals (DB-grounded)",
-        "",
-        "1️⃣ Current Situation",
-        f"- Member: **{name}** (member_id={member_id})",
-        "- This compares view `v_member_financial_totals` (if present) vs raw table sums.",
-        "",
-        "🧾 DB Proof",
-        f"- {_db_proof_line(table_totals.get('_rows', {}))}",
-    ]
-    if table_notes:
-        msg_lines.append("")
-        msg_lines.append("🔒 Data Integrity Notes (columns missing / limits)")
-        for n in table_notes:
-            msg_lines.append(f"- {n}")
-
-    return "\n".join(msg_lines), df, "Verify: view vs tables totals", "verify:view_vs_tables"
-
-
-# =============================================================================
-# 7) INTERNET (Tavily) — NEVER used for Njangi numbers
+# 4) INTERNET (Tavily) — NEVER for Njangi numbers
 # =============================================================================
 def _internet_enabled() -> bool:
     key = (os.getenv("TAVILY_API_KEY") or "").strip()
@@ -1088,7 +340,7 @@ def _tavily_search(query: str) -> Dict[str, Any]:
 
 
 # =============================================================================
-# 8) FOUNDATION MODEL (HF Router)
+# 5) FOUNDATION MODEL (HF Router) — Non-DB only
 # =============================================================================
 def _has_hf_token() -> bool:
     return bool((os.getenv("HF_TOKEN") or "").strip())
@@ -1149,61 +401,13 @@ def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 6
         return False, f"Bad HF completions response: {raw[:600]}"
 
 
-def _manifold_reasoner_prompt(manifold_state: Dict[str, Any], question: str) -> str:
-    return (
-        "You are younchat, an assistant inside the Njangi platform.\n"
-        "RULES (STRICT):\n"
-        "- Use ONLY MANIFOLD_STATE JSON below.\n"
-        "- Do NOT invent numbers, dates, or IDs.\n"
-        "- If something is missing in MANIFOLD_STATE, say: 'I don’t have that in this snapshot/state.'\n"
-        "- Keep answers short, structured, and directly responsive.\n"
-        "- Never output SQL or Python.\n\n"
-        f"MANIFOLD_STATE:\n{json.dumps(manifold_state, ensure_ascii=False)}\n\n"
-        f"USER_QUESTION:\n{question}\n\n"
-        "Answer:"
-    )
-
-
-def _hf_reason_over_manifold(question: str, manifold_state: Dict[str, Any]) -> Tuple[bool, str, str]:
-    token = (os.getenv("HF_TOKEN") or "").strip()
-    model = _hf_model()
-    force = _hf_force_mode()
-    if not token:
-        return False, "HF_TOKEN missing", "hf:missing"
-
-    sys = (
-        "You are younchat.\n"
-        "Start every answer with: 'Hello 👋🏽'.\n"
-        "Never output SQL or code.\n"
-    )
-    prompt = _manifold_reasoner_prompt(manifold_state, question)
-    messages = [{"role": "system", "content": sys}, {"role": "user", "content": prompt}]
-
-    if force == "completions":
-        ok, txt = _hf_router_completions(model, token, prompt)
-        return (ok, txt, f"hf:completions:{model}") if ok else (False, txt, f"hf:completions_failed:{model}")
-    if force == "chat":
-        ok, txt = _hf_router_chat(model, token, messages)
-        return (ok, txt, f"hf:chat:{model}") if ok else (False, txt, f"hf:chat_failed:{model}")
-
-    ok, txt = _hf_router_completions(model, token, prompt)
-    if ok and txt:
-        return True, txt, f"hf:completions:{model}"
-    ok2, txt2 = _hf_router_chat(model, token, messages)
-    if ok2 and txt2:
-        return True, txt2, f"hf:chat:{model}"
-    return False, (txt2 or txt or "HF failed"), f"hf:failed:{model}"
-
-
 def _foundation_intent_system_prompt() -> str:
     return (
         "You are younchat, the assistant inside the Njangi system.\n\n"
-        "GOAL:\n"
-        "Help members achieve their goal inside Njangi. Understand their intent and guide them to the correct Njangi action.\n\n"
         "STRICT RULES:\n"
         "1) Start every reply with exactly: \"Hello 👋🏽\"\n"
         "2) You are NOT allowed to invent or guess any Njangi financial numbers, balances, totals, dates, or member IDs.\n"
-        "3) If the request needs real Njangi data, you must tell them the exact DB command to type next, OR ask exactly ONE short clarifying question.\n"
+        "3) If the request needs real Njangi data, tell them the exact DB command to type next, OR ask exactly ONE short clarifying question.\n"
         "4) Do NOT output SQL, Python, code blocks, schema changes, or markdown fences.\n"
         "5) Keep replies short and system-focused.\n\n"
         "AVAILABLE DB COMMANDS YOU CAN RECOMMEND:\n"
@@ -1257,231 +461,63 @@ def _hf_smalltalk_answer(question: str) -> Tuple[bool, str, str]:
 
 
 # =============================================================================
-# ✅ 8B) HF ACTION PLANNER (returns ONLY JSON tool plan)
+# 6) TOOL RUNNER + CONFIRMATIONS (writes staged)
 # =============================================================================
-def _db_action_planner_system_prompt() -> str:
-    tool_list = sorted(list(ALL_TOOLS.keys()))
-    read_list = sorted(list(READ_TOOLS.keys()))
-    write_list = sorted(list(WRITE_TOOLS.keys()))
-    return (
-        "You are younchat inside Njangi.\n"
-        "You MUST output ONLY valid JSON. No prose.\n\n"
-        "GOAL:\n"
-        "Translate the user's request into Njangi tool actions.\n\n"
-        "STRICT RULES:\n"
-        "- Output ONLY JSON in one of these forms:\n"
-        "  1) {\"tool\":\"<tool>\",\"params\":{...}}\n"
-        "  2) {\"actions\":[{\"tool\":\"...\",\"params\":{...}}, ...]}\n"
-        "- NEVER invent IDs, totals, balances, or DB facts.\n"
-        "- If missing required info, output ONE action that is a READ tool to fetch it, OR ask for exactly one missing field by returning:\n"
-        "  {\"tool\":\"ask_one\",\"params\":{\"question\":\"...\"}}\n"
-        "- Use READ tools for lookup. Use WRITE tools only when user clearly wants a write.\n\n"
-        f"READ_TOOLS: {read_list}\n"
-        f"WRITE_TOOLS: {write_list}\n"
-        f"ALL_TOOLS: {tool_list}\n\n"
-        "PARAMS HINTS:\n"
-        "- member lookup: use member_query (name fragment or numeric member id)\n"
-        "- create_contribution requires: member_query, session_id, amount\n"
-        "- create_fine requires: member_query, amount, reason (optional session_id)\n"
-        "- approve_loan_request requires: loan_request_id, session_id\n"
-        "- create_loan_payment requires: loan_id, member_id, session_id, amount\n"
-    )
+@dataclass
+class ToolRun:
+    ok: bool
+    message: str
+    data: Any = None
 
 
-def _hf_plan_db_actions(user_text: str) -> Tuple[bool, Dict[str, Any], str]:
-    token = (os.getenv("HF_TOKEN") or "").strip()
-    if not token:
-        return False, {}, "hf:missing"
-    model = _hf_model()
+def _run_read_tool(sb_anon, sb_service, schema: str, tool: str, params: Dict[str, Any]) -> ToolRun:
+    try:
+        if tool == "members":
+            res = execute_tool("members", sb_anon, sb_service, schema, limit=int(params.get("limit") or 5000))
+            return ToolRun(True, "members ok", res)
+        if tool == "tables":
+            res = execute_tool("tables")
+            return ToolRun(True, "tables ok", res)
+        if tool == "show_table":
+            rel = _clean(params.get("relation"))
+            lim = int(params.get("limit") or 2000)
+            order_by = params.get("order_by") or None
+            order_asc = bool(params.get("order_asc") or False)
+            res = execute_tool("show_table", sb_anon, sb_service, schema, relation=rel, limit=lim, order_by=order_by, order_asc=order_asc)
+            return ToolRun(True, "show_table ok", res)
+        if tool == "describe_table":
+            rel = _clean(params.get("relation"))
+            res = execute_tool("describe_table", sb_anon, sb_service, schema, relation=rel)
+            return ToolRun(True, "describe_table ok", res)
+        if tool == "loans":
+            mid = params.get("member_id")
+            res = execute_tool("loans", sb_anon, sb_service, schema, member_id=str(mid) if mid is not None else None)
+            return ToolRun(True, "loans ok", res)
+        if tool == "member_summary":
+            mid = _clean(params.get("member_id"))
+            res = execute_tool("member_summary", sb_anon, sb_service, schema, member_id=mid)
+            return ToolRun(True, "member_summary ok", res)
 
-    sys = _db_action_planner_system_prompt()
-    messages = [{"role": "system", "content": sys}, {"role": "user", "content": user_text}]
-    ok, txt = _hf_router_chat(model, token, messages)
-    if not ok or not txt:
-        return False, {}, f"hf:planner_failed:{model}"
-
-    payload = safe_json_from_text(txt)
-    if not payload:
-        return False, {}, f"hf:planner_bad_json:{model}"
-
-    if payload.get("tool") == "ask_one":
-        return True, payload, f"hf:planner:{model}"
-
-    if "tool" in payload:
-        if payload.get("tool") not in ALL_TOOLS:
-            return False, {}, f"hf:planner_unknown_tool:{model}"
-        return True, payload, f"hf:planner:{model}"
-
-    if "actions" in payload and isinstance(payload["actions"], list):
-        for a in payload["actions"]:
-            if isinstance(a, dict) and a.get("tool") == "ask_one":
-                continue
-            if _clean(str((a or {}).get("tool") or "")) not in ALL_TOOLS:
-                return False, {}, f"hf:planner_unknown_tool:{model}"
-        return True, payload, f"hf:planner:{model}"
-
-    return False, {}, f"hf:planner_invalid_format:{model}"
-
-
-# =============================================================================
-# 9) LOCAL REPORT BUILDERS (still manifold-grounded)
-# =============================================================================
-def _build_control_tower_report_local(manifold: Dict[str, Any]) -> str:
-    m = (manifold or {}).get("metrics") or {}
-    d = (manifold or {}).get("derived") or {}
-    proof = (manifold or {}).get("db_proof") or {}
-
-    risk_label = d.get("risk_classification") or "—"
-    signals = d.get("risk_signals") or []
-    hs = d.get("health_score")
-    hs_lvl = d.get("health_score_level") or "—"
-    hs_reasons = d.get("health_score_reasons") or []
-
-    lines: List[str] = []
-    lines.append("Hello 👋🏽 Njangi Financial Intelligence Review (DB-grounded)\n")
-
-    lines.append("1️⃣ Current Situation")
-    lines.append(f"- Total contributions: **{_fmt(m.get('total_contributions'))}**" if m.get("total_contributions") is not None else "- Total contributions: **Not available**")
-    lines.append(f"- Foundation reserves: **{_fmt(m.get('foundation_total'))}**" if m.get("foundation_total") is not None else "- Foundation reserves: **Not available**")
-    lines.append(f"- Active loan exposure: **{_fmt(m.get('active_loan_exposure'))}**" if m.get("active_loan_exposure") is not None else "- Active loan exposure: **Not available**")
-    lines.append(f"- Active loans (count): **{int(m.get('active_loan_count') or 0)}**")
-    lines.append(f"- Overdue loans (count): **{int(m.get('overdue_loan_count') or 0)}**")
-    lines.append(f"- Overdue ratio: **{_pct(m.get('overdue_ratio'))}**" if m.get("overdue_ratio") is not None else "- Overdue ratio: **Not available**")
-    lines.append(f"- Unpaid interest: **{_fmt(m.get('unpaid_interest'))}**" if m.get("unpaid_interest") is not None else "- Unpaid interest: **Not available**")
-    lines.append(f"- Liquidity Pressure Ratio: **{_pct(m.get('liquidity_pressure_ratio'))}**" if m.get("liquidity_pressure_ratio") is not None else "- Liquidity Pressure Ratio: **Not available**")
-
-    lines.append("\n2️⃣ Risk Assessment")
-    lines.append(f"- Risk classification: **{risk_label}**")
-    if signals:
-        lines.append("- Signals:")
-        for s in signals[:8]:
-            lines.append(f"  - {s}")
-    else:
-        lines.append("- Signals: **None detected from available metrics**")
-
-    lines.append("\n🏆 NJANGI HEALTH SCORE (0–100)")
-    if hs is None:
-        lines.append("- Health Score not generated (missing inputs).")
-    else:
-        lines.append(f"- Score: **{hs}/100** → **{hs_lvl}**")
-        for r in hs_reasons[:6]:
-            lines.append(f"- {r}")
-
-    lines.append("\n🧾 DB Proof")
-    lines.append(f"- {_db_proof_line((proof.get('row_counts') or {}))}")
-
-    notes = proof.get("notes") or []
-    if notes:
-        lines.append("\n🔒 Data Integrity Notes")
-        for n in notes[:8]:
-            lines.append(f"- {n}")
-
-    return "\n".join(lines)
+        res = execute_tool(tool, sb_anon, sb_service, schema, **(params or {}))
+        return ToolRun(True, f"{tool} ok", res)
+    except Exception as e:
+        return ToolRun(False, f"{tool} failed: {e}", None)
 
 
-def _build_member_report_local(manifold: Dict[str, Any]) -> str:
-    mem = (manifold or {}).get("member") or {}
-    m = (manifold or {}).get("metrics") or {}
-    d = (manifold or {}).get("derived") or {}
-    proof = (manifold or {}).get("db_proof") or {}
-
-    lines: List[str] = []
-    lines.append("Hello 👋🏽 Member Financial Intelligence (DB-grounded)\n")
-    lines.append("1️⃣ Current Situation")
-    lines.append(f"- Member: **{mem.get('member_name','(unknown)')}** (member_id={mem.get('member_id','—')})")
-    lines.append(f"- Contributions total: **{_fmt(m.get('contributions_total'))}**")
-    lines.append(f"- Foundation total: **{_fmt(m.get('foundation_total'))}**")
-    lines.append(f"- Fines total: **{_fmt(m.get('fines_total'))}**")
-    lines.append(f"- Active loan balance: **{_fmt(m.get('active_loan_balance'))}**")
-    lines.append(f"- Active unpaid interest: **{_fmt(m.get('active_unpaid_interest'))}**")
-    lines.append(f"- Interest ledger total: **{_fmt(m.get('interest_total'))}**")
-
-    lines.append("\n2️⃣ Risk Assessment")
-    lines.append(f"- Member Risk Grade: **{d.get('risk_grade','—')}**")
-    ratio_val = d.get("exposure_to_contributions_ratio")
-    lines.append(f"- Exposure/Contributions ratio: **{_pct(ratio_val) if isinstance(ratio_val,(int,float)) else '—'}**")
-
-    lines.append("\n3️⃣ Signals")
-    for s in (d.get("signals") or [])[:6]:
-        lines.append(f"- {s}")
-
-    lines.append("\n4️⃣ Next Best Actions")
-    lines.append("- Type: **loans** (or include member id in your message) to see loan rows.")
-    lines.append("- Type: **verify member <id>** to compare view vs tables (integrity check).")
-
-    lines.append("\n🧾 DB Proof")
-    lines.append(f"- {_db_proof_line((proof.get('row_counts') or {}))}")
-
-    notes = proof.get("notes") or []
-    if notes:
-        lines.append("\n🔒 Data Integrity Notes")
-        for n in notes[:8]:
-            lines.append(f"- {n}")
-
-    return "\n".join(lines)
-
-
-# =============================================================================
-# ✅ 9B) TOOLS RUNNER + CONFIRMATION UI
-# =============================================================================
-def _run_tool_payload(supabase, ctx, payload: Dict[str, Any]) -> Dict[str, Any]:
-    out = {"reads": [], "staged": [], "asks": None, "errors": []}
-
-    if not isinstance(payload, dict):
-        out["errors"].append("Invalid payload type.")
-        return out
-
-    if payload.get("tool") == "ask_one":
-        q = _clean((payload.get("params") or {}).get("question"))
-        out["asks"] = q or "I need one detail to proceed. What’s missing?"
-        return out
-
-    actions: List[Dict[str, Any]] = []
-    if "actions" in payload and isinstance(payload["actions"], list):
-        actions = payload["actions"]
-    elif "tool" in payload:
-        actions = [payload]
-    else:
-        out["errors"].append("Payload must contain tool or actions.")
-        return out
-
+def _stage_write_action(tool: str, params: Dict[str, Any]) -> ToolRun:
     st.session_state.setdefault("pending_confirmations", [])
-
-    for act in actions:
-        tool = _clean(str(act.get("tool") or ""))
-        params = act.get("params") if isinstance(act.get("params"), dict) else {}
-
-        if tool not in ALL_TOOLS:
-            out["errors"].append(f"Unknown tool: {tool}")
-            continue
-
-        if tool in READ_TOOLS:
-            try:
-                tr: ToolResult = READ_TOOLS[tool](supabase, ctx, params)
-                out["reads"].append({"tool": tool, "ok": tr.ok, "message": tr.message, "data": tr.data})
-            except Exception as e:
-                out["errors"].append(f"Read tool error ({tool}): {e}")
-            continue
-
-        if tool in WRITE_TOOLS:
-            try:
-                tr: ToolResult = WRITE_TOOLS[tool](supabase, ctx, params)
-                if tr.needs_confirmation and tr.confirmation_payload:
-                    st.session_state["pending_confirmations"].append({
-                        "created_at": iso_utc(),
-                        "tool": tr.confirmation_payload.get("tool"),
-                        "params": tr.confirmation_payload.get("params"),
-                    })
-                    out["staged"].append({"tool": tool, "message": tr.message})
-                else:
-                    out["staged"].append({"tool": tool, "message": tr.message})
-            except Exception as e:
-                out["errors"].append(f"Write tool error ({tool}): {e}")
-
-    return out
+    st.session_state["pending_confirmations"].append({"created_at": iso_utc(), "tool": tool, "params": params})
+    return ToolRun(True, f"Staged write: {tool} (confirm to execute)", {"tool": tool, "params": params})
 
 
-def _render_pending_confirmations(supabase, ctx):
+def execute_confirmed_action(sb_anon, sb_service, schema: str, tool: str, params: Dict[str, Any]) -> ToolRun:
+    if tool not in WRITE_TOOLS:
+        return ToolRun(False, f"Write tool not available: {tool}", None)
+    # NOTE: intentionally not wired yet (safe default)
+    return ToolRun(False, f"Write tool exists but execution is not wired yet: {tool}", None)
+
+
+def _render_pending_confirmations(sb_anon, sb_service, schema: str):
     pending = st.session_state.get("pending_confirmations", [])
     if not pending:
         return
@@ -1490,21 +526,18 @@ def _render_pending_confirmations(supabase, ctx):
     pending = list(reversed(pending))
 
     for idx, p in enumerate(pending):
-        tool = _clean(str(p.get("tool") or ""))
+        tool = _clean(p.get("tool"))
         params = p.get("params") if isinstance(p.get("params"), dict) else {}
-        created_at = _clean(str(p.get("created_at") or ""))
+        created_at = _clean(p.get("created_at"))
 
         with st.expander(f"Confirm: {tool} • {created_at}", expanded=(idx == 0)):
             st.json({"tool": tool, "params": params}, expanded=False)
 
             c1, c2 = st.columns(2)
             with c1:
-                if st.button(f"CONFIRM & EXECUTE ({tool})", key=f"chat_confirm_{idx}", type="primary", use_container_width=True):
-                    tr = execute_confirmed_action(supabase, ctx, tool, params)
-                    if tr.ok:
-                        st.success(tr.message)
-                    else:
-                        st.error(tr.message)
+                if st.button(f"CONFIRM & EXECUTE ({tool})", key=f"y_confirm_{idx}", type="primary", use_container_width=True):
+                    tr = execute_confirmed_action(sb_anon, sb_service, schema, tool, params)
+                    (st.success if tr.ok else st.error)(tr.message)
 
                     try:
                         orig = list(reversed(st.session_state.get("pending_confirmations", [])))
@@ -1515,7 +548,7 @@ def _render_pending_confirmations(supabase, ctx):
                     st.rerun()
 
             with c2:
-                if st.button("Cancel", key=f"chat_cancel_{idx}", use_container_width=True):
+                if st.button("Cancel", key=f"y_cancel_{idx}", use_container_width=True):
                     try:
                         orig = list(reversed(st.session_state.get("pending_confirmations", [])))
                         orig.remove(p)
@@ -1525,26 +558,68 @@ def _render_pending_confirmations(supabase, ctx):
                     st.rerun()
 
 
+def _run_tool_payload(sb_anon, sb_service, schema: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    out = {"reads": [], "staged": [], "asks": None, "errors": []}
+    if not isinstance(payload, dict) or not payload:
+        out["errors"].append("Invalid JSON payload.")
+        return out
+
+    actions: List[Dict[str, Any]] = []
+    if "actions" in payload and isinstance(payload["actions"], list):
+        actions = [a for a in payload["actions"] if isinstance(a, dict)]
+    elif "tool" in payload:
+        actions = [payload]
+    else:
+        out["errors"].append("Payload must contain 'tool' or 'actions'.")
+        return out
+
+    for act in actions:
+        tool = _clean(act.get("tool"))
+        params = act.get("params") if isinstance(act.get("params"), dict) else {}
+
+        if not tool:
+            out["errors"].append("Missing tool name.")
+            continue
+
+        if tool == "ask_one":
+            q = _clean((params or {}).get("question"))
+            out["asks"] = q or "I need one detail to proceed. What’s missing?"
+            continue
+
+        if tool in READ_TOOLS:
+            tr = _run_read_tool(sb_anon, sb_service, schema, tool, params)
+            out["reads"].append({"tool": tool, "ok": tr.ok, "message": tr.message, "data": tr.data})
+            continue
+
+        if tool in WRITE_TOOLS:
+            tr = _stage_write_action(tool, params)
+            out["staged"].append({"tool": tool, "ok": tr.ok, "message": tr.message, "data": tr.data})
+            continue
+
+        out["errors"].append(f"Unknown tool: {tool}")
+
+    return out
+
+
 # =============================================================================
-# 10) MAIN UI
+# 7) MAIN UI
 # =============================================================================
 def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     st.subheader("💬 younchat", anchor=False)
 
-    hf_token = (os.getenv("HF_TOKEN") or "").strip()
     internet_on = _internet_enabled()
+    hf_on = _has_hf_token()
 
-    supabase = sb_service or sb_anon  # tools layer uses supabase.table(...)
     if "younchat_write_mode" not in st.session_state:
         st.session_state["younchat_write_mode"] = False
 
     with st.expander("⚙️ Chat Settings", expanded=False):
         st.write("**Schema**:", schema)
         st.write("**HF models (locked)**:", ", ".join(HF_ALLOWED_MODELS))
-        st.write("**HF_TOKEN present**:", "✅ Yes" if hf_token else "❌ No")
+        st.write("**HF_TOKEN present**:", "✅ Yes" if hf_on else "❌ No")
         st.write("**HF_FORCE_MODE**:", (os.getenv("HF_FORCE_MODE") or "auto"))
         st.write("**Internet**:", "✅ ON" if internet_on else "❌ OFF")
-        st.caption("DB integrity: DB commands are DB-only. Non-DB routes to HF with intent & next-step guidance. Writes require confirmation.")
+        st.caption("DB integrity: DB commands are DB-only. Non-DB routes to HF (intent & next-step). Writes require confirmation.")
 
     colW1, colW2 = st.columns([1, 2], gap="small")
     with colW1:
@@ -1555,22 +630,10 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         else:
             st.info("Write Mode is OFF (reads only).", icon="ℹ️")
 
-    use_foundation_reasoner = st.toggle(
-        "Use foundation reasoner (HF) for intelligence reports (manifold-grounded)",
-        value=bool(hf_token),
-        help="HF writes the narrative ONLY from DB-built manifold JSON for reports. DB commands stay DB-only.",
-        key="younchat_use_foundation",
-    )
-
-    @st.cache_data(ttl=30, show_spinner=False)
-    def _cached_members_truth(_ts: int) -> pd.DataFrame:
-        return _load_members_truth(sb_anon, sb_service, schema, limit=3000)
-
-    members_truth = _cached_members_truth(int(time.time() // 10))
-
     if "younchat_history" not in st.session_state:
         st.session_state["younchat_history"] = [{"role": "assistant", "content": _intro_only()}]
 
+    # Render chat history
     for m in st.session_state["younchat_history"]:
         with st.chat_message("assistant" if m.get("role") == "assistant" else "user"):
             st.markdown(m.get("content", ""))
@@ -1585,13 +648,10 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         st.session_state.pop("pending_confirmations", None)
         st.rerun()
 
-    # ✅ context + confirmation UI (always visible)
-    ctx = resolve_user_context(supabase, st.session_state)
-    _render_pending_confirmations(supabase, ctx)
+    _render_pending_confirmations(sb_anon, sb_service, schema)
 
-    # ✅ optional: manual tool JSON entry
     with st.expander("🧰 Paste tool JSON (optional)", expanded=False):
-        tool_json = st.text_area("Tool JSON", height=120, placeholder='{"tool":"get_member","params":{"member_query":"John"}}')
+        tool_json = st.text_area("Tool JSON", height=120, placeholder='{"tool":"members","params":{"limit":200}}')
         if st.button("Run tool JSON", use_container_width=True):
             payload = safe_json_from_text(tool_json)
             if not payload:
@@ -1604,7 +664,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                 if is_write_payload and (not st.session_state["younchat_write_mode"]):
                     st.error("Write Mode is OFF. Turn it ON to stage write actions.")
                 else:
-                    ran = _run_tool_payload(supabase, ctx, payload)
+                    ran = _run_tool_payload(sb_anon, sb_service, schema, payload)
                     if ran.get("asks"):
                         st.info(_force_hello_prefix(ran["asks"]))
                     for r in ran.get("reads", []):
@@ -1625,7 +685,6 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     with st.chat_message("user"):
         st.markdown(q)
 
-    # Remember last member id if user mentions it
     detected_id = _extract_member_id(q)
     if detected_id:
         st.session_state["younchat_last_member_id"] = detected_id
@@ -1636,15 +695,9 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     df_show: Optional[pd.DataFrame] = None
     df_title: Optional[str] = None
 
-    # -------------------------------------------------------------------------
-    # ROUTING RULE:
-    #   - DB => DB tools only
-    #   - Non-DB => HF intent model (if HF_TOKEN exists)
-    #   - DB "actions" => HF plans tool JSON (still DB-only execution + confirm)
-    # -------------------------------------------------------------------------
     is_db = _is_db_command(q)
 
-    # Internet commands are NON-DB (still never Njangi numbers)
+    # INTERNET
     if _wants_internet(q):
         used_source = "tavily" if internet_on else "tavily:off"
         if not internet_on:
@@ -1669,9 +722,9 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                             lines.append(f"  - {snippet[:180]}…")
                     answer = "\n".join(lines)
 
+    # NON-DB => HF intent helper
     elif not is_db:
-        # ✅ STRICT: every non-DB message goes to foundation model (if possible)
-        if _has_hf_token():
+        if hf_on:
             ok, txt, used = _hf_smalltalk_answer(q)
             if ok and txt and (not _looks_like_code_output(txt)):
                 used_source = used
@@ -1681,239 +734,201 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                 answer = (
                     "Hello 👋🏽 I couldn’t get a clean response from the foundation model.\n"
                     "Intent: Foundation model failed\n"
-                    "Next: Please try again (or type: members / loans / finance kpis)."
+                    "Next: Try again, or type: members / loans / finance kpis."
                 )
         else:
             used_source = "local:no_hf"
             answer = (
-                "Hello 👋🏽 HF_TOKEN is missing, so foundation replies are OFF.\n"
+                "Hello 👋🏽 HF_TOKEN is missing, so non-DB answers are OFF.\n"
                 "Intent: Non-DB request\n"
-                "Next: Add HF_TOKEN to enable non-DB answers (or use: members / loans / finance kpis)."
+                "Next: Add HF_TOKEN (or use: members / loans / finance kpis)."
             )
 
+    # DB COMMANDS => DB-only tools
     else:
-        # ✅ DB-ACTIONS: plan tools JSON, execute reads immediately, stage writes
-        if _wants_db_actions(q):
-            if not _has_hf_token():
-                used_source = "db:planner:no_hf"
-                answer = (
-                    "Hello 👋🏽 To auto-plan DB actions, HF_TOKEN must be set.\n"
-                    "Next: Either set HF_TOKEN or paste tool JSON in the Tool JSON expander."
-                )
-            else:
-                ok, payload, used = _hf_plan_db_actions(q)
-                used_source = used
-                if not ok or not payload:
-                    answer = "Hello 👋🏽 I couldn’t plan that action. Please rephrase or paste tool JSON."
-                else:
-                    if payload.get("tool") == "ask_one":
-                        question = _clean((payload.get("params") or {}).get("question"))
-                        answer = _force_hello_prefix(question or "I need one detail to proceed. What’s missing?")
-                    else:
-                        is_write_payload = (
-                            (payload.get("tool") in WRITE_TOOLS)
-                            or any((a.get("tool") in WRITE_TOOLS) for a in (payload.get("actions") or []) if isinstance(a, dict))
-                        )
-
-                        if is_write_payload and (not st.session_state["younchat_write_mode"]):
-                            answer = (
-                                "Hello 👋🏽 This requires a WRITE action.\n"
-                                "Next: Turn **Write Mode ON**, then send the same request again."
-                            )
-                        else:
-                            ran = _run_tool_payload(supabase, ctx, payload)
-
-                            parts = ["Hello 👋🏽 I processed your Njangi request using DB tools only."]
-                            if ran.get("reads"):
-                                parts.append("\n✅ Reads")
-                                for r in ran["reads"]:
-                                    parts.append(f"- {r['tool']}: {r['message']}")
-                            if ran.get("staged"):
-                                parts.append("\n⚠️ Writes staged (needs confirmation)")
-                                for s in ran["staged"]:
-                                    parts.append(f"- {s['tool']}: {s['message']}")
-                                parts.append("Next: Confirm the pending action(s) above to execute.")
-                            if ran.get("asks"):
-                                parts.append(f"\nNext: {ran['asks']}")
-                            if ran.get("errors"):
-                                parts.append("\n❌ Errors")
-                                for e in ran["errors"]:
-                                    parts.append(f"- {e}")
-
-                            answer = "\n".join(parts)
-
-        # ---------------------------------------------------------------------
-        # DB COMMANDS: DB-only (never HF for these)
-        # ---------------------------------------------------------------------
-        elif _wants_help(q):
+        if _wants_help(q):
             used_source = "help"
             answer = (
                 "Hello 👋🏽 Commands:\n\n"
                 "- **members**\n"
-                "- type **10** (member intelligence)\n"
-                "- **verify member 10** (view vs tables)\n"
-                "- **loans** / include member id in message\n"
+                "- type **10** or **member_id=10** (member intelligence)\n"
+                "- **verify member 10**\n"
+                "- **loans** (optionally include member id)\n"
                 "- **finance kpis**\n"
                 "- **tables**\n"
                 "- **show <table>** (example: show contributions)\n"
                 "- **describe <table>** (example: describe loans)\n"
-                "- Ask: **How are we doing?** (Control Tower Review)\n"
-                "- **web: <topic>** (internet help)\n\n"
-                "✅ Actions (Write Mode ON):\n"
-                "- \"create contribution for John session 12 amount 1000\"\n"
-                "- \"fine Peter 500 reason absence session 12\"\n"
-                "- \"approve loan request 17 session 12\"\n"
+                "- **web: <topic>** (internet)\n"
             )
 
         elif _wants_tables_list(q):
-            used_source = "relations"
-            rows = [{"relation": k, "type": RELATIONS[k].get("type", "?")} for k in sorted(RELATIONS.keys())]
-            df_show = pd.DataFrame(rows)
-            df_title = "Readable relations (allowlist)"
-            answer = "Hello 👋🏽 Here are the tables/views younchat can read:"
+            used_source = "tool:tables"
+            tr = _run_read_tool(sb_anon, sb_service, schema, "tables", {})
+            data = (tr.data or {}).get("data") if isinstance(tr.data, dict) else None
+            df_show = pd.DataFrame(data) if isinstance(data, list) else pd.DataFrame()
+            df_title = "Allowed relations"
+            answer = "Hello 👋🏽 Here are the allowed relations (tables/views):"
+
+        elif _wants_list_members(q):
+            used_source = "tool:members"
+            tr = _run_read_tool(sb_anon, sb_service, schema, "members", {"limit": 5000})
+            rows = (tr.data or {}).get("data") if isinstance(tr.data, dict) else []
+            df_show = pd.DataFrame(rows) if isinstance(rows, list) else pd.DataFrame()
+            df_title = "members (truth)"
+            if df_show.empty:
+                answer = "Hello 👋🏽 I couldn’t read members (RLS blocked or empty)."
+            else:
+                lines = ["Hello 👋🏽 Here are members (from `members`):\n"]
+                for _, r in df_show.head(60).iterrows():
+                    lines.append(f"- **{_clean(r.get('member_id'))}** • {_clean(r.get('member_name'))}")
+                if len(df_show) > 60:
+                    lines.append(f"\n… and {len(df_show) - 60} more (see table).")
+                answer = "\n".join(lines)
+
+        elif _wants_kpis(q):
+            used_source = "tool:finance_kpis"
+            if "finance_kpis" in READ_TOOLS:
+                tr = _run_read_tool(sb_anon, sb_service, schema, "finance_kpis", {"limit": 200})
+                rows = (tr.data or {}).get("data") if isinstance(tr.data, dict) else []
+                df_show = pd.DataFrame(rows) if isinstance(rows, list) else pd.DataFrame()
+                df_title = "Finance KPIs"
+                answer = "Hello 👋🏽 Finance KPIs (DB-grounded):"
+            else:
+                answer = "Hello 👋🏽 `finance_kpis` tool is not available. If you have `v_finance_kpis`, add it into actions_agent."
+
+        elif _wants_loans(q):
+            used_source = "tool:loans"
+            mid = _extract_member_id(q) or member_id_focus
+            tr = _run_read_tool(sb_anon, sb_service, schema, "loans", {"member_id": mid} if mid else {})
+            rows = (tr.data or {}).get("data") if isinstance(tr.data, dict) else []
+            df_show = pd.DataFrame(rows) if isinstance(rows, list) else pd.DataFrame()
+            df_title = f"Loans{' (member_id=' + str(mid) + ')' if mid else ''}"
+            answer = "Hello 👋🏽 Loans (DB-grounded):" if not df_show.empty else "Hello 👋🏽 No loan rows returned."
 
         elif _wants_describe(q):
             rel = _extract_relation_name(q)
             if not rel:
-                used_source = "describe"
-                answer = "Hello 👋🏽 Say: **describe loans** (or any table/view in the allowlist)."
+                answer = "Hello 👋🏽 Say: **describe loans** (or describe <table/view>)."
             else:
-                answer, df_show, used_source = _describe_relation(sb_anon, sb_service, schema, rel)
+                used_source = "tool:describe_table"
+                tr = _run_read_tool(sb_anon, sb_service, schema, "describe_table", {"relation": rel})
+                rows = (tr.data or {}).get("data") if isinstance(tr.data, dict) else []
+                df_show = pd.DataFrame(rows) if isinstance(rows, list) else pd.DataFrame()
                 df_title = f"Columns: {rel}"
+                answer = f"Hello 👋🏽 Columns for **{rel}**:"
 
         elif _wants_show_table(q):
             rel = _extract_relation_name(q)
             if not rel:
-                used_source = "show"
-                answer = "Hello 👋🏽 Say: **show contributions** (or any table/view in the allowlist)."
+                answer = "Hello 👋🏽 Say: **show contributions** (or show <table/view>)."
             else:
-                answer, df_show, used_source = _show_relation(sb_anon, sb_service, schema, rel)
+                used_source = "tool:show_table"
+                tr = _run_read_tool(sb_anon, sb_service, schema, "show_table", {"relation": rel, "limit": 2000})
+                rows = (tr.data or {}).get("data") if isinstance(tr.data, dict) else []
+                df_show = pd.DataFrame(rows) if isinstance(rows, list) else pd.DataFrame()
                 df_title = f"Preview: {rel}"
-
-        elif _wants_list_members(q):
-            used_source = "members"
-            if members_truth is None or members_truth.empty:
-                answer = "Hello 👋🏽 I couldn’t read **members** (source of truth). Check RLS / permissions."
-            else:
-                lines = ["Hello 👋🏽 Here are all members (from `members`):\n"]
-                for r in members_truth.itertuples(index=False):
-                    lines.append(f"- **{r.member_id}** • {r.member_name}")
-                answer = "\n".join(lines)
-                df_show, df_title = members_truth, "members (truth)"
-
-        elif _wants_kpis(q):
-            title, df, src = _kpis(sb_anon, sb_service, schema)
-            used_source = src
-            df_show, df_title = df, title
-            answer = f"Hello 👋🏽 {title} (from `{src}`):" if not df.empty else "Hello 👋🏽 No KPI rows returned."
-
-        elif _wants_loans(q):
-            mid = _extract_member_id(q) or member_id_focus
-            title, df, src = _loans_with_member(sb_anon, sb_service, schema, mid, members_truth)
-            used_source = src
-            df_show, df_title = df, title
-            answer = f"Hello 👋🏽 {title} (from `{src}`):" if not df.empty else f"Hello 👋🏽 {title}: no rows returned."
-
-        elif _wants_financial_review(q):
-            ctx0 = _collect_global_finance_context(sb_anon, sb_service, schema)
-            metrics = _compute_global_metrics(ctx0)
-            manifold = _manifold_global_state(metrics)
-
-            if use_foundation_reasoner and _has_hf_token():
-                ok, txt, used = _hf_reason_over_manifold(q, manifold)
-                if ok and txt and not _looks_like_code_output(txt):
-                    used_source = used
-                    answer = txt
-                else:
-                    used_source = f"{used}:fallback_local"
-                    answer = _build_control_tower_report_local(manifold)
-            else:
-                used_source = "local:manifold"
-                answer = _build_control_tower_report_local(manifold)
-
-            proof_counts = (manifold.get("db_proof") or {}).get("row_counts") or {}
-            answer = answer.rstrip() + "\n\n🧾 DB Proof\n- " + _db_proof_line(proof_counts)
+                answer = f"Hello 👋🏽 Preview of **{rel}**:"
 
         elif _wants_verify_member(q):
             mid = _extract_verify_member_id(q) or member_id_focus
             if not mid:
-                used_source = "verify"
                 answer = "Hello 👋🏽 Say: **verify member 10**"
             else:
-                answer, df_show, df_title, used_source = _member_verify_view_vs_tables(sb_anon, sb_service, schema, str(mid), members_truth)
+                used_source = "tool:member_summary"
+                tr = _run_read_tool(sb_anon, sb_service, schema, "member_summary", {"member_id": str(mid)})
+                data = (tr.data or {}).get("data") if isinstance(tr.data, dict) else {}
+                answer = "Hello 👋🏽 Verify (DB-grounded member summary):"
+                if isinstance(data, dict):
+                    st.session_state["__last_verify_payload"] = data
 
-        elif _is_member_id_only_request(q) or (detected_id is not None and detected_id == (member_id_focus or detected_id)):
-            # ✅ member_id=4 should land here and produce a real DB answer
-            mid = str(detected_id or member_id_focus or "").strip()
-            used_source = "db:member_intelligence"
-
-            if not mid:
-                answer = "Hello 👋🏽 Type a member id (example: **10**) to get that member’s intelligence summary."
-            elif not _member_exists(members_truth, mid):
+        elif _wants_db_actions(q):
+            used_source = "db:actions_guard"
+            if not st.session_state["younchat_write_mode"]:
                 answer = (
-                    "Hello 👋🏽 I can’t confirm that member_id exists in `members` (source of truth).\n"
-                    "Next: Type **members** to see valid IDs, then try again."
+                    "Hello 👋🏽 This looks like a WRITE request.\n"
+                    "Next: Turn **Write Mode ON**, then paste tool JSON in the Tool JSON section."
                 )
             else:
-                name = _member_name_from_truth(members_truth, mid)
-                table_totals, table_notes = _compute_member_totals_from_tables(sb_anon, sb_service, schema, mid)
-                manifold = _manifold_member_state(mid, name, table_totals, table_notes)
-
-                if use_foundation_reasoner and _has_hf_token():
-                    ok, txt, used = _hf_reason_over_manifold(
-                        "Give a short member financial intelligence summary with next best actions.",
-                        manifold,
-                    )
-                    if ok and txt and not _looks_like_code_output(txt):
-                        used_source = used
-                        answer = txt
-                    else:
-                        used_source = f"{used}:fallback_local"
-                        answer = _build_member_report_local(manifold)
-                else:
-                    answer = _build_member_report_local(manifold)
-
-                proof_counts = (manifold.get("db_proof") or {}).get("row_counts") or {}
-                answer = answer.rstrip() + "\n\n🧾 DB Proof\n- " + _db_proof_line(proof_counts)
-
-        elif _lc(q) in RELATIONS:
-            rel = _lc(q)
-            answer, df_show, used_source = _show_relation(sb_anon, sb_service, schema, rel)
-            df_title = f"Preview: {rel}"
+                answer = (
+                    "Hello 👋🏽 Write Mode is ON.\n"
+                    "Next: Paste a tool JSON action (example):\n"
+                    '{ "tool": "<write_tool>", "params": { ... } }'
+                )
 
         else:
-            used_source = "db:guard"
-            answer = (
-                "Hello 👋🏽 I can answer using your real Njangi database only.\n\n"
-                "Try:\n"
-                "- **members**\n"
-                "- **loans**\n"
-                "- **finance kpis**\n"
-                "- **tables**\n"
-                "- **show contributions**\n"
-                "- **describe loans**\n"
-                "- **verify member 10**\n"
-                "- Or type **10** (member intelligence)\n"
-                "- Ask: **How are we doing?**\n\n"
-                "✅ Actions (Write Mode ON):\n"
-                "- \"create contribution for John session 12 amount 1000\"\n"
-            )
+            if _is_member_id_only_request(q) or (_extract_member_id(q) is not None and _extract_member_id(q) == member_id_focus):
+                mid = str(_extract_member_id(q) or member_id_focus or "").strip()
+                used_source = "tool:member_summary"
+                if not mid:
+                    answer = "Hello 👋🏽 Type a member id (example: **10**) to get that member’s intelligence summary."
+                else:
+                    tr = _run_read_tool(sb_anon, sb_service, schema, "member_summary", {"member_id": mid})
+                    payload = tr.data if isinstance(tr.data, dict) else {}
+                    data = payload.get("data") if isinstance(payload, dict) else None
 
-    # Enforce Hello prefix while preserving exact intro message
-    if answer != _intro_only():
-        answer = _force_hello_prefix(answer)
+                    if not tr.ok or not isinstance(data, dict):
+                        answer = "Hello 👋🏽 I couldn’t fetch that member summary (RLS blocked or missing member). Type **members** to confirm IDs."
+                    else:
+                        mem = (data.get("member") or {})
+                        totals = (data.get("totals") or {})
+                        derived = (data.get("derived") or {})
+
+                        lines = []
+                        lines.append("Hello 👋🏽 Member Financial Intelligence (DB-grounded)\n")
+                        lines.append("1️⃣ Current Situation")
+                        lines.append(f"- Member: **{_clean(mem.get('member_name'))}** (member_id={_clean(mem.get('member_id'))})")
+                        lines.append(f"- Contributions total: **{_fmt_money(totals.get('contributions_total'))}**")
+                        lines.append(f"- Foundation total: **{_fmt_money(totals.get('foundation_total'))}**")
+                        lines.append(f"- Fines total: **{_fmt_money(totals.get('fines_total'))}**")
+                        lines.append(f"- Active loan balance: **{_fmt_money(totals.get('active_loan_balance'))}**")
+                        lines.append(f"- Active unpaid interest: **{_fmt_money(totals.get('active_unpaid_interest'))}**")
+                        lines.append(f"- Active loan count: **{int(totals.get('active_loan_count') or 0)}**")
+                        lines.append(f"- Overdue loan count: **{int(totals.get('overdue_loan_count') or 0)}**")
+
+                        lines.append("\n2️⃣ Risk Assessment")
+                        lines.append(f"- Risk grade: **{_clean(derived.get('risk_grade')) or '—'}**")
+                        ratio = derived.get("exposure_to_contributions_ratio")
+                        if isinstance(ratio, (int, float)):
+                            lines.append(f"- Exposure ÷ Contributions: **{ratio * 100:.1f}%**")
+                        else:
+                            lines.append("- Exposure ÷ Contributions: **—**")
+
+                        lines.append("\n3️⃣ Next Best Actions")
+                        lines.append("- Type: **loans** (or 'loans member_id=10') to see loan rows.")
+                        lines.append("- Type: **verify member 10** to re-run totals summary.")
+                        answer = "\n".join(lines)
+            else:
+                used_source = "db:guard"
+                answer = (
+                    "Hello 👋🏽 I can answer using your real Njangi database only.\n\n"
+                    "Try:\n"
+                    "- **members**\n"
+                    "- **loans**\n"
+                    "- **finance kpis**\n"
+                    "- **tables**\n"
+                    "- **show contributions**\n"
+                    "- **describe loans**\n"
+                    "- **verify member 10**\n"
+                    "- Or type **10** / **member_id=10** (member intelligence)\n"
+                    "- **web: <topic>** (internet)\n"
+                )
+
+    answer = _force_hello_prefix(answer)
 
     st.session_state["younchat_history"].append({"role": "assistant", "content": answer})
     with st.chat_message("assistant"):
         st.markdown(answer)
         if df_show is not None and df_title:
             with st.expander(df_title, expanded=False):
-                st.dataframe(df_show, use_container_width=True)
+                st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+        if st.session_state.get("__last_verify_payload"):
+            with st.expander("Verify payload (raw)", expanded=False):
+                st.json(st.session_state.get("__last_verify_payload"), expanded=False)
 
     st.caption(
         f"Source used: {used_source} • member_id: {member_id_focus or '—'} • "
         f"Internet: {'ON' if internet_on else 'OFF'} • "
-        f"HF_TOKEN: {'ON' if _has_hf_token() else 'OFF'} • "
-        f"Write Mode: {'ON' if st.session_state['younchat_write_mode'] else 'OFF'} • "
-        f"Manifold reasoner: {'ON' if (use_foundation_reasoner and _has_hf_token()) else 'OFF'}"
+        f"HF_TOKEN: {'ON' if hf_on else 'OFF'} • "
+        f"Write Mode: {'ON' if st.session_state['younchat_write_mode'] else 'OFF'}"
     )
