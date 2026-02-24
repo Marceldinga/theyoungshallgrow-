@@ -1,23 +1,21 @@
-
-# njangi_actions_agent.py
-# ✅ NJANGI Actions Agent (NO legacy)
-# ✅ Fixes circular import by:
+# njangi_actions_agent.py ✅ SINGLE COMPLETE FILE (NO legacy)
+# ✅ Fixes circular imports by:
 #   - NOT importing app.py or njangi_llm_panel.py
-#   - NOT building READ_TOOLS at import-time using external modules
-#   - Exporting READ_TOOLS as a LAZY mapping that initializes only on use
+#   - NOT importing Streamlit
+#   - Exporting READ_TOOLS / WRITE_TOOLS / ALL_TOOLS as LAZY mappings (init on first use)
 #
-# You can still do:
-#   from njangi_actions_agent import READ_TOOLS
-# without crashes.
+# Exports:
+#   - RELATIONS
+#   - READ_TOOLS, WRITE_TOOLS, ALL_TOOLS
+#   - get_read_tools(), get_write_tools(), get_all_tools()
+#   - execute_tool(tool_name, *args, **kwargs)
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 import pandas as pd
-
 
 # =============================================================================
 # 0) Allowlist relations (safe)
@@ -62,7 +60,6 @@ RELATIONS: Dict[str, Dict[str, Any]] = {
     "v_attendance_with_member": {"type": "view"},
 }
 
-
 # =============================================================================
 # 1) Small helpers
 # =============================================================================
@@ -91,10 +88,6 @@ def _to_num(x: Any) -> float:
         return float(v)
     except Exception:
         return 0.0
-
-
-def _fmt_money(x: Any) -> str:
-    return f"{_to_num(x):,.2f}"
 
 
 # =============================================================================
@@ -135,7 +128,7 @@ def sb_select(
                 elif op == "ilike":
                     q = q.ilike(col, val)
                 elif op == "in":
-                    q = q.in_(col, val)  # type: ignore
+                    q = q.in_(col, val)  # type: ignore[attr-defined]
         if order:
             c, asc = order
             q = q.order(c, desc=not asc)
@@ -174,7 +167,7 @@ def tool_members(sb_anon, sb_service, schema: str, limit: int = 5000) -> Dict[st
     name_col = _pick_col(df, ["display_name", "full_name", "name"])
     phone_col = _pick_col(df, ["phone"])
 
-    out = []
+    out: List[Dict[str, Any]] = []
     for _, r in df.iterrows():
         out.append(
             {
@@ -212,7 +205,7 @@ def tool_describe_table(sb_anon, sb_service, schema: str, relation: str) -> Dict
 
 
 def tool_loans(sb_anon, sb_service, schema: str, member_id: Optional[str] = None, limit: int = 5000) -> Dict[str, Any]:
-    # prefer view if exists
+    # prefer view if allowlisted
     rel = "v_loans_with_member" if "v_loans_with_member" in RELATIONS else "loans"
     filters = [("member_id", "eq", member_id)] if member_id else None
     df = sb_select(sb_anon, sb_service, schema, rel, cols="*", limit=limit, filters=filters, order=("created_at", False))
@@ -220,21 +213,42 @@ def tool_loans(sb_anon, sb_service, schema: str, member_id: Optional[str] = None
 
 
 def tool_member_summary(sb_anon, sb_service, schema: str, member_id: str) -> Dict[str, Any]:
-    # Pull member + totals from tables (safe + generic)
+    """
+    Member intelligence summary (DB-grounded).
+    Uses tables only (safe + generic) and tolerates different column names.
+    """
     members = sb_select(sb_anon, sb_service, schema, "members", cols="*", limit=1, filters=[("id", "eq", member_id)])
     mname = ""
     if not members.empty:
         name_col = _pick_col(members, ["display_name", "full_name", "name"])
         mname = _clean(members.iloc[0].get(name_col)) if name_col else ""
 
-    contributions = sb_select(sb_anon, sb_service, schema, "contributions", cols="amount", limit=200000, filters=[("member_id", "eq", member_id)])
-    foundation = sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="amount", limit=200000, filters=[("member_id", "eq", member_id)])
+    contributions = sb_select(
+        sb_anon, sb_service, schema, "contributions", cols="amount", limit=200000, filters=[("member_id", "eq", member_id)]
+    )
+    foundation = sb_select(
+        sb_anon,
+        sb_service,
+        schema,
+        "foundation_contributions",
+        cols="amount",
+        limit=200000,
+        filters=[("member_id", "eq", member_id)],
+    )
     fines = sb_select(sb_anon, sb_service, schema, "fines", cols="amount", limit=200000, filters=[("member_id", "eq", member_id)])
-    loans = sb_select(sb_anon, sb_service, schema, "loans", cols="status,principal_current,principal,unpaid_interest,total_due", limit=200000, filters=[("member_id", "eq", member_id)])
+    loans = sb_select(
+        sb_anon,
+        sb_service,
+        schema,
+        "loans",
+        cols="status,principal_current,principal,unpaid_interest,total_due,created_at",
+        limit=200000,
+        filters=[("member_id", "eq", member_id)],
+    )
 
-    c_total = float(pd.to_numeric(contributions["amount"], errors="coerce").fillna(0).sum()) if "amount" in contributions.columns else 0.0
-    f_total = float(pd.to_numeric(foundation["amount"], errors="coerce").fillna(0).sum()) if "amount" in foundation.columns else 0.0
-    fines_total = float(pd.to_numeric(fines["amount"], errors="coerce").fillna(0).sum()) if "amount" in fines.columns else 0.0
+    c_total = float(pd.to_numeric(contributions.get("amount"), errors="coerce").fillna(0).sum()) if "amount" in contributions.columns else 0.0
+    f_total = float(pd.to_numeric(foundation.get("amount"), errors="coerce").fillna(0).sum()) if "amount" in foundation.columns else 0.0
+    fines_total = float(pd.to_numeric(fines.get("amount"), errors="coerce").fillna(0).sum()) if "amount" in fines.columns else 0.0
 
     active_bal = 0.0
     unpaid_int = 0.0
@@ -246,9 +260,9 @@ def tool_member_summary(sb_anon, sb_service, schema: str, member_id: str) -> Dic
         bal_col = _pick_col(loans, ["principal_current", "principal", "total_due"])
         unpaid_col = _pick_col(loans, ["unpaid_interest"])
 
-        st = loans[status_col].astype(str).str.lower().fillna("") if status_col else pd.Series([""] * len(loans))
-        active_mask = st.isin({"active", "open", "overdue", "late", "running", "ongoing", "disbursed"})
-        overdue_mask = st.isin({"overdue", "late"})
+        st_series = loans[status_col].astype(str).str.lower().fillna("") if status_col else pd.Series([""] * len(loans))
+        active_mask = st_series.isin({"active", "open", "overdue", "late", "running", "ongoing", "disbursed"})
+        overdue_mask = st_series.isin({"overdue", "late"})
 
         active_df = loans[active_mask] if len(loans) else loans
         overdue_df = loans[overdue_mask] if len(loans) else loans.iloc[0:0]
@@ -262,6 +276,7 @@ def tool_member_summary(sb_anon, sb_service, schema: str, member_id: str) -> Dic
         overdue_count = int(len(overdue_df))
 
     exposure_ratio = (active_bal / c_total) if c_total > 0 else None
+    # simple conservative grade
     risk_grade = "A" if (active_bal <= 0 and unpaid_int <= 0) else ("B" if unpaid_int <= 0 else "C")
 
     return {
@@ -301,10 +316,7 @@ ToolFn = Callable[..., Any]
 
 
 def _build_read_tools_internal() -> Dict[str, ToolFn]:
-    """
-    Build tools WITHOUT importing other app modules.
-    Safe to call at runtime.
-    """
+    """Build tools WITHOUT importing other app modules. Safe to call at runtime."""
     return {
         "tables": tool_tables,
         "members": tool_members,
@@ -317,17 +329,12 @@ def _build_read_tools_internal() -> Dict[str, ToolFn]:
 
 
 def _build_write_tools_internal() -> Dict[str, ToolFn]:
-    # You can add write tools later (insert/update) using service key.
+    # Add write tools later (insert/update) using service key.
     return {}
 
 
 class _LazyToolMap(Mapping[str, ToolFn]):
-    """
-    Mapping that initializes tools only when accessed.
-    This allows:
-       from njangi_actions_agent import READ_TOOLS
-    without triggering circular imports.
-    """
+    """Mapping that initializes tools only when accessed."""
 
     def __init__(self, builder: Callable[[], Dict[str, ToolFn]]):
         self._builder = builder
@@ -364,14 +371,20 @@ class _LazyToolMap(Mapping[str, ToolFn]):
 READ_TOOLS: Mapping[str, ToolFn] = _LazyToolMap(_build_read_tools_internal)
 WRITE_TOOLS: Mapping[str, ToolFn] = _LazyToolMap(_build_write_tools_internal)
 
+# ✅ IMPORTANT: provides ALL_TOOLS so nothing crashes if imported
+ALL_TOOLS: Mapping[str, ToolFn] = _LazyToolMap(lambda: {**dict(READ_TOOLS.items()), **dict(WRITE_TOOLS.items())})
+
 
 def get_read_tools() -> Dict[str, ToolFn]:
-    """If you prefer a real dict."""
     return dict(READ_TOOLS.items())
 
 
 def get_write_tools() -> Dict[str, ToolFn]:
     return dict(WRITE_TOOLS.items())
+
+
+def get_all_tools() -> Dict[str, ToolFn]:
+    return {**get_read_tools(), **get_write_tools()}
 
 
 def execute_tool(tool_name: str, *args, **kwargs) -> Any:
