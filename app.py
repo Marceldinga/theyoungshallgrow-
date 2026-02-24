@@ -1,8 +1,8 @@
-
 # app.py ✅ COMPLETE SINGLE FILE — NJANGI STANDARD (NO legacy)
 # FAST VERSION + SLOW/GENTLE MODE + ✅ younchat + SAFE NAV FIX + ✅ DASHBOARD-AI NAV BRIDGE
 # ✅ NEW: Smooth floating rotating manifold background (CSS-only, Streamlit-safe)
 # ✅ NEW: Minutes PDF + Attendance PDF download buttons (via pdfs.py)
+# ✅ FIX: AI Suite signature-adapter (prevents TypeError unexpected keyword args)
 # ------------------------------------------------------------------------------
 # ✅ Keeps:
 #   - Safe navigation + nav bridge (dashboard → other pages)
@@ -18,6 +18,7 @@ import os
 import sys
 import time
 import importlib
+import inspect
 from datetime import datetime, timezone
 from typing import Any, Optional, Tuple, List, Dict
 
@@ -254,6 +255,72 @@ def glass_close() -> str:
 
 
 inject_global_theme()
+
+
+# =========================
+# SAFE CALL ADAPTER (signature-aware)
+# =========================
+def _call_with_supported_kwargs(fn, **kwargs):
+    """
+    Calls fn with only kwargs it supports.
+    - If fn has **kwargs, passes everything.
+    - Else filters to declared parameters only.
+    """
+    try:
+        sig = inspect.signature(fn)
+        params = sig.parameters
+
+        # If function accepts **kwargs, pass all
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return fn(**kwargs)
+
+        supported = {k: v for k, v in kwargs.items() if k in params}
+        return fn(**supported)
+    except Exception:
+        # Fallback: try direct
+        return fn(**kwargs)
+
+
+def _alias_kwargs(kwargs: dict) -> dict:
+    """
+    Adds common alias names so AI suite panel can accept different parameter names.
+    """
+    out = dict(kwargs)
+
+    if "members" in out:
+        out.setdefault("members_df", out["members"])
+        out.setdefault("df_members", out["members"])
+        out.setdefault("members_data", out["members"])
+
+    if "contributions" in out:
+        out.setdefault("contributions_df", out["contributions"])
+        out.setdefault("df_contributions", out["contributions"])
+
+    if "foundation_contributions" in out:
+        out.setdefault("foundation_df", out["foundation_contributions"])
+        out.setdefault("df_foundation", out["foundation_contributions"])
+
+    if "loans" in out:
+        out.setdefault("loans_df", out["loans"])
+        out.setdefault("df_loans", out["loans"])
+
+    if "loan_payments" in out:
+        out.setdefault("loan_payments_df", out["loan_payments"])
+        out.setdefault("df_loan_payments", out["loan_payments"])
+
+    if "payouts" in out:
+        out.setdefault("payouts_df", out["payouts"])
+        out.setdefault("df_payouts", out["payouts"])
+
+    if "fines" in out:
+        out.setdefault("fines_df", out["fines"])
+        out.setdefault("df_fines", out["fines"])
+
+    if "sessions" in out:
+        out.setdefault("sessions_df", out["sessions"])
+        out.setdefault("df_sessions", out["sessions"])
+
+    return out
 
 
 # =========================
@@ -845,8 +912,10 @@ elif page == "🧠 AI Suite":
         st.markdown(glass_close(), unsafe_allow_html=True)
         st.stop()
 
-    fn(
-        members=bundle["members"].rename(columns={"member_name": "display_name"}).assign(name=bundle["members"]["member_name"]),
+    payload = dict(
+        members=bundle["members"].rename(columns={"member_name": "display_name"}).assign(
+            name=bundle["members"]["member_name"]
+        ),
         contributions=bundle["contributions"],
         loans=bundle["loans"],
         loan_payments=bundle["loan_payments"],
@@ -861,7 +930,11 @@ elif page == "🧠 AI Suite":
         slow_mode=bool(SLOW_MODE),
     )
 
+    payload = _alias_kwargs(payload)
+    _call_with_supported_kwargs(fn, **payload)
+
     with st.expander("🔧 AI Suite load diagnostics", expanded=False):
+        st.caption(f"AI Suite signature: {str(inspect.signature(fn))}")
         for t in ["contributions", "foundation_contributions", "loans", "loan_payments", "payouts", "fines", "sessions"]:
             errk = f"_last_ai_load_err_{t}"
             if st.session_state.get(errk):
@@ -1065,7 +1138,6 @@ elif page == "Minutes & Attendance":
                 st.caption("PDF download not available.")
                 st.code(pdf_err or "", language="text")
             else:
-                # best row for current session (latest updated_at)
                 row0 = dfm.iloc[0].to_dict()
                 try:
                     pdf_bytes = make_minutes_pdf(APP_BRAND, row0)
@@ -1197,8 +1269,6 @@ elif page == "Minutes & Attendance":
             st.code(pdf_err or "", language="text")
         else:
             try:
-                # use the *raw* attendance rows (your pdfs.py expects list[dict] with member_id/present/note)
-                # If you want member names in the PDF, we can change pdfs.py later to accept joined rows.
                 pdf_bytes = make_attendance_pdf(
                     brand=APP_BRAND,
                     session_id=int(current_session_id),
