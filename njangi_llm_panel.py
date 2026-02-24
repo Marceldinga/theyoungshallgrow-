@@ -1,4 +1,3 @@
-
 # njangi_llm_panel.py ✅ SINGLE COMPLETE FILE — younchat reads your DB (members = source of truth)
 # =============================================================================
 # 💬 younchat — DB-TOOLS FIRST + Manifold State + Foundation Reasoner (HF) + Optional Tavily
@@ -10,13 +9,18 @@
 #   3) EVERY message that is NOT DB-related is routed to HF foundation model (if HF_TOKEN exists)
 #   4) Start every answer with "Hello 👋🏽"
 #
-# IMPORTANT ADDITION (your request):
-#   - Non-DB messages routed to HF use a strict Njangi "intent & next step" prompt:
-#     The model MUST assess what the member wants inside Njangi and guide them to the
-#     right DB command (or ask 1 short clarifying question), without inventing numbers.
+# IMPORTANT ADDITION:
+#   - Non-DB messages routed to HF use a strict Njangi "intent & next step" prompt
+#     (no hallucinated DB numbers).
 #
-# ✅ FIX INCLUDED (your screenshot issue):
-#   - Messages like "member_id=4" or "Member id = 4" are now treated as DB requests
+# ✅ ONE-AGENT UPGRADE (this file):
+#   - Integrated Tools Layer via njangi_actions_agent.py
+#   - READ tools execute immediately
+#   - WRITE tools are STAGED and require CONFIRMATION
+#   - Optional HF action planner can translate “do something” requests into tool JSON
+#
+# ✅ FIX INCLUDED:
+#   - Messages like "member_id=4" or "Member id = 4" are treated as DB requests
 #     and return a DB-grounded Member Intelligence Summary automatically (no HF).
 # =============================================================================
 
@@ -38,6 +42,19 @@ try:
 except Exception:
     APIError = Exception  # type: ignore
 
+# =============================================================================
+# ✅ TOOLS LAYER (new file you created)
+# =============================================================================
+from njangi_actions_agent import (  # type: ignore
+    READ_TOOLS,
+    WRITE_TOOLS,
+    ALL_TOOLS,
+    ToolResult,
+    safe_json_from_text,
+    execute_confirmed_action,
+    resolve_user_context,
+    iso_utc,
+)
 
 # =============================================================================
 # 0) CONSTANTS / ALLOWLISTS
@@ -92,7 +109,6 @@ RELATIONS: Dict[str, Dict[str, Any]] = {
     "v_attendance_member_totals": {"type": "view"},
     "v_attendance_with_member": {"type": "view"},
 }
-
 
 # =============================================================================
 # 1) CORE HELPERS
@@ -185,6 +201,19 @@ def _db_proof_line(row_counts: Dict[str, int]) -> str:
         return f"DB Proof: (no row counts) • fetched_at={ts}"
     parts = [f"{k}={int(v)}" for k, v in row_counts.items()]
     return f"DB Proof: {', '.join(parts)} • fetched_at={ts}"
+
+
+def _looks_like_code_output(txt: str) -> bool:
+    t = (txt or "").strip().lower()
+    if not t:
+        return False
+    if "```" in t:
+        return True
+    code_markers = [
+        "import ", "def ", "class ", "select ", "create table", "alter table", "drop table",
+        "insert into", "update ", "delete from"
+    ]
+    return any(m in t for m in code_markers)
 
 
 # =============================================================================
@@ -818,7 +847,6 @@ def _extract_relation_name(text: str) -> Optional[str]:
 _MEMBER_ID_PATTERNS = [
     re.compile(r"\bmember[_\s-]?id\s*[:=#]?\s*(\d+)\b", re.IGNORECASE),
     re.compile(r"\bmember\s*#?\s*(\d+)\b", re.IGNORECASE),
-    # keep this last: "id=4" could match lots of contexts; still useful for your UI
     re.compile(r"\bid\s*[:=#]?\s*(\d+)\b", re.IGNORECASE),
 ]
 
@@ -837,42 +865,29 @@ def _extract_member_id(text: str) -> Optional[str]:
 
 
 def _is_member_id_only_request(text: str) -> bool:
-    """
-    True when message is basically "member_id=4" or "4" or "member 4"
-    and should trigger Member Intelligence Summary (DB-only).
-    """
     t = _lc(text)
     mid = _extract_member_id(t)
     if not mid:
         return False
 
-    # If it's purely numeric, that's definitely a member focus request.
     if t.strip().isdigit():
         return True
 
-    # If it contains clear member/id token but not other command words, treat as member summary.
     member_tokens = {"member", "member_id", "member-id", "member id", "id"}
     has_member_token = any(tok in t for tok in member_tokens)
 
-    # If they included another explicit command, don't treat as "id-only"
     other_cmd_tokens = [
         "loans", "loan", "kpi", "kpis", "tables", "show ", "describe ", "verify ",
         "contributions", "fines", "payouts", "attendance", "minutes",
         "web:", "internet:", "tavily:",
+        # action keywords (avoid treating as id-only)
+        "create", "add", "record", "approve", "fine", "pay", "payout", "session",
     ]
     has_other = any(tok in t for tok in other_cmd_tokens)
     return has_member_token and not has_other
 
 
 def _is_db_command(text: str) -> bool:
-    """
-    True => MUST be answered from DB tools (never HF).
-    False => route to HF (foundation model) per your request.
-
-    ✅ IMPORTANT FIX:
-      - Any message that contains a member_id pattern is now treated as DB-related.
-        Example: "member_id=4" should NEVER go to HF.
-    """
     t = _lc(text)
     if not t:
         return False
@@ -888,27 +903,29 @@ def _is_db_command(text: str) -> bool:
     if _wants_show_table(t) or _wants_describe(t) or _wants_help(t) or _wants_verify_member(t):
         return True
 
-    # any finance-ish questions should be treated DB-only (to prevent hallucination)
     finance_words = [
         "contribution", "contributions", "payout", "payouts", "loan", "loans",
         "repayment", "interest", "unpaid", "overdue", "balance", "exposure",
         "liquidity", "foundation", "kpi", "kpis", "risk", "health score", "grade",
         "total", "arrears", "dpd", "due",
+        # action words (still DB)
+        "create", "add", "record", "approve", "fine", "pay", "payout", "session", "mark paid"
     ]
     return any(w in t for w in finance_words)
 
 
-def _looks_like_code_output(txt: str) -> bool:
-    t = (txt or "").strip().lower()
-    if not t:
-        return False
-    if "```" in t:
-        return True
-    code_markers = [
-        "import ", "def ", "class ", "select ", "create table", "alter table", "drop table",
-        "insert into", "update ", "delete from"
+def _wants_db_actions(text: str) -> bool:
+    """
+    True when user is requesting a write / operational action.
+    We allow HF to PLAN tool JSON, but execution is DB-only + confirm.
+    """
+    t = _lc(text)
+    verbs = [
+        "create ", "add ", "record ", "approve ", "fine ", "mark fine", "mark paid",
+        "pay fine", "payout ", "disburse ", "request loan", "loan request",
+        "make payment", "loan payment", "new session", "open session"
     ]
-    return any(m in t for m in code_markers)
+    return any(v in t for v in verbs)
 
 
 # =============================================================================
@@ -1106,7 +1123,7 @@ def _post_with_retries(url: str, headers: dict, payload: dict, timeout: int = 60
 
 def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], timeout: int = 60) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": model, "messages": messages, "temperature": 0.20, "max_tokens": 520}
+    payload = {"model": model, "messages": messages, "temperature": 0.20, "max_tokens": 700}
     ok, raw = _post_with_retries(HF_ROUTER_CHAT_URL, headers, payload, timeout=timeout)
     if not ok:
         return False, raw
@@ -1120,7 +1137,7 @@ def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], time
 
 def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 60) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {"model": model, "prompt": prompt, "temperature": 0.20, "max_tokens": 520}
+    payload = {"model": model, "prompt": prompt, "temperature": 0.20, "max_tokens": 700}
     ok, raw = _post_with_retries(HF_ROUTER_COMPLETIONS_URL, headers, payload, timeout=timeout)
     if not ok:
         return False, raw
@@ -1179,12 +1196,6 @@ def _hf_reason_over_manifold(question: str, manifold_state: Dict[str, Any]) -> T
 
 
 def _foundation_intent_system_prompt() -> str:
-    """
-    Strict prompt for non-DB messages:
-    - Assess what the member wants inside Njangi
-    - Map to the right DB command (or ask ONE question)
-    - Never invent any Njangi numbers
-    """
     return (
         "You are younchat, the assistant inside the Njangi system.\n\n"
         "GOAL:\n"
@@ -1226,10 +1237,6 @@ def _foundation_intent_user_wrapper(user_message: str) -> str:
 
 
 def _hf_smalltalk_answer(question: str) -> Tuple[bool, str, str]:
-    """
-    For NON-DB messages only.
-    Uses HF directly with strict "intent & next" Njangi prompt.
-    """
     token = (os.getenv("HF_TOKEN") or "").strip()
     model = _hf_model()
     force = _hf_force_mode()
@@ -1247,6 +1254,73 @@ def _hf_smalltalk_answer(question: str) -> Tuple[bool, str, str]:
     messages = [{"role": "system", "content": sys}, {"role": "user", "content": user}]
     ok, txt = _hf_router_chat(model, token, messages)
     return (ok, txt, f"hf:intent:chat:{model}") if ok else (False, txt, f"hf:intent:chat_failed:{model}")
+
+
+# =============================================================================
+# ✅ 8B) HF ACTION PLANNER (returns ONLY JSON tool plan)
+# =============================================================================
+def _db_action_planner_system_prompt() -> str:
+    tool_list = sorted(list(ALL_TOOLS.keys()))
+    read_list = sorted(list(READ_TOOLS.keys()))
+    write_list = sorted(list(WRITE_TOOLS.keys()))
+    return (
+        "You are younchat inside Njangi.\n"
+        "You MUST output ONLY valid JSON. No prose.\n\n"
+        "GOAL:\n"
+        "Translate the user's request into Njangi tool actions.\n\n"
+        "STRICT RULES:\n"
+        "- Output ONLY JSON in one of these forms:\n"
+        "  1) {\"tool\":\"<tool>\",\"params\":{...}}\n"
+        "  2) {\"actions\":[{\"tool\":\"...\",\"params\":{...}}, ...]}\n"
+        "- NEVER invent IDs, totals, balances, or DB facts.\n"
+        "- If missing required info, output ONE action that is a READ tool to fetch it, OR ask for exactly one missing field by returning:\n"
+        "  {\"tool\":\"ask_one\",\"params\":{\"question\":\"...\"}}\n"
+        "- Use READ tools for lookup. Use WRITE tools only when user clearly wants a write.\n\n"
+        f"READ_TOOLS: {read_list}\n"
+        f"WRITE_TOOLS: {write_list}\n"
+        f"ALL_TOOLS: {tool_list}\n\n"
+        "PARAMS HINTS:\n"
+        "- member lookup: use member_query (name fragment or numeric member id)\n"
+        "- create_contribution requires: member_query, session_id, amount\n"
+        "- create_fine requires: member_query, amount, reason (optional session_id)\n"
+        "- approve_loan_request requires: loan_request_id, session_id\n"
+        "- create_loan_payment requires: loan_id, member_id, session_id, amount\n"
+    )
+
+
+def _hf_plan_db_actions(user_text: str) -> Tuple[bool, Dict[str, Any], str]:
+    token = (os.getenv("HF_TOKEN") or "").strip()
+    if not token:
+        return False, {}, "hf:missing"
+    model = _hf_model()
+
+    sys = _db_action_planner_system_prompt()
+    messages = [{"role": "system", "content": sys}, {"role": "user", "content": user_text}]
+    ok, txt = _hf_router_chat(model, token, messages)
+    if not ok or not txt:
+        return False, {}, f"hf:planner_failed:{model}"
+
+    payload = safe_json_from_text(txt)
+    if not payload:
+        return False, {}, f"hf:planner_bad_json:{model}"
+
+    if payload.get("tool") == "ask_one":
+        return True, payload, f"hf:planner:{model}"
+
+    if "tool" in payload:
+        if payload.get("tool") not in ALL_TOOLS:
+            return False, {}, f"hf:planner_unknown_tool:{model}"
+        return True, payload, f"hf:planner:{model}"
+
+    if "actions" in payload and isinstance(payload["actions"], list):
+        for a in payload["actions"]:
+            if isinstance(a, dict) and a.get("tool") == "ask_one":
+                continue
+            if _clean(str((a or {}).get("tool") or "")) not in ALL_TOOLS:
+                return False, {}, f"hf:planner_unknown_tool:{model}"
+        return True, payload, f"hf:planner:{model}"
+
+    return False, {}, f"hf:planner_invalid_format:{model}"
 
 
 # =============================================================================
@@ -1332,7 +1406,7 @@ def _build_member_report_local(manifold: Dict[str, Any]) -> str:
         lines.append(f"- {s}")
 
     lines.append("\n4️⃣ Next Best Actions")
-    lines.append("- Type: **loans** (or **loans for member <id>**) to see loan rows.")
+    lines.append("- Type: **loans** (or include member id in your message) to see loan rows.")
     lines.append("- Type: **verify member <id>** to compare view vs tables (integrity check).")
 
     lines.append("\n🧾 DB Proof")
@@ -1348,6 +1422,110 @@ def _build_member_report_local(manifold: Dict[str, Any]) -> str:
 
 
 # =============================================================================
+# ✅ 9B) TOOLS RUNNER + CONFIRMATION UI
+# =============================================================================
+def _run_tool_payload(supabase, ctx, payload: Dict[str, Any]) -> Dict[str, Any]:
+    out = {"reads": [], "staged": [], "asks": None, "errors": []}
+
+    if not isinstance(payload, dict):
+        out["errors"].append("Invalid payload type.")
+        return out
+
+    if payload.get("tool") == "ask_one":
+        q = _clean((payload.get("params") or {}).get("question"))
+        out["asks"] = q or "I need one detail to proceed. What’s missing?"
+        return out
+
+    actions: List[Dict[str, Any]] = []
+    if "actions" in payload and isinstance(payload["actions"], list):
+        actions = payload["actions"]
+    elif "tool" in payload:
+        actions = [payload]
+    else:
+        out["errors"].append("Payload must contain tool or actions.")
+        return out
+
+    st.session_state.setdefault("pending_confirmations", [])
+
+    for act in actions:
+        tool = _clean(str(act.get("tool") or ""))
+        params = act.get("params") if isinstance(act.get("params"), dict) else {}
+
+        if tool not in ALL_TOOLS:
+            out["errors"].append(f"Unknown tool: {tool}")
+            continue
+
+        if tool in READ_TOOLS:
+            try:
+                tr: ToolResult = READ_TOOLS[tool](supabase, ctx, params)
+                out["reads"].append({"tool": tool, "ok": tr.ok, "message": tr.message, "data": tr.data})
+            except Exception as e:
+                out["errors"].append(f"Read tool error ({tool}): {e}")
+            continue
+
+        if tool in WRITE_TOOLS:
+            try:
+                tr: ToolResult = WRITE_TOOLS[tool](supabase, ctx, params)
+                if tr.needs_confirmation and tr.confirmation_payload:
+                    st.session_state["pending_confirmations"].append({
+                        "created_at": iso_utc(),
+                        "tool": tr.confirmation_payload.get("tool"),
+                        "params": tr.confirmation_payload.get("params"),
+                    })
+                    out["staged"].append({"tool": tool, "message": tr.message})
+                else:
+                    out["staged"].append({"tool": tool, "message": tr.message})
+            except Exception as e:
+                out["errors"].append(f"Write tool error ({tool}): {e}")
+
+    return out
+
+
+def _render_pending_confirmations(supabase, ctx):
+    pending = st.session_state.get("pending_confirmations", [])
+    if not pending:
+        return
+
+    st.markdown("### ✅ Pending Actions (Confirm to Execute)")
+    pending = list(reversed(pending))
+
+    for idx, p in enumerate(pending):
+        tool = _clean(str(p.get("tool") or ""))
+        params = p.get("params") if isinstance(p.get("params"), dict) else {}
+        created_at = _clean(str(p.get("created_at") or ""))
+
+        with st.expander(f"Confirm: {tool} • {created_at}", expanded=(idx == 0)):
+            st.json({"tool": tool, "params": params}, expanded=False)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button(f"CONFIRM & EXECUTE ({tool})", key=f"chat_confirm_{idx}", type="primary", use_container_width=True):
+                    tr = execute_confirmed_action(supabase, ctx, tool, params)
+                    if tr.ok:
+                        st.success(tr.message)
+                    else:
+                        st.error(tr.message)
+
+                    try:
+                        orig = list(reversed(st.session_state.get("pending_confirmations", [])))
+                        orig.remove(p)
+                        st.session_state["pending_confirmations"] = list(reversed(orig))
+                    except Exception:
+                        st.session_state["pending_confirmations"] = []
+                    st.rerun()
+
+            with c2:
+                if st.button("Cancel", key=f"chat_cancel_{idx}", use_container_width=True):
+                    try:
+                        orig = list(reversed(st.session_state.get("pending_confirmations", [])))
+                        orig.remove(p)
+                        st.session_state["pending_confirmations"] = list(reversed(orig))
+                    except Exception:
+                        st.session_state["pending_confirmations"] = []
+                    st.rerun()
+
+
+# =============================================================================
 # 10) MAIN UI
 # =============================================================================
 def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
@@ -1356,13 +1534,26 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     hf_token = (os.getenv("HF_TOKEN") or "").strip()
     internet_on = _internet_enabled()
 
+    supabase = sb_service or sb_anon  # tools layer uses supabase.table(...)
+    if "younchat_write_mode" not in st.session_state:
+        st.session_state["younchat_write_mode"] = False
+
     with st.expander("⚙️ Chat Settings", expanded=False):
         st.write("**Schema**:", schema)
         st.write("**HF models (locked)**:", ", ".join(HF_ALLOWED_MODELS))
         st.write("**HF_TOKEN present**:", "✅ Yes" if hf_token else "❌ No")
         st.write("**HF_FORCE_MODE**:", (os.getenv("HF_FORCE_MODE") or "auto"))
         st.write("**Internet**:", "✅ ON" if internet_on else "❌ OFF")
-        st.caption("DB integrity: DB commands are DB-only. Non-DB messages route to HF with intent & next-step guidance.")
+        st.caption("DB integrity: DB commands are DB-only. Non-DB routes to HF with intent & next-step guidance. Writes require confirmation.")
+
+    colW1, colW2 = st.columns([1, 2], gap="small")
+    with colW1:
+        st.session_state["younchat_write_mode"] = st.toggle("Write Mode ON", value=st.session_state["younchat_write_mode"])
+    with colW2:
+        if st.session_state["younchat_write_mode"]:
+            st.warning("Write Mode is ON. Writes still require confirmation.", icon="⚠️")
+        else:
+            st.info("Write Mode is OFF (reads only).", icon="ℹ️")
 
     use_foundation_reasoner = st.toggle(
         "Use foundation reasoner (HF) for intelligence reports (manifold-grounded)",
@@ -1391,7 +1582,40 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     if colB.button("🧹 Clear chat", use_container_width=True):
         st.session_state["younchat_history"] = [{"role": "assistant", "content": _intro_only()}]
         st.session_state.pop("younchat_last_member_id", None)
+        st.session_state.pop("pending_confirmations", None)
         st.rerun()
+
+    # ✅ context + confirmation UI (always visible)
+    ctx = resolve_user_context(supabase, st.session_state)
+    _render_pending_confirmations(supabase, ctx)
+
+    # ✅ optional: manual tool JSON entry
+    with st.expander("🧰 Paste tool JSON (optional)", expanded=False):
+        tool_json = st.text_area("Tool JSON", height=120, placeholder='{"tool":"get_member","params":{"member_query":"John"}}')
+        if st.button("Run tool JSON", use_container_width=True):
+            payload = safe_json_from_text(tool_json)
+            if not payload:
+                st.error("Invalid JSON.")
+            else:
+                is_write_payload = (
+                    (payload.get("tool") in WRITE_TOOLS)
+                    or any((a.get("tool") in WRITE_TOOLS) for a in (payload.get("actions") or []) if isinstance(a, dict))
+                )
+                if is_write_payload and (not st.session_state["younchat_write_mode"]):
+                    st.error("Write Mode is OFF. Turn it ON to stage write actions.")
+                else:
+                    ran = _run_tool_payload(supabase, ctx, payload)
+                    if ran.get("asks"):
+                        st.info(_force_hello_prefix(ran["asks"]))
+                    for r in ran.get("reads", []):
+                        (st.success if r.get("ok") else st.error)(f"{r['tool']}: {r['message']}")
+                        if r.get("data") is not None:
+                            st.json(r["data"], expanded=False)
+                    for s in ran.get("staged", []):
+                        st.warning(f"Staged: {s['tool']} • {s['message']}")
+                    for e in ran.get("errors", []):
+                        st.error(e)
+                    st.rerun()
 
     q = st.chat_input("Type your message…")
     if not q:
@@ -1416,6 +1640,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
     # ROUTING RULE:
     #   - DB => DB tools only
     #   - Non-DB => HF intent model (if HF_TOKEN exists)
+    #   - DB "actions" => HF plans tool JSON (still DB-only execution + confirm)
     # -------------------------------------------------------------------------
     is_db = _is_db_command(q)
 
@@ -1467,23 +1692,77 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
             )
 
     else:
+        # ✅ DB-ACTIONS: plan tools JSON, execute reads immediately, stage writes
+        if _wants_db_actions(q):
+            if not _has_hf_token():
+                used_source = "db:planner:no_hf"
+                answer = (
+                    "Hello 👋🏽 To auto-plan DB actions, HF_TOKEN must be set.\n"
+                    "Next: Either set HF_TOKEN or paste tool JSON in the Tool JSON expander."
+                )
+            else:
+                ok, payload, used = _hf_plan_db_actions(q)
+                used_source = used
+                if not ok or not payload:
+                    answer = "Hello 👋🏽 I couldn’t plan that action. Please rephrase or paste tool JSON."
+                else:
+                    if payload.get("tool") == "ask_one":
+                        question = _clean((payload.get("params") or {}).get("question"))
+                        answer = _force_hello_prefix(question or "I need one detail to proceed. What’s missing?")
+                    else:
+                        is_write_payload = (
+                            (payload.get("tool") in WRITE_TOOLS)
+                            or any((a.get("tool") in WRITE_TOOLS) for a in (payload.get("actions") or []) if isinstance(a, dict))
+                        )
+
+                        if is_write_payload and (not st.session_state["younchat_write_mode"]):
+                            answer = (
+                                "Hello 👋🏽 This requires a WRITE action.\n"
+                                "Next: Turn **Write Mode ON**, then send the same request again."
+                            )
+                        else:
+                            ran = _run_tool_payload(supabase, ctx, payload)
+
+                            parts = ["Hello 👋🏽 I processed your Njangi request using DB tools only."]
+                            if ran.get("reads"):
+                                parts.append("\n✅ Reads")
+                                for r in ran["reads"]:
+                                    parts.append(f"- {r['tool']}: {r['message']}")
+                            if ran.get("staged"):
+                                parts.append("\n⚠️ Writes staged (needs confirmation)")
+                                for s in ran["staged"]:
+                                    parts.append(f"- {s['tool']}: {s['message']}")
+                                parts.append("Next: Confirm the pending action(s) above to execute.")
+                            if ran.get("asks"):
+                                parts.append(f"\nNext: {ran['asks']}")
+                            if ran.get("errors"):
+                                parts.append("\n❌ Errors")
+                                for e in ran["errors"]:
+                                    parts.append(f"- {e}")
+
+                            answer = "\n".join(parts)
+
         # ---------------------------------------------------------------------
         # DB COMMANDS: DB-only (never HF for these)
         # ---------------------------------------------------------------------
-        if _wants_help(q):
+        elif _wants_help(q):
             used_source = "help"
             answer = (
                 "Hello 👋🏽 Commands:\n\n"
                 "- **members**\n"
                 "- type **10** (member intelligence)\n"
                 "- **verify member 10** (view vs tables)\n"
-                "- **loans** / **loans for member 10**\n"
+                "- **loans** / include member id in message\n"
                 "- **finance kpis**\n"
                 "- **tables**\n"
                 "- **show <table>** (example: show contributions)\n"
                 "- **describe <table>** (example: describe loans)\n"
                 "- Ask: **How are we doing?** (Control Tower Review)\n"
-                "- **web: <topic>** (internet help)\n"
+                "- **web: <topic>** (internet help)\n\n"
+                "✅ Actions (Write Mode ON):\n"
+                "- \"create contribution for John session 12 amount 1000\"\n"
+                "- \"fine Peter 500 reason absence session 12\"\n"
+                "- \"approve loan request 17 session 12\"\n"
             )
 
         elif _wants_tables_list(q):
@@ -1536,8 +1815,8 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
             answer = f"Hello 👋🏽 {title} (from `{src}`):" if not df.empty else f"Hello 👋🏽 {title}: no rows returned."
 
         elif _wants_financial_review(q):
-            ctx = _collect_global_finance_context(sb_anon, sb_service, schema)
-            metrics = _compute_global_metrics(ctx)
+            ctx0 = _collect_global_finance_context(sb_anon, sb_service, schema)
+            metrics = _compute_global_metrics(ctx0)
             manifold = _manifold_global_state(metrics)
 
             if use_foundation_reasoner and _has_hf_token():
@@ -1564,7 +1843,7 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                 answer, df_show, df_title, used_source = _member_verify_view_vs_tables(sb_anon, sb_service, schema, str(mid), members_truth)
 
         elif _is_member_id_only_request(q) or (detected_id is not None and detected_id == (member_id_focus or detected_id)):
-            # ✅ NEW: member_id=4 should land here and produce a real DB answer
+            # ✅ member_id=4 should land here and produce a real DB answer
             mid = str(detected_id or member_id_focus or "").strip()
             used_source = "db:member_intelligence"
 
@@ -1580,9 +1859,11 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                 table_totals, table_notes = _compute_member_totals_from_tables(sb_anon, sb_service, schema, mid)
                 manifold = _manifold_member_state(mid, name, table_totals, table_notes)
 
-                # Narrative: local or manifold HF reasoner (still DB-grounded)
                 if use_foundation_reasoner and _has_hf_token():
-                    ok, txt, used = _hf_reason_over_manifold("Give a short member financial intelligence summary with next best actions.", manifold)
+                    ok, txt, used = _hf_reason_over_manifold(
+                        "Give a short member financial intelligence summary with next best actions.",
+                        manifold,
+                    )
                     if ok and txt and not _looks_like_code_output(txt):
                         used_source = used
                         answer = txt
@@ -1613,7 +1894,9 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
                 "- **describe loans**\n"
                 "- **verify member 10**\n"
                 "- Or type **10** (member intelligence)\n"
-                "- Ask: **How are we doing?**\n"
+                "- Ask: **How are we doing?**\n\n"
+                "✅ Actions (Write Mode ON):\n"
+                "- \"create contribution for John session 12 amount 1000\"\n"
             )
 
     # Enforce Hello prefix while preserving exact intro message
@@ -1631,5 +1914,6 @@ def render_njangi_llm_panel(sb_anon, sb_service, schema: str) -> None:
         f"Source used: {used_source} • member_id: {member_id_focus or '—'} • "
         f"Internet: {'ON' if internet_on else 'OFF'} • "
         f"HF_TOKEN: {'ON' if _has_hf_token() else 'OFF'} • "
+        f"Write Mode: {'ON' if st.session_state['younchat_write_mode'] else 'OFF'} • "
         f"Manifold reasoner: {'ON' if (use_foundation_reasoner and _has_hf_token()) else 'OFF'}"
     )
