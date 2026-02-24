@@ -1,6 +1,8 @@
+
 # app.py ✅ COMPLETE SINGLE FILE — NJANGI STANDARD (NO legacy)
 # FAST VERSION + SLOW/GENTLE MODE + ✅ younchat + SAFE NAV FIX + ✅ DASHBOARD-AI NAV BRIDGE
 # ✅ NEW: Smooth floating rotating manifold background (CSS-only, Streamlit-safe)
+# ✅ NEW: Minutes PDF + Attendance PDF download buttons (via pdfs.py)
 # ------------------------------------------------------------------------------
 # ✅ Keeps:
 #   - Safe navigation + nav bridge (dashboard → other pages)
@@ -24,12 +26,18 @@ import streamlit as st
 from postgrest.exceptions import APIError
 from supabase import create_client
 
-# Required module
-from dashboard_panel import render_dashboard
 
+# =========================
+# PATH FIX (CRITICAL)
+# Put APP_DIR on sys.path BEFORE importing local modules.
+# =========================
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 if APP_DIR not in sys.path:
     sys.path.insert(0, APP_DIR)
+
+# Required local module (after sys.path fix)
+from dashboard_panel import render_dashboard  # noqa: E402
+
 
 APP_BRAND = "theyoungshallgrow"
 
@@ -622,10 +630,6 @@ def load_ai_table(
     order_desc: bool,
     limit: int,
 ) -> pd.DataFrame:
-    """
-    Cache-safe AI loader: creates a new client inside cache function (OK).
-    Throttle is global; works fine here to protect rate limits.
-    """
     client = create_client(url, anon_key)
     try:
         throttle_db()
@@ -645,11 +649,6 @@ def _ai_limit(slow_mode: bool, fast_limit: int, slow_limit: int) -> int:
 
 
 def load_ai_bundle() -> dict:
-    """
-    Loads raw tables needed for ai_suite_panel.render_full_ai_suite_panel().
-    Uses anon key reads (RLS must allow). If your RLS blocks anon reads,
-    you can flip these reads to service key by adding parallel loaders.
-    """
     lim_small = _ai_limit(SLOW_MODE, 2500, 1200)
     lim_med = _ai_limit(SLOW_MODE, 4000, 2000)
     lim_big = _ai_limit(SLOW_MODE, 6000, 3000)
@@ -790,6 +789,24 @@ else:
 
 apply_nav_before_widget(default_page="Dashboard", allowed_pages=PAGES)
 page = st.sidebar.radio("Menu", PAGES, key="main_menu")
+
+
+# =========================
+# OPTIONAL: PDF FUNCTIONS (lazy)
+# =========================
+def get_pdf_tools():
+    """
+    Lazy-load pdf makers from pdfs.py.
+    Returns (make_minutes_pdf, make_attendance_pdf, err)
+    """
+    mod, err = lazy_import("pdfs", None)
+    if mod is None:
+        return None, None, err or "pdfs.py not found"
+    mm = getattr(mod, "make_minutes_pdf", None)
+    ma = getattr(mod, "make_attendance_pdf", None)
+    if not mm or not ma:
+        return None, None, "pdfs.py missing make_minutes_pdf or make_attendance_pdf"
+    return mm, ma, None
 
 
 # =========================
@@ -969,6 +986,7 @@ elif page == "Minutes & Attendance":
 
     tab1, tab2, tab3 = st.tabs(["Minutes / Documentation", "Attendance", "Summaries"])
 
+    # ---------- Minutes ----------
     with tab1:
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.subheader("Meeting Minutes / Documentation")
@@ -1023,6 +1041,7 @@ elif page == "Minutes & Attendance":
 
         st.divider()
         st.markdown("### Current session minutes")
+
         rows = safe_select(
             sb_service,
             "minutes",
@@ -1039,8 +1058,32 @@ elif page == "Minutes & Attendance":
             st.info("No minutes recorded yet.")
         else:
             st.dataframe(dfm, use_container_width=True, hide_index=True)
+
+            # ✅ PDF Download (Minutes)
+            make_minutes_pdf, _, pdf_err = get_pdf_tools()
+            if make_minutes_pdf is None:
+                st.caption("PDF download not available.")
+                st.code(pdf_err or "", language="text")
+            else:
+                # best row for current session (latest updated_at)
+                row0 = dfm.iloc[0].to_dict()
+                try:
+                    pdf_bytes = make_minutes_pdf(APP_BRAND, row0)
+                    fname = f"minutes_session_{int(current_session_id)}.pdf"
+                    st.download_button(
+                        "⬇️ Download Minutes PDF (current session)",
+                        data=pdf_bytes,
+                        file_name=fname,
+                        mime="application/pdf",
+                        use_container_width=True,
+                    )
+                except Exception as e:
+                    st.error("Failed to generate Minutes PDF.")
+                    st.code(_api_msg(e), language="text")
+
         st.markdown(glass_close(), unsafe_allow_html=True)
 
+    # ---------- Attendance ----------
     with tab2:
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.subheader("Attendance")
@@ -1147,8 +1190,36 @@ elif page == "Minutes & Attendance":
                 st.warning("View v_attendance_with_member not readable. Showing attendance joined in Python.")
                 st.dataframe(dfa, use_container_width=True, hide_index=True)
 
+        # ✅ PDF Download (Attendance)
+        _, make_attendance_pdf, pdf_err = get_pdf_tools()
+        if make_attendance_pdf is None:
+            st.caption("PDF download not available.")
+            st.code(pdf_err or "", language="text")
+        else:
+            try:
+                # use the *raw* attendance rows (your pdfs.py expects list[dict] with member_id/present/note)
+                # If you want member names in the PDF, we can change pdfs.py later to accept joined rows.
+                pdf_bytes = make_attendance_pdf(
+                    brand=APP_BRAND,
+                    session_id=int(current_session_id),
+                    attendance_rows=arows_existing or [],
+                    logo_path="assets/logo.png",
+                )
+                fname = f"attendance_session_{int(current_session_id)}.pdf"
+                st.download_button(
+                    "⬇️ Download Attendance PDF (current session)",
+                    data=pdf_bytes,
+                    file_name=fname,
+                    mime="application/pdf",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.error("Failed to generate Attendance PDF.")
+                st.code(_api_msg(e), language="text")
+
         st.markdown(glass_close(), unsafe_allow_html=True)
 
+    # ---------- Summaries ----------
     with tab3:
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.subheader("Summaries")
