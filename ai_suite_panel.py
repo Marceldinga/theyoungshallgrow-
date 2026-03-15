@@ -5,7 +5,9 @@
 # Risk • Reliability • Dropout • Fraud • Liquidity • Decisions • Alerts • Trends
 # Segments • Stress Test • (Optional) ML (XGBoost if installed + enough data)
 #
-# ✅ FIXES YOUR CRASH (ValueError length mismatch):
+# ✅ FIXES:
+#   - tz-aware timestamp crash:
+#       TypeError: Cannot localize tz-aware Timestamp, use tz_convert for conversions
 #   - ALL feature vectors are built on a FULL members index (member_id)
 #   - Aggregates from loans/contrib/payments etc are MERGED back (left join)
 #   - No ".values" assignment from shorter group results
@@ -25,7 +27,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -82,6 +83,16 @@ def _utc_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _utc_now_ts() -> pd.Timestamp:
+    """Always return a timezone-aware UTC timestamp."""
+    return pd.Timestamp.now(tz="UTC")
+
+
+def _to_utc_datetime(value: Any) -> Any:
+    """Parse scalar/Series to UTC-aware pandas datetime."""
+    return pd.to_datetime(value, errors="coerce", utc=True)
+
+
 def _throttle_db():
     slow = bool(st.session_state.get("_slow_mode_override", True))
     min_wait = float(st.session_state.get("MIN_SECONDS_BETWEEN_DB_CALLS_UI", 0.15))
@@ -107,10 +118,10 @@ def _days_since_utc(dt: Any) -> Optional[int]:
     if dt is None or str(dt).strip() == "":
         return None
     try:
-        ts = pd.to_datetime(dt, errors="coerce", utc=True)
+        ts = _to_utc_datetime(dt)
         if pd.isna(ts):
             return None
-        delta = (pd.Timestamp.utcnow().tz_localize("UTC") - ts)
+        delta = (_utc_now_ts() - ts)
         return int(delta.total_seconds() // 86400)
     except Exception:
         return None
@@ -228,7 +239,6 @@ def _normalize_members(df: pd.DataFrame) -> pd.DataFrame:
     if not id_col:
         return pd.DataFrame(columns=["member_id", "member_name"])
 
-    # name preference: display_name > full_name/name
     disp = _pick_col(df, ["display_name"])
     nm = _pick_col(df, ["full_name", "name"])
 
@@ -247,8 +257,6 @@ def _normalize_members(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     out["member_name"] = disp_clean.where(disp_clean != "", nm_clean).replace("", "(no name)")
-
-    # stable sort by numeric id when possible
     out["_id_num"] = pd.to_numeric(out["member_id"], errors="coerce")
     out = out.sort_values(["_id_num", "member_id"], ascending=True).drop(columns=["_id_num"])
 
@@ -270,9 +278,9 @@ def _agg_contributions(contrib: pd.DataFrame) -> pd.DataFrame:
     tmp["_amt"] = pd.to_numeric(tmp[amt], errors="coerce").fillna(0) if amt and amt in tmp.columns else 0.0
 
     if dt and dt in tmp.columns:
-        tmp["_dt"] = pd.to_datetime(tmp[dt], errors="coerce", utc=True)
+        tmp["_dt"] = _to_utc_datetime(tmp[dt])
         last_dt = tmp.groupby("member_id")["_dt"].max()
-        last_days = (pd.Timestamp.utcnow().tz_localize("UTC") - last_dt).dt.days
+        last_days = (_utc_now_ts() - last_dt).dt.days
         last_days = last_days.replace([np.inf, -np.inf], np.nan)
     else:
         last_days = pd.Series(index=tmp["member_id"].unique(), dtype="float64")
@@ -345,7 +353,6 @@ def _agg_loans(loans: pd.DataFrame) -> pd.DataFrame:
     tmp["_is_active"] = stt.isin(ACTIVE_STATUSES)
     tmp["_is_overdue"] = stt.isin({"overdue", "late"})
 
-    # choose exposure from best available
     if principal and principal in tmp.columns:
         tmp["_exposure"] = pd.to_numeric(tmp[principal], errors="coerce").fillna(0)
     elif total_due and total_due in tmp.columns:
@@ -385,9 +392,10 @@ def _agg_payments(pay: pd.DataFrame) -> pd.DataFrame:
     tmp["_amt"] = pd.to_numeric(tmp[amt], errors="coerce").fillna(0) if amt and amt in tmp.columns else 0.0
 
     if dt and dt in tmp.columns:
-        tmp["_dt"] = pd.to_datetime(tmp[dt], errors="coerce", utc=True)
+        tmp["_dt"] = _to_utc_datetime(tmp[dt])
         last_dt = tmp.groupby("member_id")["_dt"].max()
-        last_days = (pd.Timestamp.utcnow().tz_localize("UTC") - last_dt).dt.days
+        last_days = (_utc_now_ts() - last_dt).dt.days
+        last_days = last_days.replace([np.inf, -np.inf], np.nan)
     else:
         last_days = pd.Series(index=tmp["member_id"].unique(), dtype="float64")
 
@@ -406,16 +414,20 @@ def _agg_payouts(payouts: pd.DataFrame) -> pd.DataFrame:
     cols = ["member_id", "payout_count", "last_payout_days"]
     if payouts is None or payouts.empty:
         return pd.DataFrame(columns=cols)
+
     mid = _pick_col(payouts, ["member_id"])
     dt = _pick_col(payouts, ["paid_at", "created_at"])
     if not mid:
         return pd.DataFrame(columns=cols)
+
     tmp = payouts.copy()
     tmp["member_id"] = tmp[mid].astype(str)
+
     if dt and dt in tmp.columns:
-        tmp["_dt"] = pd.to_datetime(tmp[dt], errors="coerce", utc=True)
+        tmp["_dt"] = _to_utc_datetime(tmp[dt])
         last_dt = tmp.groupby("member_id")["_dt"].max()
-        last_days = (pd.Timestamp.utcnow().tz_localize("UTC") - last_dt).dt.days
+        last_days = (_utc_now_ts() - last_dt).dt.days
+        last_days = last_days.replace([np.inf, -np.inf], np.nan)
     else:
         last_days = pd.Series(index=tmp["member_id"].unique(), dtype="float64")
 
@@ -439,13 +451,12 @@ def build_member_features(
     foundation: pd.DataFrame,
 ) -> pd.DataFrame:
     """
-    ✅ Always returns full member frame with safe merged aggregates.
+    Always returns full member frame with safe merged aggregates.
     """
     base = _normalize_members(members)
     if base.empty:
         return pd.DataFrame()
 
-    # aggregates
     a_contrib = _agg_contributions(contrib)
     a_loans = _agg_loans(loans)
     a_pay = _agg_payments(payments)
@@ -453,32 +464,27 @@ def build_member_features(
     a_fines = _agg_fines(fines)
     a_found = _agg_foundation(foundation)
 
-    # merge all onto base member_id
     X = base.copy()
     for agg in [a_contrib, a_found, a_fines, a_loans, a_pay, a_payout]:
         if agg is None or agg.empty:
             continue
         X = X.merge(agg, on="member_id", how="left")
 
-    # fill
     num_cols = [c for c in X.columns if c not in ("member_id", "member_name")]
     for c in num_cols:
         X[c] = pd.to_numeric(X[c], errors="coerce")
 
     for c in num_cols:
         if c.endswith("_days"):
-            # days can be NaN if never happened
             X[c] = X[c].fillna(np.nan)
         else:
             X[c] = X[c].fillna(0.0)
 
-    # derived signals
     X["no_payment_14d"] = (X.get("last_payment_days") >= 14).fillna(True).astype(int) if "last_payment_days" in X else 1
     X["no_payment_30d"] = (X.get("last_payment_days") >= 30).fillna(True).astype(int) if "last_payment_days" in X else 1
     X["no_contrib_14d"] = (X.get("last_contrib_days") >= 14).fillna(True).astype(int) if "last_contrib_days" in X else 1
     X["no_contrib_30d"] = (X.get("last_contrib_days") >= 30).fillna(True).astype(int) if "last_contrib_days" in X else 1
 
-    # simple fraud-ish / behavior flags (heuristic)
     X["bad_status_flag"] = (X.get("overdue_flag_count", 0) > 0).astype(int)
     X["outstanding_loan_flag"] = (X.get("active_loan_exposure", 0) > 0).astype(int)
 
@@ -486,32 +492,23 @@ def build_member_features(
 
 
 # =============================================================================
-# Heuristic Scoring (Manifold-style: smooth blend of signals)
+# Heuristic Scoring
 # =============================================================================
 def score_members_heuristic(
     X: pd.DataFrame,
     w: Dict[str, float],
 ) -> pd.DataFrame:
-    """
-    Returns X with:
-      - risk_score (0..100)
-      - reliability_score (0..100)
-      - dropout_score (0..100)
-      - risk_band
-    """
     if X is None or X.empty:
         return pd.DataFrame()
 
     df = X.copy()
 
-    # Normalize helpers
     def zpos(series: pd.Series) -> pd.Series:
         s = pd.to_numeric(series, errors="coerce").fillna(0.0).astype(float)
         if s.max() <= 0:
             return s * 0
         return (s / (s.max() + 1e-9)).clip(0, 1)
 
-    # Core components
     outstanding = zpos(df.get("active_loan_exposure", 0))
     total_due = zpos(df.get("total_due_like", 0))
     bad_status = zpos(df.get("bad_status_flag", 0))
@@ -524,7 +521,6 @@ def score_members_heuristic(
     contrib_total = zpos(df.get("contrib_total", 0))
     contrib_freq = zpos(df.get("contrib_count", 0))
 
-    # "Manifold blend": smooth weighted sum → sigmoid-like squashing
     raw = (
         w.get("w_outstanding", 0.50) * outstanding
         + w.get("w_total_due", 0.30) * total_due
@@ -538,15 +534,12 @@ def score_members_heuristic(
         - w.get("w_bonus_contrib_freq", 0.20) * contrib_freq
     )
 
-    # squash to 0..100 (smooth)
     risk_score = (1 / (1 + np.exp(-4 * (raw - 0.5)))) * 100
     df["risk_score"] = np.clip(risk_score, 0, 100).round(1)
 
-    # Reliability: inverse-risk blended with contribution strength
     reli_raw = (0.60 * (1 - (df["risk_score"] / 100.0)) + 0.25 * contrib_total + 0.15 * contrib_freq)
     df["reliability_score"] = np.clip(reli_raw * 100, 0, 100).round(1)
 
-    # Dropout: mainly contribution inactivity + low frequency
     drop_raw = 0.55 * no_contrib_30 + 0.25 * no_contrib_14 + 0.20 * (1 - contrib_freq)
     df["dropout_score"] = np.clip(drop_raw * 100, 0, 100).round(1)
 
@@ -562,7 +555,6 @@ def score_members_heuristic(
         return "Low"
 
     df["risk_band"] = df["risk_score"].apply(lambda x: band(float(x)))
-
     return df
 
 
@@ -575,7 +567,6 @@ def stress_test(df: pd.DataFrame, drop_pct: float, pay_delay_days: int, fines_in
 
     X = df.copy()
 
-    # apply what-if perturbations
     if "contrib_total" in X:
         X["contrib_total"] = X["contrib_total"] * (1 - (float(drop_pct) / 100.0))
     if "last_payment_days" in X:
@@ -589,7 +580,7 @@ def stress_test(df: pd.DataFrame, drop_pct: float, pay_delay_days: int, fines_in
 
 
 # =============================================================================
-# Segmentation (KMeans if available)
+# Segmentation
 # =============================================================================
 def segment_members(df: pd.DataFrame, k: int) -> pd.DataFrame:
     if df is None or df.empty:
@@ -623,19 +614,14 @@ def segment_members(df: pd.DataFrame, k: int) -> pd.DataFrame:
 
 
 # =============================================================================
-# Optional ML (XGBoost) — only if installed + enough loans
+# Optional ML
 # =============================================================================
 def train_xgb_if_possible(df: pd.DataFrame, min_loans: int) -> Tuple[Optional[Dict[str, Any]], str]:
-    """
-    Trains a simple classifier for "high risk" label using engineered features.
-    This is OPTIONAL and never blocks the UI.
-    """
     if df is None or df.empty:
         return None, "ml:empty"
     if xgb is None:
         return None, "ml:xgboost_missing"
 
-    # We need a proxy label: high risk if overdue_flag_count>0 or unpaid_interest_like>0 or risk_score>=60
     if "active_loan_count" not in df:
         return None, "ml:missing_active_loan_count"
 
@@ -649,7 +635,6 @@ def train_xgb_if_possible(df: pd.DataFrame, min_loans: int) -> Tuple[Optional[Di
         | (pd.to_numeric(df.get("risk_score", 0), errors="coerce").fillna(0) >= 60)
     ).astype(int)
 
-    # features
     feat_cols = [c for c in [
         "contrib_total", "contrib_count",
         "foundation_total",
@@ -664,7 +649,6 @@ def train_xgb_if_possible(df: pd.DataFrame, min_loans: int) -> Tuple[Optional[Di
     for c in feat_cols:
         X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0.0)
 
-    # guard
     if y.nunique() < 2:
         return None, "ml:label_single_class"
 
@@ -681,13 +665,15 @@ def train_xgb_if_possible(df: pd.DataFrame, min_loans: int) -> Tuple[Optional[Di
     booster = xgb.train(params, dtrain, num_boost_round=60)
 
     preds = booster.predict(dtrain)
+    score_map = booster.get_score(importance_type="weight")
+
     out = {
         "feat_cols": feat_cols,
         "train_rows": int(len(df)),
         "pos_rate": float(y.mean()),
         "avg_pred": float(np.mean(preds)),
         "top_features": sorted(
-            [(f, float(w)) for f, w in zip(feat_cols, booster.get_score(importance_type="weight").values())],
+            [(f, float(score_map.get(f, 0.0))) for f in feat_cols],
             key=lambda x: x[1],
             reverse=True,
         )[:8],
@@ -710,7 +696,6 @@ def build_member_features_cached(
     fines_json: str,
     foundation_json: str,
 ) -> pd.DataFrame:
-    # cache key uses serialized JSON to avoid supabase client caching issues
     members = pd.read_json(members_json)
     contrib = pd.read_json(contrib_json)
     loans = pd.read_json(loans_json)
@@ -724,7 +709,6 @@ def build_member_features_cached(
 def _safe_json(df: pd.DataFrame) -> str:
     if df is None or df.empty:
         return pd.DataFrame().to_json()
-    # cap to avoid huge cache payload
     if len(df) > MAX_ROWS_SCAN:
         df = df.head(MAX_ROWS_SCAN).copy()
     return df.to_json()
@@ -744,7 +728,6 @@ def _render_settings() -> Dict[str, Any]:
 
     st.markdown("#### Heuristic weights (optional)")
 
-    # weights (match your UI vibe)
     w_outstanding = st.slider("Outstanding loan weight", 0.0, 1.0, 0.50, 0.05)
     w_total_due = st.slider("Total due/arrears weight", 0.0, 1.0, 0.30, 0.05)
     w_bad_status = st.slider("Bad status per flag", 0.0, 1.0, 0.30, 0.05)
@@ -789,7 +772,6 @@ def _render_top_kpis(sb_anon, sb_service, schema: str):
         st.caption("Snapshot: rpc missing → KPIs will be computed from tables below.")
         return
 
-    # support nested or flat
     totals = snap.get("totals") if isinstance(snap.get("totals"), dict) else {}
     total_contrib = totals.get("total_contributions") if totals else snap.get("total_contributions")
     foundation_total = totals.get("foundation_total") if totals else snap.get("foundation_total")
@@ -817,9 +799,14 @@ def _render_alerts(df: pd.DataFrame):
         return
 
     crit = crit.sort_values(["risk_score", "dropout_score"], ascending=False).head(15)
+    cols = [
+        "member_id", "member_name", "risk_band", "risk_score", "reliability_score", "dropout_score",
+        "active_loan_exposure", "overdue_flag_count", "fines_total", "last_contrib_days", "last_payment_days"
+    ]
+    cols = [c for c in cols if c in crit.columns]
+
     st.dataframe(
-        crit[["member_id", "member_name", "risk_band", "risk_score", "reliability_score", "dropout_score",
-              "active_loan_exposure", "overdue_flag_count", "fines_total", "last_contrib_days", "last_payment_days"]],
+        crit[cols],
         use_container_width=True,
         hide_index=True,
     )
@@ -829,17 +816,20 @@ def _render_trends(contrib: pd.DataFrame, payments: pd.DataFrame):
     st.markdown("#### 📈 Trends (last 90 days, if timestamps available)")
     cdt = _pick_col(contrib, ["paid_at", "created_at"]) if contrib is not None else None
     pdt = _pick_col(payments, ["paid_at", "created_at"]) if payments is not None else None
+    now_utc = _utc_now_ts()
+    cutoff = now_utc - pd.Timedelta(days=90)
 
     colA, colB = st.columns(2)
+
     with colA:
         st.caption("Contributions")
         if contrib is None or contrib.empty or not cdt or cdt not in contrib.columns:
             st.info("No contribution timestamps available.")
         else:
             tmp = contrib.copy()
-            tmp["_dt"] = pd.to_datetime(tmp[cdt], errors="coerce", utc=True)
+            tmp["_dt"] = _to_utc_datetime(tmp[cdt])
             tmp = tmp.dropna(subset=["_dt"])
-            tmp = tmp[tmp["_dt"] >= (pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(days=90))]
+            tmp = tmp[tmp["_dt"] >= cutoff]
             if tmp.empty:
                 st.info("No contributions in the last 90 days (or timestamps missing).")
             else:
@@ -855,9 +845,9 @@ def _render_trends(contrib: pd.DataFrame, payments: pd.DataFrame):
             st.info("No payment timestamps available.")
         else:
             tmp = payments.copy()
-            tmp["_dt"] = pd.to_datetime(tmp[pdt], errors="coerce", utc=True)
+            tmp["_dt"] = _to_utc_datetime(tmp[pdt])
             tmp = tmp.dropna(subset=["_dt"])
-            tmp = tmp[tmp["_dt"] >= (pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(days=90))]
+            tmp = tmp[tmp["_dt"] >= cutoff]
             if tmp.empty:
                 st.info("No payments in the last 90 days (or timestamps missing).")
             else:
@@ -907,7 +897,6 @@ def _render_minutes_generator(df_scored: pd.DataFrame, schema: str):
 def render_full_ai_suite_panel(sb_anon, sb_service=None, schema: str = "public") -> None:
     _render_header()
 
-    # settings UI (matches your screenshot)
     cfg = _render_settings()
     w = cfg["weights"]
 
@@ -915,7 +904,6 @@ def render_full_ai_suite_panel(sb_anon, sb_service=None, schema: str = "public")
     _render_top_kpis(sb_anon, sb_service, schema)
     st.divider()
 
-    # Load core tables (safe columns; broad select to survive schema variation)
     with st.spinner("Loading Njangi data…"):
         members = _sb_select(sb_anon, sb_service, schema, "members", cols="*", limit=20_000, order_by="id", desc=False)
         contrib = _sb_select(sb_anon, sb_service, schema, "contributions", cols="*", limit=MAX_ROWS_SCAN, order_by="created_at", desc=True)
@@ -925,7 +913,6 @@ def render_full_ai_suite_panel(sb_anon, sb_service=None, schema: str = "public")
         fines = _sb_select(sb_anon, sb_service, schema, "fines", cols="*", limit=MAX_ROWS_SCAN, order_by="created_at", desc=True)
         foundation = _sb_select(sb_anon, sb_service, schema, "foundation_contributions", cols="*", limit=MAX_ROWS_SCAN, order_by="created_at", desc=True)
 
-    # Build features (cached)
     url_sig = f"{schema}:{id(sb_service or sb_anon)}"
     X = build_member_features_cached(
         url_sig=url_sig,
@@ -943,15 +930,11 @@ def render_full_ai_suite_panel(sb_anon, sb_service=None, schema: str = "public")
         st.error("AI Suite: could not build features (members table empty or unreadable).")
         return
 
-    # Score
     df_scored = score_members_heuristic(X, w)
-
-    # Segments
     df_scored = segment_members(df_scored, cfg["segments"])
 
-    # Stress test
     st.markdown("#### 🧪 Stress Test Output")
-    st.caption("Applies your what-if knobs and recomputes risk smoothly (manifold blend).")
+    st.caption("Applies your what-if knobs and recomputes risk smoothly.")
     st_df = stress_test(
         df_scored,
         drop_pct=cfg["stress"]["drop_pct"],
@@ -972,7 +955,6 @@ def render_full_ai_suite_panel(sb_anon, sb_service=None, schema: str = "public")
 
     st.divider()
 
-    # Main tabs
     tab1, tab2, tab3, tab4, tab5 = st.tabs(
         ["📌 Leaderboard", "🚨 Alerts", "📈 Trends", "🧩 Segments", "📝 Minutes Generator"]
     )
@@ -994,7 +976,6 @@ def render_full_ai_suite_panel(sb_anon, sb_service=None, schema: str = "public")
             use_container_width=True,
             hide_index=True,
         )
-
         st.caption(f"Built at (UTC): {_utc_iso()} • Members: {len(df_scored)}")
 
     with tab2:
@@ -1027,30 +1008,32 @@ def render_full_ai_suite_panel(sb_anon, sb_service=None, schema: str = "public")
             st.dataframe(seg_summary, use_container_width=True, hide_index=True)
 
             st.markdown("**Members in selected segment**")
-            seg_pick = st.selectbox("Segment", sorted(df_scored["segment"].dropna().unique().tolist()), index=0)
-            seg_members = df_scored[df_scored["segment"] == seg_pick].sort_values("risk_score", ascending=False).head(50)
-            cols = [c for c in ["member_id", "member_name", "risk_band", "risk_score", "contrib_total", "active_loan_exposure", "fines_total"] if c in seg_members.columns]
-            st.dataframe(seg_members[cols], use_container_width=True, hide_index=True)
+            seg_options = sorted(df_scored["segment"].dropna().unique().tolist())
+            if seg_options:
+                seg_pick = st.selectbox("Segment", seg_options, index=0)
+                seg_members = df_scored[df_scored["segment"] == seg_pick].sort_values("risk_score", ascending=False).head(50)
+                cols = [c for c in ["member_id", "member_name", "risk_band", "risk_score", "contrib_total", "active_loan_exposure", "fines_total"] if c in seg_members.columns]
+                st.dataframe(seg_members[cols], use_container_width=True, hide_index=True)
+            else:
+                st.info("No segment labels available.")
 
     with tab5:
         _render_minutes_generator(df_scored, schema=schema)
 
     st.divider()
 
-    # Optional ML
     st.markdown("#### 🤖 Optional ML (XGBoost)")
-    st.caption("Only runs if xgboost is installed AND enough loans exist. Never blocks the suite.")
+    st.caption("Only runs if xgboost is installed and enough loans exist.")
     ml_info, ml_status = train_xgb_if_possible(df_scored, min_loans=cfg["min_loans"])
 
     if ml_info is None:
         st.info(f"ML status: {ml_status}")
         if ml_status == "ml:xgboost_missing":
-            st.caption("If you want ML: add `xgboost` to requirements.txt.")
+            st.caption("If you want ML, add `xgboost` to requirements.txt.")
     else:
         st.success(f"ML status: {ml_status}")
         st.json(ml_info)
 
-    # Debug
     with st.expander("🔎 Debug (feature columns)", expanded=False):
         st.write("Feature columns:", list(df_scored.columns))
         st.write("Row counts:")
@@ -1063,4 +1046,4 @@ def render_full_ai_suite_panel(sb_anon, sb_service=None, schema: str = "public")
             "fines": _safe_count(fines),
             "foundation_contributions": _safe_count(foundation),
         })
-        st.caption("This panel is index-safe: all aggregates are merged onto full members list (no length mismatch).")
+        st.caption("This panel is index-safe: all aggregates are merged onto full members list.")
