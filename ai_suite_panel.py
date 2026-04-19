@@ -1,4 +1,3 @@
-
 # ai_suite_panel.py ✅ COMPLETE SINGLE FILE — NJANGI STANDARD (NO legacy)
 # =============================================================================
 # 🧠 NJANGI AI Suite — Advanced+ (No API Key)
@@ -11,6 +10,8 @@
 #   - ALL feature vectors are built on a FULL members index (member_id)
 #   - Aggregates from loans/contrib/payments etc are MERGED back (left join)
 #   - No ".values" assignment from shorter group results
+#   - JSON cache rebuild fix:
+#       pd.read_json(StringIO(...)) instead of treating JSON text as filepath
 #
 # ✅ Snapshot-first friendly:
 #   - Uses RPC: fn_finance_snapshot() when available (fast)
@@ -29,6 +30,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
+from io import StringIO
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -190,14 +192,14 @@ def _sb_select(
 
     try:
         _throttle_db()
-        q = (sb.schema(schema).table(table).select(cols).limit(int(limit)))
+        q = sb.schema(schema).table(table).select(cols).limit(int(limit))
         q = _apply(q)
         res = q.execute()
         return pd.DataFrame(getattr(res, "data", None) or [])
     except Exception:
         try:
             _throttle_db()
-            q = (sb.table(table).select(cols).limit(int(limit)))
+            q = sb.table(table).select(cols).limit(int(limit))
             q = _apply(q)
             res = q.execute()
             return pd.DataFrame(getattr(res, "data", None) or [])
@@ -696,13 +698,21 @@ def build_member_features_cached(
     fines_json: str,
     foundation_json: str,
 ) -> pd.DataFrame:
-    members = pd.read_json(members_json)
-    contrib = pd.read_json(contrib_json)
-    loans = pd.read_json(loans_json)
-    pay = pd.read_json(pay_json)
-    payouts = pd.read_json(payouts_json)
-    fines = pd.read_json(fines_json)
-    foundation = pd.read_json(foundation_json)
+    def _json_to_df(raw: str) -> pd.DataFrame:
+        if raw is None:
+            return pd.DataFrame()
+        raw = str(raw).strip()
+        if not raw:
+            return pd.DataFrame()
+        return pd.read_json(StringIO(raw))
+
+    members = _json_to_df(members_json)
+    contrib = _json_to_df(contrib_json)
+    loans = _json_to_df(loans_json)
+    pay = _json_to_df(pay_json)
+    payouts = _json_to_df(payouts_json)
+    fines = _json_to_df(fines_json)
+    foundation = _json_to_df(foundation_json)
     return build_member_features(members, contrib, loans, pay, payouts, fines, foundation)
 
 
