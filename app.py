@@ -3,6 +3,7 @@
 # ✅ NEW: Smooth floating rotating manifold background (CSS-only, Streamlit-safe)
 # ✅ NEW: Minutes PDF + Attendance PDF download buttons (via pdfs.py)
 # ✅ FIX: AI Suite signature-adapter (prevents TypeError unexpected keyword args)
+# ✅ UPDATE: Uses backend.data.readers.sb_select when available
 # ------------------------------------------------------------------------------
 # ✅ Keeps:
 #   - Safe navigation + nav bridge (dashboard → other pages)
@@ -39,6 +40,14 @@ if APP_DIR not in sys.path:
 # Required local module (after sys.path fix)
 from dashboard_panel import render_dashboard  # noqa: E402
 
+# Optional bridge to your new backend helpers
+try:
+    from backend.data.readers import sb_select
+    BACKEND_READERS_OK = True
+except Exception:
+    sb_select = None
+    BACKEND_READERS_OK = False
+
 
 APP_BRAND = "theyoungshallgrow"
 
@@ -47,6 +56,7 @@ st.set_page_config(
     layout="wide",
     page_icon="🏦",
 )
+
 
 # =========================
 # TIME
@@ -271,22 +281,18 @@ def _call_with_supported_kwargs(fn, **kwargs):
     - We do NOT catch exceptions raised by fn() itself,
       otherwise we'd retry with unfiltered kwargs and crash again.
     """
-    # Unwrap decorators if any
     try:
         target = inspect.unwrap(fn)
     except Exception:
         target = fn
 
-    # Only protect signature inspection
     try:
         sig = inspect.signature(target)
     except Exception:
-        # Can't inspect -> call directly (best effort)
         return fn(**kwargs)
 
     params = sig.parameters
 
-    # If function accepts **kwargs, pass everything
     if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
         return fn(**kwargs)
 
@@ -415,9 +421,57 @@ def _api_msg(e: Exception) -> str:
     return repr(e)
 
 
+def _safe_rows_via_backend(
+    client,
+    schema: str,
+    relation: str,
+    cols: str = "*",
+    limit: int = 2000,
+    filters: Optional[List[Tuple[str, str, Any]]] = None,
+    order_by: Optional[str] = None,
+    order_desc: bool = False,
+) -> Optional[List[Dict]]:
+    """
+    Uses backend.data.readers.sb_select when available.
+    Returns None if backend bridge is not available.
+    """
+    if not BACKEND_READERS_OK or sb_select is None or client is None:
+        return None
+
+    try:
+        throttle_db()
+        order_spec = (order_by, not order_desc) if order_by else None
+        df = sb_select(
+            sb_anon=client,
+            sb_service=None,
+            schema=schema,
+            relation=relation,
+            cols=cols,
+            limit=int(limit),
+            filters=filters,
+            order=order_spec,
+        )
+        if df is None or df.empty:
+            return []
+        return df.to_dict(orient="records")
+    except Exception:
+        return []
+
+
 def table_readable(client, schema: str, table_name: str) -> bool:
     if client is None:
         return False
+
+    via_backend = _safe_rows_via_backend(
+        client=client,
+        schema=schema,
+        relation=table_name,
+        cols="*",
+        limit=1,
+    )
+    if via_backend is not None:
+        return True if isinstance(via_backend, list) else False
+
     try:
         throttle_db()
         client.schema(schema).table(table_name).select("*").limit(1).execute()
@@ -439,7 +493,27 @@ def safe_select(
 ) -> List[Dict]:
     if client is None:
         return []
+
     try:
+        filter_specs: List[Tuple[str, str, Any]] = []
+        for col, val in (filters or {}).items():
+            if val is None:
+                continue
+            filter_specs.append((col, "eq", val))
+
+        via_backend = _safe_rows_via_backend(
+            client=client,
+            schema=schema,
+            relation=table_name,
+            cols=select_cols,
+            limit=int(limit) if limit is not None else 2000,
+            filters=filter_specs,
+            order_by=order_by,
+            order_desc=order_desc,
+        )
+        if via_backend is not None:
+            return via_backend
+
         throttle_db()
         q = client.schema(schema).table(table_name).select(select_cols)
         for col, val in (filters or {}).items():
@@ -450,7 +524,7 @@ def safe_select(
             q = q.order(order_by, desc=order_desc)
         if limit is not None:
             q = q.limit(int(limit))
-        return (q.execute().data or [])
+        return q.execute().data or []
     except Exception as e:
         if show_error:
             st.error(f"Error reading {schema}.{table_name}")
@@ -495,12 +569,22 @@ def show_connected_db_banner():
     st.write("Schema:", f"`{SUPABASE_SCHEMA}`")
     st.write("Anon key looks valid:", "✅" if looks_like_jwt(SUPABASE_ANON_KEY) else "❌")
     st.write("Service key set:", "✅" if bool(SUPABASE_SERVICE_KEY) else "❌")
+    st.write("Backend readers bridge:", "✅" if BACKEND_READERS_OK else "⚠️ fallback mode")
 
     try:
-        throttle_db()
-        r = sb_anon.schema(SUPABASE_SCHEMA).table("members").select("id").limit(1).execute()
-        st.success("Anon read test: ✅ can read members")
-        st.write("Sample:", r.data)
+        test_rows = safe_select(
+            sb_anon,
+            "members",
+            "id",
+            schema=SUPABASE_SCHEMA,
+            limit=1,
+            show_error=False,
+        )
+        if test_rows is not None:
+            st.success("Anon read test: ✅ can read members")
+            st.write("Sample:", test_rows)
+        else:
+            st.error("Anon read test: ❌ no result")
     except Exception as e:
         st.error("Anon read test: ❌ cannot read members (RLS policy or wrong schema)")
         st.code(_api_msg(e), language="text")
@@ -523,7 +607,6 @@ def apply_nav_before_widget(default_page: str, allowed_pages: List[str]):
     if "nav_request" not in st.session_state:
         st.session_state["nav_request"] = None
 
-    # Bridge: dashboard_panel.py may set st.session_state["page"] = "<Menu Name>"
     dash_req = st.session_state.get("page")
     if isinstance(dash_req, str) and dash_req.strip():
         st.session_state["nav_request"] = dash_req.strip()
@@ -610,8 +693,25 @@ def load_members(url: str, anon_key: str, schema: str) -> pd.DataFrame:
     ]
     rows = []
     last_err = None
+
     for cols in cols_try:
         try:
+            via_backend = _safe_rows_via_backend(
+                client=client,
+                schema=schema,
+                relation="members",
+                cols=cols,
+                limit=5000,
+                order_by="id",
+                order_desc=False,
+            )
+            if via_backend is not None:
+                rows = via_backend or []
+                if rows:
+                    last_err = None
+                    break
+                continue
+
             throttle_db()
             rows = (
                 client.schema(schema)
@@ -659,8 +759,21 @@ def load_members(url: str, anon_key: str, schema: str) -> pd.DataFrame:
 @st.cache_data(ttl=VIEW_TTL, show_spinner=False)
 def load_contributions_view(url: str, anon_key: str, schema: str, slow_mode: bool) -> pd.DataFrame:
     client = create_client(url, anon_key)
-    throttle_db()
     try:
+        via_backend = _safe_rows_via_backend(
+            client=client,
+            schema=schema,
+            relation="v_contributions_with_member",
+            cols="id,member_id,member_name,session_id,amount,paid_at,note,created_at",
+            limit=500 if not slow_mode else 350,
+            order_by="created_at",
+            order_desc=True,
+        )
+        if via_backend is not None:
+            st.session_state.pop("_last_contrib_view_error", None)
+            return pd.DataFrame(via_backend) if via_backend else pd.DataFrame()
+
+        throttle_db()
         rows = (
             client.schema(schema)
             .table("v_contributions_with_member")
@@ -681,8 +794,21 @@ def load_contributions_view(url: str, anon_key: str, schema: str, slow_mode: boo
 @st.cache_data(ttl=VIEW_TTL, show_spinner=False)
 def load_attendance_view(url: str, anon_key: str, schema: str, session_id: int) -> pd.DataFrame:
     client = create_client(url, anon_key)
-    throttle_db()
     try:
+        via_backend = _safe_rows_via_backend(
+            client=client,
+            schema=schema,
+            relation="v_attendance_with_member",
+            cols="*",
+            limit=5000,
+            filters=[("session_id", "eq", int(session_id))],
+            order_by="member_id",
+            order_desc=False,
+        )
+        if via_backend is not None:
+            return pd.DataFrame(via_backend) if via_backend else pd.DataFrame()
+
+        throttle_db()
         rows = (
             client.schema(schema)
             .table("v_attendance_with_member")
@@ -712,12 +838,24 @@ def load_ai_table(
 ) -> pd.DataFrame:
     client = create_client(url, anon_key)
     try:
+        via_backend = _safe_rows_via_backend(
+            client=client,
+            schema=schema,
+            relation=table,
+            cols=select_cols,
+            limit=int(limit),
+            order_by=order_by,
+            order_desc=order_desc,
+        )
+        if via_backend is not None:
+            return pd.DataFrame(via_backend) if via_backend else pd.DataFrame()
+
         throttle_db()
         q = client.schema(schema).table(table).select(select_cols)
         if order_by:
             q = q.order(order_by, desc=order_desc)
         q = q.limit(int(limit))
-        rows = (q.execute().data or [])
+        rows = q.execute().data or []
         return pd.DataFrame(rows) if rows else pd.DataFrame()
     except Exception as e:
         st.session_state[f"_last_ai_load_err_{table}"] = _api_msg(e)
@@ -948,6 +1086,7 @@ elif page == "🧠 AI Suite":
 
     with st.expander("🔧 AI Suite load diagnostics", expanded=False):
         st.caption(f"AI Suite signature: {str(inspect.signature(fn))}")
+        st.write("Backend readers bridge:", "✅ enabled" if BACKEND_READERS_OK else "⚠️ fallback mode")
         for t in ["contributions", "foundation_contributions", "loans", "loan_payments", "payouts", "fines", "sessions"]:
             errk = f"_last_ai_load_err_{t}"
             if st.session_state.get(errk):
@@ -1072,7 +1211,6 @@ elif page == "Minutes & Attendance":
 
     tab1, tab2, tab3 = st.tabs(["Minutes / Documentation", "Attendance", "Summaries"])
 
-    # ---------- Minutes ----------
     with tab1:
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.subheader("Meeting Minutes / Documentation")
@@ -1145,7 +1283,6 @@ elif page == "Minutes & Attendance":
         else:
             st.dataframe(dfm, use_container_width=True, hide_index=True)
 
-            # ✅ PDF Download (Minutes)
             make_minutes_pdf, _, pdf_err = get_pdf_tools()
             if make_minutes_pdf is None:
                 st.caption("PDF download not available.")
@@ -1168,7 +1305,6 @@ elif page == "Minutes & Attendance":
 
         st.markdown(glass_close(), unsafe_allow_html=True)
 
-    # ---------- Attendance ----------
     with tab2:
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.subheader("Attendance")
@@ -1275,7 +1411,6 @@ elif page == "Minutes & Attendance":
                 st.warning("View v_attendance_with_member not readable. Showing attendance joined in Python.")
                 st.dataframe(dfa, use_container_width=True, hide_index=True)
 
-        # ✅ PDF Download (Attendance)
         _, make_attendance_pdf, pdf_err = get_pdf_tools()
         if make_attendance_pdf is None:
             st.caption("PDF download not available.")
@@ -1302,7 +1437,6 @@ elif page == "Minutes & Attendance":
 
         st.markdown(glass_close(), unsafe_allow_html=True)
 
-    # ---------- Summaries ----------
     with tab3:
         st.markdown(glass_open(), unsafe_allow_html=True)
         st.subheader("Summaries")
